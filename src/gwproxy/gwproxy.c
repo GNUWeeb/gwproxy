@@ -1840,6 +1840,8 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	gde = gcp->gde;
 	if (gde) {
+		pr_dbg(ctx, "Freeing DNS entry for connection pair (idx=%u, fd=%d)",
+			gcp->idx, gde->ev_fd);
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, gde->ev_fd, NULL);
 		if (unlikely(r))
 			return r;
@@ -1849,12 +1851,20 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	if (gcp->client.fd >= 0) {
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, gcp->client.fd, NULL);
+		if (unlikely(r))
+			return r;
+
 		nr_fd_closed++;
 		w->ev_need_reload = true;
 		log_conn_pair_close(w, gcp);
 	}
 
 	if (gcp->timer_fd >= 0) {
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, gcp->timer_fd, NULL);
+		if (unlikely(r))
+			return r;
+
 		nr_fd_closed++;
 		__sys_close(gcp->timer_fd);
 		gcp->timer_fd = -1;
@@ -2698,7 +2708,9 @@ static int handle_socks5_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	tfd = create_sock_target(w, &gcp->target_addr, &gcp->is_target_alive);
 	if (unlikely(tfd < 0)) {
-		pr_err(w->ctx, "Failed to create target socket: %s", strerror(-tfd));
+		pr_err(w->ctx, "Failed to create target socket (2) family: %d: %s",
+			gcp->target_addr.sa.sa_family, strerror(-tfd));
+		abort();
 		return tfd;
 	}
 
@@ -2789,11 +2801,10 @@ static int handle_socks5_data(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	out = gcp->target.buf + gcp->target.len;
 	out_len = gcp->target.cap - gcp->target.len;
 	r = gwp_socks5_conn_handle_data(sc, in, &in_len, out, &out_len);
-	if (r)
-		return (r == -EAGAIN) ? 0 : r;
-
 	gwp_conn_buf_advance(&gcp->client, in_len);
 	gcp->target.len += out_len;
+	if (r)
+		return (r == -EAGAIN) ? 0 : r;
 
 	if (sc->state == GWP_SOCKS5_ST_CMD_CONNECT) {
 		r = socks5_prepare_target_addr(w, gcp);
