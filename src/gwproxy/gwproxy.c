@@ -1278,9 +1278,6 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		if (gcp->s5_conn)
 			gwp_socks5_conn_free(gcp->s5_conn);
 
-		if (gcp->gde)
-			gwp_dns_entry_put(gcp->gde);
-
 		free(gcp);
 	}
 
@@ -1621,7 +1618,6 @@ static void gwp_ctx_free_dns(struct gwp_ctx *ctx)
 	if (!ctx->dns)
 		return;
 
-	pr_dbg(ctx, "Freeing DNS context");
 	gwp_dns_ctx_free(ctx->dns);
 	ctx->dns = NULL;
 	pr_dbg(ctx, "DNS context freed");
@@ -2894,7 +2890,7 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, gde->ev_fd, NULL);
 	if (unlikely(r))
-		goto out_put;
+		return r;
 
 	log_dns_query(w, gcp, gde);
 	if (likely(!gde->res)) {
@@ -2904,14 +2900,12 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		r = prep_and_send_socks5_rep_connect(w, gcp, gde->res);
 	}
 
-	if (unlikely(gcp->conn_state == CONN_STATE_SOCKS5_ERR)) {
-		r = -ECONNRESET;
-		goto out_put;
-	}
-
-out_put:
 	gwp_dns_entry_put(gde);
 	gcp->gde = NULL;
+
+	if (unlikely(gcp->conn_state == CONN_STATE_SOCKS5_ERR))
+		return -ECONNRESET;
+
 	return r;
 }
 
