@@ -2850,11 +2850,13 @@ static int handle_ev_client_socks5(struct gwp_wrk *w,
 			return sr;
 	}
 
-	r = handle_socks5_data(w, gcp);
-	if (gcp->target.len) {
-		r = handle_socks5_pollout(w, gcp);
-		if (r && r != -EAGAIN)
-			return r;
+	if (gcp->conn_state == CONN_STATE_SOCKS5_DATA) {
+		r = handle_socks5_data(w, gcp);
+		if (gcp->target.len) {
+			r = handle_socks5_pollout(w, gcp);
+			if (r && r != -EAGAIN)
+				return r;
+		}
 	}
 	return r;
 }
