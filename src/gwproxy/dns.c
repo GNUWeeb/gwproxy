@@ -8,6 +8,7 @@
 
 #include "dns.h"
 
+#include <stdio.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,10 +63,11 @@ struct gwp_dns_ctx {
 static void put_all_entries(struct gwp_dns_entry *head)
 {
 	struct gwp_dns_entry *e, *next;
-
+	uint32_t i = 0;
 	for (e = head; e; e = next) {
 		next = e->next;
 		gwp_dns_entry_put(e);
+		i++;
 	}
 }
 
@@ -361,13 +363,30 @@ static void wait_for_queue_entry(struct gwp_dns_ctx *ctx)
 /*
  * Must be called with ctx->lock held.
  */
-static struct gwp_dns_entry *unplug_queue_list(struct gwp_dns_ctx *ctx)
+static struct gwp_dns_entry *unplug_queue_list(struct gwp_dns_ctx *ctx,
+					       uint32_t max)
 {
-	struct gwp_dns_entry *head = ctx->head;
+	struct gwp_dns_entry *ret = ctx->head;
+	uint32_t i = 0;
 
-	ctx->head = ctx->tail = NULL;
-	ctx->nr_entries = 0;
-	return head;
+	while (ctx->head && i < max) {
+		struct gwp_dns_entry *e = ctx->head;
+
+		ctx->head = e->next;
+		if (!ctx->head)
+			ctx->tail = NULL;
+
+		e->next = NULL;
+		i++;
+	}
+
+	ctx->nr_entries -= i;
+	if (ctx->nr_entries == 0) {
+		ctx->head = NULL;
+		ctx->tail = NULL;
+	}
+	printf("Processing %u entries from the queue\n", i);
+	return ret;
 }
 
 struct dbq_entry {
@@ -390,11 +409,14 @@ static void dbq_free(struct dns_batch_query *dbq)
 	if (!dbq)
 		return;
 
-	if (dbq->reqs) {
-		for (i = 0; i < dbq->nr_entries; i++) {
-			if (dbq->reqs[i]->ar_result)
-				freeaddrinfo(dbq->reqs[i]->ar_result);
-		}
+	for (i = 0; i < dbq->nr_entries; i++) {
+		struct gwp_dns_entry *e = dbq->entries[i].e;
+
+		if (e)
+			gwp_dns_entry_put(e);
+
+		if (dbq->reqs && dbq->reqs[i]->ar_result)
+			freeaddrinfo(dbq->reqs[i]->ar_result);
 	}
 
 	free(dbq->entries);
@@ -433,7 +455,7 @@ static int collect_active_queries(struct gwp_dns_ctx *ctx,
 				  struct gwp_dns_entry **head_p,
 				  struct dns_batch_query **dbq_p)
 {
-	struct gwp_dns_entry *e, *next, *prev = NULL, *head = *head_p;
+	struct gwp_dns_entry *e, *next, *head = *head_p;
 	struct dns_batch_query *dbq;
 
 	dbq = calloc(1, sizeof(*dbq));
@@ -444,31 +466,17 @@ static int collect_active_queries(struct gwp_dns_ctx *ctx,
 	prep_hints(&dbq->hints, ctx->cfg.restyp);
 	for (e = head; e; e = next) {
 		int x = atomic_load(&e->refcnt);
-		next = e->next;
 		if (x > 1) {
-
 			if (dbq_add_entry(dbq, e)) {
 				dbq_free(dbq);
+				put_all_entries(e);
 				return -ENOMEM;
 			}
-
-			prev = e;
-			continue;
+		} else {
+			assert(x == 1);
+			gwp_dns_entry_free(e);
 		}
-
-		assert(x == 1);
-		/*
-		 * If the refcnt is 1, it means we are the last reference
-		 * to this entry. The client no longer cares about the
-		 * result. We can free it immediately. No need to resolve
-		 * the query nor to signal the eventfd.
-		 */
-		if (prev)
-			prev->next = next;
-		else
-			head = next;
-
-		gwp_dns_entry_free(e);
+		next = e->next;
 	}
 
 	*head_p = head;
@@ -531,7 +539,7 @@ static int prep_reqs(struct dns_batch_query *dbq)
  */
 static void process_queue_entry_batch(struct gwp_dns_ctx *ctx)
 {
-	struct gwp_dns_entry *head = unplug_queue_list(ctx);
+	struct gwp_dns_entry *head = unplug_queue_list(ctx, 64);
 	struct dns_batch_query *dbq = NULL;
 
 	if (!head)
@@ -552,7 +560,6 @@ static void process_queue_entry_batch(struct gwp_dns_ctx *ctx)
 	}
 
 	dbq_free(dbq);
-	put_all_entries(head);
 	pthread_mutex_lock(&ctx->lock);
 }
 
@@ -616,9 +623,9 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 	 * clone() for each entry if we can process them in the current
 	 * thread.
 	 */
-	if ((ctx->nr_entries + 16) > ctx->nr_sleeping)
-		process_queue_entry_batch(ctx);
-	else
+	// if ((ctx->nr_entries + 16) > ctx->nr_sleeping)
+	// 	process_queue_entry_batch(ctx);
+	// else
 		process_queue_entry_single(ctx);
 }
 
