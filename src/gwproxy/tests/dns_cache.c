@@ -58,6 +58,8 @@ static void test_dns_cache_basic_insert_lookup(void)
 	struct gwp_dns_cache_entry *entry;
 	struct addrinfo *ai;
 	struct addrinfo hints;
+	time_t expire_time;
+	uint8_t *i4_addrs;
 	int r;
 
 	r = gwp_dns_cache_init(&cache, 128);
@@ -72,7 +74,7 @@ static void test_dns_cache_basic_insert_lookup(void)
 	assert(ai != NULL);
 
 	/* Insert entry */
-	time_t expire_time = time(NULL) + 300; /* 5 minutes from now */
+	expire_time = time(NULL) + 300; /* 5 minutes from now */
 	r = gwp_dns_cache_insert(cache, "test.local", ai, expire_time);
 	assert(r == 0);
 
@@ -87,7 +89,7 @@ static void test_dns_cache_basic_insert_lookup(void)
 	assert(entry->nr_i4 >= 1);
 
 	/* Check IPv4 addresses */
-	uint8_t *i4_addrs = gwp_dns_cache_entget_i4(entry);
+	i4_addrs = gwp_dns_cache_entget_i4(entry);
 	assert(i4_addrs != NULL);
 
 	/* Put the entry back */
@@ -109,6 +111,8 @@ static void test_dns_cache_ipv6_support(void)
 	struct gwp_dns_cache_entry *entry;
 	struct addrinfo *ai;
 	struct addrinfo hints;
+	time_t expire_time;
+	uint8_t *i6_addrs;
 	int r;
 
 	r = gwp_dns_cache_init(&cache, 128);
@@ -123,7 +127,7 @@ static void test_dns_cache_ipv6_support(void)
 	assert(ai != NULL);
 
 	/* Insert IPv6 entry */
-	time_t expire_time = time(NULL) + 300;
+	expire_time = time(NULL) + 300;
 	r = gwp_dns_cache_insert(cache, "ipv6test.local", ai, expire_time);
 	assert(r == 0);
 
@@ -134,7 +138,7 @@ static void test_dns_cache_ipv6_support(void)
 
 	/* Verify IPv6 entry */
 	assert(entry->nr_i6 >= 1);
-	uint8_t *i6_addrs = gwp_dns_cache_entget_i6(entry);
+	i6_addrs = gwp_dns_cache_entget_i6(entry);
 	assert(i6_addrs != NULL);
 
 	gwp_dns_cache_putent(entry);
@@ -150,6 +154,9 @@ static void test_dns_cache_mixed_ipv4_ipv6(void)
 	struct gwp_dns_cache_entry *entry;
 	struct addrinfo *ai_v4, *ai_v6, *ai_mixed;
 	struct addrinfo hints;
+	time_t expire_time;
+	uint8_t *i4_addrs;
+	uint8_t *i6_addrs;
 	int r;
 
 	r = gwp_dns_cache_init(&cache, 128);
@@ -171,7 +178,7 @@ static void test_dns_cache_mixed_ipv4_ipv6(void)
 	ai_v4->ai_next = ai_v6;
 
 	/* Insert mixed entry */
-	time_t expire_time = time(NULL) + 300;
+	expire_time = time(NULL) + 300;
 	r = gwp_dns_cache_insert(cache, "mixed.local", ai_mixed, expire_time);
 	assert(r == 0);
 
@@ -184,8 +191,8 @@ static void test_dns_cache_mixed_ipv4_ipv6(void)
 	assert(entry->nr_i4 >= 1);
 	assert(entry->nr_i6 >= 1);
 
-	uint8_t *i4_addrs = gwp_dns_cache_entget_i4(entry);
-	uint8_t *i6_addrs = gwp_dns_cache_entget_i6(entry);
+	i4_addrs = gwp_dns_cache_entget_i4(entry);
+	i6_addrs = gwp_dns_cache_entget_i6(entry);
 	assert(i4_addrs != NULL);
 	assert(i6_addrs != NULL);
 
@@ -206,6 +213,7 @@ static void test_dns_cache_entry_replacement(void)
 	struct gwp_dns_cache_entry *entry1, *entry2;
 	struct addrinfo *ai1, *ai2;
 	struct addrinfo hints;
+	time_t expire_time;
 	int r;
 
 	r = gwp_dns_cache_init(&cache, 128);
@@ -223,7 +231,7 @@ static void test_dns_cache_entry_replacement(void)
 	assert(r == 0);
 
 	/* Insert first entry */
-	time_t expire_time = time(NULL) + 300;
+	expire_time = time(NULL) + 300;
 	r = gwp_dns_cache_insert(cache, "replace.local", ai1, expire_time);
 	assert(r == 0);
 
@@ -261,6 +269,7 @@ static void test_dns_cache_expiration(void)
 	struct gwp_dns_cache_entry *entry;
 	struct addrinfo *ai;
 	struct addrinfo hints;
+	time_t expire_time;
 	int r;
 
 	r = gwp_dns_cache_init(&cache, 128);
@@ -274,7 +283,7 @@ static void test_dns_cache_expiration(void)
 	assert(r == 0);
 
 	/* Insert entry that expires immediately */
-	time_t expire_time = time(NULL) - 1; /* Already expired */
+	expire_time = time(NULL) - 1; /* Already expired */
 	r = gwp_dns_cache_insert(cache, "expired.local", ai, expire_time);
 	assert(r == 0);
 
@@ -305,6 +314,7 @@ static void test_dns_cache_housekeeping(void)
 	struct gwp_dns_cache_entry *entry;
 	struct addrinfo *ai;
 	struct addrinfo hints;
+	time_t now;
 	int r;
 
 	r = gwp_dns_cache_init(&cache, 128);
@@ -318,7 +328,7 @@ static void test_dns_cache_housekeeping(void)
 	assert(r == 0);
 
 	/* Insert multiple entries, some expired */
-	time_t now = time(NULL);
+	now = time(NULL);
 	r = gwp_dns_cache_insert(cache, "expired1.local", ai, now - 10);
 	assert(r == 0);
 	r = gwp_dns_cache_insert(cache, "expired2.local", ai, now - 5);
@@ -357,6 +367,7 @@ static void test_dns_cache_hash_collisions(void)
 	struct gwp_dns_cache_entry *entry;
 	struct addrinfo *ai;
 	struct addrinfo hints;
+	time_t expire_time;
 	int r, i;
 	char key[64];
 
@@ -371,7 +382,7 @@ static void test_dns_cache_hash_collisions(void)
 	r = getaddrinfo("127.0.0.1", "80", &hints, &ai);
 	assert(r == 0);
 
-	time_t expire_time = time(NULL) + 300;
+	expire_time = time(NULL) + 300;
 
 	/* Insert many entries to force hash collisions */
 	for (i = 0; i < 20; i++) {
@@ -402,6 +413,7 @@ static void test_dns_cache_reference_counting(void)
 	struct gwp_dns_cache_entry *entry1, *entry2, *entry3;
 	struct addrinfo *ai;
 	struct addrinfo hints;
+	time_t expire_time;
 	int r;
 
 	r = gwp_dns_cache_init(&cache, 128);
@@ -415,7 +427,7 @@ static void test_dns_cache_reference_counting(void)
 	assert(r == 0);
 
 	/* Insert entry */
-	time_t expire_time = time(NULL) + 300;
+	expire_time = time(NULL) + 300;
 	r = gwp_dns_cache_insert(cache, "refcount.local", ai, expire_time);
 	assert(r == 0);
 
@@ -456,6 +468,7 @@ static void test_dns_cache_invalid_inputs(void)
 	struct gwp_dns_cache_entry *entry;
 	struct addrinfo *ai, dummy_ai;
 	struct addrinfo hints;
+	time_t expire_time;
 	int r;
 
 	r = gwp_dns_cache_init(&cache, 128);
@@ -468,7 +481,7 @@ static void test_dns_cache_invalid_inputs(void)
 	r = getaddrinfo("127.0.0.1", "80", &hints, &ai);
 	assert(r == 0);
 
-	time_t expire_time = time(NULL) + 300;
+	expire_time = time(NULL) + 300;
 
 	/* Empty key should fail */
 	r = gwp_dns_cache_insert(cache, "", ai, expire_time);
@@ -510,6 +523,7 @@ static void test_dns_cache_large_dataset(void)
 	struct gwp_dns_cache_entry *entry;
 	struct addrinfo *ai;
 	struct addrinfo hints;
+	time_t expire_time;
 	int r, i;
 	char key[64];
 
@@ -523,7 +537,7 @@ static void test_dns_cache_large_dataset(void)
 	r = getaddrinfo("127.0.0.1", "80", &hints, &ai);
 	assert(r == 0);
 
-	time_t expire_time = time(NULL) + 300;
+	expire_time = time(NULL) + 300;
 
 	/* Insert many entries */
 	for (i = 0; i < 1000; i++) {
