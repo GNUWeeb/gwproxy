@@ -24,8 +24,20 @@ static const struct req_template req_template[] = {
 	{ "localhost",		"80" },
 	{ "127.0.0.1",		"80" },
 	{ "::1",		"80" },
-	{ "example.com",	"80" },
+	{ "facebook.com",	"80" },
 	{ "google.com",		"443" },
+	{ "github.com",		"443" },
+	{ "example.com",	"80" },
+	{ "twitter.com",	"443" },
+	{ "reddit.com",		"80" },
+	{ "youtube.com",	"443" },
+	{ "wikipedia.org",	"80" },
+	{ "stackoverflow.com",	"443" },
+	{ "amazon.com",		"80" },
+	{ "microsoft.com",	"443" },
+	{ "apple.com",		"80" },
+	{ "linkedin.com",	"443" },
+	{ "bing.com",		"80" },
 };
 
 static int poll_all_in(struct pollfd *pfd, int n, int timeout)

@@ -403,23 +403,34 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		return -EINVAL;
 	}
 
-	if (cfg->target_buf_size <= 1 || cfg->target_buf_size > (1024 * 1024)) {
-		fprintf(stderr, "Error: --target-buf-size must be between 2 and 1MB.\n");
+	if (cfg->target_buf_size <= 1 || cfg->target_buf_size > INT_MAX) {
+		fprintf(stderr, "Error: --target-buf-size must be between 2 and %d bytes (~2GB).\n", INT_MAX);
 		return -EINVAL;
 	}
 
-	if (cfg->client_buf_size <= 1 || cfg->client_buf_size > (1024 * 1024)) {
-		fprintf(stderr, "Error: --client-buf-size must be between 2 and 1MB.\n");
+	if (cfg->client_buf_size <= 1 || cfg->client_buf_size > INT_MAX) {
+		fprintf(stderr, "Error: --client-buf-size must be between 2 and %d bytes (~2GB).\n", INT_MAX);
 		return -EINVAL;
 	}
 
-	if (cfg->connect_timeout < 0 || cfg->connect_timeout > 300) {
-		fprintf(stderr, "Error: --connect-timeout must be between 0 and 300 seconds.\n");
+	if (cfg->as_socks5) {
+		if (cfg->target_buf_size < 1024) {
+			fprintf(stderr, "Error: --target-buf-size must be at least 1024 bytes when using SOCKS5.\n");
+			return -EINVAL;
+		}
+		if (cfg->client_buf_size < 1024) {
+			fprintf(stderr, "Error: --client-buf-size must be at least 1024 bytes when using SOCKS5.\n");
+			return -EINVAL;
+		}
+	}
+
+	if (cfg->connect_timeout > 300) {
+		fprintf(stderr, "Error: --connect-timeout must be 300 seconds or less (negative means no timeout).\n");
 		return -EINVAL;
 	}
 
-	if (cfg->socks5_timeout < 0 || cfg->socks5_timeout > 300) {
-		fprintf(stderr, "Error: --socks5-timeout must be between 0 and 300 seconds.\n");
+	if (cfg->socks5_timeout > 300) {
+		fprintf(stderr, "Error: --socks5-timeout must be 300 seconds or less (negative means no timeout).\n");
 		return -EINVAL;
 	}
 
