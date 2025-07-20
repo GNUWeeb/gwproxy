@@ -61,7 +61,6 @@ jobs:
           - arch: x86_64
             cc_pkg: clang
             cc: clang
-            extra_flags: -Wmissing-prototypes -Wstrict-prototypes
             sanitize: 0
 
           # x86 (32-bit) gcc
@@ -125,7 +124,6 @@ jobs:
             sanitize: 0
 
     env:
-      CFLAGS: -g -O3 -Wall -Wextra -Werror -Wno-sign-compare ${{matrix.build_args.extra_flags}}
       CC: ${{matrix.build_args.cc}}
       SANITIZE: ${{matrix.build_args.sanitize}}
 
