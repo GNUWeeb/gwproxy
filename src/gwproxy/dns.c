@@ -490,7 +490,7 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 	 * clone() for each entry if we can process them in the current
 	 * thread.
 	 */
-	if ((ctx->nr_entries + 16) > ctx->nr_sleeping)
+	if (ctx->nr_entries > (ctx->nr_sleeping + 16))
 		process_queue_entry_batch(ctx);
 	else
 		process_queue_entry_single(ctx);

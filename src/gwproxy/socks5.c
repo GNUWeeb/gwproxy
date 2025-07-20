@@ -890,6 +890,9 @@ repeat:
 	case GWP_SOCKS5_ST_CMD:
 		r = handle_state_cmd(&arg);
 		break;
+	case GWP_SOCKS5_ST_CMD_CONNECT:
+		r = 0;
+		goto out;
 	default:
 		return -EINVAL;
 	}
@@ -900,6 +903,7 @@ repeat:
 	if (r && r != -EAGAIN && r != -ENOBUFS)
 		conn->state = GWP_SOCKS5_ST_ERR;
 
+out:
 	if (r == -ENOBUFS) {
 		/*
 		 * If we run out of output buffer space, don't change
