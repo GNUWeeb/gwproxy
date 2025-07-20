@@ -564,20 +564,28 @@ static void test_dns_cache_large_dataset(void)
 
 int main(void)
 {
-	printf("Running DNS cache tests...\n");
+	int i;
 
-	test_dns_cache_init_free();
-	test_dns_cache_basic_insert_lookup();
-	test_dns_cache_ipv6_support();
-	test_dns_cache_mixed_ipv4_ipv6();
-	test_dns_cache_entry_replacement();
-	test_dns_cache_expiration();
-	test_dns_cache_housekeeping();
-	test_dns_cache_hash_collisions();
-	test_dns_cache_reference_counting();
-	test_dns_cache_invalid_inputs();
-	test_dns_cache_large_dataset();
+	printf("Running DNS cache tests 5000 times...\n");
 
-	printf("All DNS cache tests passed!\n");
+	for (i = 0; i < 5000; i++) {
+		if (i % 500 == 0) {
+			printf("Iteration %d/5000...\n", i + 1);
+		}
+
+		test_dns_cache_init_free();
+		test_dns_cache_basic_insert_lookup();
+		test_dns_cache_ipv6_support();
+		test_dns_cache_mixed_ipv4_ipv6();
+		test_dns_cache_entry_replacement();
+		test_dns_cache_expiration();
+		test_dns_cache_housekeeping();
+		test_dns_cache_hash_collisions();
+		test_dns_cache_reference_counting();
+		test_dns_cache_invalid_inputs();
+		test_dns_cache_large_dataset();
+	}
+
+	printf("All DNS cache tests passed 5000 times!\n");
 	return 0;
 }
