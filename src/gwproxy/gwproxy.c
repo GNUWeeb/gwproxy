@@ -594,14 +594,12 @@ static int convert_str_to_ssaddr(const char *str, struct gwp_sockaddr *gs)
 	int r;
 
 	/* Input validation */
-	if (!str || !gs) {
+	if (!str || !gs)
 		return -EINVAL;
-	}
 	
 	str_len = strlen(str);
-	if (str_len == 0 || str_len > 256) {
+	if (str_len == 0 || str_len > 256)
 		return -EINVAL;
-	}
 
 	if (*str == '[') {
 		p = strchr(++str, ']');
@@ -627,17 +625,15 @@ static int convert_str_to_ssaddr(const char *str, struct gwp_sockaddr *gs)
 	host[l] = '\0';
 	
 	/* Validate port string length */
-	if (strlen(p + 1) >= sizeof(port)) {
+	if (strlen(p + 1) >= sizeof(port))
 		return -EINVAL;
-	}
 	
 	strncpy(port, p + 1, sizeof(port) - 1);
 	port[sizeof(port) - 1] = '\0';
 	
 	/* Validate port is not empty */
-	if (!*port) {
+	if (!*port)
 		return -EINVAL;
-	}
 
 	r = getaddrinfo(host, port, &hints, &res);
 	if (r)
@@ -1018,23 +1014,20 @@ static int gwp_load_s5auth_add_user(struct gwp_socks5_auth *s5a,
 	char *u, *p;
 
 	/* Input validation */
-	if (!line || !*line) {
+	if (!line || !*line)
 		return -EINVAL;
-	}
 
 	/* Check line length to prevent excessive memory usage */
-	if (strlen(line) > 512) {
+	if (strlen(line) > 512)
 		return -EINVAL;
-	}
 
 	if (s5a->nr >= s5a->cap) {
 		size_t new_cap = s5a->cap ? s5a->cap * 2 : 16;
 		struct gwp_socks5_user *new_users;
 		
 		/* Prevent excessive memory allocation */
-		if (new_cap > 10000) {
+		if (new_cap > 10000)
 			return -ENOMEM;
-		}
 		
 		new_users = realloc(s5a->users, new_cap * sizeof(*new_users));
 		if (!new_users)
@@ -1404,9 +1397,8 @@ __cold
 static int init_conn(struct gwp_conn *conn, uint32_t buf_size)
 {
 	/* Input validation */
-	if (!conn || buf_size == 0 || buf_size > (1024 * 1024)) {
+	if (!conn || buf_size == 0 || buf_size > (1024 * 1024))
 		return -EINVAL;
-	}
 	
 	conn->fd = -1;
 	conn->len = 0;
