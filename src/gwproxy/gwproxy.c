@@ -1065,12 +1065,6 @@ static int gwp_load_s5auth_add_user(struct gwp_socks5_auth *s5a,
 		return -EINVAL;
 	}
 
-	/* Check for empty username */
-	if (!*u) {
-		free(u);
-		return -EINVAL;
-	}
-
 	s5a->users[s5a->nr].u = u;
 	s5a->users[s5a->nr].p = p;
 	s5a->users[s5a->nr].ulen = strlen(u);
@@ -1185,12 +1179,10 @@ static int gwp_ctx_init_s5auth(struct gwp_ctx *ctx)
 	{
 		struct stat st;
 		if (fstat(fileno(s5a->handle), &st) == 0) {
-			if (st.st_mode & (S_IROTH | S_IWOTH)) {
+			if (st.st_mode & (S_IROTH | S_IWOTH))
 				pr_warn(ctx, "SECURITY WARNING: Auth file '%s' is readable/writable by others", s5a_file);
-			}
-			if (st.st_mode & S_IRGRP) {
+			if (st.st_mode & S_IRGRP)
 				pr_warn(ctx, "SECURITY WARNING: Auth file '%s' is readable by group", s5a_file);
-			}
 		}
 	}
 
@@ -2015,22 +2007,10 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 __hot
 static void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
 {
-	/* Bounds checking to prevent buffer underflow */
-	if (unlikely(len > conn->len)) {
-		/* This should never happen, but handle gracefully */
-		conn->len = 0;
-		return;
-	}
-	
+	assert(len <= conn->len);
 	conn->len -= len;
-	if (conn->len > 0) {
-		/* Additional safety check for buffer bounds */
-		if (unlikely(len >= conn->cap)) {
-			conn->len = 0;
-			return;
-		}
+	if (conn->len)
 		memmove(conn->buf, conn->buf + len, conn->len);
-	}
 }
 
 __hot
