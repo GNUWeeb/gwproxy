@@ -37,6 +37,7 @@
 #include <sys/timerfd.h>
 #include <sys/resource.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 
 #include <gwproxy/socks5.h>
 #include <gwproxy/dns.h>
@@ -392,18 +393,38 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		return -EINVAL;
 	}
 
-	if (cfg->nr_workers <= 0) {
-		fprintf(stderr, "Error: --nr-workers must be at least 1.\n");
+	if (cfg->nr_workers <= 0 || cfg->nr_workers > 1000) {
+		fprintf(stderr, "Error: --nr-workers must be between 1 and 1000.\n");
 		return -EINVAL;
 	}
 
-	if (cfg->target_buf_size <= 1) {
-		fprintf(stderr, "Error: --target-buf-size must be greater than 1.\n");
+	if (cfg->nr_dns_workers <= 0 || cfg->nr_dns_workers > 100) {
+		fprintf(stderr, "Error: --nr-dns-workers must be between 1 and 100.\n");
 		return -EINVAL;
 	}
 
-	if (cfg->client_buf_size <= 1) {
-		fprintf(stderr, "Error: --client-buf-size must be greater than 1.\n");
+	if (cfg->target_buf_size <= 1 || cfg->target_buf_size > (1024 * 1024)) {
+		fprintf(stderr, "Error: --target-buf-size must be between 2 and 1MB.\n");
+		return -EINVAL;
+	}
+
+	if (cfg->client_buf_size <= 1 || cfg->client_buf_size > (1024 * 1024)) {
+		fprintf(stderr, "Error: --client-buf-size must be between 2 and 1MB.\n");
+		return -EINVAL;
+	}
+
+	if (cfg->connect_timeout < 0 || cfg->connect_timeout > 300) {
+		fprintf(stderr, "Error: --connect-timeout must be between 0 and 300 seconds.\n");
+		return -EINVAL;
+	}
+
+	if (cfg->socks5_timeout < 0 || cfg->socks5_timeout > 300) {
+		fprintf(stderr, "Error: --socks5-timeout must be between 0 and 300 seconds.\n");
+		return -EINVAL;
+	}
+
+	if (cfg->log_level < 0 || cfg->log_level > 4) {
+		fprintf(stderr, "Error: --log-level must be between 0 and 4.\n");
 		return -EINVAL;
 	}
 
@@ -414,14 +435,14 @@ __hot
 __attribute__((__format__(printf, 3, 4)))
 static void __pr_log(FILE *handle, int level, const char *fmt, ...)
 {
-	char loc_buf[4096], *tmp, *pb, time_buf[64];
+	char loc_buf[4096], *tmp = NULL, *pb, time_buf[64];
 	va_list ap, ap2;
 	const char *ls;
 	struct tm tm;
 	time_t now;
 	int r;
 
-	if (!handle)
+	if (!handle || !fmt)
 		return;
 
 	switch (level) {
@@ -435,13 +456,21 @@ static void __pr_log(FILE *handle, int level, const char *fmt, ...)
 	va_start(ap, fmt);
 	va_copy(ap2, ap);
 	r = vsnprintf(loc_buf, sizeof(loc_buf), fmt, ap);
-	if (unlikely((size_t)r >= sizeof(loc_buf))) {
-		tmp = malloc(r + 1);
-		if (!tmp)
-			goto out;
-
-		vsnprintf(tmp, r + 1, fmt, ap2);
-		pb = tmp;
+	if (unlikely(r < 0)) {
+		/* Handle vsnprintf error */
+		pb = loc_buf;
+		snprintf(loc_buf, sizeof(loc_buf), "[logging error]");
+	} else if (unlikely((size_t)r >= sizeof(loc_buf))) {
+		/* Limit allocation size to prevent excessive memory usage */
+		size_t alloc_size = (r < 65536) ? (r + 1) : 65536;
+		tmp = malloc(alloc_size);
+		if (!tmp) {
+			pb = loc_buf;
+			snprintf(loc_buf, sizeof(loc_buf), "[out of memory for log]");
+		} else {
+			vsnprintf(tmp, alloc_size, fmt, ap2);
+			pb = tmp;
+		}
 	} else {
 		pb = loc_buf;
 	}
@@ -450,12 +479,14 @@ static void __pr_log(FILE *handle, int level, const char *fmt, ...)
 	if (likely(localtime_r(&now, &tm)))
 		strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm);
 	else
-		time_buf[0] = '\0';
+		snprintf(time_buf, sizeof(time_buf), "unknown-time");
 
 	fprintf(handle, "[%s][%s][%08d]: %s\n", time_buf, ls, gettid(), pb);
-	if (unlikely(pb != loc_buf))
-		free(pb);
-out:
+	fflush(handle);
+	
+	if (tmp)
+		free(tmp);
+	
 	va_end(ap2);
 	va_end(ap);
 }
@@ -559,15 +590,25 @@ static int convert_str_to_ssaddr(const char *str, struct gwp_sockaddr *gs)
 	char host[NI_MAXHOST], port[6], *p;
 	struct addrinfo *res, *ai;
 	bool found = false;
-	size_t l;
+	size_t l, str_len;
 	int r;
+
+	/* Input validation */
+	if (!str || !gs) {
+		return -EINVAL;
+	}
+	
+	str_len = strlen(str);
+	if (str_len == 0 || str_len > 256) {
+		return -EINVAL;
+	}
 
 	if (*str == '[') {
 		p = strchr(++str, ']');
 		if (!p)
 			return -EINVAL;
 		l = p - str;
-		if (l >= sizeof(host))
+		if (l >= sizeof(host) || l == 0)
 			return -EINVAL;
 		p++;
 		if (*p != ':')
@@ -577,14 +618,26 @@ static int convert_str_to_ssaddr(const char *str, struct gwp_sockaddr *gs)
 		if (!p)
 			return -EINVAL;
 		l = p - str;
-		if (l >= sizeof(host))
+		if (l >= sizeof(host) || l == 0)
 			return -EINVAL;
 	}
 
-	strncpy(host, str, l);
+	/* Safe string copying with explicit null termination */
+	memcpy(host, str, l);
 	host[l] = '\0';
+	
+	/* Validate port string length */
+	if (strlen(p + 1) >= sizeof(port)) {
+		return -EINVAL;
+	}
+	
 	strncpy(port, p + 1, sizeof(port) - 1);
 	port[sizeof(port) - 1] = '\0';
+	
+	/* Validate port is not empty */
+	if (!*port) {
+		return -EINVAL;
+	}
 
 	r = getaddrinfo(host, port, &hints, &res);
 	if (r)
@@ -964,9 +1017,25 @@ static int gwp_load_s5auth_add_user(struct gwp_socks5_auth *s5a,
 {
 	char *u, *p;
 
+	/* Input validation */
+	if (!line || !*line) {
+		return -EINVAL;
+	}
+
+	/* Check line length to prevent excessive memory usage */
+	if (strlen(line) > 512) {
+		return -EINVAL;
+	}
+
 	if (s5a->nr >= s5a->cap) {
 		size_t new_cap = s5a->cap ? s5a->cap * 2 : 16;
 		struct gwp_socks5_user *new_users;
+		
+		/* Prevent excessive memory allocation */
+		if (new_cap > 10000) {
+			return -ENOMEM;
+		}
+		
 		new_users = realloc(s5a->users, new_cap * sizeof(*new_users));
 		if (!new_users)
 			return -ENOMEM;
@@ -988,6 +1057,12 @@ static int gwp_load_s5auth_add_user(struct gwp_socks5_auth *s5a,
 	}
 
 	if (unlikely(p && strlen(p) > 255)) {
+		free(u);
+		return -EINVAL;
+	}
+
+	/* Check for empty username */
+	if (!*u) {
 		free(u);
 		return -EINVAL;
 	}
@@ -1100,6 +1175,19 @@ static int gwp_ctx_init_s5auth(struct gwp_ctx *ctx)
 		pr_err(ctx, "Failed to open SOCKS5 auth file '%s': %s",
 			s5a_file, strerror(-r));
 		goto out_destroy_lock;
+	}
+
+	/* Security check: warn if auth file is world-readable */
+	{
+		struct stat st;
+		if (fstat(fileno(s5a->handle), &st) == 0) {
+			if (st.st_mode & (S_IROTH | S_IWOTH)) {
+				pr_warn(ctx, "SECURITY WARNING: Auth file '%s' is readable/writable by others", s5a_file);
+			}
+			if (st.st_mode & S_IRGRP) {
+				pr_warn(ctx, "SECURITY WARNING: Auth file '%s' is readable by group", s5a_file);
+			}
+		}
 	}
 
 	s5a->ino_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -1315,12 +1403,24 @@ static void gwp_ctx_free(struct gwp_ctx *ctx)
 __cold
 static int init_conn(struct gwp_conn *conn, uint32_t buf_size)
 {
+	/* Input validation */
+	if (!conn || buf_size == 0 || buf_size > (1024 * 1024)) {
+		return -EINVAL;
+	}
+	
 	conn->fd = -1;
 	conn->len = 0;
 	conn->cap = buf_size;
 	conn->ep_mask = 0;
 	conn->buf = malloc(buf_size);
-	return conn->buf ? 0 : -ENOMEM;
+	if (!conn->buf) {
+		conn->cap = 0;
+		return -ENOMEM;
+	}
+	
+	/* Initialize buffer to zero for security */
+	memset(conn->buf, 0, buf_size);
+	return 0;
 }
 
 static void free_conn(struct gwp_conn *conn)
@@ -1328,11 +1428,19 @@ static void free_conn(struct gwp_conn *conn)
 	if (!conn)
 		return;
 
-	if (conn->buf)
+	if (conn->buf) {
+		/* Clear sensitive data before freeing */
+		if (conn->cap > 0) {
+			memset(conn->buf, 0, conn->cap);
+		}
 		free(conn->buf);
+		conn->buf = NULL;
+	}
 
-	if (conn->fd >= 0)
+	if (conn->fd >= 0) {
 		__sys_close(conn->fd);
+		conn->fd = -1;
+	}
 
 	conn->len = 0;
 	conn->cap = 0;
@@ -1749,11 +1857,24 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 		return handle_accept_error(w, -ENOMEM);
 	}
 
+	/*
+	 * Get and validate client address early to prevent processing
+	 * invalid or malicious connections
+	 */
 	addr = &gcp->client_addr.sa;
 	addr_len = sizeof(gcp->client_addr);
 	fd = __sys_accept4(w->tcp_fd, addr, &addr_len, flags);
 	if (fd < 0) {
 		r = handle_accept_error(w, fd);
+		goto out_err;
+	}
+
+	/* Additional validation for address family */
+	if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
+		pr_warn(ctx, "Rejected connection with unsupported address family %d", 
+			addr->sa_family);
+		__sys_close(fd);
+		r = -EINVAL;
 		goto out_err;
 	}
 
@@ -1891,9 +2012,22 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 __hot
 static void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
 {
+	/* Bounds checking to prevent buffer underflow */
+	if (unlikely(len > conn->len)) {
+		/* This should never happen, but handle gracefully */
+		conn->len = 0;
+		return;
+	}
+	
 	conn->len -= len;
-	if (conn->len)
+	if (conn->len > 0) {
+		/* Additional safety check for buffer bounds */
+		if (unlikely(len >= conn->cap)) {
+			conn->len = 0;
+			return;
+		}
 		memmove(conn->buf, conn->buf + len, conn->len);
+	}
 }
 
 __hot
@@ -2531,12 +2665,37 @@ static bool is_ev_bit_conn_pair(uint64_t ev_bit)
 	return !!(ev_bit & conn_pair_ev_bit);
 }
 
+/**
+ * handle_event - Process a single epoll event
+ * @w: Worker thread context
+ * @ev: The epoll event to process
+ *
+ * This function is the core event dispatcher for the proxy. It extracts
+ * the event type from the upper bits of ev->data.u64 and dispatches to
+ * the appropriate handler function.
+ *
+ * Event types include:
+ * - EV_BIT_ACCEPT: New client connection
+ * - EV_BIT_EVENTFD: Worker thread control signal
+ * - EV_BIT_TARGET: Target socket I/O
+ * - EV_BIT_CLIENT: Client socket I/O 
+ * - EV_BIT_TIMER: Timeout event
+ * - EV_BIT_CLIENT_SOCKS5: Client SOCKS5 protocol handling
+ * - EV_BIT_DNS_QUERY: DNS resolution completed
+ * - EV_BIT_SOCKS5_AUTH_FILE: Auth file change notification
+ *
+ * For connection pair events, if an error occurs, the connection pair
+ * is automatically freed to prevent resource leaks.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
 static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 {
 	uint64_t ev_bit;
 	void *udata;
 	int r;
 
+	/* Extract event type from upper bits */
 	ev_bit = GET_EV_BIT(ev->data.u64);
 	ev->data.u64 = CLEAR_EV_BIT(ev->data.u64);
 	udata = ev->data.ptr;
@@ -2571,6 +2730,10 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		return -EINVAL;
 	}
 
+	/* 
+	 * If error occurred on a connection pair event, automatically
+	 * clean up the connection to prevent resource leaks
+	 */
 	if (r && is_ev_bit_conn_pair(ev_bit)) {
 		struct gwp_conn_pair *gcp = udata;
 		r = free_conn_pair(w, gcp);
