@@ -46,27 +46,36 @@ struct gwp_cfg {
 struct gwp_ctx;
 
 enum {
-	EV_BIT_ACCEPT		= (1ull << 48ull),
-	EV_BIT_EVENTFD		= (2ull << 48ull),
-	EV_BIT_TARGET		= (3ull << 48ull),
-	EV_BIT_CLIENT		= (4ull << 48ull),
-	EV_BIT_TIMER		= (5ull << 48ull),
-	EV_BIT_CLIENT_SOCKS5	= (6ull << 48ull),
-	EV_BIT_DNS_QUERY	= (7ull << 48ull),
-	EV_BIT_SOCKS5_AUTH_FILE	= (8ull << 48ull),
+	EV_BIT_ACCEPT			= (1ull << 48ull),
+	EV_BIT_EVENTFD			= (2ull << 48ull),
+	EV_BIT_TARGET			= (3ull << 48ull),
+	EV_BIT_CLIENT			= (4ull << 48ull),
+	EV_BIT_TIMER			= (5ull << 48ull),
+	EV_BIT_CLIENT_SOCKS5		= (6ull << 48ull),
+	EV_BIT_DNS_QUERY		= (7ull << 48ull),
+	EV_BIT_SOCKS5_AUTH_FILE		= (8ull << 48ull),
 
-	EV_BIT_CLOSE		= (9ull << 48ull),
-	EV_BIT_TARGET_CONNECT	= (10ull << 48ull),
-	EV_BIT_TARGET_CANCEL	= (11ull << 48ull),
-	EV_BIT_CLIENT_CANCEL	= (12ull << 48ull),
-	EV_BIT_TIMER_DEL	= (13ull << 48ull),
-	EV_BIT_TARGET_SEND	= (14ull << 48ull),
-	EV_BIT_CLIENT_SEND	= (15ull << 48ull),
-	EV_BIT_CLIENT_RECV	= EV_BIT_CLIENT,
-	EV_BIT_TARGET_RECV	= EV_BIT_TARGET,
-	EV_BIT_MSG_RING		= (16ull << 48ull),
-
-	EV_BIT_CLIENT_SEND_NO_CB	= (17ull << 48ull),
+#ifdef CONFIG_IO_URING
+	/*
+	 * Only used by io_uring.
+	 */
+	EV_BIT_IOU_DNS_QUERY		= EV_BIT_DNS_QUERY,
+	EV_BIT_IOU_SOCKS5_AUTH_FILE	= EV_BIT_SOCKS5_AUTH_FILE,
+	EV_BIT_IOU_TIMER		= EV_BIT_TIMER,
+	EV_BIT_IOU_ACCEPT		= EV_BIT_ACCEPT,
+	EV_BIT_IOU_CLIENT_SOCKS5	= EV_BIT_CLIENT_SOCKS5,
+	EV_BIT_IOU_CLIENT_RECV		= EV_BIT_CLIENT,
+	EV_BIT_IOU_TARGET_RECV		= EV_BIT_TARGET,
+	EV_BIT_IOU_TARGET_SEND		= (9ull << 48ull),
+	EV_BIT_IOU_CLIENT_SEND		= (10ull << 48ull),
+	EV_BIT_IOU_CLOSE		= (11ull << 48ull),
+	EV_BIT_IOU_TARGET_CONNECT	= (12ull << 48ull),
+	EV_BIT_IOU_TARGET_CANCEL	= (13ull << 48ull),
+	EV_BIT_IOU_CLIENT_CANCEL	= (14ull << 48ull),
+	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
+	EV_BIT_IOU_MSG_RING		= (16ull << 48ull),
+	EV_BIT_IOU_CLIENT_SEND_NO_CB	= (17ull << 48ull),
+#endif
 };
 
 
