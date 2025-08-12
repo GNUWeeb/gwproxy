@@ -18,11 +18,14 @@
 #include <liburing.h>
 #endif
 
+#include <gwproxy/http1.h>
+
 struct gwp_cfg {
 	const char	*event_loop;
 	const char	*bind;
 	const char	*target;
 	bool		as_socks5;
+	bool		as_http;
 	bool		socks5_prefer_ipv6;
 	int		socks5_timeout;
 	const char	*socks5_auth_file;
@@ -113,6 +116,14 @@ enum {
 	GWP_CONN_FLAG_IS_CANCEL		= (1ull << 2ull),
 };
 
+struct gwp_http_conn {
+	union {
+		struct gwnet_http_hdr_pctx	ctx_hdr;
+		struct gwnet_http_body_pctx	ctx_body;
+	};
+	struct gwnet_http_req_hdr	req_hdr;
+};
+
 struct gwp_conn_pair {
 	struct gwp_conn		target;
 	struct gwp_conn		client;
@@ -127,7 +138,10 @@ struct gwp_conn_pair {
 	int			conn_state;
 	int			timer_fd;
 	uint32_t		idx;
-	struct gwp_socks5_conn	*s5_conn;
+	union {
+		struct gwp_socks5_conn	*s5_conn;
+		struct gwp_http_conn	*http_conn;
+	};
 	struct gwp_dns_query	*gdq;
 	struct gwp_dns_entry	*gde;
 	struct gwp_sockaddr	client_addr;
