@@ -197,18 +197,25 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_cfg *cfg = &ctx->cfg;
-	int fd, timer_fd, timeout, r;
+	int fd = -1, timer_fd, timeout, r;
 	struct epoll_event ev;
 	uint64_t cl_ev_bit;
 
-	if (ctx->cfg.as_socks5) {
-		/*
-		 * If we are running as a SOCKS5 proxy, the initial connection
-		 * does not have a target socket. We will create the target
-		 * socket later, when the client sends a CONNECT command.
-		 */
+	/*
+	 * If we are running as a SOCKS5 proxy or an HTTP proxy, the initial
+	 * connection does not have a target socket. We will create the target
+	 * socket later.
+	 */
+	if (cfg->as_http) {
+		timeout = cfg->http_timeout;
+		gcp->conn_state = CONN_STATE_HTTP_HDR;
+		cl_ev_bit = EV_BIT_HTTP_CONN;
+		gcp->is_target_alive = false;
+		gcp->http_conn = gwp_http_conn_alloc();
+		if (unlikely(!gcp->http_conn))
+			return -ENOMEM;
+	} else if (cfg->as_socks5) {
 		timeout = cfg->socks5_timeout;
-		fd = -1;
 		gcp->conn_state = CONN_STATE_SOCKS5_DATA;
 		cl_ev_bit = EV_BIT_CLIENT_SOCKS5;
 		gcp->is_target_alive = false;
@@ -234,9 +241,8 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			pr_err(&ctx->lh, "Failed to create connect timeout timer: %s",
 				strerror(-timer_fd));
 			__sys_close(fd);
-			gwp_socks5_conn_free(gcp->s5_conn);
-			gcp->s5_conn = NULL;
-			return timer_fd;
+			r = timer_fd;
+			goto out_free_conn;
 		}
 		gcp->timer_fd = timer_fd;
 	}
@@ -283,6 +289,17 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		log_conn_pair_created(w, gcp);
 
 	return 0;
+
+
+out_free_conn:
+	if (cfg->as_http) {
+		gwp_http_conn_free(gcp->http_conn);
+		gcp->http_conn = NULL;
+	} else if (cfg->as_socks5) {
+		gwp_socks5_conn_free(gcp->s5_conn);
+		gcp->s5_conn = NULL;
+	}
+	return r;
 }
 
 static int handle_accept_error(struct gwp_wrk *w, int e)

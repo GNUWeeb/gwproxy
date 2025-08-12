@@ -53,6 +53,7 @@ static const struct option long_opts[] = {
 	{ "socks5-timeout",	required_argument,	NULL,	'o' },
 	{ "socks5-auth-file",	required_argument,	NULL,	'A' },
 	{ "socks5-dns-cache-secs",	required_argument,	NULL,	'L' },
+	{ "http-timeout",	required_argument,	NULL,	'z' },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
 	{ "connect-timeout",	required_argument,	NULL,	'c' },
@@ -77,7 +78,14 @@ static const struct gwp_cfg default_opts = {
 	.as_socks5		= false,
 	.as_http		= false,
 	.socks5_prefer_ipv6	= false,
-	.socks5_timeout		= 10,
+	{
+		/*
+		 * http_timeout and socks5_timeout are in the same offset.
+		 * They are used for the same purpose, but for different
+		 * protocols. Defined in the same union.
+		 */
+		.socks5_timeout		= 10,
+	},
 	.socks5_auth_file	= NULL,
 	.socks5_dns_cache_secs	= 0,
 	.nr_workers		= 4,
@@ -113,6 +121,7 @@ static void show_help(const char *app)
 	printf("  -A, --socks5-auth-file=file     File containing username:password for SOCKS5 auth (default: no auth)\n");
 	printf("  -L, --socks5-dns-cache-secs=sec SOCKS5 DNS cache duration in seconds (default: %d)\n", default_opts.socks5_dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
+	printf("  -z, --http-timeout=sec          HTTP request timeout in seconds (default: %d)\n", default_opts.http_timeout);
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
 	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads for SOCKS5 (default: %d)\n", default_opts.nr_dns_workers);
 	printf("  -c, --connect-timeout=sec       Connection to target timeout in seconds (default: %d)\n", default_opts.connect_timeout);
@@ -185,6 +194,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'L':
 			cfg->socks5_dns_cache_secs = atoi(optarg);
+			break;
+		case 'z':
+			cfg->http_timeout = atoi(optarg);
 			break;
 		case 'w':
 			cfg->nr_workers = atoi(optarg);
@@ -959,6 +971,7 @@ __hot
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn_slot *gcs = &w->conn_slot;
+	struct gwp_cfg *cfg = &w->ctx->cfg;
 	struct gwp_conn_pair *tmp;
 	uint32_t i = gcp->idx;
 
@@ -986,8 +999,13 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->gde)
 		gwp_dns_entry_put(gcp->gde);
 
-	if (gcp->s5_conn)
-		gwp_socks5_conn_free(gcp->s5_conn);
+	if (cfg->as_socks5) {
+		if (gcp->s5_conn)
+			gwp_socks5_conn_free(gcp->s5_conn);
+	} else if (cfg->as_http) {
+		if (gcp->http_conn)
+			gwp_http_conn_free(gcp->http_conn);
+	}
 
 	free(gcp);
 	shrink_conn_slot(w);
@@ -1264,6 +1282,29 @@ int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
 	gwp_conn_buf_advance(&gcp->client, in_len);
 	gcp->target.len += out_len;
 	return (r == -EAGAIN) ? 0 : r;
+}
+
+struct gwp_http_conn *gwp_http_conn_alloc(void)
+{
+	struct gwp_http_conn *ghc = malloc(sizeof(*ghc));
+	int r;
+
+	if (!ghc)
+		return NULL;
+
+	r = gwnet_http_hdr_pctx_init(&ghc->ctx_hdr);
+	if (r < 0) {
+		free(ghc);
+		return NULL;
+	}
+
+	return ghc;
+}
+
+void gwp_http_conn_free(struct gwp_http_conn *conn)
+{
+	gwnet_http_hdr_pctx_free(&conn->ctx_hdr);
+	free(conn);
 }
 
 noinline
