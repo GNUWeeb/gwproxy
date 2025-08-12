@@ -605,12 +605,6 @@ static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
 	struct gwp_socks5_cfg s5cfg;
 	int r;
 
-	if (!cfg->as_socks5) {
-		ctx->socks5 = NULL;
-		ctx->ino_fd = -1;
-		return 0;
-	}
-
 	pr_dbg(&ctx->lh, "Initializing SOCKS5 context");
 	memset(&s5cfg, 0, sizeof(s5cfg));
 	s5cfg.auth_file = (char *)cfg->socks5_auth_file;
@@ -667,9 +661,7 @@ out_err:
 
 static void gwp_ctx_free_socks5(struct gwp_ctx *ctx)
 {
-	if (!ctx->socks5)
-		return;
-
+	assert(ctx->cfg->as_socks5);
 	gwp_socks5_ctx_free(ctx->socks5);
 	ctx->socks5 = NULL;
 	pr_dbg(&ctx->lh, "SOCKS5 context freed");
@@ -746,6 +738,35 @@ static int gwp_ctx_parse_ev(struct gwp_ctx *ctx)
 }
 
 __cold
+static int gwp_ctx_init_prot(struct gwp_ctx *ctx)
+{
+	struct gwp_cfg *cfg = &ctx->cfg;
+
+	/*
+	 * socks5 and http can't be running together.
+	 */
+	assert(!(cfg->as_socks5 && cfg->as_http));
+
+	if (cfg->as_socks5) {
+		return gwp_ctx_init_socks5(ctx);
+	} else {
+		ctx->socks5 = NULL;
+		ctx->ino_fd = -1;
+	}
+
+	return 0;
+}
+
+__cold
+static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
+{
+	struct gwp_cfg *cfg = &ctx->cfg;
+
+	if (cfg->as_socks5)
+		gwp_ctx_free_socks5(ctx);
+}
+
+__cold
 static int gwp_ctx_init(struct gwp_ctx *ctx)
 {
 	int r;
@@ -770,13 +791,13 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (ctx->cfg.pid_file)
 		gwp_ctx_init_pid_file(ctx);
 
-	r = gwp_ctx_init_socks5(ctx);
+	r = gwp_ctx_init_prot(ctx);
 	if (r < 0)
 		goto out_free_log;
 
 	r = gwp_ctx_init_dns(ctx);
 	if (r < 0)
-		goto out_free_socks5;
+		goto out_free_prot;
 
 	r = gwp_ctx_init_threads(ctx);
 	if (r < 0) {
@@ -788,8 +809,8 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 
 out_free_dns:
 	gwp_ctx_free_dns(ctx);
-out_free_socks5:
-	gwp_ctx_free_socks5(ctx);
+out_free_prot:
+	gwp_ctx_free_prot(ctx);
 out_free_log:
 	gwp_ctx_free_log(ctx);
 	return r;
@@ -808,7 +829,7 @@ static void gwp_ctx_free(struct gwp_ctx *ctx)
 	gwp_ctx_stop(ctx);
 	gwp_ctx_free_threads(ctx);
 	gwp_ctx_free_dns(ctx);
-	gwp_ctx_free_socks5(ctx);
+	gwp_ctx_free_prot(ctx);
 	gwp_ctx_free_log(ctx);
 }
 
