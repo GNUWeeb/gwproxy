@@ -48,6 +48,7 @@ static const struct option long_opts[] = {
 	{ "bind",		required_argument,	NULL,	'b' },
 	{ "target",		required_argument,	NULL,	't' },
 	{ "as-socks5",		required_argument,	NULL,	'S' },
+	{ "as-http",		required_argument,	NULL,	'H' },
 	{ "socks5-prefer-ipv6",	required_argument,	NULL,	'Q' },
 	{ "socks5-timeout",	required_argument,	NULL,	'o' },
 	{ "socks5-auth-file",	required_argument,	NULL,	'A' },
@@ -74,6 +75,7 @@ static const struct gwp_cfg default_opts = {
 	.bind			= "[::]:1080",
 	.target			= NULL,
 	.as_socks5		= false,
+	.as_http		= false,
 	.socks5_prefer_ipv6	= false,
 	.socks5_timeout		= 10,
 	.socks5_auth_file	= NULL,
@@ -105,6 +107,7 @@ static void show_help(const char *app)
 	printf("  -b, --bind=addr:port            Bind to the specified address (default: %s)\n", default_opts.bind);
 	printf("  -t, --target=addr_port          Target address to connect to\n");
 	printf("  -S, --as-socks5=0|1             Run as a SOCKS5 proxy (default: %d)\n", default_opts.as_socks5);
+	printf("  -H, --as-http=0|1               Run as an HTTP proxy (default: %d)\n", default_opts.as_http);
 	printf("  -Q, --socks5-prefer-ipv6=0|1    Prefer IPv6 for SOCKS5 DNS queries (default: %d)\n", default_opts.socks5_prefer_ipv6);
 	printf("  -o, --socks5-timeout=sec        SOCKS5 auth timeout in seconds (default: %d)\n", default_opts.socks5_timeout);
 	printf("  -A, --socks5-auth-file=file     File containing username:password for SOCKS5 auth (default: no auth)\n");
@@ -130,6 +133,7 @@ static void show_help(const char *app)
 __cold
 static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 {
+	#define ERR_WRAP "==============================================\n"
 	#define NR_OPTS ((sizeof(long_opts) / sizeof(long_opts[0])) - 1)
 	char short_opts[(NR_OPTS * 2) + 1], *p;
 	size_t i;
@@ -166,6 +170,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'S':
 			cfg->as_socks5 = !!atoi(optarg);
+			break;
+		case 'H':
+			cfg->as_http = !!atoi(optarg);
 			break;
 		case 'Q':
 			cfg->socks5_prefer_ipv6 = !!atoi(optarg);
@@ -228,25 +235,31 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		}
 	}
 
-	if (!cfg->as_socks5 && !cfg->target) {
-		fprintf(stderr, "Error: --target is required unless --as-socks5 is specified.\n");
+	if (!cfg->as_socks5 && !cfg->as_http && !cfg->target) {
+		fprintf(stderr, ERR_WRAP "Error: --target is required unless --as-socks5=1 or --as-http=1\n" ERR_WRAP);
 		goto einval;
 	}
 
 	if (cfg->nr_workers <= 0) {
-		fprintf(stderr, "Error: --nr-workers must be at least 1.\n");
+		fprintf(stderr, ERR_WRAP "Error: --nr-workers must be at least 1.\n" ERR_WRAP);
 		goto einval;
 	}
 
 	if (cfg->target_buf_size <= 1) {
-		fprintf(stderr, "Error: --target-buf-size must be greater than 1.\n");
+		fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be greater than 1.\n" ERR_WRAP);
 		goto einval;
 	}
 
 	if (cfg->client_buf_size <= 1) {
-		fprintf(stderr, "Error: --client-buf-size must be greater than 1.\n");
+		fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be greater than 1.\n" ERR_WRAP);
 		goto einval;
 	}
+
+	if (cfg->as_http && cfg->as_socks5) {
+		fprintf(stderr, ERR_WRAP "Error: --as-http and --as-socks5 cannot be used together.\n" ERR_WRAP);
+		goto einval;
+	}
+
 
 	return 0;
 
@@ -745,7 +758,7 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (r < 0)
 		goto out_free_log;
 
-	if (!ctx->cfg.as_socks5) {
+	if (!ctx->cfg.as_socks5 && !ctx->cfg.as_http) {
 		const char *t = ctx->cfg.target;
 		r = convert_str_to_ssaddr(t, &ctx->target_addr, 0);
 		if (r) {
