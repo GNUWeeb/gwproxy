@@ -975,6 +975,28 @@ static int handle_ev_socks5_auth_file(struct gwp_wrk *w)
 	return 0;
 }
 
+static int handle_ev_http_hdr(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			       struct epoll_event *ev)
+{
+	int r = 0;
+
+	return r;
+}
+
+static int handle_ev_http_conn(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			       struct epoll_event *ev)
+{
+	int r = 0;
+
+	switch (gcp->conn_state) {
+	case CONN_STATE_HTTP_HDR:
+		r = handle_ev_http_hdr(w, gcp, ev);
+		break;
+	}
+
+	return r;
+}
+
 static bool is_ev_bit_conn_pair(uint64_t ev_bit)
 {
 	static const uint64_t conn_pair_ev_bit =
@@ -1012,6 +1034,9 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		break;
 	case EV_BIT_CLIENT_SOCKS5:
 		r = handle_ev_client_socks5(w, udata, ev);
+		break;
+	case EV_BIT_HTTP_CONN:
+		r = handle_ev_http_conn(w, udata, ev);
 		break;
 	case EV_BIT_DNS_QUERY:
 		r = handle_ev_dns_query(w, udata);
