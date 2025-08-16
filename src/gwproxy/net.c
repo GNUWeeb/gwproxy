@@ -32,16 +32,16 @@ int convert_str_to_ssaddr(const char *str,
 			return -EINVAL;
 		l = p - str;
 		p++;
-		if (*p != ':' && !default_port)
-			return -EINVAL;
-	} else if (!default_port) {
-		p = strchr(str, ':');
-		if (!p)
-			return -EINVAL;
-		l = p - str;
 	} else {
-		l = strlen(str);
-		p = NULL;
+		p = strchr(str, ':');
+		l = p - str;
+	}
+
+	if (!p || *p != ':') {
+		if (default_port)
+			l = strlen(str);
+		else
+			return -EINVAL;
 	}
 
 	if (l >= sizeof(host))

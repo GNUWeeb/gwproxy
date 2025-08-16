@@ -4,6 +4,9 @@
 
 #include <arpa/inet.h>
 
+#ifndef GWP_NET_H
+#define GWP_NET_H
+
 #define FULL_ADDRSTRLEN (INET6_ADDRSTRLEN + sizeof(":65535[]") - 1)
 
 struct gwp_sockaddr {
@@ -34,3 +37,5 @@ int convert_str_to_ssaddr(const char *str,
  */
 int convert_ssaddr_to_str(char buf[FULL_ADDRSTRLEN],
 			const struct gwp_sockaddr *gs);
+
+#endif /* #ifndef GWP_NET_H */
