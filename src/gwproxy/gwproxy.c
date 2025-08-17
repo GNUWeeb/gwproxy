@@ -48,8 +48,9 @@ static const struct option long_opts[] = {
 	{ "bind",		required_argument,	NULL,	'b' },
 	{ "target",		required_argument,	NULL,	't' },
 	{ "as-socks5",		required_argument,	NULL,	'S' },
+	{ "as-http",		required_argument,	NULL,	'H' },
 	{ "socks5-prefer-ipv6",	required_argument,	NULL,	'Q' },
-	{ "socks5-timeout",	required_argument,	NULL,	'o' },
+	{ "protocol-timeout",	required_argument,	NULL,	'o' },
 	{ "socks5-auth-file",	required_argument,	NULL,	'A' },
 	{ "socks5-dns-cache-secs",	required_argument,	NULL,	'L' },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
@@ -74,8 +75,9 @@ static const struct gwp_cfg default_opts = {
 	.bind			= "[::]:1080",
 	.target			= NULL,
 	.as_socks5		= false,
+	.as_http		= false,
 	.socks5_prefer_ipv6	= false,
-	.socks5_timeout		= 10,
+	.protocol_timeout	= 10,
 	.socks5_auth_file	= NULL,
 	.socks5_dns_cache_secs	= 0,
 	.nr_workers		= 4,
@@ -105,8 +107,9 @@ static void show_help(const char *app)
 	printf("  -b, --bind=addr:port            Bind to the specified address (default: %s)\n", default_opts.bind);
 	printf("  -t, --target=addr_port          Target address to connect to\n");
 	printf("  -S, --as-socks5=0|1             Run as a SOCKS5 proxy (default: %d)\n", default_opts.as_socks5);
+	printf("  -H, --as-http=0|1               Run as an HTTP proxy (default: %d)\n", default_opts.as_http);
 	printf("  -Q, --socks5-prefer-ipv6=0|1    Prefer IPv6 for SOCKS5 DNS queries (default: %d)\n", default_opts.socks5_prefer_ipv6);
-	printf("  -o, --socks5-timeout=sec        SOCKS5 auth timeout in seconds (default: %d)\n", default_opts.socks5_timeout);
+	printf("  -o, --protocol-timeout=sec      Timeout for protocol handshake process (default: %d)\n", default_opts.protocol_timeout);
 	printf("  -A, --socks5-auth-file=file     File containing username:password for SOCKS5 auth (default: no auth)\n");
 	printf("  -L, --socks5-dns-cache-secs=sec SOCKS5 DNS cache duration in seconds (default: %d)\n", default_opts.socks5_dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
@@ -130,6 +133,7 @@ static void show_help(const char *app)
 __cold
 static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 {
+	#define ERR_WRAP "==============================================\n"
 	#define NR_OPTS ((sizeof(long_opts) / sizeof(long_opts[0])) - 1)
 	char short_opts[(NR_OPTS * 2) + 1], *p;
 	size_t i;
@@ -167,11 +171,14 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'S':
 			cfg->as_socks5 = !!atoi(optarg);
 			break;
+		case 'H':
+			cfg->as_http = !!atoi(optarg);
+			break;
 		case 'Q':
 			cfg->socks5_prefer_ipv6 = !!atoi(optarg);
 			break;
 		case 'o':
-			cfg->socks5_timeout = atoi(optarg);
+			cfg->protocol_timeout = atoi(optarg);
 			break;
 		case 'A':
 			cfg->socks5_auth_file = optarg;
@@ -228,24 +235,36 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		}
 	}
 
-	if (!cfg->as_socks5 && !cfg->target) {
-		fprintf(stderr, "Error: --target is required unless --as-socks5 is specified.\n");
+	if (!cfg->as_socks5 && !cfg->as_http && !cfg->target) {
+		fprintf(stderr, ERR_WRAP "Error: --target is required unless --as-socks5=1 or --as-http=1\n" ERR_WRAP);
 		goto einval;
 	}
 
 	if (cfg->nr_workers <= 0) {
-		fprintf(stderr, "Error: --nr-workers must be at least 1.\n");
+		fprintf(stderr, ERR_WRAP "Error: --nr-workers must be at least 1.\n" ERR_WRAP);
 		goto einval;
 	}
 
 	if (cfg->target_buf_size <= 1) {
-		fprintf(stderr, "Error: --target-buf-size must be greater than 1.\n");
+		fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be greater than 1.\n" ERR_WRAP);
 		goto einval;
 	}
 
 	if (cfg->client_buf_size <= 1) {
-		fprintf(stderr, "Error: --client-buf-size must be greater than 1.\n");
+		fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be greater than 1.\n" ERR_WRAP);
 		goto einval;
+	}
+
+	if (cfg->as_socks5 || cfg->as_http) {
+		if (cfg->client_buf_size < 256) {
+			fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be at least 256 for SOCKS5 or HTTP.\n" ERR_WRAP);
+			goto einval;
+		}
+
+		if (cfg->target_buf_size < 256) {
+			fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least 256 for SOCKS5 or HTTP.\n" ERR_WRAP);
+			goto einval;
+		}
 	}
 
 	return 0;
@@ -592,12 +611,6 @@ static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
 	struct gwp_socks5_cfg s5cfg;
 	int r;
 
-	if (!cfg->as_socks5) {
-		ctx->socks5 = NULL;
-		ctx->ino_fd = -1;
-		return 0;
-	}
-
 	pr_dbg(&ctx->lh, "Initializing SOCKS5 context");
 	memset(&s5cfg, 0, sizeof(s5cfg));
 	s5cfg.auth_file = (char *)cfg->socks5_auth_file;
@@ -654,9 +667,7 @@ out_err:
 
 static void gwp_ctx_free_socks5(struct gwp_ctx *ctx)
 {
-	if (!ctx->socks5)
-		return;
-
+	assert(ctx->cfg->as_socks5);
 	gwp_socks5_ctx_free(ctx->socks5);
 	ctx->socks5 = NULL;
 	pr_dbg(&ctx->lh, "SOCKS5 context freed");
@@ -684,7 +695,7 @@ static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 	};
 	int r;
 
-	if (!cfg->as_socks5) {
+	if (!cfg->as_socks5 && !cfg->as_http) {
 		ctx->dns = NULL;
 		return 0;
 	}
@@ -733,6 +744,35 @@ static int gwp_ctx_parse_ev(struct gwp_ctx *ctx)
 }
 
 __cold
+static int gwp_ctx_init_prot(struct gwp_ctx *ctx)
+{
+	struct gwp_cfg *cfg = &ctx->cfg;
+
+	/*
+	 * socks5 and http can't be running together.
+	 */
+	assert(!(cfg->as_socks5 && cfg->as_http));
+
+	if (cfg->as_socks5) {
+		return gwp_ctx_init_socks5(ctx);
+	} else {
+		ctx->socks5 = NULL;
+		ctx->ino_fd = -1;
+	}
+
+	return 0;
+}
+
+__cold
+static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
+{
+	struct gwp_cfg *cfg = &ctx->cfg;
+
+	if (cfg->as_socks5)
+		gwp_ctx_free_socks5(ctx);
+}
+
+__cold
 static int gwp_ctx_init(struct gwp_ctx *ctx)
 {
 	int r;
@@ -745,7 +785,7 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (r < 0)
 		goto out_free_log;
 
-	if (!ctx->cfg.as_socks5) {
+	if (!ctx->cfg.as_socks5 && !ctx->cfg.as_http) {
 		const char *t = ctx->cfg.target;
 		r = convert_str_to_ssaddr(t, &ctx->target_addr, 0);
 		if (r) {
@@ -757,13 +797,13 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (ctx->cfg.pid_file)
 		gwp_ctx_init_pid_file(ctx);
 
-	r = gwp_ctx_init_socks5(ctx);
+	r = gwp_ctx_init_prot(ctx);
 	if (r < 0)
 		goto out_free_log;
 
 	r = gwp_ctx_init_dns(ctx);
 	if (r < 0)
-		goto out_free_socks5;
+		goto out_free_prot;
 
 	r = gwp_ctx_init_threads(ctx);
 	if (r < 0) {
@@ -775,8 +815,8 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 
 out_free_dns:
 	gwp_ctx_free_dns(ctx);
-out_free_socks5:
-	gwp_ctx_free_socks5(ctx);
+out_free_prot:
+	gwp_ctx_free_prot(ctx);
 out_free_log:
 	gwp_ctx_free_log(ctx);
 	return r;
@@ -795,7 +835,7 @@ static void gwp_ctx_free(struct gwp_ctx *ctx)
 	gwp_ctx_stop(ctx);
 	gwp_ctx_free_threads(ctx);
 	gwp_ctx_free_dns(ctx);
-	gwp_ctx_free_socks5(ctx);
+	gwp_ctx_free_prot(ctx);
 	gwp_ctx_free_log(ctx);
 }
 
@@ -878,6 +918,7 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 	gcp->conn_state = CONN_STATE_INIT;
 	gcs->pairs[gcs->nr++] = gcp;
 	gcp->flags = 0;
+	gcp->prot_type = GWP_PROT_TYPE_NONE;
 	return gcp;
 
 out_free_target_conn:
@@ -952,8 +993,14 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->gde)
 		gwp_dns_entry_put(gcp->gde);
 
-	if (gcp->s5_conn)
+	switch (gcp->prot_type) {
+	case GWP_PROT_TYPE_SOCKS5:
 		gwp_socks5_conn_free(gcp->s5_conn);
+		break;
+	case GWP_PROT_TYPE_HTTP:
+		gwp_http_conn_free(gcp->http_conn);
+		break;
+	}
 
 	free(gcp);
 	shrink_conn_slot(w);
@@ -1139,11 +1186,8 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
-__hot
-static int handle_socks5_connect_domain_async(struct gwp_wrk *w,
-					      struct gwp_conn_pair *gcp,
-					      const char *host,
-					      const char *port)
+static int queue_dns_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				const char *host, const char *port)
 {
 	struct gwp_dns_ctx *dns = w->ctx->dns;
 	struct gwp_dns_entry *gde;
@@ -1154,15 +1198,30 @@ static int handle_socks5_connect_domain_async(struct gwp_wrk *w,
 		return -ENOMEM;
 	}
 
-	gcp->conn_state = CONN_STATE_SOCKS5_DNS_QUERY;
 	gcp->gde = gde;
 	return -EINPROGRESS;
+}
+
+static int prepare_target_addr_domain(struct gwp_wrk *w,
+				      struct gwp_conn_pair *gcp,
+				      const char *host, const char *port)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	int r;
+
+	r = gwp_dns_cache_lookup(ctx->dns, host, port, &gcp->target_addr);
+	if (!r) {
+		pr_dbg(&ctx->lh, "Found %s:%s in DNS cache %s", host, port,
+			ip_to_str(&gcp->target_addr));
+		return 0;
+	}
+
+	return queue_dns_resolution(w, gcp, host, port);
 }
 
 static int socks5_prepare_target_addr_domain(struct gwp_wrk *w,
 					     struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_socks5_addr *dst;
 	const char *host;
 	char portstr[6];
@@ -1173,14 +1232,11 @@ static int socks5_prepare_target_addr_domain(struct gwp_wrk *w,
 	port = ntohs(dst->port);
 	host = dst->domain.str;
 	snprintf(portstr, sizeof(portstr), "%hu", port);
-	r = gwp_dns_cache_lookup(ctx->dns, host, portstr, &gcp->target_addr);
-	if (!r) {
-		pr_dbg(&ctx->lh, "Found %s:%s in DNS cache %s", host, portstr,
-			ip_to_str(&gcp->target_addr));
-		return 0;
-	}
+	r = prepare_target_addr_domain(w, gcp, host, portstr);
+	if (r == -EINPROGRESS)
+		gcp->conn_state = CONN_STATE_SOCKS5_DNS_QUERY;
 
-	return handle_socks5_connect_domain_async(w, gcp, host, portstr);
+	return r;
 }
 
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -1190,7 +1246,7 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_socks5_addr *dst;
 
 	assert(sc);
-	assert(sc->state == GWP_SOCKS5_ST_CMD_CONNECT);
+	assert(sc->state == CONN_STATE_SOCKS5_CONNECT);
 
 	dst = &sc->dst_addr;
 	memset(ta, 0, sizeof(*ta));
@@ -1212,7 +1268,6 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return -ENOSYS;
 }
 
-__hot
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
 {
 	struct gwp_socks5_conn *sc = gcp->s5_conn;
@@ -1230,6 +1285,230 @@ int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
 	gwp_conn_buf_advance(&gcp->client, in_len);
 	gcp->target.len += out_len;
 	return (r == -EAGAIN) ? 0 : r;
+}
+
+struct gwp_http_conn *gwp_http_conn_alloc(void)
+{
+	struct gwp_http_conn *ghc = malloc(sizeof(*ghc));
+	int r;
+
+	if (!ghc)
+		return NULL;
+
+	r = gwnet_http_hdr_pctx_init(&ghc->ctx_hdr);
+	if (r < 0) {
+		free(ghc);
+		return NULL;
+	}
+
+	return ghc;
+}
+
+static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	int r;
+
+	gcp->s5_conn = gwp_socks5_conn_alloc(ctx->socks5);
+	if (!gcp->s5_conn) {
+		pr_err(&ctx->lh, "Failed to allocate SOCKS5 connection");
+		return -ENOMEM;
+	}
+
+	r = gwp_socks5_handle_data(gcp);
+	if (r < 0) {
+		gwp_socks5_conn_free(gcp->s5_conn);
+		gcp->s5_conn = NULL;
+		return r;
+	}
+
+	if (gcp->s5_conn->state != GWP_SOCKS5_ST_INIT) {
+		/*
+		 * This must be a SOCKS5 data connection, there is no
+		 * possibility to fallback to HTTP because the SOCKS5
+		 * parser already sees the SOCKS5 header.
+		 */
+		gcp->conn_state = CONN_STATE_SOCKS5_DATA;
+		gcp->prot_type = GWP_PROT_TYPE_SOCKS5;
+	}
+
+	return 0;
+}
+
+int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int r, ct;
+
+	ct = gcp->conn_state;
+	if (ct == CONN_STATE_PROT) {
+		return handle_socks5_prot(w, gcp);
+	} else if (ct == CONN_STATE_SOCKS5_DATA) {
+		r = gwp_socks5_handle_data(gcp);
+		if (r)
+			return r;
+	} else {
+		assert(0 && "Invalid SOCKS5 connection state");
+		return -EINVAL;
+	}
+
+	if (gcp->s5_conn->state == GWP_SOCKS5_ST_CMD_CONNECT) {
+		r = gwp_socks5_prepare_target_addr(w, gcp);
+		if (r == -EINPROGRESS) {
+			gcp->conn_state = CONN_STATE_SOCKS5_DNS_QUERY;
+			return r;
+		}
+
+		if (!r)
+			gcp->conn_state = CONN_STATE_SOCKS5_CONNECT;
+	}
+
+	return r;
+}
+
+static int handle_http_hdr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwnet_http_hdr_pctx *ctx_hdr;
+	struct gwnet_http_req_hdr *req_hdr;
+	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_http_conn *conn;
+	int r;
+
+	conn = gcp->http_conn;
+	ctx_hdr = &conn->ctx_hdr;
+	req_hdr = &conn->req_hdr;
+	ctx_hdr->buf = gcp->client.buf;
+	ctx_hdr->len = gcp->client.len;
+	ctx_hdr->off = 0;
+	r = gwnet_http_req_hdr_parse(ctx_hdr, req_hdr);
+	gwp_conn_buf_advance(&gcp->client, ctx_hdr->off);
+	if (r < 0) {
+		if (r == -EAGAIN)
+			return 0;
+		pr_dbg(&ctx->lh, "Invalid HTTP header: %s", strerror(-r));
+		return r;
+	}
+
+	gcp->prot_type = GWP_PROT_TYPE_HTTP;
+	return 0;
+}
+
+static int handle_http_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	int r;
+
+	gcp->http_conn = gwp_http_conn_alloc();
+	if (!gcp->http_conn) {
+		pr_err(&ctx->lh, "Failed to allocate HTTP connection");
+		return -ENOMEM;
+	}
+
+	gcp->conn_state = CONN_STATE_HTTP_HDR;
+	r = handle_http_hdr(w, gcp);
+	if (r)
+		return r;
+
+	return 0;
+}
+
+int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwnet_http_req_hdr *req_hdr;
+	bool port_found = false;
+	char *host, *port;
+	int r, ct;
+
+	ct = gcp->conn_state;
+	if (ct == CONN_STATE_PROT) {
+		r = handle_http_prot(w, gcp);
+	} else if (ct == CONN_STATE_HTTP_HDR) {
+		r = handle_http_hdr(w, gcp);
+	} else {
+		assert(0 && "Invalid HTTP connection state");
+		return -EINVAL;
+	}
+
+	if (r == -EAGAIN)
+		return r;
+
+	req_hdr = &gcp->http_conn->req_hdr;
+
+	/*
+	 * TODO(ammarfaizi2): Support non-HTTP CONNECT methods.
+	 */
+	if (req_hdr->method != GWNET_HTTP_METHOD_CONNECT)
+		return -EINVAL;
+
+	host = req_hdr->uri;
+	port = strlen(host) + host;
+	while (port > host) {
+		if (*port == ':') {
+			port_found = true;
+			*port = '\0';
+			port++;
+			break;
+		}
+		port--;
+	}
+
+	if (!port_found)
+		return -EINVAL;
+
+	r = prepare_target_addr_domain(w, gcp, host, port);
+	if (r == -EINPROGRESS)
+		gcp->conn_state = CONN_STATE_HTTP_DNS_QUERY;
+	else if (!r)
+		gcp->conn_state = CONN_STATE_HTTP_CONNECT;
+
+	return r;
+}
+
+int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_cfg *cfg = &w->ctx->cfg;
+	struct gwp_ctx *ctx = w->ctx;
+	bool socks5_einval = false;
+	int r = 0;
+
+	assert(gcp->target.fd < 0);
+	assert(cfg->as_http || cfg->as_socks5);
+	assert(gcp->conn_state == CONN_STATE_PROT);
+
+	/*
+	 * At this point, the used protocol may not be known yet.
+	 *
+	 * If both as_socks5 and as_http and are true. Then, try
+	 * parsing as SOCKS5 first. If it fails with -EINVAL, try
+	 * parsing as HTTP.
+	 *
+	 * This allows a single server port be used as both HTTP
+	 * and SOCKS5 simultaneously.
+	 */
+	if (cfg->as_socks5) {
+		r = gwp_handle_conn_state_socks5(w, gcp);
+		if (r != -EINVAL)
+			return r;
+		socks5_einval = true;
+	}
+
+	if (cfg->as_http) {
+		if (socks5_einval)
+			pr_dbg(&ctx->lh,
+				"Not a socks5 protocol, fallback to HTTP (fd=%d; ca=%s)",
+				gcp->client.fd, ip_to_str(&gcp->client_addr));
+
+		r = gwp_handle_conn_state_http(w, gcp);
+		if (r != -EINVAL)
+			return r;
+	}
+
+	return r;
+}
+
+void gwp_http_conn_free(struct gwp_http_conn *conn)
+{
+	gwnet_http_hdr_pctx_free(&conn->ctx_hdr);
+	free(conn);
 }
 
 noinline

@@ -124,7 +124,7 @@ static void arm_accept(struct gwp_wrk *w)
 
 	*addr_len = sizeof(iou->accept_addr);
 	io_uring_prep_accept(s, w->tcp_fd, addr, addr_len, SOCK_CLOEXEC);
-	s->user_data = EV_BIT_ACCEPT;
+	s->user_data = EV_BIT_IOU_ACCEPT;
 }
 
 static void prep_close(struct gwp_wrk *w, int fd)
@@ -138,7 +138,7 @@ static void prep_close(struct gwp_wrk *w, int fd)
 
 	io_uring_prep_close(s, fd);
 	s->flags |= IOSQE_CQE_SKIP_SUCCESS;
-	s->user_data = EV_BIT_CLOSE | (unsigned)fd;
+	s->user_data = EV_BIT_IOU_CLOSE | (unsigned)fd;
 	pr_dbg(&w->ctx->lh, "Prepared close for fd=%d", fd);
 }
 
@@ -195,7 +195,7 @@ static struct io_uring_sqe *prep_connect_target(struct gwp_wrk *w,
 	fd = gcp->target.fd;
 	io_uring_prep_connect(s, fd, addr, addr_len);
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_TARGET_CONNECT;
+	s->user_data |= EV_BIT_IOU_TARGET_CONNECT;
 	get_gcp(gcp);
 	pr_dbg(&w->ctx->lh,
 		"Prepared connect for target fd=%d, addr=%s, ref_cnt=%d",
@@ -214,7 +214,7 @@ static struct io_uring_sqe *prep_recv_target(struct gwp_wrk *w,
 	s = get_sqe_nofail(w);
 	io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_TARGET_RECV;
+	s->user_data |= EV_BIT_IOU_TARGET_RECV;
 	get_gcp(gcp);
 	pr_dbg(&w->ctx->lh,
 		"Prepared recv for target fd=%d, len=%zu, buf=%p, ref_cnt=%d",
@@ -233,7 +233,7 @@ static struct io_uring_sqe *prep_recv_client(struct gwp_wrk *w,
 	s = get_sqe_nofail(w);
 	io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_CLIENT_RECV;
+	s->user_data |= EV_BIT_IOU_CLIENT_RECV;
 	get_gcp(gcp);
 	pr_dbg(&w->ctx->lh,
 		"Prepared recv for client fd=%d, len=%zu, buf=%p, ref_cnt=%d",
@@ -256,7 +256,7 @@ static struct io_uring_sqe *prep_send_target(struct gwp_wrk *w,
 	io_uring_prep_send(s, fd, buf, len, MSG_NOSIGNAL);
 #endif
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_TARGET_SEND;
+	s->user_data |= EV_BIT_IOU_TARGET_SEND;
 	get_gcp(gcp);
 	pr_dbg(&w->ctx->lh,
 		"Prepared send for target fd=%d, len=%zu, buf=%p, ref_cnt=%d",
@@ -290,7 +290,7 @@ static struct io_uring_sqe *prep_send_client(struct gwp_wrk *w,
 					     struct gwp_conn_pair *gcp)
 {
 	struct io_uring_sqe *s = __prep_send_client(w, gcp);
-	s->user_data |= EV_BIT_CLIENT_SEND;
+	s->user_data |= EV_BIT_IOU_CLIENT_SEND;
 	return s;
 }
 
@@ -298,7 +298,7 @@ static struct io_uring_sqe *prep_send_client_no_cb(struct gwp_wrk *w,
 						   struct gwp_conn_pair *gcp)
 {
 	struct io_uring_sqe *s = __prep_send_client(w, gcp);
-	s->user_data |= EV_BIT_CLIENT_SEND_NO_CB;
+	s->user_data |= EV_BIT_IOU_CLIENT_SEND_NO_CB;
 	return s;
 }
 
@@ -312,7 +312,7 @@ static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 	gcp->ts.tv_sec = sec;
 	io_uring_prep_timeout(s, &gcp->ts, 0, 0);
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_TIMER;
+	s->user_data |= EV_BIT_IOU_TIMER;
 	get_gcp(gcp);
 	pr_dbg(&w->ctx->lh,
 		"Prepared timer for target fd=%d, ts=%lld.%09lld, ref_cnt=%d",
@@ -324,9 +324,9 @@ static void prep_timer_del_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
 
-	io_uring_prep_timeout_remove(s, EV_BIT_TIMER | PTR_TO_U64(gcp), 0);
+	io_uring_prep_timeout_remove(s, EV_BIT_IOU_TIMER | PTR_TO_U64(gcp), 0);
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_TIMER_DEL;
+	s->user_data |= EV_BIT_IOU_TIMER_DEL;
 	get_gcp(gcp);
 	pr_dbg(&w->ctx->lh,
 		"Prepared del timer for target fd=%d, ref_cnt=%d",
@@ -346,7 +346,7 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->target.fd, 0);
 		io_uring_sqe_set_data(s, gcp);
-		s->user_data |= EV_BIT_TARGET_CANCEL;
+		s->user_data |= EV_BIT_IOU_TARGET_CANCEL;
 		get_gcp(gcp);
 	}
 
@@ -355,7 +355,7 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->client.fd, 0);
 		io_uring_sqe_set_data(s, gcp);
-		s->user_data |= EV_BIT_CLIENT_CANCEL;
+		s->user_data |= EV_BIT_IOU_CLIENT_CANCEL;
 		get_gcp(gcp);
 	}
 
@@ -367,7 +367,7 @@ static struct io_uring_sqe *prep_recv_client_socks5(struct gwp_wrk *w,
 {
 	struct io_uring_sqe *s = prep_recv_client(w, gcp);
 	s->user_data &= ~EV_BIT_ALL;
-	s->user_data |= EV_BIT_CLIENT_SOCKS5;
+	s->user_data |= EV_BIT_IOU_CLIENT_SOCKS5;
 	return s;
 }
 
@@ -393,8 +393,8 @@ static int arm_gcp_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * does not have a target socket. We will create the target
 	 * socket later, when the client sends a CONNECT command.
 	 */
-	if (ctx->cfg.socks5_timeout > 0)
-		prep_timer_target(w, gcp, ctx->cfg.socks5_timeout);
+	if (ctx->cfg.protocol_timeout > 0)
+		prep_timer_target(w, gcp, ctx->cfg.protocol_timeout);
 
 	return 0;
 }
@@ -677,7 +677,7 @@ static int prep_domain_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	s = get_sqe_nofail(w);
 	io_uring_prep_poll_add(s, gde->ev_fd, POLLIN);
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_DNS_QUERY;
+	s->user_data |= EV_BIT_IOU_DNS_QUERY;
 	get_gcp(gcp);
 	pr_dbg(&ctx->lh,
 		"Prepared DNS query for domain '%s' (fd=%d, idx=%u, ref_cnt=%d)",
@@ -755,7 +755,7 @@ static void prep_socks5_auth_reload(struct gwp_wrk *w)
 	assert(ctx->socks5);
 	s = get_sqe_nofail(w);
 	io_uring_prep_read(s, ctx->ino_fd, ctx->ino_buf, l, 0);
-	s->user_data = EV_BIT_SOCKS5_AUTH_FILE;
+	s->user_data = EV_BIT_IOU_SOCKS5_AUTH_FILE;
 }
 
 static int handle_ev_socks5_auth_file(struct gwp_wrk *w)
@@ -778,67 +778,67 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	int r;
 
 	switch (ev_bit) {
-	case EV_BIT_ACCEPT:
+	case EV_BIT_IOU_ACCEPT:
 		pr_dbg(&ctx->lh, "Handling accept event: %d", cqe->res);
 		return handle_ev_accept(w, cqe);
-	case EV_BIT_TARGET_CONNECT:
+	case EV_BIT_IOU_TARGET_CONNECT:
 		pr_dbg(&ctx->lh, "Handling target connect event: %d", cqe->res);
 		r = handle_ev_target_connect(w, udata, cqe->res);
 		break;
-	case EV_BIT_TIMER:
+	case EV_BIT_IOU_TIMER:
 		pr_dbg(&ctx->lh, "Handling timer event: %d", cqe->res);
 		r = handle_ev_timer(w, udata, false, cqe->res);
 		break;
-	case EV_BIT_TIMER_DEL:
+	case EV_BIT_IOU_TIMER_DEL:
 		pr_dbg(&ctx->lh, "Handling timer event delete: %d", cqe->res);
 		r = handle_ev_timer(w, udata, true, cqe->res);
 		break;
-	case EV_BIT_CLIENT_RECV:
+	case EV_BIT_IOU_CLIENT_RECV:
 		pr_dbg(&ctx->lh, "Handling client recv event: %d", cqe->res);
 		r = handle_ev_client_recv(w, udata, cqe);
 		break;
-	case EV_BIT_TARGET_RECV:
+	case EV_BIT_IOU_TARGET_RECV:
 		pr_dbg(&ctx->lh, "Handling target recv event: %d", cqe->res);
 		r = handle_ev_target_recv(w, udata, cqe);
 		break;
-	case EV_BIT_CLIENT_SEND:
+	case EV_BIT_IOU_CLIENT_SEND:
 		pr_dbg(&ctx->lh, "Handling client send event: %d", cqe->res);
 		r = handle_ev_client_send(w, udata, cqe);
 		break;
-	case EV_BIT_TARGET_SEND:
+	case EV_BIT_IOU_TARGET_SEND:
 		pr_dbg(&ctx->lh, "Handling target send event: %d", cqe->res);
 		r = handle_ev_target_send(w, udata, cqe);
 		break;
-	case EV_BIT_CLIENT_SOCKS5:
+	case EV_BIT_IOU_CLIENT_SOCKS5:
 		pr_dbg(&ctx->lh, "Handling client SOCKS5 event: %d", cqe->res);
 		r = handle_ev_client_socks5(w, udata, cqe);
 		break;
-	case EV_BIT_CLIENT_SEND_NO_CB:
+	case EV_BIT_IOU_CLIENT_SEND_NO_CB:
 		pr_dbg(&ctx->lh, "Handling client send no callback event: %d", cqe->res);
 		r = (cqe->res < 0) ? cqe->res : 0;
 		break;
-	case EV_BIT_SOCKS5_AUTH_FILE:
+	case EV_BIT_IOU_SOCKS5_AUTH_FILE:
 		pr_dbg(&ctx->lh, "Handling SOCKS5 auth file reload event: %d", cqe->res);
 		return handle_ev_socks5_auth_file(w);
-	case EV_BIT_TARGET_CANCEL:
+	case EV_BIT_IOU_TARGET_CANCEL:
 		gcp = udata;
 		pr_dbg(&ctx->lh, "Handling target cancel event: %d", cqe->res);
 		assert(gcp->flags & GWP_CONN_FLAG_IS_CANCEL);
 		r = 0;
 		break;
-	case EV_BIT_CLIENT_CANCEL:
+	case EV_BIT_IOU_CLIENT_CANCEL:
 		gcp = udata;
 		pr_dbg(&ctx->lh, "Handling client cancel event: %d", cqe->res);
 		assert(gcp->flags & GWP_CONN_FLAG_IS_CANCEL);
 		r = 0;
 		break;
-	case EV_BIT_DNS_QUERY:
+	case EV_BIT_IOU_DNS_QUERY:
 		pr_dbg(&ctx->lh, "Handling DNS query event: %d", cqe->res);
 		r = handle_ev_dns_query(w, udata);
 		break;
-	case EV_BIT_MSG_RING:
+	case EV_BIT_IOU_MSG_RING:
 		return 0;
-	case EV_BIT_CLOSE:
+	case EV_BIT_IOU_CLOSE:
 		inv_op = "close";
 		goto out_bug;
 	default:
@@ -950,8 +950,8 @@ void gwp_ctx_signal_all_io_uring(struct gwp_ctx *ctx)
 		struct io_uring_sqe *s = __get_sqe_nofail(&we->iou->ring);
 		struct gwp_wrk *wo = &ctx->workers[i];
 		int fd = wo->iou->ring.ring_fd;
-		io_uring_prep_msg_ring(s, fd, 0, EV_BIT_MSG_RING, 0);
-		s->user_data = EV_BIT_MSG_RING;
+		io_uring_prep_msg_ring(s, fd, 0, EV_BIT_IOU_MSG_RING, 0);
+		s->user_data = EV_BIT_IOU_MSG_RING;
 	}
 
 	io_uring_submit_eintr(&we->iou->ring, 8);

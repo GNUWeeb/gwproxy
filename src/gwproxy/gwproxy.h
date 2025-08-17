@@ -18,13 +18,16 @@
 #include <liburing.h>
 #endif
 
+#include <gwproxy/http1.h>
+
 struct gwp_cfg {
 	const char	*event_loop;
 	const char	*bind;
 	const char	*target;
 	bool		as_socks5;
+	bool		as_http;
 	bool		socks5_prefer_ipv6;
-	int		socks5_timeout;
+	int		protocol_timeout;
 	const char	*socks5_auth_file;
 	int		socks5_dns_cache_secs;
 	int		nr_workers;
@@ -46,27 +49,51 @@ struct gwp_cfg {
 struct gwp_ctx;
 
 enum {
-	EV_BIT_ACCEPT		= (1ull << 48ull),
-	EV_BIT_EVENTFD		= (2ull << 48ull),
-	EV_BIT_TARGET		= (3ull << 48ull),
-	EV_BIT_CLIENT		= (4ull << 48ull),
-	EV_BIT_TIMER		= (5ull << 48ull),
-	EV_BIT_CLIENT_SOCKS5	= (6ull << 48ull),
-	EV_BIT_DNS_QUERY	= (7ull << 48ull),
-	EV_BIT_SOCKS5_AUTH_FILE	= (8ull << 48ull),
+	EV_BIT_ACCEPT			= (1ull << 48ull),
+	EV_BIT_EVENTFD			= (2ull << 48ull),
+	EV_BIT_TARGET			= (3ull << 48ull),
+	EV_BIT_CLIENT			= (4ull << 48ull),
+	EV_BIT_TIMER			= (5ull << 48ull),
+	EV_BIT_CLIENT_SOCKS5		= (6ull << 48ull),
+	EV_BIT_DNS_QUERY		= (7ull << 48ull),
+	EV_BIT_SOCKS5_AUTH_FILE		= (8ull << 48ull),
 
-	EV_BIT_CLOSE		= (9ull << 48ull),
-	EV_BIT_TARGET_CONNECT	= (10ull << 48ull),
-	EV_BIT_TARGET_CANCEL	= (11ull << 48ull),
-	EV_BIT_CLIENT_CANCEL	= (12ull << 48ull),
-	EV_BIT_TIMER_DEL	= (13ull << 48ull),
-	EV_BIT_TARGET_SEND	= (14ull << 48ull),
-	EV_BIT_CLIENT_SEND	= (15ull << 48ull),
-	EV_BIT_CLIENT_RECV	= EV_BIT_CLIENT,
-	EV_BIT_TARGET_RECV	= EV_BIT_TARGET,
-	EV_BIT_MSG_RING		= (16ull << 48ull),
+	EV_BIT_HTTP_CONN		= (18ull << 48ull),
 
-	EV_BIT_CLIENT_SEND_NO_CB	= (17ull << 48ull),
+	/*
+	 * This ev_bit is used for user_data masking during protocol
+	 * initalization.
+	 *
+	 * Supported protocols:
+	 *   - SOCKS5
+	 *   - HTTP
+	 *
+	 * It means it waits for the data specific protocol before
+	 * solely forwarding the received data to the destination host.
+	 */
+	EV_BIT_CLIENT_PROT		= (1000ull << 48ull),
+
+#ifdef CONFIG_IO_URING
+	/*
+	 * Only used by io_uring.
+	 */
+	EV_BIT_IOU_DNS_QUERY		= EV_BIT_DNS_QUERY,
+	EV_BIT_IOU_SOCKS5_AUTH_FILE	= EV_BIT_SOCKS5_AUTH_FILE,
+	EV_BIT_IOU_TIMER		= EV_BIT_TIMER,
+	EV_BIT_IOU_ACCEPT		= EV_BIT_ACCEPT,
+	EV_BIT_IOU_CLIENT_SOCKS5	= EV_BIT_CLIENT_SOCKS5,
+	EV_BIT_IOU_CLIENT_RECV		= EV_BIT_CLIENT,
+	EV_BIT_IOU_TARGET_RECV		= EV_BIT_TARGET,
+	EV_BIT_IOU_TARGET_SEND		= (9ull << 48ull),
+	EV_BIT_IOU_CLIENT_SEND		= (10ull << 48ull),
+	EV_BIT_IOU_CLOSE		= (11ull << 48ull),
+	EV_BIT_IOU_TARGET_CONNECT	= (12ull << 48ull),
+	EV_BIT_IOU_TARGET_CANCEL	= (13ull << 48ull),
+	EV_BIT_IOU_CLIENT_CANCEL	= (14ull << 48ull),
+	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
+	EV_BIT_IOU_MSG_RING		= (16ull << 48ull),
+	EV_BIT_IOU_CLIENT_SEND_NO_CB	= (17ull << 48ull),
+#endif
 };
 
 
@@ -75,14 +102,27 @@ enum {
 #define CLEAR_EV_BIT(X)	((X) & ~EV_BIT_ALL)
 
 enum {
-	CONN_STATE_INIT			= 101,
+	CONN_STATE_INIT			= 0,
+	CONN_STATE_FORWARDING		= 1,
 
-	CONN_STATE_SOCKS5_DATA		= 100,
-	CONN_STATE_SOCKS5_CMD_CONNECT	= 221,
-	CONN_STATE_SOCKS5_ERR		= 250,
-	CONN_STATE_SOCKS5_DNS_QUERY	= 260,
+	CONN_STATE_SOCKS5_MIN		= 100,
+	CONN_STATE_SOCKS5_DATA		= 101,
+	CONN_STATE_SOCKS5_CONNECT	= 102,
+	CONN_STATE_SOCKS5_DNS_QUERY	= 104,
+	CONN_STATE_SOCKS5_MAX		= 199,
 
-	CONN_STATE_FORWARDING		= 301,
+	CONN_STATE_HTTP_MIN		= 400,
+	CONN_STATE_HTTP_HDR		= 401,
+	CONN_STATE_HTTP_CONNECT		= 402,
+	CONN_STATE_HTTP_DNS_QUERY	= 403,
+	CONN_STATE_HTTP_MAX		= 499,
+
+	/*
+	 * Still waiting for protocol specific. Can be one of these:
+	 *    - SOCKS5
+	 *    - HTTP
+	 */
+	CONN_STATE_PROT			= 500,
 };
 
 struct gwp_conn {
@@ -104,10 +144,22 @@ enum {
 	GWP_CONN_FLAG_IS_CANCEL		= (1ull << 2ull),
 };
 
+enum {
+	GWP_PROT_TYPE_NONE	= 0,
+	GWP_PROT_TYPE_SOCKS5	= 1,
+	GWP_PROT_TYPE_HTTP	= 2,
+};
+
+struct gwp_http_conn {
+	struct gwnet_http_hdr_pctx	ctx_hdr;
+	struct gwnet_http_req_hdr	req_hdr;
+};
+
 struct gwp_conn_pair {
 	struct gwp_conn		target;
 	struct gwp_conn		client;
 	bool			is_target_alive;
+	uint8_t			prot_type;
 
 #ifdef CONFIG_IO_URING
 	int				ref_cnt;
@@ -118,7 +170,10 @@ struct gwp_conn_pair {
 	int			conn_state;
 	int			timer_fd;
 	uint32_t		idx;
-	struct gwp_socks5_conn	*s5_conn;
+	union {
+		struct gwp_socks5_conn	*s5_conn;
+		struct gwp_http_conn	*http_conn;
+	};
 	struct gwp_dns_query	*gdq;
 	struct gwp_dns_entry	*gde;
 	struct gwp_sockaddr	client_addr;
@@ -215,7 +270,13 @@ void log_conn_pair_created(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err);
-int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+struct gwp_http_conn *gwp_http_conn_alloc(void);
+void gwp_http_conn_free(struct gwp_http_conn *conn);
+int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
+int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 #endif /* #ifndef GWPROXY_H */
