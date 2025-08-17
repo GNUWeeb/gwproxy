@@ -1,0 +1,260 @@
+.TH SOCKS5 3 "January 2025" "GWPROXY SOCKS5 library" "Library Functions Manual"
+.SH NAME
+gwp_socks5_ctx_init, gwp_socks5_ctx_free, gwp_socks5_auth_reload, gwp_socks5_conn_alloc, gwp_socks5_conn_free, gwp_socks5_conn_handle_data, gwp_socks5_conn_cmd_connect_res \- SOCKS5 proxy implementation functions
+.SH SYNOPSIS
+.nf
+.B #include <gwproxy/socks5.h>
+.PP
+.BI "enum gwp_socks5_state {"
+.br
+.BI "    GWP_SOCKS5_ST_INIT           = 0,"
+.br
+.BI "    GWP_SOCKS5_ST_CMD            = 100,"
+.br
+.BI "    GWP_SOCKS5_ST_CMD_CONNECT    = 101,"
+.br
+.BI "    GWP_SOCKS5_ST_AUTH_USERPASS  = 200,"
+.br
+.BI "    GWP_SOCKS5_ST_FORWARDING     = 300,"
+.br
+.BI "    GWP_SOCKS5_ST_ERR            = 500,"
+.br
+.BI "};"
+.PP
+.BI "enum gwp_socks5_atyp {"
+.br
+.BI "    GWP_SOCKS5_ATYP_IPV4   = 0x01,"
+.br
+.BI "    GWP_SOCKS5_ATYP_IPV6   = 0x04,"
+.br
+.BI "    GWP_SOCKS5_ATYP_DOMAIN = 0x03,"
+.br
+.BI "};"
+.PP
+.BI "enum gwp_socks5_cmd_rep {"
+.br
+.BI "    GWP_SOCKS5_REP_SUCCESS               = 0x00,"
+.br
+.BI "    GWP_SOCKS5_REP_FAILURE               = 0x01,"
+.br
+.BI "    GWP_SOCKS5_REP_NOT_ALLOWED           = 0x02,"
+.br
+.BI "    GWP_SOCKS5_REP_NETWORK_UNREACHABLE   = 0x03,"
+.br
+.BI "    GWP_SOCKS5_REP_HOST_UNREACHABLE      = 0x04,"
+.br
+.BI "    GWP_SOCKS5_REP_CONN_REFUSED          = 0x05,"
+.br
+.BI "    GWP_SOCKS5_REP_TTL_EXPIRED           = 0x06,"
+.br
+.BI "    GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED = 0x07,"
+.br
+.BI "    GWP_SOCKS5_REP_ATYP_NOT_SUPPORTED    = 0x08,"
+.br
+.BI "    GWP_SOCKS5_REP_UNASSIGNED            = 0x09,"
+.br
+.BI "};"
+.PP
+.BI "struct gwp_socks5_cfg {"
+.br
+.BI "    char *auth_file;"
+.br
+.BI "};"
+.PP
+.BI "struct gwp_socks5_addr {"
+.br
+.BI "    uint8_t ver;"
+.br
+.BI "    __be16  port;"
+.br
+.BI "    union {"
+.br
+.BI "        uint8_t ip4[4];"
+.br
+.BI "        uint8_t ip6[16];"
+.br
+.BI "        struct {"
+.br
+.BI "            uint8_t len;"
+.br
+.BI "            char    str[256];"
+.br
+.BI "        } domain;"
+.br
+.BI "    };"
+.br
+.BI "};"
+.PP
+.BI "int gwp_socks5_ctx_init(struct gwp_socks5_ctx **" ctx_p ","
+.br
+.BI "                        const struct gwp_socks5_cfg *" cfg ");"
+.PP
+.BI "void gwp_socks5_ctx_free(struct gwp_socks5_ctx *" ctx ");"
+.PP
+.BI "int gwp_socks5_auth_reload(struct gwp_socks5_ctx *" ctx ");"
+.PP
+.BI "struct gwp_socks5_conn *gwp_socks5_conn_alloc(struct gwp_socks5_ctx *" ctx ");"
+.PP
+.BI "void gwp_socks5_conn_free(struct gwp_socks5_conn *" conn ");"
+.PP
+.BI "int gwp_socks5_conn_handle_data(struct gwp_socks5_conn *" conn ","
+.br
+.BI "                                const void *" in_buf ", size_t *" in_len ","
+.br
+.BI "                                void *" out_buf ", size_t *" out_len ");"
+.PP
+.BI "int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *" conn ","
+.br
+.BI "                                    const struct gwp_socks5_addr *" bind_addr ","
+.br
+.BI "                                    uint8_t " rep ", void *" out_buf ","
+.br
+.BI "                                    size_t *" out_len ");"
+.fi
+.SH DESCRIPTION
+These functions provide a complete SOCKS5 proxy implementation for the GWPROXY library.
+The implementation supports authentication, connection handling, and data forwarding according to RFC 1928.
+.SS Context Management
+.TP
+.BR gwp_socks5_ctx_init ()
+Initializes a new SOCKS5 context with the provided configuration. The context manages authentication
+data and connection state. The context pointer is stored in
+.IR *ctx_p
+and must be freed with
+.BR gwp_socks5_ctx_free ()
+when no longer needed.
+.TP
+.BR gwp_socks5_ctx_free ()
+Releases all resources associated with the SOCKS5 context, including authentication data and
+any remaining connection references.
+.TP
+.BR gwp_socks5_auth_reload ()
+Reloads authentication data from the configured authentication file. This allows dynamic
+updates to user credentials without restarting the proxy.
+.SS Connection Management
+.TP
+.BR gwp_socks5_conn_alloc ()
+Allocates a new SOCKS5 connection associated with the given context. Each connection maintains
+its own state machine and can handle one client session. The connection must be freed with
+.BR gwp_socks5_conn_free ()
+when the client disconnects.
+.TP
+.BR gwp_socks5_conn_free ()
+Releases resources associated with a SOCKS5 connection and decrements the connection count
+in the associated context.
+.SS Data Handling
+.TP
+.BR gwp_socks5_conn_handle_data ()
+Processes incoming data from the client and generates appropriate responses. This function
+implements the SOCKS5 state machine, handling authentication, command processing, and protocol
+negotiation. The function updates
+.IR *in_len
+to indicate how much input data was consumed and
+.IR *out_len
+to indicate how much output data was generated.
+.TP
+.BR gwp_socks5_conn_cmd_connect_res ()
+Constructs a response for a SOCKS5 CONNECT command after the proxy has attempted to establish
+the outbound connection. The
+.I bind_addr
+parameter contains the local address information obtained from
+.BR getsockname (2),
+and
+.I rep
+contains the appropriate SOCKS5 reply code.
+.SH DATA STRUCTURES
+.SS Connection States
+The
+.B enum gwp_socks5_state
+defines the possible states of a SOCKS5 connection:
+.RS 4
+.TP
+.B GWP_SOCKS5_ST_INIT
+Initial state, waiting for client greeting
+.TP
+.B GWP_SOCKS5_ST_CMD
+Waiting for client command
+.TP
+.B GWP_SOCKS5_ST_CMD_CONNECT
+Processing CONNECT command
+.TP
+.B GWP_SOCKS5_ST_AUTH_USERPASS
+Performing username/password authentication
+.TP
+.B GWP_SOCKS5_ST_FORWARDING
+Data forwarding mode
+.TP
+.B GWP_SOCKS5_ST_ERR
+Error state
+.RE
+.SS Address Types
+The
+.B enum gwp_socks5_atyp
+defines supported address types:
+.RS 4
+.TP
+.B GWP_SOCKS5_ATYP_IPV4
+IPv4 address (4 bytes)
+.TP
+.B GWP_SOCKS5_ATYP_IPV6
+IPv6 address (16 bytes)
+.TP
+.B GWP_SOCKS5_ATYP_DOMAIN
+Domain name (length-prefixed string)
+.RE
+.SS Reply Codes
+The
+.B enum gwp_socks5_cmd_rep
+defines SOCKS5 reply codes as specified in RFC 1928.
+.SH RETURN VALUES
+.BR gwp_socks5_ctx_init ()
+returns 0 on success, or a negative error code on failure.
+.PP
+.BR gwp_socks5_auth_reload ()
+returns 0 on success, or a negative error code on failure.
+.PP
+.BR gwp_socks5_conn_alloc ()
+returns a pointer to a new connection object, or NULL on failure.
+.PP
+.BR gwp_socks5_conn_handle_data ()
+and
+.BR gwp_socks5_conn_cmd_connect_res ()
+return 0 on success, or a negative error code:
+.RS 4
+.TP
+.B -ENOMEM
+Not enough memory to handle the request.
+.TP
+.B -EINVAL
+Invalid input parameters.
+.TP
+.B -EAGAIN
+More data is needed to complete the request.
+.TP
+.B -ENOBUFS
+Not enough space in the output buffer. The required size is returned in
+.IR *out_len .
+.RE
+.PP
+.BR gwp_socks5_ctx_free ()
+and
+.BR gwp_socks5_conn_free ()
+do not return values.
+.SH NOTES
+The SOCKS5 implementation is designed for high-performance proxy applications and supports
+concurrent handling of multiple client connections. Authentication is optional and can be
+configured via the authentication file.
+.PP
+The state machine approach ensures robust handling of partial data and network conditions
+typical in proxy environments. Connections maintain independent state, allowing safe
+concurrent operation.
+.SH SEE ALSO
+.BR socket (2),
+.BR getsockname (2),
+.BR connect (2)
+.PP
+RFC 1928: SOCKS Protocol Version 5
+.SH COPYRIGHT
+Copyright (C) 2025 Ammar Faizi <ammarfaizi2@gnuweeb.org>
+.PP
+This library is licensed under GPL-2.0-only.
