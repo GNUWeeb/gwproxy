@@ -1415,7 +1415,7 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwnet_http_req_hdr *req_hdr;
 	bool port_found = false;
-	char *host, *port;
+	char *host, *port, *lc;
 	int r, ct;
 
 	ct = gcp->conn_state;
@@ -1443,6 +1443,7 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	port = strlen(host) + host;
 	while (port > host) {
 		if (*port == ':') {
+			lc = port - 1;
 			port_found = true;
 			*port = '\0';
 			port++;
@@ -1453,6 +1454,11 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (!port_found)
 		return -EINVAL;
+
+	if (*host == '[' && *lc == ']') {
+		host++;
+		*lc = '\0';
+	}
 
 	r = prepare_target_addr_domain(w, gcp, host, port);
 	if (r == -EINPROGRESS)
