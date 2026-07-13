@@ -119,7 +119,6 @@ enum {
 	EV_BIT_IOU_CLIENT_CANCEL	= (14ull << 48ull),
 	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
 	EV_BIT_IOU_MSG_RING		= (16ull << 48ull),
-	EV_BIT_IOU_CLIENT_SEND_NO_CB	= (17ull << 48ull),
 	EV_BIT_IOU_UPSTREAM_S5		= (20ull << 48ull),
 #endif
 };

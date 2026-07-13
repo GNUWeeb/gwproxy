@@ -301,14 +301,6 @@ static struct io_uring_sqe *prep_send_client(struct gwp_wrk *w,
 	return s;
 }
 
-static struct io_uring_sqe *prep_send_client_no_cb(struct gwp_wrk *w,
-						   struct gwp_conn_pair *gcp)
-{
-	struct io_uring_sqe *s = __prep_send_client(w, gcp);
-	s->user_data |= EV_BIT_IOU_CLIENT_SEND_NO_CB;
-	return s;
-}
-
 static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 					      struct gwp_conn_pair *gcp,
 					      int sec)
@@ -429,7 +421,16 @@ static int do_prep_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (!ctx->upstream.enabled) {
 		s->flags |= IOSQE_IO_LINK;
 		prep_recv_client(w, gcp);
-		prep_recv_target(w, gcp);
+
+		/*
+		 * In SOCKS5 mode the CONNECT reply is written into target.buf
+		 * after connect completes; arming the target recv here would
+		 * race with it and splice stale reply bytes into the forwarded
+		 * stream. Defer it until the reply has been flushed (see
+		 * handle_ev_target_connect() -> handle_ev_client_send()).
+		 */
+		if (!ctx->cfg.as_socks5)
+			prep_recv_target(w, gcp);
 	}
 
 	if (ctx->cfg.connect_timeout > 0)
@@ -805,8 +806,15 @@ static int handle_ev_target_connect(struct gwp_wrk *w, void *udata, int res)
 		if (r)
 			return r;
 
+		/*
+		 * Flush the reply with a completion callback (not _no_cb): its
+		 * handler drains target.buf and only then arms the target recv,
+		 * so the recv never overwrites the still-pending reply.
+		 */
 		if (gcp->target.len)
-			prep_send_client_no_cb(w, gcp);
+			prep_send_client(w, gcp);
+		else
+			prep_recv_target(w, gcp);
 	}
 
 	return 0;
@@ -1091,10 +1099,6 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	case EV_BIT_IOU_CLIENT_SOCKS5:
 		pr_dbg(&ctx->lh, "Handling client SOCKS5 event: %d", cqe->res);
 		r = handle_ev_client_socks5(w, udata, cqe);
-		break;
-	case EV_BIT_IOU_CLIENT_SEND_NO_CB:
-		pr_dbg(&ctx->lh, "Handling client send no callback event: %d", cqe->res);
-		r = (cqe->res < 0) ? cqe->res : 0;
 		break;
 	case EV_BIT_IOU_UPSTREAM_S5:
 		pr_dbg(&ctx->lh, "Handling upstream SOCKS5 handshake event: %d", cqe->res);
