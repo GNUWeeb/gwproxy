@@ -302,8 +302,12 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 
 	/*
 	 * Trim trailing slashes from the path.
+	 *
+	 * @path_len may be zero here when the request-target has an empty
+	 * path (e.g. a CONNECT or OPTIONS target that starts with '?'), so
+	 * guard the index to avoid an out-of-bounds read on path[-1].
 	 */
-	while (path[path_len - 1] == '/') {
+	while (path_len > 0 && path[path_len - 1] == '/') {
 		if (path_len == 1)
 			break; /* Keep at least one slash. */
 		path_len--;
