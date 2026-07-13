@@ -902,14 +902,22 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 
 	r = handle_sock_ret(r);
-	if (r < 0) {
+	if (r < 0)
 		return r;
-	} else if (!r) {
+
+	if (r > 0)
+		gwp_conn_buf_advance(&gcp->target, (size_t)r);
+
+	/*
+	 * A short send leaves unsent bytes in target.buf; flush the remainder
+	 * before reading more from the target, otherwise the leftover data is
+	 * overwritten by the next recv and the transfer stalls.
+	 */
+	if (gcp->target.len > 0) {
 		prep_send_client(w, gcp);
 		return 0;
 	}
 
-	gwp_conn_buf_advance(&gcp->target, (size_t)r);
 	if (gcp->target.fd >= 0)
 		prep_recv_target(w, gcp);
 	return 0;
@@ -921,14 +929,18 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 
 	r = handle_sock_ret(r);
-	if (r < 0) {
+	if (r < 0)
 		return r;
-	} else if (!r) {
+
+	if (r > 0)
+		gwp_conn_buf_advance(&gcp->client, (size_t)r);
+
+	/* Short send: flush the rest before reading more from the client. */
+	if (gcp->client.len > 0) {
 		prep_send_target(w, gcp);
 		return 0;
 	}
 
-	gwp_conn_buf_advance(&gcp->client, (size_t)r);
 	prep_recv_client(w, gcp);
 	return 0;
 }
