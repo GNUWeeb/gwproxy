@@ -133,8 +133,6 @@ struct gwp_conn {
 	uint32_t	ep_mask;
 };
 
-struct gwp_dns_query;
-
 enum {
 	/*
 	 * Don't close the file descriptor when freeing the connection pair.
@@ -174,7 +172,6 @@ struct gwp_conn_pair {
 		struct gwp_socks5_conn	*s5_conn;
 		struct gwp_http_conn	*http_conn;
 	};
-	struct gwp_dns_query	*gdq;
 	struct gwp_dns_entry	*gde;
 	struct gwp_sockaddr	client_addr;
 	struct gwp_sockaddr	target_addr;
