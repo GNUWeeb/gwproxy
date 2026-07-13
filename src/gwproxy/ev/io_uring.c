@@ -127,6 +127,23 @@ static void arm_accept(struct gwp_wrk *w)
 	s->user_data = EV_BIT_IOU_ACCEPT;
 }
 
+/*
+ * accept() is paused because of fd exhaustion (EMFILE/ENFILE): arm a short
+ * one-shot timer and retry the accept when it fires (see handle_ev_accept()).
+ * Polling this way decouples recovery from connection-teardown timing, so the
+ * worker can never get permanently stuck with accepting disabled.
+ */
+static void arm_accept_retry(struct gwp_wrk *w)
+{
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+	struct iou *iou = w->iou;
+
+	iou->accept_retry_ts.tv_sec = 0;
+	iou->accept_retry_ts.tv_nsec = 100000000L;	/* 100 ms */
+	io_uring_prep_timeout(s, &iou->accept_retry_ts, 0, 0);
+	s->user_data = EV_BIT_IOU_ACCEPT_RETRY;
+}
+
 static void prep_close(struct gwp_wrk *w, int fd)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
@@ -466,10 +483,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		if (fd == -EAGAIN || fd == -EINTR)
 			return 0;
 
-		/*
-		 * TODO(ammarfaizi2): Handle -EMFILE and -ENFILE.
-		 */
-		pr_err(&ctx->lh, "accept() failed: %s", strerror(-fd));
+		/* Resource errors are classified and logged by handle_ev_accept(). */
 		return fd;
 	}
 
@@ -541,8 +555,31 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	int r = __handle_ev_accept(w, cqe);
 
 	if (unlikely(r < 0)) {
+		/*
+		 * Resource exhaustion is transient: pause accepting instead of
+		 * killing the worker, and retry via a timer (arm_accept_retry())
+		 * until descriptors free up. Analogous to the epoll
+		 * handle_accept_error().
+		 */
+		if (r == -EMFILE || r == -ENFILE || r == -ENOMEM) {
+			if (!w->accept_is_stopped) {
+				w->accept_is_stopped = true;
+				pr_warn(&w->ctx->lh,
+					"Too many open files, pausing accept (tidx=%u)",
+					w->idx);
+			}
+			arm_accept_retry(w);
+			return 0;
+		}
+
 		pr_err(&w->ctx->lh, "Failed to handle accept event: %s", strerror(-r));
 		return r;
+	}
+
+	if (unlikely(w->accept_is_stopped)) {
+		w->accept_is_stopped = false;
+		pr_info(&w->ctx->lh, "Resumed accepting new connections (tidx=%u)",
+			w->idx);
 	}
 
 	arm_accept(w);
@@ -1139,6 +1176,10 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	case EV_BIT_IOU_ACCEPT:
 		pr_dbg(&ctx->lh, "Handling accept event: %d", cqe->res);
 		return handle_ev_accept(w, cqe);
+	case EV_BIT_IOU_ACCEPT_RETRY:
+		pr_dbg(&ctx->lh, "Handling accept retry timer: %d", cqe->res);
+		arm_accept(w);
+		return 0;
 	case EV_BIT_IOU_TARGET_CONNECT:
 		pr_dbg(&ctx->lh, "Handling target connect event: %d", cqe->res);
 		r = handle_ev_target_connect(w, udata, cqe->res);
