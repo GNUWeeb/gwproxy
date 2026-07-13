@@ -924,6 +924,8 @@ out:
 	return r;
 }
 
+static int gwp_socks5_addr_encode(uint8_t *b, const struct gwp_socks5_addr *a);
+
 static int __gwp_socks5_conn_cmd_connect_res(struct data_arg *arg,
 					     const struct gwp_socks5_addr *ba,
 					     uint8_t rep)
@@ -939,27 +941,10 @@ static int __gwp_socks5_conn_cmd_connect_res(struct data_arg *arg,
 	resp[2] = 0x00; /* RSV */
 	resp_len = 4;
 	if (ba) {
-		resp[3] = ba->ver; /* ATYP */
-		switch (ba->ver) {
-		case GWP_SOCKS5_ATYP_IPV4:
-			memcpy(&resp[4], ba->ip4, 4);
-			memcpy(&resp[8], &ba->port, 2);
-			resp_len += 4 + 2;
-			break;
-		case GWP_SOCKS5_ATYP_IPV6:
-			memcpy(&resp[4], ba->ip6, 16);
-			memcpy(&resp[20], &ba->port, 2);
-			resp_len += 16 + 2;
-			break;
-		case GWP_SOCKS5_ATYP_DOMAIN:
-			memcpy(&resp[4], &ba->domain.len, 1);
-			memcpy(&resp[5], ba->domain.str, resp[4]);
-			memcpy(&resp[5 + resp[4]], &ba->port, 2);
-			resp_len += 1 + ba->domain.len + 2;
-			break;
-		default:
-			return -EINVAL;
-		}
+		int al = gwp_socks5_addr_encode(&resp[3], ba);
+		if (al < 0)
+			return al;
+		resp_len += al - 1; /* al includes the ATYP byte counted above */
 	} else {
 		resp[3] = GWP_SOCKS5_ATYP_IPV4; /* ATYP: IPv4 address */
 		memset(&resp[4], 0, 6); /* BND.ADDR + BND.PORT */
@@ -995,4 +980,187 @@ int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
 					    : GWP_SOCKS5_ST_ERR;
 
 	return r;
+}
+
+/*
+ * Serialize the ATYP + address + port portion of a SOCKS5 request/reply.
+ * The byte layout is identical between a request (DST.ADDR) and a reply
+ * (BND.ADDR), so this is shared by the server reply builder above and the
+ * client CONNECT request builder below. Returns the number of bytes written,
+ * or a negative error code.
+ */
+static int gwp_socks5_addr_len(const struct gwp_socks5_addr *a)
+{
+	switch (a->ver) {
+	case GWP_SOCKS5_ATYP_IPV4:
+		return 1 + 4 + 2;
+	case GWP_SOCKS5_ATYP_IPV6:
+		return 1 + 16 + 2;
+	case GWP_SOCKS5_ATYP_DOMAIN:
+		return 1 + 1 + a->domain.len + 2;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int gwp_socks5_addr_encode(uint8_t *b, const struct gwp_socks5_addr *a)
+{
+	b[0] = a->ver; /* ATYP */
+	switch (a->ver) {
+	case GWP_SOCKS5_ATYP_IPV4:
+		memcpy(&b[1], a->ip4, 4);
+		memcpy(&b[5], &a->port, 2);
+		return 1 + 4 + 2;
+	case GWP_SOCKS5_ATYP_IPV6:
+		memcpy(&b[1], a->ip6, 16);
+		memcpy(&b[17], &a->port, 2);
+		return 1 + 16 + 2;
+	case GWP_SOCKS5_ATYP_DOMAIN:
+		b[1] = a->domain.len;
+		memcpy(&b[2], a->domain.str, a->domain.len);
+		memcpy(&b[2 + a->domain.len], &a->port, 2);
+		return 1 + 1 + a->domain.len + 2;
+	default:
+		return -EINVAL;
+	}
+}
+
+int gwp_socks5_cli_build_greeting(bool have_auth, void *buf, size_t *len)
+{
+	uint8_t *b = buf;
+	size_t need = have_auth ? 4 : 3;
+
+	if (*len < need) {
+		*len = need;
+		return -ENOBUFS;
+	}
+
+	b[0] = 0x05; /* VER */
+	if (have_auth) {
+		b[1] = 0x02; /* NMETHODS */
+		b[2] = 0x00; /* NO AUTHENTICATION REQUIRED */
+		b[3] = 0x02; /* USERNAME/PASSWORD */
+	} else {
+		b[1] = 0x01; /* NMETHODS */
+		b[2] = 0x00; /* NO AUTHENTICATION REQUIRED */
+	}
+
+	*len = need;
+	return 0;
+}
+
+int gwp_socks5_cli_parse_method(const void *buf, size_t len, uint8_t *method)
+{
+	const uint8_t *b = buf;
+
+	if (len < 2)
+		return -EAGAIN;
+
+	if (b[0] != 0x05)
+		return -EINVAL;
+
+	*method = b[1];
+	return 0;
+}
+
+int gwp_socks5_cli_build_userpass(const char *u, size_t ulen,
+				  const char *p, size_t plen,
+				  void *buf, size_t *len)
+{
+	uint8_t *b = buf;
+	size_t need = 3 + ulen + plen;
+
+	if (ulen > 255 || plen > 255)
+		return -EINVAL;
+
+	if (*len < need) {
+		*len = need;
+		return -ENOBUFS;
+	}
+
+	b[0] = 0x01; /* VER (subnegotiation) */
+	b[1] = (uint8_t)ulen;
+	memcpy(&b[2], u, ulen);
+	b[2 + ulen] = (uint8_t)plen;
+	memcpy(&b[3 + ulen], p, plen);
+
+	*len = need;
+	return 0;
+}
+
+int gwp_socks5_cli_parse_userpass(const void *buf, size_t len, uint8_t *status)
+{
+	const uint8_t *b = buf;
+
+	if (len < 2)
+		return -EAGAIN;
+
+	if (b[0] != 0x01)
+		return -EINVAL;
+
+	*status = b[1];
+	return 0;
+}
+
+int gwp_socks5_cli_build_connect(const struct gwp_socks5_addr *dst,
+				 void *buf, size_t *len)
+{
+	uint8_t *b = buf;
+	int alen;
+	size_t need;
+
+	alen = gwp_socks5_addr_len(dst);
+	if (alen < 0)
+		return alen;
+
+	need = 3 + (size_t)alen;
+	if (*len < need) {
+		*len = need;
+		return -ENOBUFS;
+	}
+
+	b[0] = 0x05; /* VER */
+	b[1] = 0x01; /* CMD: CONNECT */
+	b[2] = 0x00; /* RSV */
+	gwp_socks5_addr_encode(&b[3], dst);
+
+	*len = need;
+	return 0;
+}
+
+int gwp_socks5_cli_parse_connect(const void *buf, size_t len,
+				 uint8_t *rep, size_t *consumed)
+{
+	const uint8_t *b = buf;
+	size_t need = 4; /* VER + REP + RSV + ATYP */
+
+	if (len < need)
+		return -EAGAIN;
+
+	if (b[0] != 0x05)
+		return -EINVAL;
+
+	switch (b[3]) {
+	case GWP_SOCKS5_ATYP_IPV4:
+		need += 4 + 2;
+		break;
+	case GWP_SOCKS5_ATYP_IPV6:
+		need += 16 + 2;
+		break;
+	case GWP_SOCKS5_ATYP_DOMAIN:
+		need += 1;
+		if (len < need)
+			return -EAGAIN;
+		need += b[4] + 2;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (len < need)
+		return -EAGAIN;
+
+	*rep = b[1];
+	*consumed = need;
+	return 0;
 }
