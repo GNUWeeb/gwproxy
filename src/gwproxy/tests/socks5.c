@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #define test_socks5_init_ctx_no_auth(CTX)		\
 do {							\
@@ -369,24 +370,26 @@ static void test_short_recv(void)
 	gwp_socks5_ctx_free(ctx);
 }
 
-static ssize_t file_put_contents(const char *path, const char *data, size_t len)
+/*
+ * Create a unique temporary file from @tmpl (an mkstemp(3) template, rewritten
+ * in place with the chosen name) and write @len bytes of @data to it. Using
+ * mkstemp() rather than opening a fixed path keeps each run's file unique and
+ * owned by the current user; that matters under fs.protected_regular, where
+ * (re)opening another user's file for writing in the sticky, world-writable
+ * /tmp is denied even for root. The caller unlink()s @tmpl when done.
+ */
+static ssize_t write_temp_file(char *tmpl, const void *data, size_t len)
 {
-	size_t fwr;
-	FILE *f;
-	int ret;
+	ssize_t w;
+	int fd;
 
-	f = fopen(path, "wb");
-	if (!f)
-		return -errno;
+	fd = mkstemp(tmpl);
+	if (fd < 0)
+		return -1;
 
-	fwr = fwrite(data, 1, len, f);
-	if (fwr < len)
-		ret = -EIO;
-	else
-		ret = (int)fwr;
-
-	fclose(f);
-	return ret;
+	w = write(fd, data, len);
+	close(fd);
+	return w;
 }
 
 static void test_auth_userpass(void)
@@ -414,7 +417,7 @@ static void test_auth_userpass(void)
 	uint8_t out[4096];
 	ssize_t r;
 
-	r = file_put_contents(cred_file, cred_data, sizeof(cred_data) - 1);
+	r = write_temp_file(cred_file, cred_data, sizeof(cred_data) - 1);
 	assert(r == (ssize_t)(sizeof(cred_data) - 1));
 
 	cfg.auth_file = cred_file;
@@ -490,6 +493,7 @@ static void test_auth_userpass(void)
 	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
+	unlink(cred_file);
 }
 
 static void test_offered_methods_no_match(void)
@@ -783,7 +787,7 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	ssize_t r;
 	size_t i;
 
-	r = file_put_contents(cred_file, cred_data, sizeof(cred_data) - 1);
+	r = write_temp_file(cred_file, cred_data, sizeof(cred_data) - 1);
 	assert(r == (ssize_t)(sizeof(cred_data) - 1));
 
 	cfg.auth_file = cred_file;
@@ -858,6 +862,7 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
+	unlink(cred_file);
 }
 
 static void gwp_socks5_run_tests(void)
