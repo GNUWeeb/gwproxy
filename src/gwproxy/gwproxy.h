@@ -51,6 +51,7 @@ struct gwp_cfg {
 	const char	*pid_file;
 	const char	*dns_servers;
 	const char	*upstream_socks5;
+	int		mark;
 };
 
 struct gwp_ctx;

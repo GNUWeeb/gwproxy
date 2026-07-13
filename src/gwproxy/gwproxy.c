@@ -68,6 +68,7 @@ static const struct option long_opts[] = {
 	{ "log-file",		required_argument,	NULL,	'f' },
 	{ "pid-file",		required_argument,	NULL,	'p' },
 	{ "upstream-socks5",	required_argument,	NULL,	'x' },
+	{ "mark",		required_argument,	NULL,	'M' },
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	{ "dns-server",		required_argument,	NULL,	'j' },
 	{ "raw-dns",		required_argument,	NULL,	'r' },
@@ -101,7 +102,8 @@ static const struct gwp_cfg default_opts = {
 	.log_file		= "/dev/stdout",
 	.pid_file		= NULL,
 	.dns_servers		= "1.1.1.1",
-	.upstream_socks5	= NULL
+	.upstream_socks5	= NULL,
+	.mark			= 0
 };
 
 __cold
@@ -138,6 +140,7 @@ static void show_help(const char *app)
 	printf("  -x, --upstream-socks5=url       Route outgoing connections through an upstream SOCKS5 proxy\n");
 	printf("                                  URL: socks5://[user:pass@]host:port (local DNS) or\n");
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
+	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN; 0 = off)\n");
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	printf("  -j, --dns-server=addr:port      DNS server address (default: system resolver)\n");
 	printf("  -r, --raw-dns=0|1               Use raw DNS for SOCKS5 (default: %d)\n", default_opts.use_raw_dns);
@@ -245,6 +248,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'x':
 			cfg->upstream_socks5 = optarg;
+			break;
+		case 'M':
+			cfg->mark = atoi(optarg);
 			break;
 		case 'j':
 			cfg->dns_servers = optarg;
@@ -1087,6 +1093,21 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 		}
 	}
 
+	if (ctx->cfg.mark) {
+		int tfd = __sys_socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+		if (tfd >= 0) {
+			r = __sys_setsockopt(tfd, SOL_SOCKET, SO_MARK,
+					     &ctx->cfg.mark, sizeof(ctx->cfg.mark));
+			__sys_close(tfd);
+			if (r) {
+				pr_err(&ctx->lh, "Cannot set --mark=%d (SO_MARK): %s (CAP_NET_ADMIN required)",
+				       ctx->cfg.mark, strerror(-r));
+				goto out_free_log;
+			}
+		}
+	}
+
 	if (ctx->cfg.pid_file)
 		gwp_ctx_init_pid_file(ctx);
 
@@ -1303,6 +1324,14 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
+/*
+ * SO_MARK comes from <asm-generic/socket.h>; define a fallback in case the
+ * libc headers are too old. The value is part of the stable UAPI.
+ */
+#ifndef SO_MARK
+#define SO_MARK 36
+#endif
+
 static int setskopt_int(int fd, int level, int optname, int value)
 {
 	return __sys_setsockopt(fd, level, optname, &value, sizeof(value));
@@ -1341,6 +1370,10 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 		return fd;
 
 	gwp_setup_cli_sock_options(w, fd);
+
+	/* Mark the outgoing connection for policy routing / iptables matching. */
+	if (w->ctx->cfg.mark)
+		setskopt_int(fd, SOL_SOCKET, SO_MARK, w->ctx->cfg.mark);
 
 	/*
 	 * Do not connect if non_block is false, as we
