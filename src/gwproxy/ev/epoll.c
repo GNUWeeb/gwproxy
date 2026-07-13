@@ -1107,13 +1107,13 @@ static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 /*
- * A full hangup means no further I/O is possible on @c's fd. Mark both of its
- * directions done and stop monitoring it; forward_progress() then flushes the
- * peer and closes once everything is delivered.
+ * @c's fd hung up (EPOLLHUP) and its read side has already been drained to
+ * EOF. No further I/O is possible on it, so mark its write side shut and stop
+ * monitoring it (EPOLLHUP is level-triggered and would otherwise wake us in a
+ * loop); forward_progress() then finishes the pair once the peer is flushed.
  */
 static void handle_ev_hup(struct gwp_wrk *w, struct gwp_conn *c)
 {
-	c->rd_eof = true;
 	c->wr_shut = true;
 	if (c->ep_mask) {
 		__sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, c->fd, NULL);
@@ -1143,7 +1143,13 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	assert(gcp->conn_state == CONN_STATE_FORWARDING);
-	if (ev->events & EPOLLIN) {
+
+	/*
+	 * Drain on EPOLLHUP as well as EPOLLIN: a hung-up socket can still have
+	 * unread data in its receive buffer, and EPOLLIN keeps firing (level
+	 * triggered) until recv() returns 0 and sets rd_eof.
+	 */
+	if (ev->events & (EPOLLIN | EPOLLHUP)) {
 		r = do_splice(&gcp->target, &gcp->client, true, true);
 		if (r)
 			return r;
@@ -1155,7 +1161,7 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return r;
 	}
 
-	if (ev->events & EPOLLHUP)
+	if ((ev->events & EPOLLHUP) && gcp->target.rd_eof)
 		handle_ev_hup(w, &gcp->target);
 
 	return forward_progress(w, gcp);
@@ -1172,7 +1178,7 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return -ECONNRESET;
 	}
 
-	if (ev->events & EPOLLIN) {
+	if (ev->events & (EPOLLIN | EPOLLHUP)) {
 		r = do_splice(&gcp->client, &gcp->target, true, gcp->is_target_alive);
 		if (r)
 			return r;
@@ -1184,7 +1190,7 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return r;
 	}
 
-	if (ev->events & EPOLLHUP)
+	if ((ev->events & EPOLLHUP) && gcp->client.rd_eof)
 		handle_ev_hup(w, &gcp->client);
 
 	return forward_progress(w, gcp);
