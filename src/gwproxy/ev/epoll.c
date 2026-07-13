@@ -545,7 +545,8 @@ static int handle_ev_eventfd(struct gwp_wrk *w, struct epoll_event *ev)
 
 static bool adj_epl_out(struct gwp_conn *src, struct gwp_conn *dst)
 {
-	if (src->len > 0) {
+	/* Nothing to write, or the write side is already shut down. */
+	if (src->len > 0 && !dst->wr_shut) {
 		if (!(dst->ep_mask & EPOLLOUT)) {
 			dst->ep_mask |= EPOLLOUT;
 			return true;
@@ -562,16 +563,23 @@ static bool adj_epl_out(struct gwp_conn *src, struct gwp_conn *dst)
 
 static bool adj_epl_in(struct gwp_conn *src)
 {
-	if (src->cap - src->len) {
-		if (!(src->ep_mask & EPOLLIN)) {
-			src->ep_mask |= EPOLLIN;
-			return true;
-		}
-	} else {
-		if (src->ep_mask & EPOLLIN) {
-			src->ep_mask &= ~EPOLLIN;
-			return true;
-		}
+	uint32_t desired;
+
+	/*
+	 * Once this fd's read side is at EOF, stop listening for EPOLLIN and
+	 * EPOLLRDHUP on it. While the buffer is full, keep RDHUP but drop IN
+	 * so we still learn of a peer close under backpressure.
+	 */
+	if (src->rd_eof)
+		desired = 0;
+	else if (src->cap - src->len)
+		desired = EPOLLIN | EPOLLRDHUP;
+	else
+		desired = EPOLLRDHUP;
+
+	if ((src->ep_mask & (EPOLLIN | EPOLLRDHUP)) != desired) {
+		src->ep_mask = (src->ep_mask & ~(EPOLLIN | EPOLLRDHUP)) | desired;
+		return true;
 	}
 
 	return false;
@@ -633,7 +641,13 @@ static ssize_t __do_recv(struct gwp_conn *src)
 			return ret;
 		ret = 0;
 	} else if (!ret) {
-		return -ECONNRESET;
+		/*
+		 * Peer closed its write side. Flag EOF instead of erroring so
+		 * the caller can flush any buffered data before tearing the
+		 * connection down (see forward_progress()).
+		 */
+		src->rd_eof = true;
+		return 0;
 	}
 
 	src->len += (size_t)ret;
@@ -982,6 +996,8 @@ static int handle_ev_upstream_socks5(struct gwp_wrk *w,
 		sr = __do_recv(&gcp->target);
 		if (unlikely(sr < 0))
 			return (int)sr;
+		if (unlikely(gcp->target.rd_eof))
+			return -ECONNRESET;
 	}
 
 	r = upstream_s5_parse(w, gcp);
@@ -1065,6 +1081,46 @@ out_conn_err:
 	return r;
 }
 
+/*
+ * After a forwarding splice, propagate half-closes and decide whether the
+ * pair is done. Once a direction's source has reached EOF and everything it
+ * sent has been flushed to the peer, shut the peer's write side so it sees the
+ * FIN. When both directions have been shut, the pair is fully drained and is
+ * torn down without dropping any buffered data.
+ */
+static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
+		__sys_shutdown(gcp->client.fd, SHUT_WR);
+		gcp->client.wr_shut = true;
+	}
+
+	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
+		__sys_shutdown(gcp->target.fd, SHUT_WR);
+		gcp->target.wr_shut = true;
+	}
+
+	if (gcp->client.wr_shut && gcp->target.wr_shut)
+		return -ECONNRESET;
+
+	return adjust_epl_mask(w, gcp);
+}
+
+/*
+ * A full hangup means no further I/O is possible on @c's fd. Mark both of its
+ * directions done and stop monitoring it; forward_progress() then flushes the
+ * peer and closes once everything is delivered.
+ */
+static void handle_ev_hup(struct gwp_wrk *w, struct gwp_conn *c)
+{
+	c->rd_eof = true;
+	c->wr_shut = true;
+	if (c->ep_mask) {
+		__sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, c->fd, NULL);
+		c->ep_mask = 0;
+	}
+}
+
 __hot
 static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    struct epoll_event *ev)
@@ -1099,10 +1155,10 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return r;
 	}
 
-	if (ev->events & (EPOLLRDHUP | EPOLLHUP))
-		return -ECONNRESET;
+	if (ev->events & EPOLLHUP)
+		handle_ev_hup(w, &gcp->target);
 
-	return adjust_epl_mask(w, gcp);
+	return forward_progress(w, gcp);
 }
 
 __hot
@@ -1128,10 +1184,10 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return r;
 	}
 
-	if (ev->events & (EPOLLRDHUP | EPOLLHUP))
-		return -ECONNRESET;
+	if (ev->events & EPOLLHUP)
+		handle_ev_hup(w, &gcp->client);
 
-	return adjust_epl_mask(w, gcp);
+	return forward_progress(w, gcp);
 }
 
 __hot
@@ -1410,8 +1466,12 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 	int r, ct;
 
 	ret = __do_recv(&gcp->client);
-	if (unlikely(ret <= 0))
+	if (unlikely(ret < 0))
 		return (int)ret;
+	if (unlikely(gcp->client.rd_eof))
+		return -ECONNRESET;
+	if (!ret)
+		return 0;
 
 	ct = gcp->conn_state;
 	if (ct == CONN_STATE_PROT) {
