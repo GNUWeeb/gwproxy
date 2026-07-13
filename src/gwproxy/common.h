@@ -12,6 +12,10 @@
 #define unlikely(x)	__builtin_expect(!!(x), 0)
 #endif
 
+#ifndef __unused
+#define __unused	__attribute__((__unused__))
+#endif
+
 #ifndef __cold
 #define __cold		__attribute__((__cold__))
 #endif
