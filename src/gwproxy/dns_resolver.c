@@ -250,3 +250,128 @@ void gwp_dns_res_free(struct gwp_dns_resolver *res)
 	__sys_close(res->udp_fd);
 	memset(res, 0, sizeof(*res));
 }
+
+int gwp_dns_res_prep_query(struct gwp_dns_resolver *res,
+			   struct gwp_dns_packet *gdp)
+{
+	int af, ret;
+	ssize_t tmp;
+
+	assert(gdp->gcp);
+
+	if (!gdp->__in_fallback_attempt) {
+		ret = insert_map(res->sess_map, gdp->gcp, &gdp->txid);
+		if (ret)
+			return ret;
+	} else {
+		assert(gdp->gcp == lookup_map(res->sess_map, gdp->txid));
+	}
+
+	ret = 0;
+	if (gdp->restyp == GWP_DNS_RESTYP_PREFER_IPV6) {
+		af = AF_INET6;
+		gdp->restyp = GWP_DNS_RESTYP_IPV4_ONLY;
+		gdp->__in_fallback_attempt = true;
+	} else if (gdp->restyp == GWP_DNS_RESTYP_PREFER_IPV4) {
+		af = AF_INET;
+		gdp->restyp = GWP_DNS_RESTYP_IPV6_ONLY;
+		gdp->__in_fallback_attempt = true;
+	} else if (gdp->restyp == GWP_DNS_RESTYP_IPV6_ONLY) {
+		ret = 0;
+		af = AF_INET6;
+	} else if (gdp->restyp == GWP_DNS_RESTYP_IPV4_ONLY) {
+		ret = 0;
+		af = AF_INET;
+	} else {
+		ret = -EINVAL;
+		goto err;
+	}
+
+	tmp = gwdns_build_query(gdp->txid, gdp->host, af, gdp->buf, gdp->buf_len);
+	if (tmp < 0) {
+		ret = (int)tmp;
+		goto err;
+	}
+
+	gdp->buf_len = (uint16_t)tmp;
+	return ret;
+
+err:
+	delete_map(res->sess_map, gdp->txid);
+	return ret;
+}
+
+void gwp_dns_res_drop_query(struct gwp_dns_resolver *res,
+			    struct gwp_conn_pair *gcp, uint16_t txid)
+{
+	assert(gcp);
+	assert(gcp == lookup_map(res->sess_map, txid));
+	delete_map(res->sess_map, txid);
+	(void)gcp;
+}
+
+int gwp_dns_res_fetch_gcp_by_payload(struct gwp_dns_resolver *res,
+				     const uint8_t buf[UDP_MSG_LIMIT],
+				     uint16_t len,
+				     struct gwp_conn_pair **gcp_p)
+{
+	uint16_t txid;
+
+	if (len < 38)
+		return -EINVAL;
+
+	memcpy(&txid, buf, 2);
+	if (txid >= res->sess_map->cap)
+		return -EINVAL;
+
+	*gcp_p = lookup_map(res->sess_map, txid);
+	if (!gcp_p)
+		return -ENOENT;
+
+	return 0;
+}
+
+int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
+				struct gwp_dns_packet *gdp,
+				uint8_t buf[UDP_MSG_LIMIT],
+				uint16_t len,
+				struct gwp_sockaddr *addr)
+{
+	struct gwdns_addrinfo_node *ai = NULL;
+	char port[sizeof("65535")];
+	uint16_t txid;
+	ssize_t r;
+
+	if (len < 38)
+		return -EINVAL;
+
+	memcpy(&txid, buf, 2);
+	if (txid >= res->sess_map->cap)
+		return -EINVAL;
+
+	if (gdp->txid != txid)
+		return -EINVAL;
+
+	if (gdp->gcp != res->sess_map->sess_map[txid])
+		return -EINVAL;
+
+	snprintf(port, sizeof(port), "%hu", gdp->port);
+	r = gwdns_parse_query(txid, port, buf, len, &ai);
+	if (!r) {
+		*addr = ai->ai_addr;
+		gwdns_free_parsed_query(ai);
+		gwp_dns_res_drop_query(res, gdp->gcp, txid);
+		return 0;
+	}
+
+	if (gdp->__in_fallback_attempt) {
+		int tmp = gwp_dns_res_prep_query(res, gdp);
+		if (!tmp)
+			return -EAGAIN;
+
+		r = tmp;
+	}
+
+	gwp_dns_res_drop_query(res, gdp->gcp, txid);
+	return (int)r;
+}
