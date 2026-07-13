@@ -347,7 +347,13 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		target_fd = -1;
 	} else {
 		bool *p = &gcp->is_target_alive;
-		target_fd = gwp_create_sock_target(w, &gcp->target_addr, p, true);
+		struct gwp_sockaddr *ca = &gcp->target_addr;
+
+		/* With an upstream proxy, connect to the proxy instead. */
+		if (ctx->upstream.enabled)
+			ca = &ctx->upstream.addr;
+
+		target_fd = gwp_create_sock_target(w, ca, p, true);
 		if (target_fd < 0) {
 			pr_err(&ctx->lh, "Failed to create target socket: %s",
 				strerror(-target_fd));
@@ -356,6 +362,13 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		timeout = cfg->connect_timeout;
 		gcp->conn_state = CONN_STATE_FORWARDING;
 		cl_ev_bit = EV_BIT_CLIENT;
+
+		/*
+		 * Force the connect-result path so the upstream handshake runs
+		 * (see handle_ev_target_conn_result).
+		 */
+		if (ctx->upstream.enabled)
+			gcp->is_target_alive = false;
 	}
 
 	if (timeout > 0) {
@@ -688,6 +701,299 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
 	return r;
 }
 
+/*
+ * ------------------------------------------------------------------------
+ * Upstream SOCKS5 proxy client handshake (epoll).
+ *
+ * When ctx->upstream.enabled, the "target" socket is connected to an upstream
+ * SOCKS5 proxy rather than the real destination. Before forwarding, we perform
+ * the SOCKS5 client handshake on that socket:
+ *
+ *    greeting -> [user/pass auth] -> CONNECT(real dst) -> reply
+ *
+ * gcp->target is used as the I/O buffer for the proxy connection during the
+ * handshake (it is otherwise unused until CONN_STATE_FORWARDING). Client data
+ * that arrives meanwhile is buffered by handle_ev_client() because
+ * is_target_alive is still false.
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * Describe the upstream destination for logging. With socks5h:// the real
+ * destination is a hostname (target_addr is unset), so show up_dst instead.
+ */
+static const char *upstream_dst_str(struct gwp_conn_pair *gcp)
+{
+	static __thread char buf[300];
+
+	if (gcp->up_dst.ver == GWP_SOCKS5_ATYP_DOMAIN) {
+		snprintf(buf, sizeof(buf), "%s:%u", gcp->up_dst.domain.str,
+			 ntohs(gcp->up_dst.port));
+		return buf;
+	}
+
+	return ip_to_str(&gcp->target_addr);
+}
+
+/*
+ * A handshake with the upstream proxy failed. Inform the downstream client
+ * with a SOCKS5 failure reply where applicable, then return @err so the
+ * caller tears the connection down.
+ */
+static int upstream_s5_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    int err)
+{
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
+		int r = prep_and_send_socks5_rep_connect(w, gcp, ECONNREFUSED);
+		if (r)
+			return r;
+	}
+
+	return err;
+}
+
+static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			uint32_t mask)
+{
+	struct epoll_event ev;
+
+	gcp->target.ep_mask = mask;
+	ev.events = mask;
+	ev.data.u64 = 0;
+	ev.data.ptr = gcp;
+	ev.data.u64 |= EV_BIT_TARGET;
+	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->target.fd, &ev);
+}
+
+static int upstream_s5_send_userpass(struct gwp_wrk *w,
+				     struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream_s5 *up = &w->ctx->upstream;
+	size_t len = gcp->target.cap;
+	int r;
+
+	gcp->target.len = 0;
+	r = gwp_socks5_cli_build_userpass(up->user, up->ulen, up->pass, up->plen,
+					  gcp->target.buf, &len);
+	if (unlikely(r))
+		return r;
+
+	gcp->target.len = (uint32_t)len;
+	gcp->up_tx = true;
+	gcp->conn_state = CONN_STATE_UPSTREAM_S5_AUTH;
+	return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
+}
+
+static int upstream_s5_send_connect(struct gwp_wrk *w,
+				    struct gwp_conn_pair *gcp)
+{
+	size_t len = gcp->target.cap;
+	int r;
+
+	gcp->target.len = 0;
+	r = gwp_socks5_cli_build_connect(&gcp->up_dst, gcp->target.buf, &len);
+	if (unlikely(r))
+		return r;
+
+	gcp->target.len = (uint32_t)len;
+	gcp->up_tx = true;
+	gcp->conn_state = CONN_STATE_UPSTREAM_S5_CONNECT;
+	return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
+}
+
+static int upstream_s5_complete(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				uint8_t rep, size_t consumed)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	uint8_t rbuf[512];
+	size_t rlen = 0;
+	ssize_t sr;
+	int r;
+
+	if (rep != GWP_SOCKS5_REP_SUCCESS) {
+		pr_err(&ctx->lh, "Upstream SOCKS5 CONNECT failed (rep=0x%02x, idx=%u, dst=%s)",
+			rep, gcp->idx, upstream_dst_str(gcp));
+		return upstream_s5_fail(w, gcp, -ECONNREFUSED);
+	}
+
+	/* Build the downstream reply for the client (before any early data). */
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
+		rlen = sizeof(rbuf);
+		r = gwp_socks5_build_connect_reply(w, gcp, 0, rbuf, &rlen);
+		if (unlikely(r))
+			return r;
+	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
+		memcpy(rbuf, "HTTP/1.1 200 OK\r\n\r\n", 19);
+		rlen = 19;
+	}
+
+	/* Drop the proxy's CONNECT reply, keep any early destination data. */
+	gwp_conn_buf_advance(&gcp->target, consumed);
+
+	if (rlen) {
+		if (gcp->target.len + rlen > gcp->target.cap)
+			return -ENOBUFS;
+		memmove(gcp->target.buf + rlen, gcp->target.buf, gcp->target.len);
+		memcpy(gcp->target.buf, rbuf, rlen);
+		gcp->target.len += rlen;
+	}
+
+	if (gcp->timer_fd >= 0) {
+		__sys_close(gcp->timer_fd);
+		gcp->timer_fd = -1;
+	}
+
+	gcp->up_tx = false;
+	gcp->is_target_alive = true;
+	gcp->conn_state = CONN_STATE_FORWARDING;
+	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
+
+	pr_info(&ctx->lh, "Upstream SOCKS5 tunnel established (idx=%u, ca=%s, dst=%s)",
+		gcp->idx, ip_to_str(&gcp->client_addr), upstream_dst_str(gcp));
+
+	/* Flush downstream reply (+ early data) to the client. */
+	if (gcp->target.len) {
+		sr = __do_send(&gcp->target, &gcp->client);
+		if (unlikely(sr < 0))
+			return (int)sr;
+	}
+
+	/* Flush any client data buffered during the handshake to the target. */
+	if (gcp->client.len) {
+		sr = __do_send(&gcp->client, &gcp->target);
+		if (unlikely(sr < 0))
+			return (int)sr;
+	}
+
+	return adjust_epl_mask(w, gcp);
+}
+
+static int upstream_s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	const uint8_t *buf = (const uint8_t *)gcp->target.buf;
+	size_t len = gcp->target.len;
+	int r;
+
+	switch (gcp->conn_state) {
+	case CONN_STATE_UPSTREAM_S5_METHOD: {
+		uint8_t method;
+
+		r = gwp_socks5_cli_parse_method(buf, len, &method);
+		if (r)
+			return r;
+
+		gwp_conn_buf_advance(&gcp->target, 2);
+		if (method == 0x00)
+			return upstream_s5_send_connect(w, gcp);
+		if (method == 0x02 && ctx->upstream.has_auth)
+			return upstream_s5_send_userpass(w, gcp);
+
+		pr_err(&ctx->lh, "Upstream SOCKS5 proxy selected no acceptable auth method (0x%02x)",
+			method);
+		return upstream_s5_fail(w, gcp, -EACCES);
+	}
+	case CONN_STATE_UPSTREAM_S5_AUTH: {
+		uint8_t status;
+
+		r = gwp_socks5_cli_parse_userpass(buf, len, &status);
+		if (r)
+			return r;
+
+		gwp_conn_buf_advance(&gcp->target, 2);
+		if (status != 0x00) {
+			pr_err(&ctx->lh, "Upstream SOCKS5 authentication failed (idx=%u)",
+				gcp->idx);
+			return upstream_s5_fail(w, gcp, -EACCES);
+		}
+		return upstream_s5_send_connect(w, gcp);
+	}
+	case CONN_STATE_UPSTREAM_S5_CONNECT: {
+		uint8_t rep;
+		size_t consumed;
+
+		r = gwp_socks5_cli_parse_connect(buf, len, &rep, &consumed);
+		if (r)
+			return r;
+
+		return upstream_s5_complete(w, gcp, rep, consumed);
+	}
+	default:
+		return -EINVAL;
+	}
+}
+
+static int upstream_s5_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	size_t len = gcp->target.cap;
+	int r;
+
+	r = gwp_upstream_finalize_dst(w, gcp);
+	if (unlikely(r)) {
+		pr_err(&ctx->lh, "Failed to prepare upstream destination (idx=%u): %s",
+			gcp->idx, strerror(-r));
+		return r;
+	}
+
+	r = gwp_socks5_cli_build_greeting(ctx->upstream.has_auth,
+					  gcp->target.buf, &len);
+	if (unlikely(r))
+		return r;
+
+	gcp->target.len = (uint32_t)len;
+	gcp->up_tx = true;
+	gcp->conn_state = CONN_STATE_UPSTREAM_S5_METHOD;
+	pr_dbg(&ctx->lh, "Upstream SOCKS5 handshake started (idx=%u, dst=%s)",
+		gcp->idx, upstream_dst_str(gcp));
+	return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
+}
+
+__hot
+static int handle_ev_upstream_socks5(struct gwp_wrk *w,
+				     struct gwp_conn_pair *gcp,
+				     struct epoll_event *ev)
+{
+	ssize_t sr;
+	int r;
+
+	/* Transmit phase: flush the pending request to the proxy. */
+	if (gcp->up_tx) {
+		if (ev->events & EPOLLOUT) {
+			sr = __do_send(&gcp->target, &gcp->target);
+			if (unlikely(sr < 0))
+				return (int)sr;
+			if (gcp->target.len == 0)
+				gcp->up_tx = false;
+		}
+
+		if (gcp->up_tx) {
+			if (ev->events & (EPOLLRDHUP | EPOLLHUP))
+				return -ECONNRESET;
+			return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
+		}
+
+		/* Fully sent; wait for the reply. */
+		return upstream_arm(w, gcp, EPOLLIN | EPOLLRDHUP);
+	}
+
+	/* Receive phase: read and parse the reply. */
+	if (ev->events & EPOLLIN) {
+		sr = __do_recv(&gcp->target);
+		if (unlikely(sr < 0))
+			return (int)sr;
+	}
+
+	r = upstream_s5_parse(w, gcp);
+	if (r == -EAGAIN) {
+		if (ev->events & (EPOLLRDHUP | EPOLLHUP))
+			return -ECONNRESET;
+		return upstream_arm(w, gcp, EPOLLIN | EPOLLRDHUP);
+	}
+
+	return r;
+}
+
 __hot
 static int handle_ev_target_conn_result(struct gwp_wrk *w,
 					struct gwp_conn_pair *gcp)
@@ -715,6 +1021,13 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 		r = -err;
 		goto out_conn_err;
 	}
+
+	/*
+	 * Connected to the upstream SOCKS5 proxy. Perform the client handshake
+	 * before forwarding; the connect timer is kept to bound it.
+	 */
+	if (ctx->upstream.enabled)
+		return upstream_s5_start(w, gcp);
 
 	if (gcp->timer_fd >= 0) {
 		__sys_close(gcp->timer_fd);
@@ -763,8 +1076,15 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return -ECONNRESET;
 	}
 
-	if (!gcp->is_target_alive)
+	if (!gcp->is_target_alive) {
+		int cs = gcp->conn_state;
+
+		if (cs >= CONN_STATE_UPSTREAM_S5_MIN &&
+		    cs <= CONN_STATE_UPSTREAM_S5_MAX)
+			return handle_ev_upstream_socks5(w, gcp, ev);
+
 		return handle_ev_target_conn_result(w, gcp);
+	}
 
 	assert(gcp->conn_state == CONN_STATE_FORWARDING);
 	if (ev->events & EPOLLIN) {
@@ -853,11 +1173,23 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	p = &gcp->is_target_alive;
-	tfd = gwp_create_sock_target(w, &gcp->target_addr, p, true);
+	if (w->ctx->upstream.enabled) {
+		/* Connect to the upstream proxy, not the real destination. */
+		tfd = gwp_create_sock_target(w, &w->ctx->upstream.addr, p, true);
+	} else {
+		tfd = gwp_create_sock_target(w, &gcp->target_addr, p, true);
+	}
 	if (unlikely(tfd < 0)) {
 		pr_err(&w->ctx->lh, "Failed to create target socket: %s", strerror(-tfd));
 		return tfd;
 	}
+
+	/*
+	 * Force the connect-result path so the upstream handshake runs even if
+	 * connect() completed synchronously.
+	 */
+	if (w->ctx->upstream.enabled)
+		gcp->is_target_alive = false;
 
 	r = w->ctx->cfg.connect_timeout;
 	if (r > 0) {
