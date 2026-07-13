@@ -977,10 +977,11 @@ static int gwp_ctx_init_prot(struct gwp_ctx *ctx)
 	struct gwp_cfg *cfg = &ctx->cfg;
 
 	/*
-	 * socks5 and http can't be running together.
+	 * SOCKS5 and HTTP may run together on the same port: the connection
+	 * protocol handler tries SOCKS5 first and falls back to HTTP (see
+	 * gwp_handle_conn_state_prot()). Only SOCKS5 needs context set up here;
+	 * HTTP state is allocated per connection.
 	 */
-	assert(!(cfg->as_socks5 && cfg->as_http));
-
 	if (cfg->as_socks5) {
 		return gwp_ctx_init_socks5(ctx);
 	} else {
