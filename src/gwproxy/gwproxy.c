@@ -69,6 +69,7 @@ static const struct option long_opts[] = {
 	{ "pid-file",		required_argument,	NULL,	'p' },
 	{ "upstream-socks5",	required_argument,	NULL,	'x' },
 	{ "mark",		required_argument,	NULL,	'M' },
+	{ "as-transparent",	required_argument,	NULL,	'R' },
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	{ "dns-server",		required_argument,	NULL,	'j' },
 	{ "raw-dns",		required_argument,	NULL,	'r' },
@@ -103,7 +104,8 @@ static const struct gwp_cfg default_opts = {
 	.pid_file		= NULL,
 	.dns_servers		= "1.1.1.1",
 	.upstream_socks5	= NULL,
-	.mark			= 0
+	.mark			= 0,
+	.as_transparent		= false
 };
 
 __cold
@@ -141,6 +143,7 @@ static void show_help(const char *app)
 	printf("                                  URL: socks5://[user:pass@]host:port (local DNS) or\n");
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
 	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN; 0 = off)\n");
+	printf("  -R, --as-transparent=0|1        Transparent proxy: take the target from SO_ORIGINAL_DST (iptables REDIRECT) (default: %d)\n", default_opts.as_transparent);
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	printf("  -j, --dns-server=addr:port      DNS server address (default: system resolver)\n");
 	printf("  -r, --raw-dns=0|1               Use raw DNS for SOCKS5 (default: %d)\n", default_opts.use_raw_dns);
@@ -252,6 +255,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'M':
 			cfg->mark = atoi(optarg);
 			break;
+		case 'R':
+			cfg->as_transparent = !!atoi(optarg);
+			break;
 		case 'j':
 			cfg->dns_servers = optarg;
 			break;
@@ -276,8 +282,18 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		goto einval;
 	}
 
-	if (!cfg->as_socks5 && !cfg->as_http && !cfg->target) {
-		fprintf(stderr, ERR_WRAP "Error: --target is required unless --as-socks5=1 or --as-http=1\n" ERR_WRAP);
+	if (cfg->as_transparent && (cfg->as_socks5 || cfg->as_http)) {
+		fprintf(stderr, ERR_WRAP "Error: --as-transparent cannot be combined with --as-socks5 or --as-http\n" ERR_WRAP);
+		goto einval;
+	}
+
+	if (cfg->as_transparent && cfg->target) {
+		fprintf(stderr, ERR_WRAP "Error: --target must not be set with --as-transparent (the target comes from SO_ORIGINAL_DST)\n" ERR_WRAP);
+		goto einval;
+	}
+
+	if (!cfg->as_socks5 && !cfg->as_http && !cfg->as_transparent && !cfg->target) {
+		fprintf(stderr, ERR_WRAP "Error: --target is required unless --as-socks5=1, --as-http=1 or --as-transparent=1\n" ERR_WRAP);
 		goto einval;
 	}
 
@@ -1075,7 +1091,11 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 			ctx->upstream.remote_dns ? "remote" : "local");
 	}
 
-	if (!ctx->cfg.as_socks5 && !ctx->cfg.as_http) {
+	/*
+	 * A transparent proxy takes the target from SO_ORIGINAL_DST per
+	 * connection, so there is no --target to resolve here.
+	 */
+	if (!ctx->cfg.as_socks5 && !ctx->cfg.as_http && !ctx->cfg.as_transparent) {
 		const char *t = ctx->cfg.target;
 
 		/*
@@ -1325,12 +1345,47 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 /*
- * SO_MARK comes from <asm-generic/socket.h>; define a fallback in case the
- * libc headers are too old. The value is part of the stable UAPI.
+ * These come from linux/netfilter_ipv4.h and
+ * linux/netfilter_ipv6/ip6_tables.h, but including those headers tends to
+ * clash with <netinet/in.h>. The values are part of the stable UAPI.
  */
 #ifndef SO_MARK
 #define SO_MARK 36
 #endif
+#ifndef SO_ORIGINAL_DST
+#define SO_ORIGINAL_DST 80
+#endif
+#ifndef IP6T_SO_ORIGINAL_DST
+#define IP6T_SO_ORIGINAL_DST 80
+#endif
+
+/*
+ * Fetch the pre-DNAT destination of a connection redirected to us by iptables
+ * REDIRECT (used by --as-transparent). @client is the accepted peer address,
+ * used to pick the right protocol level (an IPv4 or v4-mapped peer carries an
+ * IPv4 original destination).
+ */
+int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
+		     struct gwp_sockaddr *dst)
+{
+	socklen_t len;
+	bool v4;
+
+	v4 = (client->sa.sa_family == AF_INET) ||
+	     (client->sa.sa_family == AF_INET6 &&
+	      IN6_IS_ADDR_V4MAPPED(&client->i6.sin6_addr));
+
+	memset(dst, 0, sizeof(*dst));
+	if (v4) {
+		len = sizeof(dst->i4);
+		return __sys_getsockopt(fd, IPPROTO_IP, SO_ORIGINAL_DST,
+					&dst->i4, &len);
+	}
+
+	len = sizeof(dst->i6);
+	return __sys_getsockopt(fd, IPPROTO_IPV6, IP6T_SO_ORIGINAL_DST,
+				&dst->i6, &len);
+}
 
 static int setskopt_int(int fd, int level, int optname, int value)
 {
