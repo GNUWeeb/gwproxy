@@ -17,6 +17,133 @@
 #include <limits.h>
 #include <sys/inotify.h>
 
+
+static int arm_poll_for_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+#ifdef CONFIG_NEW_DNS_RESOLVER
+#include <gwproxy/dns_resolver.h>
+static int register_dns_to_epoll(struct gwp_wrk *w)
+{
+	struct gwp_wrk_dns *dns = w->dns;
+	uint32_t i;
+
+	if (!dns)
+		return 0;
+
+	for (i = 0; i < dns->nr; i++) {
+		struct gwp_dns_resolver *res = &dns->resolvers[i];
+		struct epoll_event ev;
+		int r;
+
+		if (res->udp_fd < 0)
+			continue;
+
+		ev.events = EPOLLIN;
+		ev.data.u64 = 0;
+		ev.data.ptr = res;
+		ev.data.u64 |= EV_BIT_RAW_DNS_QUERY;
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, res->udp_fd, &ev);
+		if (r < 0) {
+			pr_err(&w->ctx->lh,
+			       "Failed to add raw DNS UDP socket to epoll: %s\n",
+			       strerror(-r));
+			return r;
+		}
+
+		pr_dbg(&w->ctx->lh,
+			"Worker %u registered raw DNS UDP socket to epoll (fd=%d)",
+			w->idx, res->udp_fd);
+	}
+
+	return 0;
+}
+
+static int send_dns_payload(struct gwp_dns_resolver *res,
+			    struct gwp_conn_pair *gcp)
+{
+	struct gwp_dns_packet *gdp = gcp->gdp;
+	const void *b = gdp->buf;
+	size_t l = gdp->buf_len;
+	ssize_t sr;
+
+	sr = __sys_sendto(res->udp_fd, b, l, MSG_NOSIGNAL, NULL, 0);
+	if (unlikely(sr < 0))
+		return (int)sr;
+
+	return 0;
+}
+
+static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_cfg *cfg = &w->ctx->cfg;
+
+	if (cfg->use_raw_dns) {
+		struct gwp_dns_resolver *res = &w->dns->resolvers[0];
+		return send_dns_payload(res, gcp);
+	}
+
+	return arm_poll_for_dns_query(w, gcp);
+}
+
+static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
+					    struct gwp_conn_pair *gcp,
+					    int err);
+
+static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+static int handle_ev_raw_dns_query(struct gwp_wrk *w)
+{
+	struct gwp_dns_resolver *res = &w->dns->resolvers[0];
+	struct gwp_conn_pair *gcp = NULL;
+	struct gwp_ctx *ctx = w->ctx;
+	uint8_t buf[UDP_MSG_LIMIT];
+	uint16_t len;
+	ssize_t ret;
+	int r;
+
+	ret = __sys_recv(res->udp_fd, buf, sizeof(buf), 0);
+	if (unlikely(ret < 0))
+		return (int)ret;
+
+	len = (uint16_t)ret;
+	ret = gwp_dns_res_fetch_gcp_by_payload(res, buf, len, &gcp);
+	if (unlikely(ret < 0))
+		return 0;
+
+	ret = gwp_dns_res_complete_query(res, gcp->gdp, buf, len,
+					 &gcp->target_addr);
+	if (ret == -EAGAIN)
+		return send_dns_payload(res, gcp);
+
+	if (likely(!ret)) {
+		pr_dbg(&ctx->lh, "Resolved DNS query for %s to %s (gcp_idx=%u)",
+			gcp->gdp->host, ip_to_str(&gcp->target_addr), gcp->idx);
+		r = handle_connect(w, gcp);
+	} else {
+		if (gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY)
+			r = prep_and_send_socks5_rep_connect(w, gcp, (int)ret);
+		else
+			r = -EIO;
+	}
+	return r;
+}
+#else
+static int register_dns_to_epoll(struct gwp_wrk __unused *w)
+{
+	return 0;
+}
+
+static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	return arm_poll_for_dns_query(w, gcp);
+}
+
+static int handle_ev_raw_dns_query(struct gwp_wrk __unused *w)
+{
+	return -ENOSYS;
+}
+#endif
+
 __cold
 int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 {
@@ -72,6 +199,10 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 		if (unlikely(r))
 			goto out_free_events;
 	}
+
+	r = register_dns_to_epoll(w);
+	if (r)
+		goto out_free_events;
 
 	pr_dbg(&w->ctx->lh, "Worker %u epoll (ep_fd=%d, ev_fd=%d)", w->idx,
 		ep_fd, ev_fd);
@@ -154,10 +285,12 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	int nr_fd_closed = 0;
 	int r;
 
-	if (gde) {
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, gde->ev_fd, NULL);
-		if (unlikely(r))
-			return r;
+	if (!w->ctx->cfg.use_raw_dns) {
+		if (gde) {
+			r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, gde->ev_fd, NULL);
+			if (unlikely(r))
+				return r;
+		}
 	}
 
 	if (gcp->client.fd >= 0) {
@@ -890,7 +1023,7 @@ static bool is_ev_bit_conn_pair(uint64_t ev_bit)
 static int chk_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 {
 	if (r == -EINPROGRESS && gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY)
-		return arm_poll_for_dns_query(w, gcp);
+		return chk_handle_dns_query(w, gcp);
 
 	if (r == 0 && gcp->conn_state == CONN_STATE_SOCKS5_CONNECT)
 		return handle_connect(w, gcp);
@@ -1056,6 +1189,9 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		break;
 	case EV_BIT_SOCKS5_AUTH_FILE:
 		r = handle_ev_socks5_auth_file(w);
+		break;
+	case EV_BIT_RAW_DNS_QUERY:
+		r = handle_ev_raw_dns_query(w);
 		break;
 	default:
 		pr_err(&w->ctx->lh, "Unknown event bit: %" PRIu64, ev_bit);
