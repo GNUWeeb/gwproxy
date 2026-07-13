@@ -37,6 +37,9 @@ for opt do
 	--use-io-uring)
 		use_io_uring="yes";
 	;;
+	--use-new-dns-resolver)
+		use_new_dns_resolver="yes";
+	;;
 	--sanitize)
 		use_sanitize="yes";
 	;;
@@ -88,6 +91,7 @@ Options: [defaults in brackets after descriptions]
   --debug                  Build with debug enabled
   --use-io-uring           Enable io_uring support (default: no)
   --sanitize               Enable sanitizers (default: no)
+  --use-new-dns-resolver   Use the new DNS resolver feature (default: no)
 EOF
 exit 0;
 fi
@@ -344,6 +348,10 @@ if test "${use_sanitize}" = "yes"; then
 	LDFLAGS="${LDFLAGS} -fsanitize=address -fsanitize=undefined";
 	CFLAGS="${CFLAGS} -fsanitize=address -fsanitize=undefined";
 	CXXFLAGS="${CXXFLAGS} -fsanitize=address -fsanitize=undefined";
+fi;
+
+if test "${use_new_dns_resolver}" = "yes"; then
+	add_config "CONFIG_NEW_DNS_RESOLVER";
 fi;
 
 add_config "CONFIG_LINUX";

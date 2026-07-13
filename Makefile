@@ -83,6 +83,12 @@ endif
 -include config.make
 LIBS=$(LIB_LDFLAGS)
 
+ifeq ($(CONFIG_NEW_DNS_RESOLVER),y)
+GWPROXY_CC_SOURCES += \
+	$(GWPROXY_DIR)/dns_parser.c \
+	$(GWPROXY_DIR)/dns_resolver.c
+endif
+
 ifeq ($(CONFIG_IO_URING),y)
 	GWPROXY_CC_SOURCES += $(GWPROXY_DIR)/ev/io_uring.c
 	ALL_GWPROXY_OBJECTS += $(LIBURING_TARGET)
