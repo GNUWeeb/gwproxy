@@ -67,6 +67,10 @@ static const struct option long_opts[] = {
 	{ "log-level",		required_argument,	NULL,	'm' },
 	{ "log-file",		required_argument,	NULL,	'f' },
 	{ "pid-file",		required_argument,	NULL,	'p' },
+#ifdef CONFIG_NEW_DNS_RESOLVER
+	{ "dns-server",		required_argument,	NULL,	'j' },
+	{ "raw-dns",		required_argument,	NULL,	'r' },
+#endif
 	{ NULL,			0,			NULL,	0 }
 };
 
@@ -77,6 +81,7 @@ static const struct gwp_cfg default_opts = {
 	.as_socks5		= false,
 	.as_http		= false,
 	.socks5_prefer_ipv6	= false,
+	.use_raw_dns		= false,
 	.protocol_timeout	= 10,
 	.socks5_auth_file	= NULL,
 	.socks5_dns_cache_secs	= 0,
@@ -94,6 +99,7 @@ static const struct gwp_cfg default_opts = {
 	.log_level		= 3,
 	.log_file		= "/dev/stdout",
 	.pid_file		= NULL,
+	.dns_servers		= "1.1.1.1"
 };
 
 __cold
@@ -127,6 +133,10 @@ static void show_help(const char *app)
 	printf("  -m, --log-level=level           Set log level (0=none, 1=error, 2=warning, 3=info, 4=debug, default: %d)\n", default_opts.log_level);
 	printf("  -f, --log-file=file             Log to the specified file (default: %s)\n", default_opts.log_file);
 	printf("  -p, --pid-file=file             Write PID to the specified file (default is no pid file)\n");
+#ifdef CONFIG_NEW_DNS_RESOLVER
+	printf("  -j, --dns-server=addr:port      DNS server address (default: system resolver)\n");
+	printf("  -r, --raw-dns=0|1               Use raw DNS for SOCKS5 (default: %d)\n", default_opts.use_raw_dns);
+#endif
 	printf("\n");
 }
 
@@ -228,11 +238,28 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'p':
 			cfg->pid_file = optarg;
 			break;
+		case 'j':
+			cfg->dns_servers = optarg;
+			break;
+		case 'r':
+			cfg->use_raw_dns = !!atoi(optarg);
+			break;
 		default:
 			fprintf(stderr, "Unknown option: %c\n", c);
 			show_help(argv[0]);
 			return -EINVAL;
 		}
+	}
+
+
+	if (cfg->use_raw_dns && !strcmp(cfg->event_loop, "io_uring")) {
+		fprintf(stderr, ERR_WRAP "Error: The raw DNS feature is currently not supported with the io_uring event loop\n" ERR_WRAP);
+		goto einval;
+	}
+
+	if (cfg->use_raw_dns && cfg->socks5_dns_cache_secs) {
+		fprintf(stderr, ERR_WRAP "Error: The -L/--socks5-dns-cache-secs option is not supported with the raw DNS feature\n" ERR_WRAP);
+		goto einval;
 	}
 
 	if (!cfg->as_socks5 && !cfg->as_http && !cfg->target) {
@@ -274,6 +301,138 @@ einval:
 	show_help(argv[0]);
 	return -EINVAL;
 }
+
+#ifdef CONFIG_NEW_DNS_RESOLVER
+static int gwp_ctx_init_raw_dns(struct gwp_wrk *w)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	int r;
+
+	w->dns = calloc(1, sizeof(*w->dns));
+	if (!w->dns)
+		return -ENOMEM;
+
+	/*
+	 * TODO(Viro_SSFS): Support multiple DNS servers by splitting
+	 *                  ctx->cfg.dns_servers by comma.
+	 *
+	 * For now, support only one DNS server.
+	 */
+	w->dns->nr = 1;
+	w->dns->resolvers = calloc(w->dns->nr, sizeof(*w->dns->resolvers));
+	if (!w->dns->resolvers) {
+		r = -ENOMEM;
+		goto err_dns;
+	}
+
+	r = gwp_dns_res_init(ctx, &w->dns->resolvers[0], ctx->cfg.dns_servers);
+	if (r < 0)
+		goto err_resolvers;
+
+	pr_dbg(&ctx->lh, "Worker %u initialized raw DNS resolver: %s (fd=%d)",
+		w->idx, ctx->cfg.dns_servers, w->dns->resolvers[0].udp_fd);
+	return 0;
+
+err_resolvers:
+	free(w->dns->resolvers);
+	w->dns->resolvers = NULL;
+err_dns:
+	free(w->dns);
+	w->dns = NULL;
+	return r;
+}
+
+static void gwp_ctx_free_raw_dns(struct gwp_wrk *w)
+{
+	size_t i;
+
+	if (!w->dns)
+		return;
+
+	if (w->dns->resolvers) {
+		for (i = 0; i < w->dns->nr; i++)
+			gwp_dns_res_free(&w->dns->resolvers[i]);
+		free(w->dns->resolvers);
+		w->dns->resolvers = NULL;
+	}
+
+	free(w->dns);
+	w->dns = NULL;
+}
+
+static int gwp_alloc_dns_packet(struct gwp_conn_pair *gcp)
+{
+	gcp->gdp = calloc(1, sizeof(*gcp->gdp));
+	return gcp->gdp ? 0 : -ENOMEM;
+}
+
+static void gwp_free_dns_packet(struct gwp_conn_pair *gcp)
+{
+	if (gcp->gdp) {
+		free(gcp->gdp->host);
+		free(gcp->gdp);
+		gcp->gdp = NULL;
+	}
+}
+
+static int gwp_raw_dns_resolve(struct gwp_wrk *w,
+			       struct gwp_conn_pair *gcp,
+			       const char *host,
+			       const char *port)
+{
+	struct gwp_dns_resolver *res;
+	struct gwp_dns_packet *gdp;
+	int r;
+
+	assert(w->dns);
+
+	res = &w->dns->resolvers[0];
+	r = gwp_alloc_dns_packet(gcp);
+	if (r < 0)
+		return r;
+
+	gdp = gcp->gdp;
+	gdp->host = strdup(host);
+	if (!gdp->host) {
+		r = -ENOMEM;
+		goto out_err;
+	}
+
+	gdp->restyp = w->ctx->cfg.socks5_prefer_ipv6 ?
+		GWP_DNS_RESTYP_PREFER_IPV6 :
+		GWP_DNS_RESTYP_PREFER_IPV4;
+
+	gdp->port = (uint16_t)atoi(port);
+	gdp->buf_len = sizeof(gdp->buf);
+	gdp->gcp = gcp;
+	r = gwp_dns_res_prep_query(res, gdp);
+	if (r < 0)
+		goto out_err;
+
+	return -EINPROGRESS;
+
+out_err:
+	gwp_free_dns_packet(gcp);
+	return r;
+}
+#else /* #ifdef CONFIG_NEW_DNS_RESOLVER */
+static int gwp_ctx_init_raw_dns(struct gwp_wrk __unused *w)
+{
+	return -ENOSYS;
+}
+
+static void gwp_ctx_free_raw_dns(struct gwp_wrk __unused *w)
+{
+}
+
+static int gwp_raw_dns_resolve(struct gwp_wrk __unused *w,
+			       struct gwp_conn_pair __unused *gcp,
+			       const char __unused *host,
+			       const char __unused *port)
+{
+	return -ENOSYS;
+}
+#endif /* #ifdef CONFIG_NEW_DNS_RESOLVER */
 
 #define FULL_ADDRSTRLEN (INET6_ADDRSTRLEN + sizeof(":65535[]") - 1)
 
@@ -451,6 +610,7 @@ static int gwp_ctx_init_thread(struct gwp_wrk *w,
 			       const struct gwp_sockaddr *bind_addr)
 {
 	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_cfg *cfg = &ctx->cfg;
 	int r;
 
 	r = gwp_ctx_init_thread_sock(w, bind_addr);
@@ -459,12 +619,28 @@ static int gwp_ctx_init_thread(struct gwp_wrk *w,
 		return r;
 	}
 
+
+	if (cfg->use_raw_dns) {
+		r = gwp_ctx_init_raw_dns(w);
+		if (r < 0) {
+			pr_err(&ctx->lh, "Failed to initialize raw DNS: %s", strerror(-r));
+			goto out_err;
+		}
+	}
+
 	r = gwp_ctx_init_thread_event(w);
 	if (r < 0) {
 		pr_err(&ctx->lh, "gwp_ctx_init_thread_event: %s\n", strerror(-r));
-		gwp_ctx_free_thread_sock(w);
+		goto out_err_raw_dns;
 	}
 
+	return r;
+
+out_err_raw_dns:
+	if (cfg->use_raw_dns)
+		gwp_ctx_free_raw_dns(w);
+out_err:
+	gwp_ctx_free_thread_sock(w);
 	return r;
 }
 
@@ -529,6 +705,11 @@ static void gwp_ctx_signal_all_workers(struct gwp_ctx *ctx)
 __cold
 static void gwp_ctx_free_thread(struct gwp_wrk *w)
 {
+	struct gwp_cfg *cfg = &w->ctx->cfg;
+
+	if (cfg->use_raw_dns)
+		gwp_ctx_free_raw_dns(w);
+
 	gwp_ctx_free_thread_sock_pairs(w);
 	gwp_ctx_free_thread_sock(w);
 	gwp_ctx_free_thread_event(w);
@@ -695,7 +876,7 @@ static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 	};
 	int r;
 
-	if (!cfg->as_socks5 && !cfg->as_http) {
+	if ((!cfg->as_socks5 && !cfg->as_http) || cfg->use_raw_dns) {
 		ctx->dns = NULL;
 		return 0;
 	}
@@ -966,6 +1147,7 @@ __hot
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn_slot *gcs = &w->conn_slot;
+	struct gwp_cfg *cfg = &w->ctx->cfg;
 	struct gwp_conn_pair *tmp;
 	uint32_t i = gcp->idx;
 
@@ -990,7 +1172,9 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->timer_fd >= 0)
 		__sys_close(gcp->timer_fd);
 
-	if (gcp->gde)
+	if (cfg->use_raw_dns && gcp->gdp)
+		free(gcp->gdp);
+	else if (gcp->gde)
 		gwp_dns_entry_put(gcp->gde);
 
 	switch (gcp->prot_type) {
@@ -1207,16 +1391,21 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 				      const char *host, const char *port)
 {
 	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_cfg *cfg = &ctx->cfg;
 	int r;
 
-	r = gwp_dns_cache_lookup(ctx->dns, host, port, &gcp->target_addr);
-	if (!r) {
-		pr_dbg(&ctx->lh, "Found %s:%s in DNS cache %s", host, port,
-			ip_to_str(&gcp->target_addr));
-		return 0;
-	}
+	if (cfg->use_raw_dns) {
+		return gwp_raw_dns_resolve(w, gcp, host, port);
+	} else {
+		r = gwp_dns_cache_lookup(ctx->dns, host, port, &gcp->target_addr);
+		if (!r) {
+			pr_dbg(&ctx->lh, "Found %s:%s in DNS cache %s", host, port,
+				ip_to_str(&gcp->target_addr));
+			return 0;
+		}
 
-	return queue_dns_resolution(w, gcp, host, port);
+		return queue_dns_resolution(w, gcp, host, port);
+	}
 }
 
 static int socks5_prepare_target_addr_domain(struct gwp_wrk *w,
@@ -1546,6 +1735,7 @@ static void *gwp_ctx_thread_entry(void *arg)
 		r = -EINVAL;
 		break;
 	}
+
 	ctx->stop = true;
 	gwp_ctx_signal_all_workers(ctx);
 	pr_info(&ctx->lh, "Worker %u stopped", w->idx);

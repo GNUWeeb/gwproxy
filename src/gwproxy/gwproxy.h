@@ -18,6 +18,10 @@
 #include <liburing.h>
 #endif
 
+#ifdef CONFIG_NEW_DNS_RESOLVER
+#include <gwproxy/dns_resolver.h>
+#endif
+
 #include <gwproxy/http1.h>
 
 struct gwp_cfg {
@@ -27,6 +31,7 @@ struct gwp_cfg {
 	bool		as_socks5;
 	bool		as_http;
 	bool		socks5_prefer_ipv6;
+	bool		use_raw_dns;
 	int		protocol_timeout;
 	const char	*socks5_auth_file;
 	int		socks5_dns_cache_secs;
@@ -44,6 +49,7 @@ struct gwp_cfg {
 	int		log_level;
 	const char	*log_file;
 	const char	*pid_file;
+	const char	*dns_servers;
 };
 
 struct gwp_ctx;
@@ -59,6 +65,7 @@ enum {
 	EV_BIT_SOCKS5_AUTH_FILE		= (8ull << 48ull),
 
 	EV_BIT_HTTP_CONN		= (18ull << 48ull),
+	EV_BIT_RAW_DNS_QUERY		= (19ull << 48ull),
 
 	/*
 	 * This ev_bit is used for user_data masking during protocol
@@ -153,6 +160,8 @@ struct gwp_http_conn {
 	struct gwnet_http_req_hdr	req_hdr;
 };
 
+struct gwp_dns_packet;
+
 struct gwp_conn_pair {
 	struct gwp_conn		target;
 	struct gwp_conn		client;
@@ -172,7 +181,10 @@ struct gwp_conn_pair {
 		struct gwp_socks5_conn	*s5_conn;
 		struct gwp_http_conn	*http_conn;
 	};
-	struct gwp_dns_entry	*gde;
+	union {
+		struct gwp_dns_entry	*gde;
+		struct gwp_dns_packet	*gdp;
+	};
 	struct gwp_sockaddr	client_addr;
 	struct gwp_sockaddr	target_addr;
 };
@@ -191,6 +203,13 @@ struct iou {
 	socklen_t		accept_addr_len;
 };
 #endif
+
+struct gwp_dns_resolver;
+
+struct gwp_wrk_dns {
+	struct gwp_dns_resolver		*resolvers;
+	uint32_t			nr;
+};
 
 struct gwp_wrk {
 	int			tcp_fd;
@@ -218,6 +237,10 @@ struct gwp_wrk {
 	struct gwp_ctx		*ctx;
 	uint32_t		idx;
 	pthread_t		thread;
+
+#ifdef CONFIG_NEW_DNS_RESOLVER
+	struct gwp_wrk_dns	*dns;
+#endif
 };
 
 enum {
