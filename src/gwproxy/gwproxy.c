@@ -151,6 +151,18 @@ static void show_help(const char *app)
 	printf("\n");
 }
 
+/*
+ * Whether --event-loop selects the io_uring backend. "iou" is an accepted
+ * alias for "io_uring" (see gwp_ctx_parse_ev()), so both spellings must be
+ * recognised when gating features that io_uring does not support yet.
+ */
+static bool ev_is_io_uring(const struct gwp_cfg *cfg)
+{
+	return cfg->event_loop &&
+	       (!strcmp(cfg->event_loop, "io_uring") ||
+		!strcmp(cfg->event_loop, "iou"));
+}
+
 __cold
 static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 {
@@ -272,7 +284,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 	}
 
 
-	if (cfg->use_raw_dns && !strcmp(cfg->event_loop, "io_uring")) {
+	if (cfg->use_raw_dns && ev_is_io_uring(cfg)) {
 		fprintf(stderr, ERR_WRAP "Error: The raw DNS feature is currently not supported with the io_uring event loop\n" ERR_WRAP);
 		goto einval;
 	}
