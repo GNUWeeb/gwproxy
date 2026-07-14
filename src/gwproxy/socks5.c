@@ -173,7 +173,7 @@ int gwp_socks5_auth_reload(struct gwp_socks5_ctx *ctx)
 	struct gwp_socks5_auth *auth = ctx->auth;
 	char buf[4096], *t;
 	size_t l;
-	int r;
+	int r = 0;
 
 	if (!auth || !auth->fp)
 		return -ENOSYS;
