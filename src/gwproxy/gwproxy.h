@@ -50,9 +50,29 @@ struct gwp_cfg {
 	const char	*log_file;
 	const char	*pid_file;
 	const char	*dns_servers;
+	const char	*upstream_socks5;
 };
 
 struct gwp_ctx;
+
+/*
+ * Parsed form of the --upstream-socks5 option. When @enabled, every outgoing
+ * connection is routed through this upstream SOCKS5 proxy instead of being
+ * connected to directly. Populated once at startup and shared read-only by
+ * all workers.
+ */
+struct gwp_upstream_s5 {
+	bool			enabled;
+	bool			remote_dns;	/* socks5h:// (proxy resolves) */
+	bool			has_auth;
+	uint8_t			ulen;
+	uint8_t			plen;
+	struct gwp_sockaddr	addr;		/* proxy endpoint */
+	char			user[256];
+	char			pass[256];
+};
+
+int gwp_parse_upstream_socks5(const char *url, struct gwp_upstream_s5 *up);
 
 enum {
 	EV_BIT_ACCEPT			= (1ull << 48ull),
@@ -99,7 +119,7 @@ enum {
 	EV_BIT_IOU_CLIENT_CANCEL	= (14ull << 48ull),
 	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
 	EV_BIT_IOU_MSG_RING		= (16ull << 48ull),
-	EV_BIT_IOU_CLIENT_SEND_NO_CB	= (17ull << 48ull),
+	EV_BIT_IOU_UPSTREAM_S5		= (20ull << 48ull),
 #endif
 };
 
@@ -117,6 +137,16 @@ enum {
 	CONN_STATE_SOCKS5_CONNECT	= 102,
 	CONN_STATE_SOCKS5_DNS_QUERY	= 104,
 	CONN_STATE_SOCKS5_MAX		= 199,
+
+	/*
+	 * The target socket is connected to an upstream SOCKS5 proxy and we
+	 * are performing the client-side handshake with it before forwarding.
+	 */
+	CONN_STATE_UPSTREAM_S5_MIN	= 200,
+	CONN_STATE_UPSTREAM_S5_METHOD	= 201,	/* await method selection    */
+	CONN_STATE_UPSTREAM_S5_AUTH	= 202,	/* await user/pass status    */
+	CONN_STATE_UPSTREAM_S5_CONNECT	= 203,	/* await CONNECT reply       */
+	CONN_STATE_UPSTREAM_S5_MAX	= 299,
 
 	CONN_STATE_HTTP_MIN		= 400,
 	CONN_STATE_HTTP_HDR		= 401,
@@ -187,6 +217,20 @@ struct gwp_conn_pair {
 	};
 	struct gwp_sockaddr	client_addr;
 	struct gwp_sockaddr	target_addr;
+
+	/*
+	 * Destination requested from the upstream SOCKS5 proxy. Only used
+	 * when ctx->upstream.enabled. For socks5:// this is filled from
+	 * target_addr (an IP); for socks5h:// it carries the hostname.
+	 */
+	struct gwp_socks5_addr	up_dst;
+
+	/*
+	 * True while an upstream-handshake request is still being flushed to
+	 * the proxy (target buffer holds outbound bytes); false while awaiting
+	 * a reply.
+	 */
+	bool			up_tx;
 };
 
 
@@ -256,6 +300,7 @@ struct gwp_ctx {
 	struct gwp_sockaddr		target_addr;
 	struct gwp_socks5_ctx		*socks5;
 	struct gwp_dns_ctx		*dns;
+	struct gwp_upstream_s5		upstream;
 	struct gwp_cfg			cfg;
 	int				ino_fd;
 	char				*ino_buf;
@@ -290,7 +335,10 @@ void log_conn_pair_created(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err);
+int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				   int err, void *out, size_t *out_len);
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 struct gwp_http_conn *gwp_http_conn_alloc(void);
 void gwp_http_conn_free(struct gwp_http_conn *conn);

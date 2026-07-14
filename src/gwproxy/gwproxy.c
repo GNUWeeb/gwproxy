@@ -67,6 +67,7 @@ static const struct option long_opts[] = {
 	{ "log-level",		required_argument,	NULL,	'm' },
 	{ "log-file",		required_argument,	NULL,	'f' },
 	{ "pid-file",		required_argument,	NULL,	'p' },
+	{ "upstream-socks5",	required_argument,	NULL,	'x' },
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	{ "dns-server",		required_argument,	NULL,	'j' },
 	{ "raw-dns",		required_argument,	NULL,	'r' },
@@ -99,7 +100,8 @@ static const struct gwp_cfg default_opts = {
 	.log_level		= 3,
 	.log_file		= "/dev/stdout",
 	.pid_file		= NULL,
-	.dns_servers		= "1.1.1.1"
+	.dns_servers		= "1.1.1.1",
+	.upstream_socks5	= NULL
 };
 
 __cold
@@ -133,6 +135,9 @@ static void show_help(const char *app)
 	printf("  -m, --log-level=level           Set log level (0=none, 1=error, 2=warning, 3=info, 4=debug, default: %d)\n", default_opts.log_level);
 	printf("  -f, --log-file=file             Log to the specified file (default: %s)\n", default_opts.log_file);
 	printf("  -p, --pid-file=file             Write PID to the specified file (default is no pid file)\n");
+	printf("  -x, --upstream-socks5=url       Route outgoing connections through an upstream SOCKS5 proxy\n");
+	printf("                                  URL: socks5://[user:pass@]host:port (local DNS) or\n");
+	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	printf("  -j, --dns-server=addr:port      DNS server address (default: system resolver)\n");
 	printf("  -r, --raw-dns=0|1               Use raw DNS for SOCKS5 (default: %d)\n", default_opts.use_raw_dns);
@@ -237,6 +242,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'p':
 			cfg->pid_file = optarg;
+			break;
+		case 'x':
+			cfg->upstream_socks5 = optarg;
 			break;
 		case 'j':
 			cfg->dns_servers = optarg;
@@ -953,6 +961,88 @@ static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
 		gwp_ctx_free_socks5(ctx);
 }
 
+/*
+ * Parse a --upstream-socks5 URL of the form:
+ *
+ *    socks5://[user:pass@]host:port     (gwproxy resolves the target)
+ *    socks5h://[user:pass@]host:port    (the upstream proxy resolves it)
+ *
+ * The port is optional and defaults to 1080.
+ */
+__cold
+int gwp_parse_upstream_socks5(const char *url, struct gwp_upstream_s5 *up)
+{
+	char buf[512], *at, *host;
+	const char *rest;
+	bool has_port;
+	size_t n;
+	int r;
+
+	memset(up, 0, sizeof(*up));
+
+	if (!strncmp(url, "socks5h://", 10)) {
+		up->remote_dns = true;
+		rest = url + 10;
+	} else if (!strncmp(url, "socks5://", 9)) {
+		up->remote_dns = false;
+		rest = url + 9;
+	} else {
+		return -EINVAL;
+	}
+
+	n = strlen(rest);
+	if (n == 0 || n >= sizeof(buf))
+		return -EINVAL;
+	memcpy(buf, rest, n + 1);
+
+	/* Optional "user:pass@" credentials; split at the last '@'. */
+	at = strrchr(buf, '@');
+	if (at) {
+		char *creds = buf, *pass;
+		size_t ul, pl;
+
+		*at = '\0';
+		host = at + 1;
+
+		pass = strchr(creds, ':');
+		if (pass)
+			*pass++ = '\0';
+
+		ul = strlen(creds);
+		pl = pass ? strlen(pass) : 0;
+		if (ul == 0 || ul > 255 || pl > 255)
+			return -EINVAL;
+
+		up->has_auth = true;
+		up->ulen = (uint8_t)ul;
+		up->plen = (uint8_t)pl;
+		memcpy(up->user, creds, ul + 1);
+		if (pass)
+			memcpy(up->pass, pass, pl + 1);
+	} else {
+		host = buf;
+	}
+
+	/*
+	 * convert_str_to_ssaddr() ignores an explicit port in the string when
+	 * a non-zero default_port is passed, so only pass the 1080 default
+	 * when the host has no port of its own.
+	 */
+	if (host[0] == '[') {
+		char *rb = strchr(host, ']');
+		has_port = rb && rb[1] == ':';
+	} else {
+		has_port = strchr(host, ':') != NULL;
+	}
+
+	r = convert_str_to_ssaddr(host, &up->addr, has_port ? 0 : 1080);
+	if (r)
+		return r;
+
+	up->enabled = true;
+	return 0;
+}
+
 __cold
 static int gwp_ctx_init(struct gwp_ctx *ctx)
 {
@@ -966,9 +1056,31 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (r < 0)
 		goto out_free_log;
 
+	if (ctx->cfg.upstream_socks5) {
+		r = gwp_parse_upstream_socks5(ctx->cfg.upstream_socks5,
+					      &ctx->upstream);
+		if (r) {
+			pr_err(&ctx->lh, "Invalid --upstream-socks5 value '%s'",
+			       ctx->cfg.upstream_socks5);
+			goto out_free_log;
+		}
+		pr_info(&ctx->lh, "Routing outgoing connections via upstream SOCKS5 proxy %s (%s DNS)",
+			ip_to_str(&ctx->upstream.addr),
+			ctx->upstream.remote_dns ? "remote" : "local");
+	}
+
 	if (!ctx->cfg.as_socks5 && !ctx->cfg.as_http) {
 		const char *t = ctx->cfg.target;
-		r = convert_str_to_ssaddr(t, &ctx->target_addr, 0);
+
+		/*
+		 * With socks5h:// the upstream proxy resolves the target, so
+		 * we must not resolve --target locally; keep it as a hostname
+		 * to hand to the proxy later.
+		 */
+		if (ctx->upstream.enabled && ctx->upstream.remote_dns)
+			r = 0;
+		else
+			r = convert_str_to_ssaddr(t, &ctx->target_addr, 0);
 		if (r) {
 			pr_err(&ctx->lh, "Invalid target address '%s'", t);
 			goto out_free_log;
@@ -1340,14 +1452,16 @@ static int get_local_addr_for_socks5(struct gwp_ctx *ctx, int fd,
 	}
 }
 
+/*
+ * Build a SOCKS5 CONNECT reply for the downstream client into an arbitrary
+ * output buffer. @err is 0 on success or a positive errno on failure.
+ */
 __hot
-int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-				  int err)
+int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				   int err, void *out, size_t *out_len)
 {
 	struct gwp_socks5_conn *sc = gcp->s5_conn;
 	struct gwp_socks5_addr ba;
-	size_t out_len;
-	void *out;
 	int r;
 
 	if (err == 0) {
@@ -1360,9 +1474,18 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	err = socks5_translate_err(err);
-	out = gcp->target.buf + gcp->target.len;
-	out_len = gcp->target.cap - gcp->target.len;
-	r = gwp_socks5_conn_cmd_connect_res(sc, &ba, err, out, &out_len);
+	return gwp_socks5_conn_cmd_connect_res(sc, &ba, err, out, out_len);
+}
+
+__hot
+int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				  int err)
+{
+	size_t out_len = gcp->target.cap - gcp->target.len;
+	void *out = gcp->target.buf + gcp->target.len;
+	int r;
+
+	r = gwp_socks5_build_connect_reply(w, gcp, err, out, &out_len);
 	if (r < 0)
 		return r;
 
@@ -1386,6 +1509,104 @@ static int queue_dns_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return -EINPROGRESS;
 }
 
+/*
+ * Fill @out (SOCKS5 address form) from a resolved sockaddr. Used to hand the
+ * already-resolved destination IP to the upstream SOCKS5 proxy (socks5://).
+ */
+static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
+				      struct gwp_socks5_addr *out)
+{
+	memset(out, 0, sizeof(*out));
+	switch (sa->sa.sa_family) {
+	case AF_INET:
+		out->ver = GWP_SOCKS5_ATYP_IPV4;
+		memcpy(out->ip4, &sa->i4.sin_addr, 4);
+		out->port = sa->i4.sin_port;
+		return 0;
+	case AF_INET6:
+		out->ver = GWP_SOCKS5_ATYP_IPV6;
+		memcpy(out->ip6, &sa->i6.sin6_addr, 16);
+		out->port = sa->i6.sin6_port;
+		return 0;
+	default:
+		return -EAFNOSUPPORT;
+	}
+}
+
+/*
+ * Fill @out as a domain-name destination. Used with socks5h:// so the upstream
+ * proxy performs the resolution.
+ */
+static int upstream_dst_from_domain(const char *host, uint16_t port,
+				    struct gwp_socks5_addr *out)
+{
+	size_t hl = strlen(host);
+
+	if (hl == 0 || hl > 255)
+		return -EINVAL;
+
+	memset(out, 0, sizeof(*out));
+	out->ver = GWP_SOCKS5_ATYP_DOMAIN;
+	out->domain.len = (uint8_t)hl;
+	memcpy(out->domain.str, host, hl);
+	out->domain.str[hl] = '\0';
+	out->port = htons(port);
+	return 0;
+}
+
+/*
+ * Split a "host:port" (or "[ipv6]:port") string and fill @out as a domain
+ * destination. Used for plain --target mode with socks5h://.
+ */
+static int upstream_dst_from_hostport(const char *hostport,
+				      struct gwp_socks5_addr *out)
+{
+	char buf[300], *colon, *host;
+	size_t hl, n = strlen(hostport);
+	int port;
+
+	if (n == 0 || n >= sizeof(buf))
+		return -EINVAL;
+	memcpy(buf, hostport, n + 1);
+
+	colon = strrchr(buf, ':');
+	if (!colon)
+		return -EINVAL;
+	*colon = '\0';
+	port = atoi(colon + 1);
+	if (port <= 0 || port > 65535)
+		return -EINVAL;
+
+	host = buf;
+	hl = strlen(host);
+	if (host[0] == '[' && hl >= 2 && host[hl - 1] == ']') {
+		host[hl - 1] = '\0';
+		host++;
+	}
+
+	return upstream_dst_from_domain(host, (uint16_t)port, out);
+}
+
+/*
+ * Finalize gcp->up_dst (the destination requested from the upstream proxy)
+ * right before the client handshake. If a socks5h domain was already captured
+ * during protocol parsing, keep it; otherwise derive it from the resolved
+ * target IP (socks5://), or from the configured --target host for plain mode
+ * with socks5h://.
+ */
+int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_ctx *ctx = w->ctx;
+
+	if (gcp->up_dst.ver != 0)
+		return 0;
+
+	if (ctx->upstream.remote_dns && !ctx->cfg.as_socks5 && !ctx->cfg.as_http)
+		return upstream_dst_from_hostport(ctx->cfg.target, &gcp->up_dst);
+
+	return upstream_dst_from_sockaddr(&gcp->target_addr, &gcp->up_dst);
+}
+
 static int prepare_target_addr_domain(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp,
 				      const char *host, const char *port)
@@ -1393,6 +1614,18 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_cfg *cfg = &ctx->cfg;
 	int r;
+
+	/*
+	 * socks5h://: don't resolve locally; hand the hostname to the upstream
+	 * proxy. up_dst carries the domain and we're ready to connect.
+	 */
+	if (ctx->upstream.enabled && ctx->upstream.remote_dns) {
+		int p = atoi(port);
+
+		if (p <= 0 || p > 65535)
+			return -EINVAL;
+		return upstream_dst_from_domain(host, (uint16_t)p, &gcp->up_dst);
+	}
 
 	if (cfg->use_raw_dns) {
 		return gwp_raw_dns_resolve(w, gcp, host, port);

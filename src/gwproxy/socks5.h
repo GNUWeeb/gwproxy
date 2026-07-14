@@ -191,4 +191,64 @@ int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
 bool gwp_socks5_auth_check(struct gwp_socks5_ctx *ctx, const char *u,
 			   size_t ulen, const char *p, size_t plen);
 
+/*
+ * SOCKS5 client-side helpers.
+ *
+ * These are used when gwproxy itself acts as a SOCKS5 *client* to route
+ * outgoing connections through an upstream SOCKS5 proxy. They are stateless
+ * message coders: builders serialize a request into @buf, parsers consume a
+ * reply from @buf.
+ *
+ * Builders:
+ *   @len is in/out. On input it holds the capacity of @buf. On success it is
+ *   set to the number of bytes written. If @buf is too small, -ENOBUFS is
+ *   returned and @len is set to the required size.
+ *
+ * Parsers:
+ *   Return -EAGAIN if @buf does not yet hold a complete message (the caller
+ *   should read more), -EINVAL on a protocol violation, or 0 on success.
+ */
+
+/**
+ * Build the version identifier / method selection greeting.
+ *
+ * @param have_auth	Offer the USERNAME/PASSWORD method in addition to
+ *			NO AUTHENTICATION REQUIRED.
+ */
+int gwp_socks5_cli_build_greeting(bool have_auth, void *buf, size_t *len);
+
+/**
+ * Parse the server's METHOD selection message. On success @method is set to
+ * the selected method (0x00 = none, 0x02 = user/pass, 0xFF = no acceptable
+ * methods).
+ */
+int gwp_socks5_cli_parse_method(const void *buf, size_t len, uint8_t *method);
+
+/**
+ * Build an RFC1929 USERNAME/PASSWORD authentication request.
+ */
+int gwp_socks5_cli_build_userpass(const char *u, size_t ulen,
+				  const char *p, size_t plen,
+				  void *buf, size_t *len);
+
+/**
+ * Parse the RFC1929 authentication response. On success @status is set
+ * (0x00 = success).
+ */
+int gwp_socks5_cli_parse_userpass(const void *buf, size_t len,
+				  uint8_t *status);
+
+/**
+ * Build a CONNECT request for the given destination address.
+ */
+int gwp_socks5_cli_build_connect(const struct gwp_socks5_addr *dst,
+				 void *buf, size_t *len);
+
+/**
+ * Parse a CONNECT reply. On success @rep is set to the reply code
+ * (0x00 = succeeded) and @consumed to the total reply length in bytes.
+ */
+int gwp_socks5_cli_parse_connect(const void *buf, size_t len,
+				 uint8_t *rep, size_t *consumed);
+
 #endif /* #ifndef GWP_SOCKS5_H */
