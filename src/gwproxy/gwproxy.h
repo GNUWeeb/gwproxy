@@ -203,6 +203,14 @@ enum {
 struct gwp_http_conn {
 	struct gwnet_http_hdr_pctx	ctx_hdr;
 	struct gwnet_http_req_hdr	req_hdr;
+
+	/*
+	 * True for a forwarding-proxy request (absolute-form target, e.g.
+	 * "GET http://host/path"), as opposed to a CONNECT tunnel. The rewritten
+	 * origin-form request is queued in client.buf and forwarded to the
+	 * origin; unlike CONNECT there is no "200 OK" reply to the client.
+	 */
+	bool				is_forward;
 };
 
 struct gwp_dns_packet;

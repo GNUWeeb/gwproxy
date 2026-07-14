@@ -1063,12 +1063,18 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 		r = prep_and_send_socks5_rep_connect(w, gcp, 0);
 		if (r)
 			return r;
-	} else if (gcp->conn_state == CONN_STATE_HTTP_CONNECT) {
+	} else if (gcp->conn_state == CONN_STATE_HTTP_CONNECT &&
+		   !gcp->http_conn->is_forward) {
 		if (gcp->target.cap < 19)
 			return -ENOBUFS;
 		memcpy(gcp->target.buf, "HTTP/1.1 200 OK\r\n\r\n", 19);
 		gcp->target.len = 19;
 	}
+	/*
+	 * A forwarding-proxy request writes no reply to the client: the
+	 * rewritten origin-form request is already queued in client.buf and is
+	 * flushed to the origin below; the origin's response is relayed back.
+	 */
 
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;

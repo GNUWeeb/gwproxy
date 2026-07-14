@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -1883,6 +1884,7 @@ struct gwp_http_conn *gwp_http_conn_alloc(void)
 		return NULL;
 	}
 
+	ghc->is_forward = false;
 	return ghc;
 }
 
@@ -2018,11 +2020,198 @@ static int http_reject_unauthorized(struct gwp_conn_pair *gcp)
 	return -EACCES;
 }
 
+/*
+ * Map a parsed HTTP method code back to its request-line token. Returns NULL
+ * for a method the forwarding proxy does not re-emit.
+ */
+static const char *http_method_str(uint8_t method)
+{
+	switch (method) {
+	case GWNET_HTTP_METHOD_GET:	return "GET";
+	case GWNET_HTTP_METHOD_POST:	return "POST";
+	case GWNET_HTTP_METHOD_PUT:	return "PUT";
+	case GWNET_HTTP_METHOD_DELETE:	return "DELETE";
+	case GWNET_HTTP_METHOD_HEAD:	return "HEAD";
+	case GWNET_HTTP_METHOD_OPTIONS:	return "OPTIONS";
+	case GWNET_HTTP_METHOD_PATCH:	return "PATCH";
+	case GWNET_HTTP_METHOD_TRACE:	return "TRACE";
+	default:			return NULL;
+	}
+}
+
+/*
+ * Split a "host:port" authority (a CONNECT target, or the authority of an
+ * absolute-form URI) into NUL-terminated @host_p/@port_p in place. IPv6
+ * literals in brackets ("[::1]:80") are unwrapped. With no ":port",
+ * @default_port is used; pass NULL to require an explicit port. Returns 0 on
+ * success or -EINVAL on a malformed authority.
+ */
+static int split_authority(char *authority, char **host_p, char **port_p,
+			   char *default_port)
+{
+	char *host = authority, *colon = NULL, *end;
+
+	if (!*authority)
+		return -EINVAL;
+
+	if (*host == '[') {
+		char *rb = strchr(host, ']');
+
+		if (!rb || rb == host + 1)
+			return -EINVAL;
+		host++;			/* skip '[' */
+		*rb = '\0';		/* terminate the host */
+		end = rb + 1;
+		if (*end == ':')
+			colon = end;
+		else if (*end != '\0')
+			return -EINVAL;
+	} else {
+		colon = strrchr(host, ':');
+	}
+
+	if (colon) {
+		*colon = '\0';
+		*port_p = colon + 1;
+		if (!**port_p)
+			return -EINVAL;
+	} else {
+		if (!default_port)
+			return -EINVAL;
+		*port_p = default_port;
+	}
+
+	if (!*host)
+		return -EINVAL;
+
+	*host_p = host;
+	return 0;
+}
+
+/*
+ * Rebuild the client's request in origin-form and queue it in client.buf,
+ * ahead of any request-body bytes already buffered there, so the forwarding
+ * path streams it to the origin. The absolute-form request-target is replaced
+ * by @path; hop-by-hop / proxy headers are dropped and "Connection: close" is
+ * appended (this proxy handles one request per connection).
+ */
+static int http_build_forward_request(struct gwp_conn_pair *gcp,
+				      const char *path)
+{
+	struct gwnet_http_req_hdr *req = &gcp->http_conn->req_hdr;
+	const char *method = http_method_str(req->method);
+	const char *ver = (req->version == GWNET_HTTP_VER_1_0) ? "1.0" : "1.1";
+	size_t cap = gcp->client.cap, n = 0, i;
+	char *scratch;
+	int w;
+
+	if (!method)
+		return -EINVAL;
+
+	scratch = malloc(cap);
+	if (!scratch)
+		return -ENOMEM;
+
+	w = snprintf(scratch, cap, "%s %s HTTP/%s\r\n", method, path, ver);
+	if (w < 0 || (size_t)w >= cap)
+		goto too_big;
+	n = (size_t)w;
+
+	for (i = 0; i < req->fields.nr; i++) {
+		const char *k = req->fields.ff[i].key;
+		const char *v = req->fields.ff[i].val;
+
+		/* Drop hop-by-hop / proxy-only headers. */
+		if (!strcasecmp(k, "Connection") ||
+		    !strcasecmp(k, "Proxy-Connection") ||
+		    !strcasecmp(k, "Proxy-Authorization"))
+			continue;
+
+		w = snprintf(scratch + n, cap - n, "%s: %s\r\n", k, v);
+		if (w < 0 || (size_t)w >= cap - n)
+			goto too_big;
+		n += (size_t)w;
+	}
+
+	w = snprintf(scratch + n, cap - n, "Connection: close\r\n\r\n");
+	if (w < 0 || (size_t)w >= cap - n)
+		goto too_big;
+	n += (size_t)w;
+
+	/* Prepend the rebuilt header to any already-buffered request body. */
+	if (n + gcp->client.len > cap)
+		goto too_big;
+	if (gcp->client.len)
+		memmove(gcp->client.buf + n, gcp->client.buf, gcp->client.len);
+	memcpy(gcp->client.buf, scratch, n);
+	gcp->client.len += (uint32_t)n;
+
+	free(scratch);
+	return 0;
+
+too_big:
+	free(scratch);
+	return -E2BIG;
+}
+
+/*
+ * Handle a forwarding-proxy request (absolute-form target). The rewritten
+ * origin-form request is queued in client.buf and the origin is resolved and
+ * connected; from there the connection is forwarded like a tunnel (see the
+ * is_forward handling in the event loops' connect completion).
+ */
+static int gwp_handle_http_forward(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwnet_http_req_hdr *req = &gcp->http_conn->req_hdr;
+	char default_port[] = "80";
+	char *uri = req->uri, *authority, *slash, *host, *port;
+	const char *path;
+	int r;
+
+	/* Only absolute-form http:// URIs are supported (no TLS termination). */
+	if (!uri || strncasecmp(uri, "http://", 7))
+		return -EINVAL;
+
+	authority = uri + 7;
+
+	/* The origin-form path is everything from the first '/', else "/". */
+	slash = authority;
+	while (*slash && *slash != '/')
+		slash++;
+	if (slash == authority)
+		return -EINVAL;		/* empty authority */
+	path = (*slash == '/') ? slash : "/";
+
+	/*
+	 * Build the rewritten request now, while @path is still intact; the
+	 * authority is isolated (and the path's leading '/' overwritten) only
+	 * afterwards.
+	 */
+	r = http_build_forward_request(gcp, path);
+	if (r < 0)
+		return r;
+
+	if (*slash == '/')
+		*slash = '\0';
+	r = split_authority(authority, &host, &port, default_port);
+	if (r < 0)
+		return r;
+
+	gcp->http_conn->is_forward = true;
+
+	r = prepare_target_addr_domain(w, gcp, host, port);
+	if (r == -EINPROGRESS)
+		gcp->conn_state = CONN_STATE_HTTP_DNS_QUERY;
+	else if (!r)
+		gcp->conn_state = CONN_STATE_HTTP_CONNECT;
+
+	return r;
+}
+
 int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwnet_http_req_hdr *req_hdr;
-	bool port_found = false;
-	char *host, *port, *lc;
+	char *host, *port;
 	int r, ct;
 
 	ct = gcp->conn_state;
@@ -2062,15 +2251,10 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	req_hdr = &gcp->http_conn->req_hdr;
 
 	/*
-	 * TODO(ammarfaizi2): Support non-HTTP CONNECT methods.
-	 */
-	if (req_hdr->method != GWNET_HTTP_METHOD_CONNECT)
-		return -EINVAL;
-
-	/*
 	 * Require HTTP "Basic" proxy authentication when a credential store is
-	 * configured (shared with SOCKS5). On failure, reply with 407 and drop
-	 * the connection before connecting to the target.
+	 * configured (shared with SOCKS5); it applies to CONNECT and forwarding
+	 * requests alike. On failure, reply with 407 and drop the connection
+	 * before connecting to the target.
 	 */
 	if (w->ctx->auth) {
 		const char *cred;
@@ -2081,32 +2265,14 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return http_reject_unauthorized(gcp);
 	}
 
-	host = req_hdr->uri;
-	port = strlen(host) + host;
-	while (port > host) {
-		if (*port == ':') {
-			lc = port - 1;
-			port_found = true;
-			*port = '\0';
-			port++;
-			break;
-		}
-		port--;
-	}
+	/* A non-CONNECT method is a forwarding-proxy request (absolute-form). */
+	if (req_hdr->method != GWNET_HTTP_METHOD_CONNECT)
+		return gwp_handle_http_forward(w, gcp);
 
-	if (!port_found)
-		return -EINVAL;
-
-	if (lc < host)
-		return -EINVAL;
-
-	/*
-	 * Cut IPv6 brackets.
-	 */
-	if (*host == '[' && *lc == ']') {
-		host++;
-		*lc = '\0';
-	}
+	/* CONNECT: the target is an authority-form "host:port" to tunnel to. */
+	r = split_authority(req_hdr->uri, &host, &port, NULL);
+	if (r < 0)
+		return r;
 
 	r = prepare_target_addr_domain(w, gcp, host, port);
 	if (r == -EINPROGRESS)

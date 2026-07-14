@@ -435,11 +435,23 @@ static int do_prep_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * handle_ev_target_connect().
 	 */
 	if (!ctx->upstream.enabled) {
-		s->flags |= IOSQE_IO_LINK;
-		prep_recv_client(w, gcp);
+		bool http_fwd = (gcp->prot_type == GWP_PROT_TYPE_HTTP &&
+				 gcp->http_conn && gcp->http_conn->is_forward);
 
 		/*
-		 * In SOCKS5/HTTP mode a connect reply (SOCKS5 reply or
+		 * A forwarding-proxy request queues its rewritten request in
+		 * client.buf; that is sent to the origin from
+		 * handle_ev_target_connect() after connect, and only then is the
+		 * client recv armed (for the request body). Arming it here would
+		 * race with that send on client.buf.
+		 */
+		if (!http_fwd) {
+			s->flags |= IOSQE_IO_LINK;
+			prep_recv_client(w, gcp);
+		}
+
+		/*
+		 * In SOCKS5/HTTP CONNECT mode a connect reply (SOCKS5 reply or
 		 * "HTTP/1.1 200 OK") is written into target.buf after connect
 		 * completes; arming the target recv here would race with it and
 		 * splice stale reply bytes into the forwarded stream. Defer it
@@ -876,6 +888,19 @@ static int handle_ev_target_connect(struct gwp_wrk *w, void *udata, int res)
 	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
 		static const char ok[] = "HTTP/1.1 200 OK\r\n\r\n";
 		size_t oklen = sizeof(ok) - 1;
+
+		if (gcp->http_conn->is_forward) {
+			/*
+			 * Forwarding proxy: no reply to the client. Send the
+			 * rewritten request (queued in client.buf) to the origin
+			 * and read the response; handle_ev_target_send() arms the
+			 * client recv for any request body once it is drained.
+			 */
+			gcp->conn_state = CONN_STATE_FORWARDING;
+			prep_send_target(w, gcp);
+			prep_recv_target(w, gcp);
+			return 0;
+		}
 
 		if (gcp->target.cap < oklen)
 			return -ENOBUFS;
