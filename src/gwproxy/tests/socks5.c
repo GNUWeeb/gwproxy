@@ -527,6 +527,48 @@ static void test_offered_methods_no_match(void)
 	gwp_socks5_ctx_free(ctx);
 }
 
+/*
+ * Regression test for the info-leak where the state driver's default case
+ * returned without setting *out_len. A greeting with no acceptable method
+ * moves the connection to ST_ERR while returning success; a byte pipelined
+ * after it re-enters the driver in ST_ERR (the "default" case). The driver
+ * must report the real number of bytes produced (2, the method reply), not
+ * leave *out_len at the caller-supplied output buffer capacity -- otherwise
+ * the caller flushes that many bytes of uninitialized heap to the client.
+ */
+static void test_err_state_pipelined_byte(void)
+{
+	static const uint8_t in[] = {
+		0x05, 0x01, 0x02, /* VER, NMETHODS, {USER/PASS} -- unacceptable */
+		0x00              /* one pipelined trailing byte */
+	};
+	struct gwp_socks5_conn *conn;
+	struct gwp_socks5_ctx *ctx;
+	size_t in_len, out_len;
+	uint8_t out[64];
+	int r;
+
+	test_socks5_init_ctx_no_auth(&ctx);
+	conn = test_socks5_alloc_conn(ctx);
+	in_len = sizeof(in);
+	out_len = sizeof(out);
+	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
+	assert(r == -EINVAL);
+	/* Only the 3 greeting bytes were consumed. */
+	assert(in_len == 3);
+	/* Only the 2-byte method reply was produced -- NOT sizeof(out). */
+	assert(out_len == 2);
+	/* VER */
+	assert(out[0] == 0x05);
+	/* METHOD: no acceptable methods */
+	assert(out[1] == 0xff);
+	assert(conn->state == GWP_SOCKS5_ST_ERR);
+	assert(ctx->nr_clients == 1);
+	gwp_socks5_conn_free(conn);
+	assert(ctx->nr_clients == 0);
+	gwp_socks5_ctx_free(ctx);
+}
+
 static void test_invalid_version(void)
 {
 	static const uint8_t in[] = {
@@ -876,6 +918,7 @@ static void gwp_socks5_run_tests(void)
 		test_short_recv();
 		test_auth_userpass();
 		test_offered_methods_no_match();
+		test_err_state_pipelined_byte();
 		test_invalid_version();
 		test_invalid_connect_addr_type();
 		test_invalid_command();

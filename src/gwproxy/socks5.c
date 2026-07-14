@@ -894,7 +894,16 @@ repeat:
 		r = 0;
 		goto out;
 	default:
-		return -EINVAL;
+		/*
+		 * Route through @out so that *out_len and *in_len are set
+		 * to the number of bytes actually produced/consumed. Bailing
+		 * out with a bare return here leaves *out_len at the caller's
+		 * input value (the output buffer capacity), which the caller
+		 * then treats as a reply length and flushes to the client,
+		 * disclosing uninitialized heap.
+		 */
+		r = -EINVAL;
+		goto out;
 	}
 
 	if (!r && *arg.in_len > 0)
