@@ -28,7 +28,7 @@
 struct dns_cache_entry {
 	struct dns_cache_entry		*next;
 	time_t				expired_at;
-	_Atomic(int8_t)			ref_cnt;
+	_Atomic(int)			ref_cnt;
 	struct gwp_dns_cache_entry	e;
 };
 
@@ -70,7 +70,7 @@ static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets)
 
 static void put_dns_entry(struct dns_cache_entry *e)
 {
-	int8_t x = atomic_fetch_sub(&e->ref_cnt, 1);
+	int x = atomic_fetch_sub(&e->ref_cnt, 1);
 	assert(x > 0);
 	if (x == 1)
 		free(e);
@@ -78,7 +78,7 @@ static void put_dns_entry(struct dns_cache_entry *e)
 
 static void get_dns_entry(struct dns_cache_entry *e)
 {
-	int8_t x = atomic_fetch_add(&e->ref_cnt, 1);
+	int x = atomic_fetch_add(&e->ref_cnt, 1);
 	assert(x >= 0);
 	(void)x;
 }
@@ -350,6 +350,10 @@ int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets)
 {
 	struct gwp_dns_cache *cache;
 	int r;
+
+	/* nr_buckets is used as a modulus; a zero would divide by zero. */
+	if (!nr_buckets)
+		return -EINVAL;
 
 	cache = malloc(sizeof(*cache));
 	if (!cache)
