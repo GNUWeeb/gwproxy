@@ -436,7 +436,8 @@ static int do_prep_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 */
 	if (!ctx->upstream.enabled) {
 		bool http_fwd = (gcp->prot_type == GWP_PROT_TYPE_HTTP &&
-				 gcp->http_conn && gcp->http_conn->is_forward);
+				 gcp->http_conn &&
+				 gwp_http_conn_is_forward(gcp->http_conn));
 
 		/*
 		 * A forwarding-proxy request queues its rewritten request in
@@ -700,8 +701,10 @@ static int upstream_iou_complete(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (unlikely(r))
 			return r;
 	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		memcpy(rbuf, "HTTP/1.1 200 OK\r\n\r\n", 19);
-		rlen = 19;
+		r = gwp_http_build_connect_reply(gcp->http_conn, rbuf, sizeof(rbuf));
+		if (unlikely(r < 0))
+			return r;
+		rlen = (size_t)r;
 	}
 
 	/* Drop the proxy's CONNECT reply, keep any early destination data. */
@@ -886,10 +889,7 @@ static int handle_ev_target_connect(struct gwp_wrk *w, void *udata, int res)
 		if (r)
 			return r;
 	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		static const char ok[] = "HTTP/1.1 200 OK\r\n\r\n";
-		size_t oklen = sizeof(ok) - 1;
-
-		if (gcp->http_conn->is_forward) {
+		if (gwp_http_conn_is_forward(gcp->http_conn)) {
 			/*
 			 * Forwarding proxy: no reply to the client. Send the
 			 * rewritten request (queued in client.buf) to the origin
@@ -902,10 +902,11 @@ static int handle_ev_target_connect(struct gwp_wrk *w, void *udata, int res)
 			return 0;
 		}
 
-		if (gcp->target.cap < oklen)
-			return -ENOBUFS;
-		memcpy(gcp->target.buf, ok, oklen);
-		gcp->target.len = (uint32_t)oklen;
+		r = gwp_http_build_connect_reply(gcp->http_conn, gcp->target.buf,
+						 gcp->target.cap);
+		if (r < 0)
+			return r;
+		gcp->target.len = (uint32_t)r;
 	}
 
 	if (gcp->prot_type != GWP_PROT_TYPE_NONE) {
