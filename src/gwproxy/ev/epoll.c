@@ -489,8 +489,17 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)",
 		ip_to_str(&gcp->client_addr), fd);
 
-	if (!cfg->as_socks5 && !cfg->as_http)
+	if (cfg->as_transparent) {
+		r = gwp_get_orig_dst(fd, &gcp->client_addr, &gcp->target_addr);
+		if (r) {
+			pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
+				ip_to_str(&gcp->client_addr), strerror(-r));
+			free_conn_pair(w, gcp);
+			return 0;
+		}
+	} else if (!cfg->as_socks5 && !cfg->as_http) {
 		gcp->target_addr = ctx->target_addr;
+	}
 
 	r = handle_new_client(w, gcp);
 	if (r) {

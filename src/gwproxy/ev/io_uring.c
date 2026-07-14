@@ -456,9 +456,11 @@ static int arm_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 {
+	bool transparent = w->ctx->cfg.as_transparent;
 	struct gwp_ctx *ctx = w->ctx;
 	int fd = cqe->res, tg_fd, r;
 	struct gwp_conn_pair *gcp;
+	struct gwp_sockaddr tdst;
 
 	if (unlikely(fd < 0)) {
 		if (fd == -EAGAIN || fd == -EINTR)
@@ -471,10 +473,27 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		return fd;
 	}
 
+	/* Transparent proxy: take the target from SO_ORIGINAL_DST. */
+	if (transparent) {
+		r = gwp_get_orig_dst(fd, &w->iou->accept_addr, &tdst);
+		if (r) {
+			pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
+				ip_to_str(&w->iou->accept_addr), strerror(-r));
+			prep_close(w, fd);
+			return 0;
+		}
+	}
+
 	if (!ctx->cfg.as_socks5) {
-		/* Plain mode: connect to the upstream proxy when enabled. */
-		struct gwp_sockaddr *ca = ctx->upstream.enabled
-					? &ctx->upstream.addr : &ctx->target_addr;
+		struct gwp_sockaddr *ca;
+
+		/* Connect to the upstream proxy, the original dst, or --target. */
+		if (ctx->upstream.enabled)
+			ca = &ctx->upstream.addr;
+		else if (transparent)
+			ca = &tdst;
+		else
+			ca = &ctx->target_addr;
 
 		tg_fd = gwp_create_sock_target(w, ca, NULL, false);
 		if (unlikely(tg_fd < 0)) {
@@ -496,7 +515,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	gcp->client.fd = fd;
 	gcp->target.fd = tg_fd;
 	gcp->client_addr = w->iou->accept_addr;
-	gcp->target_addr = ctx->target_addr;
+	gcp->target_addr = transparent ? tdst : ctx->target_addr;
 	gcp->is_target_alive = false;
 	r = arm_gcp(w, gcp);
 	if (unlikely(r))

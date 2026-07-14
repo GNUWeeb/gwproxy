@@ -51,6 +51,8 @@ struct gwp_cfg {
 	const char	*pid_file;
 	const char	*dns_servers;
 	const char	*upstream_socks5;
+	int		mark;
+	bool		as_transparent;
 };
 
 struct gwp_ctx;
@@ -325,6 +327,8 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   bool *is_target_alive, bool non_block);
 int gwp_create_timer(int fd, int sec, int nsec);
 void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd);
+int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
+		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
 
 static inline void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
