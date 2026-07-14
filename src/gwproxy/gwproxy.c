@@ -1313,7 +1313,6 @@ __hot
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn_slot *gcs = &w->conn_slot;
-	struct gwp_cfg *cfg = &w->ctx->cfg;
 	struct gwp_conn_pair *tmp;
 	uint32_t i = gcp->idx;
 
@@ -1338,10 +1337,23 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->timer_fd >= 0)
 		__sys_close(gcp->timer_fd);
 
-	if (cfg->use_raw_dns && gcp->gdp)
-		free(gcp->gdp);
-	else if (gcp->gde)
+#ifdef CONFIG_NEW_DNS_RESOLVER
+	if (w->ctx->cfg.use_raw_dns && gcp->gdp) {
+		/*
+		 * A raw DNS query may still be outstanding in the resolver's
+		 * session map (connection torn down before the reply arrived);
+		 * drop it so the map slot is not left dangling at this freed
+		 * gcp, then free the packet (including gdp->host).
+		 */
+		gwp_dns_res_drop_query(&w->dns->resolvers[0], gcp, gcp->gdp->txid);
+		gwp_free_dns_packet(gcp);
+	} else if (gcp->gde) {
 		gwp_dns_entry_put(gcp->gde);
+	}
+#else
+	if (gcp->gde)
+		gwp_dns_entry_put(gcp->gde);
+#endif
 
 	switch (gcp->prot_type) {
 	case GWP_PROT_TYPE_SOCKS5:
