@@ -496,6 +496,70 @@ static void test_auth_userpass(void)
 	unlink(cred_file);
 }
 
+/*
+ * Auth entry with an empty password ("user" with no ':' in the file). The
+ * client sends PLEN == 0, so gwp_socks5_auth_check() is called with p == NULL
+ * and plen == 0. This must authenticate successfully without dereferencing the
+ * NULL password pointer (a plain memcmp(NULL, ..., 0) is UB and trips UBSan).
+ */
+static void test_auth_userpass_empty_password(void)
+{
+	static const uint8_t in[] = {
+		0x05, 0x01, 0x02,	/* VER, NMETHODS, {USER/PASS} */
+
+		0x01,			/* VER  */
+		0x04,			/* ULEN */
+		'u', 's', 'e', 'r',	/* UNAME */
+		0x00,			/* PLEN = 0 (no password) */
+	};
+	static const char cred_data[] = "user\n";
+	char cred_file[] = "/tmp/gwp_socks5_auth.XXXXXX";
+	struct gwp_socks5_conn *conn;
+	struct gwp_socks5_ctx *ctx;
+	struct gwp_socks5_cfg cfg;
+	size_t in_len, out_len;
+	const uint8_t *inb;
+	uint8_t out[64];
+	ssize_t r;
+
+	r = write_temp_file(cred_file, cred_data, sizeof(cred_data) - 1);
+	assert(r == (ssize_t)(sizeof(cred_data) - 1));
+
+	cfg.auth_file = cred_file;
+	r = gwp_socks5_ctx_init(&ctx, &cfg);
+	assert(!r);
+	assert(ctx);
+
+	conn = gwp_socks5_conn_alloc(ctx);
+	assert(conn);
+
+	inb = in;
+	in_len = 3; /* greeting */
+	out_len = sizeof(out);
+	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
+	assert(!r);
+	assert(in_len == 3);
+	assert(out_len == 2);
+	assert(out[0] == 0x05);
+	assert(out[1] == 0x02); /* METHOD: USER/PASS */
+	assert(conn->state == GWP_SOCKS5_ST_AUTH_USERPASS);
+
+	inb += in_len;
+	in_len = 7; /* VER, ULEN, UNAME(4), PLEN */
+	out_len = sizeof(out);
+	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
+	assert(!r);
+	assert(in_len == 7);
+	assert(out_len == 2);
+	assert(out[0] == 0x01);
+	assert(out[1] == 0x00); /* STATUS: success */
+	assert(conn->state == GWP_SOCKS5_ST_CMD);
+
+	gwp_socks5_conn_free(conn);
+	gwp_socks5_ctx_free(ctx);
+	unlink(cred_file);
+}
+
 static void test_offered_methods_no_match(void)
 {
 	static const uint8_t in[] = {
@@ -917,6 +981,7 @@ static void gwp_socks5_run_tests(void)
 		test_connect_domain();
 		test_short_recv();
 		test_auth_userpass();
+		test_auth_userpass_empty_password();
 		test_offered_methods_no_match();
 		test_err_state_pipelined_byte();
 		test_invalid_version();

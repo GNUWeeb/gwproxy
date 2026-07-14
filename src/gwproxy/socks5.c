@@ -140,6 +140,26 @@ out_free_u:
 	return -EINVAL;
 }
 
+/*
+ * Constant-time byte comparison for credential checks. Unlike memcmp() it does
+ * not short-circuit on the first mismatch, so it does not leak (via timing) how
+ * many leading bytes of a supplied username/password are correct. A zero length
+ * compares equal without dereferencing either pointer, which also makes the
+ * empty-password case (p == NULL) well-defined rather than UB.
+ */
+static bool ct_bytes_eq(const void *a, const void *b, size_t len)
+{
+	const volatile unsigned char *pa = a;
+	const volatile unsigned char *pb = b;
+	unsigned char diff = 0;
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		diff |= pa[i] ^ pb[i];
+
+	return diff == 0;
+}
+
 bool gwp_socks5_auth_check(struct gwp_socks5_ctx *ctx, const char *u,
 			   size_t ulen, const char *p, size_t plen)
 {
@@ -147,9 +167,14 @@ bool gwp_socks5_auth_check(struct gwp_socks5_ctx *ctx, const char *u,
 	bool ret = false;
 	size_t i;
 
-	if (!auth || !auth->entries)
+	if (!auth)
 		return false;
 
+	/*
+	 * Read the entry set under the lock; a concurrent
+	 * gwp_socks5_auth_reload() frees and rebuilds it under the write lock.
+	 * When there are no entries nr is 0 and the loop simply does not run.
+	 */
 	pthread_rwlock_rdlock(&auth->lock);
 	for (i = 0; i < auth->nr; i++) {
 		const struct auth_entry *ae = &auth->entries[i];
@@ -157,9 +182,9 @@ bool gwp_socks5_auth_check(struct gwp_socks5_ctx *ctx, const char *u,
 			continue;
 		if (plen != ae->plen)
 			continue;
-		if (memcmp(u, ae->u, ulen) != 0)
+		if (!ct_bytes_eq(u, ae->u, ulen))
 			continue;
-		if (memcmp(p, ae->p, plen) != 0)
+		if (!ct_bytes_eq(p, ae->p, plen))
 			continue;
 		ret = true;
 		break;
