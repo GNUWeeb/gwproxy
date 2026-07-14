@@ -1,13 +1,34 @@
 gwproxy
 -------
-The GNU/Weeb Proxy. A simple TCP proxy running on GNU/Linux.
+The GNU/Weeb Proxy. A fast, multi-threaded TCP proxy for GNU/Linux with
+SOCKS5, HTTP CONNECT and transparent proxy modes.
 
-Features:
-  - TCP to TCP proxy.
-  - SOCKS5 CONNECT proxy.
-  - SOCKS5 User/Password authentication.
-  - SOCKS5 without authentication.
-  - SOCKS5 IPv4, IPv6 and domain name support.
+
+Features
+--------
+  - Plain TCP-to-TCP forwarding to a fixed --target.
+  - SOCKS5 CONNECT proxy (RFC 1928):
+      - IPv4, IPv6 and domain-name (ATYP) targets.
+      - Username/password authentication (RFC 1929), or no authentication.
+  - HTTP CONNECT proxy (tunneling).
+  - Combined SOCKS5 + HTTP on a single listening port (auto-detected per
+    connection).
+  - Transparent proxy: recover each connection's original destination from
+    the SO_ORIGINAL_DST socket option, for use behind an iptables REDIRECT
+    rule.
+  - Upstream SOCKS5 chaining: route every outgoing connection through a
+    next-hop SOCKS5 proxy, with local (socks5://) or remote (socks5h://)
+    name resolution and optional username/password auth.
+  - SO_MARK (fwmark) on outgoing connections, for policy routing / iptables
+    matching.
+  - Two event loops: epoll (default) and io_uring (optional, enabled at
+    build time and selected at run time).
+  - Multi-threaded workers using SO_REUSEPORT, with graceful recovery from
+    file-descriptor exhaustion (EMFILE/ENFILE).
+  - DNS caching for SOCKS5/HTTP hostname targets.
+  - Per-socket tuning: TCP_NODELAY, TCP_QUICKACK and TCP keepalive.
+  - Dual-stack IPv4/IPv6 listening.
+  - Configurable log level and log file, and an optional PID file.
 
 
 Building gwproxy
@@ -16,7 +37,61 @@ sudo apt install -y git build-essential;
 git clone https://github.com/GNUWeeb/gwproxy.git;
 cd gwproxy;
 make -j$(nproc);
-./gwproxy;
+./gwproxy --help;
+
+By default gwproxy is built with the epoll event loop only. To also build
+the io_uring event loop (then selectable at run time with
+--event-loop=io_uring), configure first:
+
+./configure --use-io-uring;
+make -j$(nproc);
+
+Other configure options include --debug, --sanitize (ASan/UBSan) and
+--use-new-dns-resolver (which enables the -r/--raw-dns and -j/--dns-server
+options). Run './configure --help' for the full list. Run 'make test' to
+build and run the unit and integration test suites.
+
+
+Usage
+-----
+Run './gwproxy --help' for the complete list of options. A few examples:
+
+  # Plain TCP forwarder: [::]:8080 -> 127.0.0.1:80
+  ./gwproxy --bind='[::]:8080' --target=127.0.0.1:80
+
+  # SOCKS5 proxy (no authentication) on port 1080
+  ./gwproxy --bind='[::]:1080' --as-socks5=1
+
+  # SOCKS5 proxy with username/password authentication
+  ./gwproxy --bind='[::]:1080' --as-socks5=1 --socks5-auth-file=auth.txt
+
+  # HTTP CONNECT proxy on port 8080
+  ./gwproxy --bind='[::]:8080' --as-http=1
+
+  # SOCKS5 and HTTP CONNECT on the same port
+  ./gwproxy --bind='[::]:1080' --as-socks5=1 --as-http=1
+
+  # Chain every outgoing connection through an upstream SOCKS5 proxy
+  ./gwproxy --bind='[::]:1080' --as-socks5=1 \
+      --upstream-socks5=socks5h://user:pass@1.2.3.4:1080
+
+  # Use the io_uring event loop, and set SO_MARK 100 on outgoing packets
+  ./gwproxy --bind='[::]:1080' --as-socks5=1 --event-loop=io_uring --mark=100
+
+The SOCKS5 authentication file holds one "username:password" entry per
+line.
+
+Transparent proxy mode takes each connection's original destination from
+SO_ORIGINAL_DST, so it must sit behind an iptables REDIRECT rule. gwproxy
+can mark its own outgoing connections so they are excluded from the
+REDIRECT (which avoids a redirect loop):
+
+  ./gwproxy --bind=127.0.0.1:1080 --as-transparent=1 --mark=1
+  iptables -t nat -A OUTPUT -p tcp --dport 80 -m mark ! --mark 1 \
+      -j REDIRECT --to-ports 1080
+
+Note that --mark requires CAP_NET_ADMIN, and transparent mode requires the
+iptables rules to be installed; both typically need root privileges.
 
 
 Contributing
