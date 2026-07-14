@@ -119,13 +119,18 @@ static bool iterate_addr_list(struct addrinfo *res, struct gwp_sockaddr *gs,
 	}
 
 	/*
-	 * Default case: first available address (IPv4 or IPv6).
+	 * Default case: prefer IPv4, then IPv6. This mirrors fetch_addr()'s
+	 * DEFAULT handling so that a cache hit and a cache miss select the
+	 * same address family for the same host.
 	 */
 	for (ai = res; ai; ai = ai->ai_next) {
 		if (ai->ai_family == AF_INET) {
 			gs->i4 = *(struct sockaddr_in *)ai->ai_addr;
 			return true;
-		} else if (ai->ai_family == AF_INET6) {
+		}
+	}
+	for (ai = res; ai; ai = ai->ai_next) {
+		if (ai->ai_family == AF_INET6) {
 			gs->i6 = *(struct sockaddr_in6 *)ai->ai_addr;
 			return true;
 		}
