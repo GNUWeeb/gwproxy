@@ -215,10 +215,16 @@ static int open_auth_file(struct gwp_socks5_ctx *ctx)
 	if (!auth)
 		return -ENOMEM;
 
+	r = pthread_rwlock_init(&auth->lock, NULL);
+	if (r) {
+		free(auth);
+		return -r;
+	}
+
 	fp = fopen(af, "rb");
 	if (!fp) {
 		r = -errno;
-		goto out_free_auth;
+		goto out_destroy_lock;
 	}
 
 	auth->fp = fp;
@@ -232,7 +238,8 @@ static int open_auth_file(struct gwp_socks5_ctx *ctx)
 out_free_auth_ent:
 	free_auth_entries(auth);
 	fclose(auth->fp);
-out_free_auth:
+out_destroy_lock:
+	pthread_rwlock_destroy(&auth->lock);
 	free(auth);
 	ctx->auth = NULL;
 	return r;
