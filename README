@@ -10,7 +10,10 @@ Features
   - SOCKS5 CONNECT proxy (RFC 1928):
       - IPv4, IPv6 and domain-name (ATYP) targets.
       - Username/password authentication (RFC 1929), or no authentication.
-  - HTTP CONNECT proxy (tunneling):
+  - HTTP proxy:
+      - CONNECT tunneling.
+      - Forwarding of ordinary absolute-form requests
+        ("GET http://host/path"), one request per connection.
       - "Basic" proxy authentication (RFC 7617), or no authentication.
   - Combined SOCKS5 + HTTP on a single listening port (auto-detected per
     connection), sharing one credential store.
@@ -66,7 +69,8 @@ Run './gwproxy --help' for the complete list of options. A few examples:
   # SOCKS5 proxy with username/password authentication
   ./gwproxy --bind='[::]:1080' --as-socks5=1 --auth-file=auth.txt
 
-  # HTTP CONNECT proxy on port 8080
+  # HTTP proxy on port 8080 (handles both CONNECT tunnels and forwarding
+  # of ordinary "GET http://host/path" requests)
   ./gwproxy --bind='[::]:8080' --as-http=1
 
   # HTTP CONNECT proxy requiring "Basic" authentication
