@@ -1180,25 +1180,25 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 	return handle_prot_connect_target(w, gcp);
 }
 
-static void prep_socks5_auth_reload(struct gwp_wrk *w)
+static void prep_auth_reload(struct gwp_wrk *w)
 {
 	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
 	struct gwp_ctx *ctx = w->ctx;
 	struct io_uring_sqe *s;
 
-	assert(ctx->socks5);
+	assert(ctx->auth);
 	s = get_sqe_nofail(w);
 	io_uring_prep_read(s, ctx->ino_fd, ctx->ino_buf, l, 0);
 	s->user_data = EV_BIT_IOU_SOCKS5_AUTH_FILE;
 }
 
-static int handle_ev_socks5_auth_file(struct gwp_wrk *w)
+static int handle_ev_auth_file(struct gwp_wrk *w)
 {
 	struct gwp_ctx *ctx = w->ctx;
 
-	prep_socks5_auth_reload(w);
-	gwp_socks5_auth_reload(ctx->socks5);
-	pr_info(&ctx->lh, "Reloaded SOCKS5 authentication file");
+	prep_auth_reload(w);
+	gwp_auth_reload(ctx->auth);
+	pr_info(&ctx->lh, "Reloaded authentication file");
 	return 0;
 }
 
@@ -1257,7 +1257,7 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		break;
 	case EV_BIT_IOU_SOCKS5_AUTH_FILE:
 		pr_dbg(&ctx->lh, "Handling SOCKS5 auth file reload event: %d", cqe->res);
-		return handle_ev_socks5_auth_file(w);
+		return handle_ev_auth_file(w);
 	case EV_BIT_IOU_TARGET_CANCEL:
 		gcp = udata;
 		pr_dbg(&ctx->lh, "Handling target cancel event: %d", cqe->res);
@@ -1353,8 +1353,8 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 
 	pr_info(&ctx->lh, "Worker %u started (io_uring)", w->idx);
 
-	if (w->idx == 0 && ctx->cfg.as_socks5 && ctx->ino_fd >= 0)
-		prep_socks5_auth_reload(w);
+	if (w->idx == 0 && ctx->ino_fd >= 0)
+		prep_auth_reload(w);
 
 	io_uring_set_iowait(&w->iou->ring, false);
 	arm_accept(w);

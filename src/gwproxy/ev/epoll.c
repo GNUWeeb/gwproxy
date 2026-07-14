@@ -1386,13 +1386,12 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return r;
 }
 
-static int handle_ev_socks5_auth_file(struct gwp_wrk *w)
+static int handle_ev_auth_file(struct gwp_wrk *w)
 {
 	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
 	ssize_t r;
 
-	assert(w->ctx->cfg.as_socks5);
-	assert(w->ctx->socks5);
+	assert(w->ctx->auth);
 
 	r = __sys_read(w->ctx->ino_fd, w->ctx->ino_buf, l);
 	if (unlikely(r < 0)) {
@@ -1403,8 +1402,8 @@ static int handle_ev_socks5_auth_file(struct gwp_wrk *w)
 		return (int)r;
 	}
 
-	gwp_socks5_auth_reload(w->ctx->socks5);
-	pr_info(&w->ctx->lh, "Reloaded SOCKS5 authentication file");
+	gwp_auth_reload(w->ctx->auth);
+	pr_info(&w->ctx->lh, "Reloaded authentication file");
 	return 0;
 }
 
@@ -1595,7 +1594,7 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		r = handle_ev_dns_query(w, udata);
 		break;
 	case EV_BIT_SOCKS5_AUTH_FILE:
-		r = handle_ev_socks5_auth_file(w);
+		r = handle_ev_auth_file(w);
 		break;
 	case EV_BIT_RAW_DNS_QUERY:
 		r = handle_ev_raw_dns_query(w);

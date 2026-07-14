@@ -11,6 +11,7 @@
 
 #include <gwproxy/syscall.h>
 #include <gwproxy/socks5.h>
+#include <gwproxy/auth.h>
 #include <gwproxy/dns.h>
 #include <gwproxy/log.h>
 #include <assert.h>
@@ -33,7 +34,7 @@ struct gwp_cfg {
 	bool		socks5_prefer_ipv6;
 	bool		use_raw_dns;
 	int		protocol_timeout;
-	const char	*socks5_auth_file;
+	const char	*auth_file;
 	int		socks5_dns_cache_secs;
 	int		nr_workers;
 	int		nr_dns_workers;
@@ -319,6 +320,7 @@ struct gwp_ctx {
 	struct gwp_wrk			*workers;
 	struct gwp_sockaddr		target_addr;
 	struct gwp_socks5_ctx		*socks5;
+	struct gwp_auth			*auth;
 	struct gwp_dns_ctx		*dns;
 	struct gwp_upstream_s5		upstream;
 	struct gwp_cfg			cfg;

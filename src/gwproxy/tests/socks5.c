@@ -6,6 +6,7 @@
 #undef NDEBUG
 #endif
 #include <gwproxy/socks5.h>
+#include <gwproxy/auth.h>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,7 +23,6 @@ do {							\
 	assert(*__ctx);					\
 	assert((*__ctx)->auth == NULL);			\
 	assert((*__ctx)->nr_clients == 0);		\
-	assert((*__ctx)->cfg.auth_file == NULL);	\
 } while (0)
 
 #define test_socks5_alloc_conn(CTX) ({			\
@@ -412,6 +412,7 @@ static void test_auth_userpass(void)
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
 	struct gwp_socks5_cfg cfg;
+	struct gwp_auth *auth;
 	size_t in_len, out_len;
 	const uint8_t *inb;
 	uint8_t out[4096];
@@ -420,11 +421,14 @@ static void test_auth_userpass(void)
 	r = write_temp_file(cred_file, cred_data, sizeof(cred_data) - 1);
 	assert(r == (ssize_t)(sizeof(cred_data) - 1));
 
-	cfg.auth_file = cred_file;
+	r = gwp_auth_create(&auth, cred_file);
+	assert(!r);
+	assert(auth);
+	cfg.auth = auth;
 	r = gwp_socks5_ctx_init(&ctx, &cfg);
 	assert(!r);
 	assert(ctx);
-	assert(!strcmp(ctx->cfg.auth_file, cred_file));
+	assert(ctx->auth == auth);
 	assert(ctx->nr_clients == 0);
 
 	conn = gwp_socks5_conn_alloc(ctx);
@@ -493,6 +497,7 @@ static void test_auth_userpass(void)
 	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
+	gwp_auth_destroy(auth);
 	unlink(cred_file);
 }
 
@@ -517,6 +522,7 @@ static void test_auth_userpass_empty_password(void)
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
 	struct gwp_socks5_cfg cfg;
+	struct gwp_auth *auth;
 	size_t in_len, out_len;
 	const uint8_t *inb;
 	uint8_t out[64];
@@ -525,7 +531,10 @@ static void test_auth_userpass_empty_password(void)
 	r = write_temp_file(cred_file, cred_data, sizeof(cred_data) - 1);
 	assert(r == (ssize_t)(sizeof(cred_data) - 1));
 
-	cfg.auth_file = cred_file;
+	r = gwp_auth_create(&auth, cred_file);
+	assert(!r);
+	assert(auth);
+	cfg.auth = auth;
 	r = gwp_socks5_ctx_init(&ctx, &cfg);
 	assert(!r);
 	assert(ctx);
@@ -557,6 +566,7 @@ static void test_auth_userpass_empty_password(void)
 
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
+	gwp_auth_destroy(auth);
 	unlink(cred_file);
 }
 
@@ -888,6 +898,7 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
 	struct gwp_socks5_cfg cfg;
+	struct gwp_auth *auth;
 	size_t in_len, out_len;
 	uint8_t out[4096];
 	ssize_t r;
@@ -896,11 +907,14 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	r = write_temp_file(cred_file, cred_data, sizeof(cred_data) - 1);
 	assert(r == (ssize_t)(sizeof(cred_data) - 1));
 
-	cfg.auth_file = cred_file;
+	r = gwp_auth_create(&auth, cred_file);
+	assert(!r);
+	assert(auth);
+	cfg.auth = auth;
 	r = gwp_socks5_ctx_init(&ctx, &cfg);
 	assert(!r);
 	assert(ctx);
-	assert(!strcmp(ctx->cfg.auth_file, cred_file));
+	assert(ctx->auth == auth);
 	assert(ctx->nr_clients == 0);
 
 	conn = gwp_socks5_conn_alloc(ctx);
@@ -968,6 +982,7 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
+	gwp_auth_destroy(auth);
 	unlink(cred_file);
 }
 

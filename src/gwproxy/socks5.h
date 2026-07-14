@@ -41,16 +41,16 @@ enum gwp_socks5_cmd_rep {
 	GWP_SOCKS5_REP_UNASSIGNED		= 0x09,
 };
 
+struct gwp_auth;
+
 struct gwp_socks5_cfg {
-	char		*auth_file;
+	/* Borrowed credential store, or NULL to disable authentication. */
+	struct gwp_auth	*auth;
 };
 
-struct gwp_socks5_auth;
-
 struct gwp_socks5_ctx {
-	struct gwp_socks5_auth	*auth;
+	struct gwp_auth		*auth;
 	_Atomic(uint32_t)	nr_clients;
-	struct gwp_socks5_cfg	cfg;
 };
 
 struct gwp_socks5_addr {
@@ -97,15 +97,6 @@ int gwp_socks5_ctx_init(struct gwp_socks5_ctx **ctx_p,
  * 		nothing.
  */
 void gwp_socks5_ctx_free(struct gwp_socks5_ctx *ctx);
-
-/**
- * Reload the authentication data for a SOCKS5 context.
- *
- * @param ctx	The SOCKS5 context to reload. If NULL, this function does
- * 		nothing.
- * @return	0 on success, or a negative error code on failure.
- */
-int gwp_socks5_auth_reload(struct gwp_socks5_ctx *ctx);
 
 /**
  * Allocate a new SOCKS5 connection associated with the given context.
@@ -187,10 +178,6 @@ int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
 				    const struct gwp_socks5_addr *bind_addr,
 				    uint8_t rep, void *out_buf,
 				    size_t *out_len);
-
-
-bool gwp_socks5_auth_check(struct gwp_socks5_ctx *ctx, const char *u,
-			   size_t ulen, const char *p, size_t plen);
 
 /*
  * SOCKS5 client-side helpers.
