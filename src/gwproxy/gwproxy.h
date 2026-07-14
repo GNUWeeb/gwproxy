@@ -168,6 +168,17 @@ struct gwp_conn {
 	uint32_t	cap;
 	char		*buf;
 	uint32_t	ep_mask;
+
+	/*
+	 * Half-close bookkeeping for the forwarding path. @rd_eof is set once
+	 * this fd's read side has reached EOF (the peer closed its write side
+	 * and we have drained everything). @wr_shut is set once we have shut
+	 * this fd's write side (propagated the peer's EOF towards it). The
+	 * connection pair is torn down only after both directions have been
+	 * fully drained and shut, so no buffered data is dropped on close.
+	 */
+	bool		rd_eof;
+	bool		wr_shut;
 };
 
 enum {

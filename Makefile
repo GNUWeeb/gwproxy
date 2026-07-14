@@ -140,12 +140,19 @@ ifeq ($(CONFIG_IO_URING),y)
 endif
 
 IE=LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):$(shell pwd)
-test: $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET)
-	@echo "Running tests...";
+test: test-unit test-integration
+	@echo "All tests completed successfully.";
+
+test-unit: $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET)
+	@echo "Running unit tests...";
 	@echo "Testing libgwdns...";
 	@$(IE) ./$(LIBGWDNS_TEST_TARGET);
 	@echo "Testing libgwpsocks5...";
 	@$(IE) ./$(LIBGWPSOCKS5_TEST_TARGET);
-	@echo "Tests completed successfully.";
+	@echo "Unit tests completed.";
 
-.PHONY: all clean test
+test-integration: $(GWPROXY_TARGET)
+	@echo "Running integration tests...";
+	@GWPROXY=./$(GWPROXY_TARGET) ./t/run.sh;
+
+.PHONY: all clean test test-unit test-integration

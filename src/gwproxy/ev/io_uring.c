@@ -860,17 +860,52 @@ static int handle_sock_ret(int r)
 	return r;
 }
 
+/*
+ * Half-close bookkeeping for the forwarding path, mirroring the epoll
+ * forward_progress(). Once a direction's source is at EOF and its buffer has
+ * been flushed to the peer, shut the peer's write side so it observes the FIN.
+ * The pair is torn down only after both directions have been shut, so a client
+ * that half-closes its write side still receives the whole response.
+ */
+static int iou_forward_progress(struct gwp_conn_pair *gcp)
+{
+	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
+		__sys_shutdown(gcp->client.fd, SHUT_WR);
+		gcp->client.wr_shut = true;
+	}
+
+	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
+		__sys_shutdown(gcp->target.fd, SHUT_WR);
+		gcp->target.wr_shut = true;
+	}
+
+	if (gcp->client.wr_shut && gcp->target.wr_shut)
+		return -ECONNRESET;
+
+	return 0;
+}
+
 static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
 	int r = cqe->res;
 
-	r = handle_sock_ret(r);
 	if (r < 0) {
+		if (r == -EAGAIN || r == -EINTR) {
+			prep_recv_client(w, gcp);
+			return 0;
+		}
 		return r;
-	} else if (!r) {
-		prep_recv_client(w, gcp);
-		return 0;
+	}
+
+	if (r == 0) {
+		/*
+		 * Client closed its write side. Half-close: stop reading it,
+		 * propagate the FIN to the target, and keep delivering the
+		 * target's response until it too is done.
+		 */
+		gcp->client.rd_eof = true;
+		return iou_forward_progress(gcp);
 	}
 
 	gcp->client.len += (uint32_t)r;
@@ -883,12 +918,17 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int r = cqe->res;
 
-	r = handle_sock_ret(r);
 	if (r < 0) {
+		if (r == -EAGAIN || r == -EINTR) {
+			prep_recv_target(w, gcp);
+			return 0;
+		}
 		return r;
-	} else if (!r) {
-		prep_recv_target(w, gcp);
-		return 0;
+	}
+
+	if (r == 0) {
+		gcp->target.rd_eof = true;
+		return iou_forward_progress(gcp);
 	}
 
 	gcp->target.len += (uint32_t)r;
@@ -902,14 +942,22 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 
 	r = handle_sock_ret(r);
-	if (r < 0) {
+	if (r < 0)
 		return r;
-	} else if (!r) {
+
+	if (r > 0)
+		gwp_conn_buf_advance(&gcp->target, (size_t)r);
+
+	/*
+	 * A short send leaves unsent bytes in target.buf; flush the remainder
+	 * before reading more from the target, otherwise the leftover data is
+	 * overwritten by the next recv and the transfer stalls.
+	 */
+	if (gcp->target.len > 0) {
 		prep_send_client(w, gcp);
 		return 0;
 	}
 
-	gwp_conn_buf_advance(&gcp->target, (size_t)r);
 	if (gcp->target.fd >= 0)
 		prep_recv_target(w, gcp);
 	return 0;
@@ -921,14 +969,18 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 
 	r = handle_sock_ret(r);
-	if (r < 0) {
+	if (r < 0)
 		return r;
-	} else if (!r) {
+
+	if (r > 0)
+		gwp_conn_buf_advance(&gcp->client, (size_t)r);
+
+	/* Short send: flush the rest before reading more from the client. */
+	if (gcp->client.len > 0) {
 		prep_send_target(w, gcp);
 		return 0;
 	}
 
-	gwp_conn_buf_advance(&gcp->client, (size_t)r);
 	prep_recv_client(w, gcp);
 	return 0;
 }
