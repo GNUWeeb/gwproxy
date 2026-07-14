@@ -110,7 +110,7 @@ enum {
 	EV_BIT_IOU_SOCKS5_AUTH_FILE	= EV_BIT_SOCKS5_AUTH_FILE,
 	EV_BIT_IOU_TIMER		= EV_BIT_TIMER,
 	EV_BIT_IOU_ACCEPT		= EV_BIT_ACCEPT,
-	EV_BIT_IOU_CLIENT_SOCKS5	= EV_BIT_CLIENT_SOCKS5,
+	EV_BIT_IOU_CLIENT_PROT		= EV_BIT_CLIENT_SOCKS5,
 	EV_BIT_IOU_CLIENT_RECV		= EV_BIT_CLIENT,
 	EV_BIT_IOU_TARGET_RECV		= EV_BIT_TARGET,
 	EV_BIT_IOU_TARGET_SEND		= (9ull << 48ull),
@@ -122,6 +122,7 @@ enum {
 	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
 	EV_BIT_IOU_MSG_RING		= (16ull << 48ull),
 	EV_BIT_IOU_UPSTREAM_S5		= (20ull << 48ull),
+	EV_BIT_IOU_ACCEPT_RETRY		= (21ull << 48ull),
 #endif
 };
 
@@ -258,6 +259,12 @@ struct iou {
 	struct io_uring		ring;
 	struct gwp_sockaddr	accept_addr;
 	socklen_t		accept_addr_len;
+
+	/*
+	 * Deadline for the accept-retry timer armed when accept() is paused
+	 * due to fd exhaustion (EMFILE/ENFILE). Must outlive SQE submission.
+	 */
+	struct __kernel_timespec accept_retry_ts;
 };
 #endif
 

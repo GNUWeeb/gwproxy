@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <linux/types.h>
 
 enum gwp_socks5_state {
@@ -48,7 +49,7 @@ struct gwp_socks5_auth;
 
 struct gwp_socks5_ctx {
 	struct gwp_socks5_auth	*auth;
-	uint32_t		nr_clients;
+	_Atomic(uint32_t)	nr_clients;
 	struct gwp_socks5_cfg	cfg;
 };
 

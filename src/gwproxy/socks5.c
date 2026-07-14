@@ -65,6 +65,14 @@ static char *trim_str(char *str)
 	while (is_space((unsigned char)*str))
 		str++;
 
+	/*
+	 * Nothing left after trimming leading whitespace. Return early so we
+	 * don't form the pointer "str - 1" below, which is undefined behaviour
+	 * when str already points at the start of the buffer.
+	 */
+	if (*str == '\0')
+		return str;
+
 	end = str + strlen(str) - 1;
 	while (end > str && is_space((unsigned char)*end))
 		end--;
@@ -140,6 +148,26 @@ out_free_u:
 	return -EINVAL;
 }
 
+/*
+ * Constant-time byte comparison for credential checks. Unlike memcmp() it does
+ * not short-circuit on the first mismatch, so it does not leak (via timing) how
+ * many leading bytes of a supplied username/password are correct. A zero length
+ * compares equal without dereferencing either pointer, which also makes the
+ * empty-password case (p == NULL) well-defined rather than UB.
+ */
+static bool ct_bytes_eq(const void *a, const void *b, size_t len)
+{
+	const volatile unsigned char *pa = a;
+	const volatile unsigned char *pb = b;
+	unsigned char diff = 0;
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		diff |= pa[i] ^ pb[i];
+
+	return diff == 0;
+}
+
 bool gwp_socks5_auth_check(struct gwp_socks5_ctx *ctx, const char *u,
 			   size_t ulen, const char *p, size_t plen)
 {
@@ -147,9 +175,14 @@ bool gwp_socks5_auth_check(struct gwp_socks5_ctx *ctx, const char *u,
 	bool ret = false;
 	size_t i;
 
-	if (!auth || !auth->entries)
+	if (!auth)
 		return false;
 
+	/*
+	 * Read the entry set under the lock; a concurrent
+	 * gwp_socks5_auth_reload() frees and rebuilds it under the write lock.
+	 * When there are no entries nr is 0 and the loop simply does not run.
+	 */
 	pthread_rwlock_rdlock(&auth->lock);
 	for (i = 0; i < auth->nr; i++) {
 		const struct auth_entry *ae = &auth->entries[i];
@@ -157,9 +190,9 @@ bool gwp_socks5_auth_check(struct gwp_socks5_ctx *ctx, const char *u,
 			continue;
 		if (plen != ae->plen)
 			continue;
-		if (memcmp(u, ae->u, ulen) != 0)
+		if (!ct_bytes_eq(u, ae->u, ulen))
 			continue;
-		if (memcmp(p, ae->p, plen) != 0)
+		if (!ct_bytes_eq(p, ae->p, plen))
 			continue;
 		ret = true;
 		break;
@@ -173,7 +206,7 @@ int gwp_socks5_auth_reload(struct gwp_socks5_ctx *ctx)
 	struct gwp_socks5_auth *auth = ctx->auth;
 	char buf[4096], *t;
 	size_t l;
-	int r;
+	int r = 0;
 
 	if (!auth || !auth->fp)
 		return -ENOSYS;
@@ -215,10 +248,16 @@ static int open_auth_file(struct gwp_socks5_ctx *ctx)
 	if (!auth)
 		return -ENOMEM;
 
+	r = pthread_rwlock_init(&auth->lock, NULL);
+	if (r) {
+		free(auth);
+		return -r;
+	}
+
 	fp = fopen(af, "rb");
 	if (!fp) {
 		r = -errno;
-		goto out_free_auth;
+		goto out_destroy_lock;
 	}
 
 	auth->fp = fp;
@@ -232,7 +271,8 @@ static int open_auth_file(struct gwp_socks5_ctx *ctx)
 out_free_auth_ent:
 	free_auth_entries(auth);
 	fclose(auth->fp);
-out_free_auth:
+out_destroy_lock:
+	pthread_rwlock_destroy(&auth->lock);
 	free(auth);
 	ctx->auth = NULL;
 	return r;
@@ -300,7 +340,7 @@ struct gwp_socks5_conn *gwp_socks5_conn_alloc(struct gwp_socks5_ctx *ctx)
 
 	conn->state = GWP_SOCKS5_ST_INIT;
 	conn->ctx = ctx;
-	ctx->nr_clients++;
+	atomic_fetch_add(&ctx->nr_clients, 1);
 	return conn;
 }
 
@@ -309,7 +349,7 @@ void gwp_socks5_conn_free(struct gwp_socks5_conn *conn)
 	if (!conn)
 		return;
 
-	conn->ctx->nr_clients--;
+	atomic_fetch_sub(&conn->ctx->nr_clients, 1);
 	free(conn);
 }
 
@@ -894,7 +934,16 @@ repeat:
 		r = 0;
 		goto out;
 	default:
-		return -EINVAL;
+		/*
+		 * Route through @out so that *out_len and *in_len are set
+		 * to the number of bytes actually produced/consumed. Bailing
+		 * out with a bare return here leaves *out_len at the caller's
+		 * input value (the output buffer capacity), which the caller
+		 * then treats as a reply length and flushes to the client,
+		 * disclosing uninitialized heap.
+		 */
+		r = -EINVAL;
+		goto out;
 	}
 
 	if (!r && *arg.in_len > 0)

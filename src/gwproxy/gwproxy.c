@@ -151,6 +151,18 @@ static void show_help(const char *app)
 	printf("\n");
 }
 
+/*
+ * Whether --event-loop selects the io_uring backend. "iou" is an accepted
+ * alias for "io_uring" (see gwp_ctx_parse_ev()), so both spellings must be
+ * recognised when gating features that io_uring does not support yet.
+ */
+static bool ev_is_io_uring(const struct gwp_cfg *cfg)
+{
+	return cfg->event_loop &&
+	       (!strcmp(cfg->event_loop, "io_uring") ||
+		!strcmp(cfg->event_loop, "iou"));
+}
+
 __cold
 static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 {
@@ -272,7 +284,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 	}
 
 
-	if (cfg->use_raw_dns && !strcmp(cfg->event_loop, "io_uring")) {
+	if (cfg->use_raw_dns && ev_is_io_uring(cfg)) {
 		fprintf(stderr, ERR_WRAP "Error: The raw DNS feature is currently not supported with the io_uring event loop\n" ERR_WRAP);
 		goto einval;
 	}
@@ -960,10 +972,11 @@ static int gwp_ctx_init_prot(struct gwp_ctx *ctx)
 	struct gwp_cfg *cfg = &ctx->cfg;
 
 	/*
-	 * socks5 and http can't be running together.
+	 * SOCKS5 and HTTP may run together on the same port: the connection
+	 * protocol handler tries SOCKS5 first and falls back to HTTP (see
+	 * gwp_handle_conn_state_prot()). Only SOCKS5 needs context set up here;
+	 * HTTP state is allocated per connection.
 	 */
-	assert(!(cfg->as_socks5 && cfg->as_http));
-
 	if (cfg->as_socks5) {
 		return gwp_ctx_init_socks5(ctx);
 	} else {
@@ -1300,7 +1313,6 @@ __hot
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn_slot *gcs = &w->conn_slot;
-	struct gwp_cfg *cfg = &w->ctx->cfg;
 	struct gwp_conn_pair *tmp;
 	uint32_t i = gcp->idx;
 
@@ -1325,10 +1337,23 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->timer_fd >= 0)
 		__sys_close(gcp->timer_fd);
 
-	if (cfg->use_raw_dns && gcp->gdp)
-		free(gcp->gdp);
-	else if (gcp->gde)
+#ifdef CONFIG_NEW_DNS_RESOLVER
+	if (w->ctx->cfg.use_raw_dns && gcp->gdp) {
+		/*
+		 * A raw DNS query may still be outstanding in the resolver's
+		 * session map (connection torn down before the reply arrived);
+		 * drop it so the map slot is not left dangling at this freed
+		 * gcp, then free the packet (including gdp->host).
+		 */
+		gwp_dns_res_drop_query(&w->dns->resolvers[0], gcp, gcp->gdp->txid);
+		gwp_free_dns_packet(gcp);
+	} else if (gcp->gde) {
 		gwp_dns_entry_put(gcp->gde);
+	}
+#else
+	if (gcp->gde)
+		gwp_dns_entry_put(gcp->gde);
+#endif
 
 	switch (gcp->prot_type) {
 	case GWP_PROT_TYPE_SOCKS5:

@@ -119,13 +119,18 @@ static bool iterate_addr_list(struct addrinfo *res, struct gwp_sockaddr *gs,
 	}
 
 	/*
-	 * Default case: first available address (IPv4 or IPv6).
+	 * Default case: prefer IPv4, then IPv6. This mirrors fetch_addr()'s
+	 * DEFAULT handling so that a cache hit and a cache miss select the
+	 * same address family for the same host.
 	 */
 	for (ai = res; ai; ai = ai->ai_next) {
 		if (ai->ai_family == AF_INET) {
 			gs->i4 = *(struct sockaddr_in *)ai->ai_addr;
 			return true;
-		} else if (ai->ai_family == AF_INET6) {
+		}
+	}
+	for (ai = res; ai; ai = ai->ai_next) {
+		if (ai->ai_family == AF_INET6) {
 			gs->i6 = *(struct sockaddr_in6 *)ai->ai_addr;
 			return true;
 		}
@@ -170,7 +175,7 @@ int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
 	prep_hints(&hints, restyp);
 	r = getaddrinfo(name, service, &hints, &res);
 	if (r)
-		return -r;
+		return -EHOSTUNREACH;
 
 	found = iterate_addr_list(res, addr, restyp);
 	if (found)
@@ -326,6 +331,13 @@ static int collect_active_queries(struct gwp_dns_ctx *ctx,
 
 			if (dbq_add_entry(dbq, e)) {
 				dbq_free(dbq);
+				/*
+				 * Hand back the partially-processed list: some
+				 * dead entries may already have been unlinked and
+				 * freed, so the caller must not keep the original
+				 * head (which could point at freed memory).
+				 */
+				*head_p = head;
 				return -ENOMEM;
 			}
 
@@ -365,14 +377,12 @@ static void dispatch_batch_result(int r, struct gwp_dns_ctx *ctx,
 		e = dbq->entries[i].e;
 		ai = dbq->reqs[i]->ar_result;
 
-		if (!r) {
-			e->res = gai_error(dbq->reqs[i]);
-			if (!e->res) {
-				if (!iterate_addr_list(ai, &e->addr, restyp))
-					e->res = -EHOSTUNREACH;
-			}
+		if (r || gai_error(dbq->reqs[i])) {
+			e->res = -EHOSTUNREACH;
+		} else if (!iterate_addr_list(ai, &e->addr, restyp)) {
+			e->res = -EHOSTUNREACH;
 		} else {
-			e->res = r;
+			e->res = 0;
 		}
 
 		eventfd_write(e->ev_fd, 1);
@@ -401,6 +411,23 @@ static int prep_reqs(struct dns_batch_query *dbq)
 }
 
 /*
+ * Signal every still-active entry (a client is still waiting) with an error so
+ * it wakes up instead of hanging until its timeout. Used on the batch error
+ * paths where the queries are never handed to getaddrinfo_a().
+ */
+static void fail_active_entries(struct gwp_dns_entry *head, int err)
+{
+	struct gwp_dns_entry *e;
+
+	for (e = head; e; e = e->next) {
+		if (atomic_load(&e->refcnt) > 1) {
+			e->res = err;
+			eventfd_write(e->ev_fd, 1);
+		}
+	}
+}
+
+/*
  * Must be called with ctx->lock held. May release the lock, but
  * it will reacquire it before returning.
  */
@@ -414,16 +441,18 @@ static void process_queue_entry_batch(struct gwp_dns_ctx *ctx)
 
 	pthread_mutex_unlock(&ctx->lock);
 
-	if (!collect_active_queries(ctx, &head, &dbq)) {
-		if (!prep_reqs(dbq)) {
-			struct sigevent ev;
-			int r;
+	if (collect_active_queries(ctx, &head, &dbq)) {
+		fail_active_entries(head, -EHOSTUNREACH);
+	} else if (prep_reqs(dbq)) {
+		fail_active_entries(head, -EHOSTUNREACH);
+	} else {
+		struct sigevent ev;
+		int r;
 
-			memset(&ev, 0, sizeof(ev));
-			ev.sigev_notify = SIGEV_NONE;
-			r = getaddrinfo_a(GAI_WAIT, dbq->reqs, dbq->nr_entries, &ev);
-			dispatch_batch_result(r, ctx, dbq, ctx->cfg.restyp);
-		}
+		memset(&ev, 0, sizeof(ev));
+		ev.sigev_notify = SIGEV_NONE;
+		r = getaddrinfo_a(GAI_WAIT, dbq->reqs, dbq->nr_entries, &ev);
+		dispatch_batch_result(r, ctx, dbq, ctx->cfg.restyp);
 	}
 
 	dbq_free(dbq);

@@ -49,7 +49,13 @@ LIBGWDNS_TEST_TARGET = $(GWPROXY_DIR)/tests/dns.t
 LIBGWDNS_TEST_CC_SOURCES = $(GWPROXY_DIR)/tests/dns.c
 LIBGWDNS_TEST_OBJECTS = $(LIBGWDNS_TEST_CC_SOURCES:%.c=%.c.o)
 
-ALL_TEST_TARGETS = $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET)
+# http1's unit tests are embedded in http1.c, gated by the
+# GWNET_HTTP1_TESTS/GWNET_HTTP1_RUN_TESTS macros, so the self-test binary
+# is built straight from http1.c rather than a separate test source.
+LIBGWHTTP1_TEST_TARGET = $(GWPROXY_DIR)/tests/http1.t
+
+ALL_TEST_TARGETS = $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET) \
+		   $(LIBGWHTTP1_TEST_TARGET)
 ALL_OBJECTS = $(GWPROXY_OBJECTS) $(LIBGWPSOCKS5_OBJECTS) $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWPSOCKS5_TEST_OBJECTS)
 ALL_TARGETS = $(GWPROXY_TARGET) $(LIBGWPSOCKS5_TARGET) $(LIBGWDNS_TARGET) $(ALL_TEST_TARGETS)
 ALL_DEPFILES = $(ALL_OBJECTS:.o=.o.d)
@@ -126,6 +132,9 @@ $(LIBGWDNS_TARGET): $(LIBGWDNS_OBJECTS)
 $(LIBGWDNS_TEST_TARGET): $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWDNS_TARGET)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+$(LIBGWHTTP1_TEST_TARGET): $(GWPROXY_DIR)/http1.c $(GWPROXY_DIR)/http1.h $(GWPROXY_DIR)/common.h $(EXTRA_DEPS)
+	$(CC) $(CFLAGS) -DGWNET_HTTP1_TESTS -DGWNET_HTTP1_RUN_TESTS $(LDFLAGS) -o $@ $< $(LIBS)
+
 %.c.o: %.c $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
@@ -143,12 +152,14 @@ IE=LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):$(shell pwd)
 test: test-unit test-integration
 	@echo "All tests completed successfully.";
 
-test-unit: $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET)
+test-unit: $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET) $(LIBGWHTTP1_TEST_TARGET)
 	@echo "Running unit tests...";
 	@echo "Testing libgwdns...";
 	@$(IE) ./$(LIBGWDNS_TEST_TARGET);
 	@echo "Testing libgwpsocks5...";
 	@$(IE) ./$(LIBGWPSOCKS5_TEST_TARGET);
+	@echo "Testing http1...";
+	@$(IE) ./$(LIBGWHTTP1_TEST_TARGET);
 	@echo "Unit tests completed.";
 
 test-integration: $(GWPROXY_TARGET)

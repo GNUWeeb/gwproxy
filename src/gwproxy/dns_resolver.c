@@ -305,9 +305,16 @@ void gwp_dns_res_drop_query(struct gwp_dns_resolver *res,
 			    struct gwp_conn_pair *gcp, uint16_t txid)
 {
 	assert(gcp);
-	assert(gcp == lookup_map(res->sess_map, txid));
+
+	/*
+	 * Idempotent: only drop the slot if it still maps to @gcp. The query
+	 * may already have been completed (and thus dropped), so this is safe
+	 * to call again from connection teardown.
+	 */
+	if (lookup_map(res->sess_map, txid) != gcp)
+		return;
+
 	delete_map(res->sess_map, txid);
-	(void)gcp;
 }
 
 int gwp_dns_res_fetch_gcp_by_payload(struct gwp_dns_resolver *res,
@@ -325,7 +332,7 @@ int gwp_dns_res_fetch_gcp_by_payload(struct gwp_dns_resolver *res,
 		return -EINVAL;
 
 	*gcp_p = lookup_map(res->sess_map, txid);
-	if (!gcp_p)
+	if (!*gcp_p)
 		return -ENOENT;
 
 	return 0;
