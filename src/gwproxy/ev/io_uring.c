@@ -378,23 +378,26 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->flags |= GWP_CONN_FLAG_IS_CANCEL;
 }
 
-static struct io_uring_sqe *prep_recv_client_socks5(struct gwp_wrk *w,
-						    struct gwp_conn_pair *gcp)
+static struct io_uring_sqe *prep_recv_client_prot(struct gwp_wrk *w,
+						  struct gwp_conn_pair *gcp)
 {
 	struct io_uring_sqe *s = prep_recv_client(w, gcp);
 	s->user_data &= ~EV_BIT_ALL;
-	s->user_data |= EV_BIT_IOU_CLIENT_SOCKS5;
+	s->user_data |= EV_BIT_IOU_CLIENT_PROT;
 	return s;
 }
 
-static int arm_gcp_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/*
+ * SOCKS5/HTTP proxy mode. The initial connection has no target socket yet: read
+ * the client's protocol handshake (SOCKS5 greeting/CONNECT or HTTP CONNECT)
+ * first; the target socket is created once the destination is known. The
+ * per-connection protocol state (s5_conn/http_conn) is allocated lazily by the
+ * shared gwp_handle_conn_state_prot() the first time it runs.
+ */
+static int arm_gcp_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	int r;
-
-	gcp->s5_conn = gwp_socks5_conn_alloc(ctx->socks5);
-	if (unlikely(!gcp->s5_conn))
-		return -ENOMEM;
 
 	r = prep_nr_sqes(w, 4);
 	if (unlikely(r < 0)) {
@@ -402,13 +405,9 @@ static int arm_gcp_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return r;
 	}
 
-	prep_recv_client_socks5(w, gcp);
+	gcp->conn_state = CONN_STATE_PROT;
+	prep_recv_client_prot(w, gcp);
 
-	/*
-	 * If we are running as a SOCKS5 proxy, the initial connection
-	 * does not have a target socket. We will create the target
-	 * socket later, when the client sends a CONNECT command.
-	 */
 	if (ctx->cfg.protocol_timeout > 0)
 		prep_timer_target(w, gcp, ctx->cfg.protocol_timeout);
 
@@ -440,13 +439,14 @@ static int do_prep_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		prep_recv_client(w, gcp);
 
 		/*
-		 * In SOCKS5 mode the CONNECT reply is written into target.buf
-		 * after connect completes; arming the target recv here would
-		 * race with it and splice stale reply bytes into the forwarded
-		 * stream. Defer it until the reply has been flushed (see
-		 * handle_ev_target_connect() -> handle_ev_client_send()).
+		 * In SOCKS5/HTTP mode a connect reply (SOCKS5 reply or
+		 * "HTTP/1.1 200 OK") is written into target.buf after connect
+		 * completes; arming the target recv here would race with it and
+		 * splice stale reply bytes into the forwarded stream. Defer it
+		 * until the reply has been flushed (see handle_ev_target_connect()
+		 * -> handle_ev_client_send()). Plain forwarding has no such reply.
 		 */
-		if (!ctx->cfg.as_socks5)
+		if (gcp->prot_type == GWP_PROT_TYPE_NONE)
 			prep_recv_target(w, gcp);
 	}
 
@@ -465,8 +465,8 @@ static int arm_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 
-	if (ctx->cfg.as_socks5)
-		return arm_gcp_socks5(w, gcp);
+	if (ctx->cfg.as_socks5 || ctx->cfg.as_http)
+		return arm_gcp_prot(w, gcp);
 	else
 		return arm_gcp_no_socks5(w, gcp);
 }
@@ -498,7 +498,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		}
 	}
 
-	if (!ctx->cfg.as_socks5) {
+	if (!ctx->cfg.as_socks5 && !ctx->cfg.as_http) {
 		struct gwp_sockaddr *ca;
 
 		/* Connect to the upstream proxy, the original dst, or --target. */
@@ -515,6 +515,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 			goto out_close;
 		}
 	} else {
+		/* SOCKS5/HTTP: the target is created after the handshake. */
 		tg_fd = -1;
 	}
 
@@ -680,11 +681,15 @@ static int upstream_iou_complete(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return -ECONNREFUSED;
 	}
 
-	if (ctx->cfg.as_socks5) {
+	/* Build the downstream reply for the client (before any early data). */
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
 		rlen = sizeof(rbuf);
 		r = gwp_socks5_build_connect_reply(w, gcp, 0, rbuf, &rlen);
 		if (unlikely(r))
 			return r;
+	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
+		memcpy(rbuf, "HTTP/1.1 200 OK\r\n\r\n", 19);
+		rlen = 19;
 	}
 
 	/* Drop the proxy's CONNECT reply, keep any early destination data. */
@@ -857,16 +862,28 @@ static int handle_ev_target_connect(struct gwp_wrk *w, void *udata, int res)
 		ip_to_str(&gcp->client_addr),
 		ip_to_str(&gcp->target_addr));
 
-	if (w->ctx->cfg.as_socks5) {
+	/*
+	 * SOCKS5/HTTP: write the connect reply into target.buf and flush it to
+	 * the client with a completion callback. Its handler drains target.buf
+	 * and only then arms the target recv, so the recv never overwrites the
+	 * still-pending reply. Plain forwarding has no reply and already armed
+	 * both recvs in do_prep_connect().
+	 */
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
 		r = gwp_socks5_prep_connect_reply(w, gcp, res);
 		if (r)
 			return r;
+	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
+		static const char ok[] = "HTTP/1.1 200 OK\r\n\r\n";
+		size_t oklen = sizeof(ok) - 1;
 
-		/*
-		 * Flush the reply with a completion callback (not _no_cb): its
-		 * handler drains target.buf and only then arms the target recv,
-		 * so the recv never overwrites the still-pending reply.
-		 */
+		if (gcp->target.cap < oklen)
+			return -ENOBUFS;
+		memcpy(gcp->target.buf, ok, oklen);
+		gcp->target.len = (uint32_t)oklen;
+	}
+
+	if (gcp->prot_type != GWP_PROT_TYPE_NONE) {
 		if (gcp->target.len)
 			prep_send_client(w, gcp);
 		else
@@ -1041,8 +1058,8 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
-static int handle_socks5_connect_target(struct gwp_wrk *w,
-					struct gwp_conn_pair *gcp)
+static int handle_prot_connect_target(struct gwp_wrk *w,
+				      struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_sockaddr *ca = &gcp->target_addr;
@@ -1081,42 +1098,64 @@ static int prep_domain_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
-static int handle_ev_client_socks5(struct gwp_wrk *w,
-				   struct gwp_conn_pair *gcp,
-				   struct io_uring_cqe *cqe)
+/*
+ * Act on the result of a protocol handler (SOCKS5 or HTTP), mirroring the epoll
+ * chk_socks5()/chk_http(): a pending DNS lookup arms a poll; a fully-decoded
+ * destination creates and connects the target socket; anything else means the
+ * handshake needs more client data.
+ */
+static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 {
-	int r = cqe->res;
+	int ct = gcp->conn_state;
 
-	r = handle_sock_ret(r);
+	if (r == -EINPROGRESS &&
+	    (ct == CONN_STATE_SOCKS5_DNS_QUERY || ct == CONN_STATE_HTTP_DNS_QUERY))
+		return prep_domain_resolution(w, gcp);
+
+	if (r == 0 &&
+	    (ct == CONN_STATE_SOCKS5_CONNECT || ct == CONN_STATE_HTTP_CONNECT))
+		return handle_prot_connect_target(w, gcp);
+
+	if (r == 0 || r == -EAGAIN) {
+		/* Handshake incomplete; read more from the client. */
+		prep_recv_client_prot(w, gcp);
+		return 0;
+	}
+
+	return r;
+}
+
+static int handle_ev_client_prot(struct gwp_wrk *w,
+				 struct gwp_conn_pair *gcp,
+				 struct io_uring_cqe *cqe)
+{
+	int r = handle_sock_ret(cqe->res);
+	int ct;
+
 	if (r < 0) {
 		return r;
 	} else if (!r) {
-		prep_recv_client_socks5(w, gcp);
+		prep_recv_client_prot(w, gcp);
 		return 0;
 	}
 
 	gcp->client.len += (uint32_t)r;
-	r = gwp_socks5_handle_data(gcp);
-	if (r)
-		return r;
 
+	ct = gcp->conn_state;
+	if (ct == CONN_STATE_PROT)
+		r = gwp_handle_conn_state_prot(w, gcp);
+	else if (CONN_STATE_HTTP_MIN < ct && ct < CONN_STATE_HTTP_MAX)
+		r = gwp_handle_conn_state_http(w, gcp);
+	else if (CONN_STATE_SOCKS5_MIN < ct && ct < CONN_STATE_SOCKS5_MAX)
+		r = gwp_handle_conn_state_socks5(w, gcp);
+	else
+		return -EINVAL;
+
+	/* Flush any mid-handshake reply (SOCKS5 method/auth) to the client. */
 	if (gcp->target.len)
 		prep_send_client(w, gcp);
 
-	if (gcp->s5_conn->state == GWP_SOCKS5_ST_CMD_CONNECT) {
-		r = gwp_socks5_prepare_target_addr(w, gcp);
-		if (r == -EINPROGRESS)
-			return prep_domain_resolution(w, gcp);
-
-		if (r)
-			return r;
-
-		r = handle_socks5_connect_target(w, gcp);
-	} else {
-		prep_recv_client_socks5(w, gcp);
-	}
-
-	return r;
+	return chk_prot_result(w, gcp, r);
 }
 
 static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
@@ -1138,7 +1177,7 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 
 	gwp_dns_entry_put(gde);
 	gcp->gde = NULL;
-	return handle_socks5_connect_target(w, gcp);
+	return handle_prot_connect_target(w, gcp);
 }
 
 static void prep_socks5_auth_reload(struct gwp_wrk *w)
@@ -1208,9 +1247,9 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		pr_dbg(&ctx->lh, "Handling target send event: %d", cqe->res);
 		r = handle_ev_target_send(w, udata, cqe);
 		break;
-	case EV_BIT_IOU_CLIENT_SOCKS5:
-		pr_dbg(&ctx->lh, "Handling client SOCKS5 event: %d", cqe->res);
-		r = handle_ev_client_socks5(w, udata, cqe);
+	case EV_BIT_IOU_CLIENT_PROT:
+		pr_dbg(&ctx->lh, "Handling client protocol event: %d", cqe->res);
+		r = handle_ev_client_prot(w, udata, cqe);
 		break;
 	case EV_BIT_IOU_UPSTREAM_S5:
 		pr_dbg(&ctx->lh, "Handling upstream SOCKS5 handshake event: %d", cqe->res);

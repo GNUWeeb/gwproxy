@@ -289,11 +289,6 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		goto einval;
 	}
 
-	if (cfg->as_http && ev_is_io_uring(cfg)) {
-		fprintf(stderr, ERR_WRAP "Error: --as-http is currently not supported with the io_uring event loop (use --event-loop=epoll)\n" ERR_WRAP);
-		goto einval;
-	}
-
 	if (cfg->use_raw_dns && cfg->socks5_dns_cache_secs) {
 		fprintf(stderr, ERR_WRAP "Error: The -L/--socks5-dns-cache-secs option is not supported with the raw DNS feature\n" ERR_WRAP);
 		goto einval;
