@@ -175,7 +175,7 @@ int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
 	prep_hints(&hints, restyp);
 	r = getaddrinfo(name, service, &hints, &res);
 	if (r)
-		return -r;
+		return -EHOSTUNREACH;
 
 	found = iterate_addr_list(res, addr, restyp);
 	if (found)
@@ -370,14 +370,12 @@ static void dispatch_batch_result(int r, struct gwp_dns_ctx *ctx,
 		e = dbq->entries[i].e;
 		ai = dbq->reqs[i]->ar_result;
 
-		if (!r) {
-			e->res = gai_error(dbq->reqs[i]);
-			if (!e->res) {
-				if (!iterate_addr_list(ai, &e->addr, restyp))
-					e->res = -EHOSTUNREACH;
-			}
+		if (r || gai_error(dbq->reqs[i])) {
+			e->res = -EHOSTUNREACH;
+		} else if (!iterate_addr_list(ai, &e->addr, restyp)) {
+			e->res = -EHOSTUNREACH;
 		} else {
-			e->res = r;
+			e->res = 0;
 		}
 
 		eventfd_write(e->ev_fd, 1);
