@@ -325,7 +325,7 @@ int gwp_dns_res_fetch_gcp_by_payload(struct gwp_dns_resolver *res,
 		return -EINVAL;
 
 	*gcp_p = lookup_map(res->sess_map, txid);
-	if (!gcp_p)
+	if (!*gcp_p)
 		return -ENOENT;
 
 	return 0;
