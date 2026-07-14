@@ -65,6 +65,14 @@ static char *trim_str(char *str)
 	while (is_space((unsigned char)*str))
 		str++;
 
+	/*
+	 * Nothing left after trimming leading whitespace. Return early so we
+	 * don't form the pointer "str - 1" below, which is undefined behaviour
+	 * when str already points at the start of the buffer.
+	 */
+	if (*str == '\0')
+		return str;
+
 	end = str + strlen(str) - 1;
 	while (end > str && is_space((unsigned char)*end))
 		end--;
