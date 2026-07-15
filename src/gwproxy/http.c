@@ -133,12 +133,67 @@ static int split_authority(char *authority, char **host_p, char **port_p,
 }
 
 /*
+ * Well-known hop-by-hop / connection-specific request header fields that a
+ * proxy must not forward (RFC 9110 Section 7.6.1). Transfer-Encoding and
+ * Content-Length are deliberately absent: this proxy relays the body verbatim,
+ * so the origin still needs them to frame it. Expect is absent too, so a
+ * "100-continue" expectation is forwarded to the origin (RFC 9110 Section
+ * 10.1.1). "Proxy-Connection" is non-standard but sent by some clients.
+ */
+static bool is_hop_by_hop(const char *k)
+{
+	static const char *const hbh[] = {
+		"Connection", "Proxy-Connection", "Keep-Alive", "TE",
+		"Trailer", "Upgrade", "Proxy-Authorization",
+		"Proxy-Authenticate",
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(hbh) / sizeof(hbh[0]); i++) {
+		if (!strcasecmp(k, hbh[i]))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Whether @name appears as one of the comma-separated connection-options in a
+ * Connection header value @conn (which may be NULL). Such fields are
+ * connection-specific and must also be dropped (RFC 9110 Section 7.6.1).
+ */
+static bool conn_lists(const char *conn, const char *name)
+{
+	size_t nlen = strlen(name);
+	const char *p = conn;
+
+	if (!conn)
+		return false;
+
+	while (*p) {
+		const char *e;
+		size_t tlen;
+
+		while (*p == ',' || *p == ' ' || *p == '\t')
+			p++;
+		for (e = p; *e && *e != ','; e++)
+			;
+		tlen = (size_t)(e - p);
+		while (tlen > 0 && (p[tlen - 1] == ' ' || p[tlen - 1] == '\t'))
+			tlen--;
+		if (tlen == nlen && !strncasecmp(p, name, nlen))
+			return true;
+		p = e;
+	}
+	return false;
+}
+
+/*
  * Rebuild the request in origin-form into hc->fwd_req: the absolute-form
- * request-target is replaced by @path, hop-by-hop / proxy headers are dropped
- * and "Connection: close" is appended (this proxy handles one request per
- * connection). @hdr_len is the length of the parsed request header, used to
- * size the scratch buffer (the rewrite is never materially larger). Returns 0
- * or a negative error.
+ * request-target is replaced by @path, hop-by-hop / connection-specific
+ * headers are dropped and "Connection: close" is appended (this proxy handles
+ * one request per connection). @hdr_len is the length of the parsed request
+ * header, used to size the scratch buffer (the rewrite is never materially
+ * larger). Returns 0 or a negative error.
  */
 static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 				 size_t hdr_len)
@@ -146,6 +201,7 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
 	const char *method = http_method_str(req->method);
 	const char *ver = (req->version == GWNET_HTTP_VER_1_0) ? "1.0" : "1.1";
+	const char *conn = gwnet_http_hdr_fields_get(&req->fields, "Connection");
 	size_t cap = hdr_len * 2 + 64, n = 0, i;
 	char *buf;
 	int w;
@@ -166,10 +222,8 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 		const char *k = req->fields.ff[i].key;
 		const char *v = req->fields.ff[i].val;
 
-		/* Drop hop-by-hop / proxy-only headers. */
-		if (!strcasecmp(k, "Connection") ||
-		    !strcasecmp(k, "Proxy-Connection") ||
-		    !strcasecmp(k, "Proxy-Authorization"))
+		/* Drop hop-by-hop and Connection-listed headers. */
+		if (is_hop_by_hop(k) || conn_lists(conn, k))
 			continue;
 
 		w = snprintf(buf + n, cap - n, "%s: %s\r\n", k, v);

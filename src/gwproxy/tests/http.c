@@ -175,6 +175,61 @@ static void test_forward_default_port(void)
 	PRTEST_OK();
 }
 
+static void test_forward_hop_by_hop(void)
+{
+	/*
+	 * Every hop-by-hop / connection-specific request header must be dropped
+	 * from the forwarded request, including a field named by the Connection
+	 * header (X-Custom). Expect (100-continue must be forwarded), the body-
+	 * framing headers and end-to-end Authorization must be kept.
+	 */
+	static const char buf[] =
+		"POST http://example.com/x HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"Authorization: Bearer tok\r\n"
+		"Expect: 100-continue\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"Keep-Alive: timeout=5\r\n"
+		"TE: trailers\r\n"
+		"Trailer: X-Trace\r\n"
+		"Upgrade: h2c\r\n"
+		"X-Keep: keep-me\r\n"
+		"X-Custom: drop-me\r\n"
+		"Connection: keep-alive, X-Custom\r\n"
+		"\r\n";
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0;
+	int r;
+
+	assert(hc);
+	r = run(hc, NULL, buf, &host, &port, &req, &req_len);
+	assert(r == GWP_HTTP_FORWARD);
+	assert(!strncmp(req, "POST /x HTTP/1.1\r\n", 17));
+
+	/* Kept. */
+	assert(strstr(req, "Host: example.com\r\n"));
+	assert(strstr(req, "Authorization: Bearer tok\r\n"));
+	assert(strstr(req, "Expect: 100-continue\r\n"));
+	assert(strstr(req, "Transfer-Encoding: chunked\r\n"));
+	assert(strstr(req, "X-Keep: keep-me\r\n"));
+
+	/* Dropped (hop-by-hop). */
+	assert(!strstr(req, "Keep-Alive"));
+	assert(!strstr(req, "\r\nTE:"));
+	assert(!strstr(req, "Trailer:"));
+	assert(!strstr(req, "Upgrade"));
+	/* Dropped (named by Connection). */
+	assert(!strstr(req, "X-Custom"));
+	/* The original Connection header is replaced by exactly "close". */
+	assert(!strstr(req, "keep-alive"));
+	assert(strstr(req, "\r\nConnection: close\r\n\r\n"));
+
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_need_more(void)
 {
 	/* Request line complete, header fields not yet terminated. */
@@ -304,6 +359,7 @@ int main(void)
 		test_connect_ipv6();
 		test_forward_get();
 		test_forward_default_port();
+		test_forward_hop_by_hop();
 		test_need_more();
 		test_errors();
 		test_auth();
