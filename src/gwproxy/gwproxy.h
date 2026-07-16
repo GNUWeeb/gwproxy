@@ -26,6 +26,14 @@
 
 #include <gwproxy/http1.h>
 
+/*
+ * Forward declarations for the optional TLS module (src/gwproxy/ssl.c, built
+ * only under CONFIG_HTTPS). The pointers below are always present but stay NULL
+ * and unused unless TLS is compiled in and configured.
+ */
+struct gwp_ssl_ctx;
+struct gwp_ssl;
+
 struct gwp_cfg {
 	const char	*event_loop;
 	const char	*bind;
@@ -55,6 +63,8 @@ struct gwp_cfg {
 	const char	*upstream_socks5;
 	int		mark;
 	bool		as_transparent;
+	const char	*tls_cert;
+	const char	*tls_key;
 };
 
 struct gwp_ctx;
@@ -184,6 +194,15 @@ struct gwp_conn {
 	 */
 	bool		rd_eof;
 	bool		wr_shut;
+
+	/*
+	 * TLS state for this endpoint (HTTPS proxy). NULL for a plaintext
+	 * endpoint; only the client side is ever TLS in this cut. Once set and
+	 * the handshake has completed, __do_recv()/__do_send() transparently
+	 * decrypt/encrypt through it. Owned here and released in
+	 * gwp_free_conn_pair().
+	 */
+	struct gwp_ssl	*tls;
 };
 
 enum {
@@ -317,6 +336,7 @@ struct gwp_ctx {
 	struct gwp_sockaddr		target_addr;
 	struct gwp_socks5_ctx		*socks5;
 	struct gwp_auth			*auth;
+	struct gwp_ssl_ctx		*ssl_ctx;
 	struct gwp_dns_ctx		*dns;
 	struct gwp_upstream_s5		upstream;
 	struct gwp_cfg			cfg;
