@@ -140,6 +140,11 @@ jobs:
         run: |
           sudo apt-get update -y;
           sudo apt-get install -y ${{matrix.build_args.cc_pkg}};
+          # OpenSSL headers for the HTTPS (--use-openssl) build. Native x86_64
+          # only; the other arches are cross-compiled without a target libssl.
+          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
+            sudo apt-get install -y libssl-dev;
+          fi;
 
       - name: Display compiler versions
         run: |
@@ -198,6 +203,32 @@ jobs:
             make test;
           fi;
 
+      # HTTPS (TLS termination) needs libssl, only installed for native
+      # x86_64, so these steps run there. 'make test' exercises the ssl unit
+      # test and the t/0034 HTTPS integration test (over both event loops),
+      # under the sanitizer too when this matrix row enables it.
+      - name: Build with OpenSSL (HTTPS)
+        if: ${{matrix.build_args.arch == 'x86_64'}}
+        run: |
+          SAN="";
+          if [ "${{matrix.build_args.sanitize}}" = "1" ]; then SAN="--sanitize"; fi;
+          rm -vf config.h config.log config.make;
+          make clean;
+          CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}} --use-openssl $SAN;
+          make -j$(nproc);
+          make test;
+
+      - name: Build with OpenSSL and io-uring (HTTPS)
+        if: ${{matrix.build_args.arch == 'x86_64'}}
+        run: |
+          SAN="";
+          if [ "${{matrix.build_args.sanitize}}" = "1" ]; then SAN="--sanitize"; fi;
+          rm -vf config.h config.log config.make;
+          make clean;
+          CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}} --use-openssl --use-io-uring $SAN;
+          make -j$(nproc);
+          make test;
+
   alpine-musl-build:
     needs: get_commit_list
     runs-on: ubuntu-24.04
@@ -227,7 +258,7 @@ jobs:
       - name: Install build dependencies
         shell: alpine.sh --root {0}
         run: |
-          apk add --no-cache build-base musl-dev linux-headers git;
+          apk add --no-cache build-base musl-dev linux-headers git openssl-dev;
 
       - name: Build default
         shell: alpine.sh {0}
@@ -266,6 +297,19 @@ jobs:
           rm -vf config.h config.log config.make;
           make clean;
           CFLAGS=-Werror ./configure --cc=gcc --use-io-uring --debug;
+          make -j$(nproc);
+          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
+            make test;
+          fi;
+
+      # Compile-test the TLS module (ssl.c) against musl. Like the other
+      # Alpine steps this is build-only ('make test' is gated off here).
+      - name: Build with OpenSSL
+        shell: alpine.sh {0}
+        run: |
+          rm -vf config.h config.log config.make;
+          make clean;
+          CFLAGS=-Werror ./configure --cc=gcc --use-openssl;
           make -j$(nproc);
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
             make test;
