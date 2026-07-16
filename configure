@@ -40,6 +40,9 @@ for opt do
 	--use-new-dns-resolver)
 		use_new_dns_resolver="yes";
 	;;
+	--use-openssl)
+		use_openssl="yes";
+	;;
 	--sanitize)
 		use_sanitize="yes";
 	;;
@@ -92,6 +95,7 @@ Options: [defaults in brackets after descriptions]
   --use-io-uring           Enable io_uring support (default: no)
   --sanitize               Enable sanitizers (default: no)
   --use-new-dns-resolver   Use the new DNS resolver feature (default: no)
+  --use-openssl            Enable HTTPS (OpenSSL TLS) support (default: no)
 EOF
 exit 0;
 fi
@@ -352,6 +356,29 @@ fi;
 
 if test "${use_new_dns_resolver}" = "yes"; then
 	add_config "CONFIG_NEW_DNS_RESOLVER";
+fi;
+
+if test "${use_openssl}" = "yes"; then
+	cat > $tmp_c << EOF
+#include <openssl/ssl.h>
+int main(void)
+{
+	SSL_CTX *ctx;
+	OPENSSL_init_ssl(0, (void *)0);
+	ctx = SSL_CTX_new(TLS_method());
+	SSL_CTX_free(ctx);
+	return 0;
+}
+EOF
+	l="Do we have OpenSSL (libssl/libcrypto)?";
+	if compile_cc "" "-lssl -lcrypto" "OpenSSL"; then
+		add_config "CONFIG_HTTPS";
+		LIB_LDFLAGS="${LIB_LDFLAGS} -lssl -lcrypto";
+		print_supp "yes" "${l}";
+	else
+		print_supp "no" "${l}";
+		fatal "ERROR: --use-openssl requested but OpenSSL (libssl/libcrypto) was not found. Install the development package, e.g. 'sudo apt install libssl-dev'.";
+	fi;
 fi;
 
 add_config "CONFIG_LINUX";
