@@ -750,8 +750,19 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		if (gcp->timer_fd >= 0)
 			__sys_close(gcp->timer_fd);
 
-		if (gcp->s5_conn)
+		/*
+		 * s5_conn and http_conn share a union, so the protocol object
+		 * must be freed through the correct type; freeing an http_conn
+		 * as a SOCKS5 conn corrupts memory. Mirror gwp_free_conn_pair().
+		 */
+		switch (gcp->prot_type) {
+		case GWP_PROT_TYPE_SOCKS5:
 			gwp_socks5_conn_free(gcp->s5_conn);
+			break;
+		case GWP_PROT_TYPE_HTTP:
+			gwp_http_conn_free(gcp->http_conn);
+			break;
+		}
 
 		free(gcp);
 	}
