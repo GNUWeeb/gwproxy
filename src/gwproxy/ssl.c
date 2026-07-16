@@ -9,6 +9,7 @@
 #endif
 
 #include <stdlib.h>
+#include <string.h>
 #include <limits.h>
 #include <errno.h>
 
@@ -29,6 +30,27 @@ struct gwp_ssl {
 	BIO	*wbio;	/* SSL -> network: we BIO_read ciphertext to send here */
 };
 
+/* ALPN wire form of the one application protocol gwproxy speaks to clients. */
+static const unsigned char alpn_http11[] = { 8, 'h','t','t','p','/','1','.','1' };
+
+/*
+ * Server ALPN: pick "http/1.1" when the client offers it (so an h2-preferring
+ * client is correctly downgraded), and decline otherwise so plaintext-inside
+ * SOCKS5-over-TLS and ALPN-less clients still complete the handshake.
+ */
+static int alpn_select_cb(SSL *ssl, const unsigned char **out,
+			  unsigned char *outlen, const unsigned char *in,
+			  unsigned int inlen, void *arg)
+{
+	(void)ssl;
+	(void)arg;
+	if (SSL_select_next_proto((unsigned char **)out, outlen, alpn_http11,
+				  sizeof(alpn_http11), in,
+				  inlen) == OPENSSL_NPN_NEGOTIATED)
+		return SSL_TLSEXT_ERR_OK;
+	return SSL_TLSEXT_ERR_NOACK;
+}
+
 int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
 			      const char *key_file)
 {
@@ -42,6 +64,7 @@ int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
 		goto err;
 
 	SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
+	SSL_CTX_set_alpn_select_cb(c->ctx, alpn_select_cb, NULL);
 	if (SSL_CTX_use_certificate_chain_file(c->ctx, cert_file) != 1)
 		goto err;
 	if (SSL_CTX_use_PrivateKey_file(c->ctx, key_file, SSL_FILETYPE_PEM) != 1)
@@ -138,6 +161,28 @@ void gwp_ssl_free(struct gwp_ssl *s)
 		return;
 	SSL_free(s->ssl);	/* also frees the two BIOs set via SSL_set_bio */
 	free(s);
+}
+
+int gwp_ssl_set_alpn(struct gwp_ssl *s, const void *protos, size_t len)
+{
+	/* SSL_set_alpn_protos() returns 0 on success (note the inverted sense). */
+	return SSL_set_alpn_protos(s->ssl, protos, (unsigned int)len) ? -EINVAL : 0;
+}
+
+const char *gwp_ssl_alpn(struct gwp_ssl *s)
+{
+	static __thread char buf[64];
+	const unsigned char *p = NULL;
+	unsigned int len = 0;
+
+	SSL_get0_alpn_selected(s->ssl, &p, &len);
+	if (!p || !len)
+		return NULL;
+	if (len >= sizeof(buf))
+		len = sizeof(buf) - 1;
+	memcpy(buf, p, len);
+	buf[len] = '\0';
+	return buf;
 }
 
 static int cap_int(size_t len)

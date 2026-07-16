@@ -91,6 +91,20 @@ int gwp_ssl_write(struct gwp_ssl *s, const void *buf, size_t len,
 int gwp_ssl_shutdown(struct gwp_ssl *s);
 
 /*
+ * Set the client-side ALPN protocol list (@protos in ALPN wire form: each entry
+ * a length byte followed by that many bytes). Returns 0 on success, <0 on error.
+ * The server side advertises "http/1.1" automatically (see server ctx creation).
+ */
+int gwp_ssl_set_alpn(struct gwp_ssl *s, const void *protos, size_t len);
+
+/*
+ * The ALPN protocol negotiated for this connection as a NUL-terminated string,
+ * or NULL if none was selected. Points at a per-thread buffer valid until the
+ * next call on this thread.
+ */
+const char *gwp_ssl_alpn(struct gwp_ssl *s);
+
+/*
  * A human-readable string for the most recent OpenSSL error on this thread
  * (drains one entry from the error queue). For logging by the caller.
  */

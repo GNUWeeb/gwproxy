@@ -590,7 +590,8 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 /* Handshake done: switch to the plaintext protocol path on the decrypted stream. */
 static int tls_hs_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	pr_dbg(&w->ctx->lh, "TLS handshake complete (cfd=%d)", gcp->client.fd);
+	pr_dbg(&w->ctx->lh, "TLS handshake complete (cfd=%d, alpn=%s)",
+	       gcp->client.fd, gwp_ssl_alpn(gcp->client.tls) ?: "none");
 	gcp->tls_io->hs_done = true;
 	gcp->conn_state = CONN_STATE_PROT;
 	/* App data may already sit in the engine from the last handshake recv. */

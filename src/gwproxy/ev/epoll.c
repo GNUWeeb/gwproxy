@@ -1785,7 +1785,8 @@ static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return tls_arm_client(w, gcp, mask);
 	}
 
-	pr_dbg(&w->ctx->lh, "TLS handshake complete (cfd=%d)", c->fd);
+	pr_dbg(&w->ctx->lh, "TLS handshake complete (cfd=%d, alpn=%s)", c->fd,
+	       gwp_ssl_alpn(c->tls) ?: "none");
 	gcp->conn_state = CONN_STATE_PROT;
 	mask = EPOLLIN | EPOLLRDHUP;
 	if (gwp_ssl_bio_pending(c->tls) > 0)

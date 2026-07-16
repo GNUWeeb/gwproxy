@@ -164,6 +164,59 @@ static void test_bad_cert_rejected(void)
 	PRTEST_OK();
 }
 
+static void test_alpn_negotiation(void)
+{
+	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
+	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
+	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
+	/* h2 (preferred by the client) then http/1.1, in ALPN wire form. */
+	static const unsigned char offer_both[] = {
+		2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'
+	};
+	/* Only h2, which the server does not speak. */
+	static const unsigned char offer_h2[] = { 2, 'h', '2' };
+	struct gwp_ssl *srv, *cli;
+	const char *sel;
+	int fd, r;
+
+	fd = mkstemp(cert); assert(fd >= 0); close(fd);
+	fd = mkstemp(key); assert(fd >= 0); close(fd);
+	write_file(cert, TEST_CERT);
+	write_file(key, TEST_KEY);
+
+	r = gwp_ssl_ctx_server_create(&sctx, cert, key); assert(!r && sctx);
+	r = gwp_ssl_ctx_client_create(&cctx); assert(!r && cctx);
+
+	/* Overlap: the server prefers and selects http/1.1 on both ends. */
+	srv = gwp_ssl_server_new(sctx);
+	cli = gwp_ssl_client_new(cctx);
+	assert(srv && cli);
+	assert(gwp_ssl_set_alpn(cli, offer_both, sizeof(offer_both)) == 0);
+	do_handshake(cli, srv);
+	sel = gwp_ssl_alpn(srv);
+	assert(sel && !strcmp(sel, "http/1.1"));
+	sel = gwp_ssl_alpn(cli);
+	assert(sel && !strcmp(sel, "http/1.1"));
+	gwp_ssl_free(srv);
+	gwp_ssl_free(cli);
+
+	/* No overlap: nothing is selected, but the handshake still succeeds. */
+	srv = gwp_ssl_server_new(sctx);
+	cli = gwp_ssl_client_new(cctx);
+	assert(srv && cli);
+	assert(gwp_ssl_set_alpn(cli, offer_h2, sizeof(offer_h2)) == 0);
+	do_handshake(cli, srv);
+	assert(gwp_ssl_alpn(srv) == NULL);
+	gwp_ssl_free(srv);
+	gwp_ssl_free(cli);
+
+	gwp_ssl_ctx_free(sctx);
+	gwp_ssl_ctx_free(cctx);
+	unlink(cert);
+	unlink(key);
+	PRTEST_OK();
+}
+
 int main(void)
 {
 	size_t i;
@@ -171,6 +224,7 @@ int main(void)
 	for (i = 0; i < 200; i++) {
 		test_handshake_and_roundtrip();
 		test_bad_cert_rejected();
+		test_alpn_negotiation();
 	}
 
 	printf("All tests passed!\n");
