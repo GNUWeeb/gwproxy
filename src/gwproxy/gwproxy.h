@@ -175,6 +175,18 @@ enum {
 	 *    - HTTP
 	 */
 	CONN_STATE_PROT			= 500,
+
+	/*
+	 * HTTPS proxy: the listener may speak TLS. TLS_DETECT peeks the first
+	 * byte to tell a TLS ClientHello (0x16) from a plaintext SOCKS5/HTTP
+	 * client; TLS_HANDSHAKE runs the server-side handshake. Both are
+	 * serviced under EV_BIT_CLIENT_PROT (EPOLLIN and EPOLLOUT). On success
+	 * the connection continues at CONN_STATE_PROT on the decrypted stream.
+	 */
+	CONN_STATE_TLS_MIN		= 600,
+	CONN_STATE_TLS_DETECT		= 601,
+	CONN_STATE_TLS_HANDSHAKE	= 602,
+	CONN_STATE_TLS_MAX		= 699,
 };
 
 struct gwp_conn {

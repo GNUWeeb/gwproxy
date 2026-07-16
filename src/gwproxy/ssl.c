@@ -14,6 +14,8 @@
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
 
 #include "ssl.h"
 
@@ -167,6 +169,40 @@ int gwp_ssl_bio_read(struct gwp_ssl *s, void *buf, size_t len)
 size_t gwp_ssl_bio_pending(struct gwp_ssl *s)
 {
 	return BIO_ctrl_pending(s->wbio);
+}
+
+const void *gwp_ssl_bio_peek(struct gwp_ssl *s, size_t *len)
+{
+	BUF_MEM *bm = NULL;
+
+	BIO_get_mem_ptr(s->wbio, &bm);
+	if (!bm || bm->length == 0) {
+		*len = 0;
+		return NULL;
+	}
+	*len = bm->length;
+	return bm->data;
+}
+
+void gwp_ssl_bio_consume(struct gwp_ssl *s, size_t len)
+{
+	unsigned char scratch[4096];
+
+	while (len > 0) {
+		int c = (len > sizeof(scratch)) ? (int)sizeof(scratch) : (int)len;
+		int r = BIO_read(s->wbio, scratch, c);
+
+		if (r <= 0)
+			break;
+		len -= (size_t)r;
+	}
+}
+
+size_t gwp_ssl_pending(struct gwp_ssl *s)
+{
+	int r = SSL_pending(s->ssl);
+
+	return (r > 0) ? (size_t)r : 0;
 }
 
 static int map_err(struct gwp_ssl *s, int ret)

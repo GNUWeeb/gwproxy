@@ -1,7 +1,8 @@
 gwproxy
 -------
 The GNU/Weeb Proxy. A fast, multi-threaded TCP proxy for GNU/Linux with
-SOCKS5, HTTP CONNECT and transparent proxy modes.
+SOCKS5, HTTP CONNECT and transparent proxy modes, and optional TLS
+termination on the listener (HTTPS proxy).
 
 
 Features
@@ -17,6 +18,11 @@ Features
       - "Basic" proxy authentication (RFC 7617), or no authentication.
   - Combined SOCKS5 + HTTP on a single listening port (auto-detected per
     connection), sharing one credential store.
+  - Optional HTTPS proxy: terminate a client's TLS on the listener (server
+    role, from --tls-cert/--tls-key) and run the SOCKS5/HTTP logic on the
+    decrypted stream, encrypting the client-to-proxy hop. TLS is
+    auto-detected from the first byte, so plaintext SOCKS5/HTTP clients keep
+    working on the same port. Built only with --use-openssl; epoll-only.
   - Transparent proxy: recover each connection's original destination from
     the SO_ORIGINAL_DST socket option, for use behind an iptables REDIRECT
     rule.
@@ -50,6 +56,13 @@ the io_uring event loop (then selectable at run time with
 ./configure --use-io-uring;
 make -j$(nproc);
 
+To build the optional HTTPS proxy (TLS termination on the listener), install
+OpenSSL's development package and configure with --use-openssl:
+
+sudo apt install -y libssl-dev;
+./configure --use-openssl;
+make -j$(nproc);
+
 Other configure options include --debug, --sanitize (ASan/UBSan) and
 --use-new-dns-resolver (which enables the -r/--raw-dns and -j/--dns-server
 options). Run './configure --help' for the full list. Run 'make test' to
@@ -78,6 +91,12 @@ Run './gwproxy --help' for the complete list of options. A few examples:
 
   # SOCKS5 and HTTP CONNECT on the same port, sharing one credential file
   ./gwproxy --bind='[::]:1080' --as-socks5=1 --as-http=1 --auth-file=auth.txt
+
+  # HTTPS proxy: terminate the client's TLS on the listener (needs a build
+  # with --use-openssl). Plaintext SOCKS5/HTTP clients still work on the same
+  # port. Try it with: curl -x https://127.0.0.1:8080 http://example.com/
+  ./gwproxy --bind='[::]:8080' --as-http=1 --as-socks5=1 \
+      --tls-cert=cert.pem --tls-key=key.pem
 
   # Chain every outgoing connection through an upstream SOCKS5 proxy
   ./gwproxy --bind='[::]:1080' --as-socks5=1 \
