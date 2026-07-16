@@ -369,3 +369,107 @@ int gwp_http_build_auth_required_reply(void *out, size_t out_cap)
 	memcpy(out, resp, len);
 	return (int)len;
 }
+
+/* Base64-encode @in into the NUL-terminated @out (RFC 4648). */
+static void base64_encode(const unsigned char *in, size_t inlen, char *out)
+{
+	static const char t[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	size_t i, o = 0;
+
+	for (i = 0; i + 2 < inlen; i += 3) {
+		out[o++] = t[in[i] >> 2];
+		out[o++] = t[((in[i] & 0x3) << 4) | (in[i + 1] >> 4)];
+		out[o++] = t[((in[i + 1] & 0xf) << 2) | (in[i + 2] >> 6)];
+		out[o++] = t[in[i + 2] & 0x3f];
+	}
+	if (i < inlen) {
+		out[o++] = t[in[i] >> 2];
+		if (i + 1 < inlen) {
+			out[o++] = t[((in[i] & 0x3) << 4) | (in[i + 1] >> 4)];
+			out[o++] = t[(in[i + 1] & 0xf) << 2];
+		} else {
+			out[o++] = t[(in[i] & 0x3) << 4];
+			out[o++] = '=';
+		}
+		out[o++] = '=';
+	}
+	out[o] = '\0';
+}
+
+/*
+ * Build an upstream "CONNECT @authority HTTP/1.1" request into @out, optionally
+ * with a Basic Proxy-Authorization header. @authority is a "host:port" (or
+ * "[ipv6]:port") string. On success *out_len holds the byte count; -ENOBUFS if
+ * @out_cap is too small.
+ */
+int gwp_http_cli_build_connect(const char *authority, const char *user,
+			       uint8_t ulen, const char *pass, uint8_t plen,
+			       void *out, size_t out_cap, size_t *out_len)
+{
+	char auth_hdr[8 + ((255 + 1 + 255 + 2) / 3) * 4 + 4] = "";
+	int n;
+
+	if (user && ulen) {
+		unsigned char raw[255 + 1 + 255];
+		char b64[((sizeof(raw)) / 3 + 1) * 4 + 4];
+		size_t rl = 0;
+
+		memcpy(raw, user, ulen);
+		rl = ulen;
+		raw[rl++] = ':';
+		if (pass && plen) {
+			memcpy(raw + rl, pass, plen);
+			rl += plen;
+		}
+		base64_encode(raw, rl, b64);
+		n = snprintf(auth_hdr, sizeof(auth_hdr),
+			     "Proxy-Authorization: Basic %s\r\n", b64);
+		if (n < 0 || (size_t)n >= sizeof(auth_hdr))
+			return -EINVAL;
+	}
+
+	n = snprintf(out, out_cap,
+		     "CONNECT %s HTTP/1.1\r\nHost: %s\r\n%s\r\n",
+		     authority, authority, auth_hdr);
+	if (n < 0)
+		return -EINVAL;
+	if ((size_t)n >= out_cap)
+		return -ENOBUFS;
+
+	*out_len = (size_t)n;
+	return 0;
+}
+
+/*
+ * Parse an upstream HTTP CONNECT reply. Returns -EAGAIN until the status line
+ * and header terminator ("\r\n\r\n") have both arrived. On completion it sets
+ * *status to the HTTP status code and *consumed to the number of bytes up to and
+ * including the blank line (any bytes after that are early tunnel data), and
+ * returns 0. Returns -EINVAL on a malformed status line.
+ */
+int gwp_http_cli_parse_connect_reply(const void *buf, size_t len, int *status,
+				     size_t *consumed)
+{
+	const char *p = buf, *end;
+	int code;
+
+	/* Need the full header block. */
+	end = memmem(p, len, "\r\n\r\n", 4);
+	if (!end)
+		return -EAGAIN;
+
+	/* Status line: "HTTP/1.x SSS ...". */
+	if (len < 12 || memcmp(p, "HTTP/1.", 7))
+		return -EINVAL;
+	if (p[8] != ' ')
+		return -EINVAL;
+	if (p[9] < '0' || p[9] > '9' || p[10] < '0' || p[10] > '9' ||
+	    p[11] < '0' || p[11] > '9')
+		return -EINVAL;
+
+	code = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+	*status = code;
+	*consumed = (size_t)(end - p) + 4;
+	return 0;
+}

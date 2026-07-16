@@ -28,9 +28,10 @@ Features
   - Transparent proxy: recover each connection's original destination from
     the SO_ORIGINAL_DST socket option, for use behind an iptables REDIRECT
     rule.
-  - Upstream SOCKS5 chaining: route every outgoing connection through a
-    next-hop SOCKS5 proxy, with local (socks5://) or remote (socks5h://)
-    name resolution and optional username/password auth.
+  - Upstream proxy chaining: route every outgoing connection through a
+    next-hop SOCKS5 proxy (socks5:// local or socks5h:// remote name
+    resolution) or HTTP CONNECT proxy (http://), with optional
+    username/password auth.
   - SO_MARK (fwmark) on outgoing connections, for policy routing / iptables
     matching.
   - Two event loops: epoll (default) and io_uring (optional, enabled at

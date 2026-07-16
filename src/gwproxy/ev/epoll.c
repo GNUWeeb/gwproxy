@@ -914,7 +914,7 @@ static const char *upstream_dst_str(struct gwp_conn_pair *gcp)
  * with a SOCKS5 failure reply where applicable, then return @err so the
  * caller tears the connection down.
  */
-static int upstream_s5_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+static int upstream_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    int err)
 {
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
@@ -975,20 +975,19 @@ static int upstream_s5_send_connect(struct gwp_wrk *w,
 	return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
 }
 
-static int upstream_s5_complete(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-				uint8_t rep, size_t consumed)
+/*
+ * The upstream proxy accepted the tunnel (SOCKS5 reply or HTTP CONNECT 2xx).
+ * Build the downstream reply for our own client, drop @consumed bytes of the
+ * proxy's reply (keeping any early destination data), and start forwarding.
+ */
+static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   size_t consumed)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	uint8_t rbuf[512];
 	size_t rlen = 0;
 	ssize_t sr;
 	int r;
-
-	if (rep != GWP_SOCKS5_REP_SUCCESS) {
-		pr_err(&ctx->lh, "Upstream SOCKS5 CONNECT failed (rep=0x%02x, idx=%u, dst=%s)",
-			rep, gcp->idx, upstream_dst_str(gcp));
-		return upstream_s5_fail(w, gcp, -ECONNREFUSED);
-	}
 
 	/* Build the downstream reply for the client (before any early data). */
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
@@ -1024,7 +1023,7 @@ static int upstream_s5_complete(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	gcp->conn_state = CONN_STATE_FORWARDING;
 	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
 
-	pr_info(&ctx->lh, "Upstream SOCKS5 tunnel established (idx=%u, ca=%s, dst=%s)",
+	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
 		gcp->idx, ip_to_str(&gcp->client_addr), upstream_dst_str(gcp));
 
 	/* Flush downstream reply (+ early data) to the client. */
@@ -1042,6 +1041,36 @@ static int upstream_s5_complete(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	return adjust_epl_mask(w, gcp);
+}
+
+static int upstream_s5_complete(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				uint8_t rep, size_t consumed)
+{
+	if (rep != GWP_SOCKS5_REP_SUCCESS) {
+		pr_err(&w->ctx->lh, "Upstream SOCKS5 CONNECT failed (rep=0x%02x, idx=%u, dst=%s)",
+			rep, gcp->idx, upstream_dst_str(gcp));
+		return upstream_fail(w, gcp, -ECONNREFUSED);
+	}
+	return upstream_finish(w, gcp, consumed);
+}
+
+/* Parse the upstream HTTP proxy's CONNECT reply and finish or fail. */
+static int upstream_http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	size_t consumed;
+	int status, r;
+
+	r = gwp_http_cli_parse_connect_reply(gcp->target.buf, gcp->target.len,
+					     &status, &consumed);
+	if (r)
+		return r;	/* -EAGAIN (need more) or -EINVAL (malformed) */
+
+	if (status < 200 || status >= 300) {
+		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT failed (status=%d, idx=%u, dst=%s)",
+			status, gcp->idx, upstream_dst_str(gcp));
+		return upstream_fail(w, gcp, -ECONNREFUSED);
+	}
+	return upstream_finish(w, gcp, consumed);
 }
 
 static int upstream_s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -1067,7 +1096,7 @@ static int upstream_s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 		pr_err(&ctx->lh, "Upstream SOCKS5 proxy selected no acceptable auth method (0x%02x)",
 			method);
-		return upstream_s5_fail(w, gcp, -EACCES);
+		return upstream_fail(w, gcp, -EACCES);
 	}
 	case CONN_STATE_UPSTREAM_S5_AUTH: {
 		uint8_t status;
@@ -1080,7 +1109,7 @@ static int upstream_s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		if (status != 0x00) {
 			pr_err(&ctx->lh, "Upstream SOCKS5 authentication failed (idx=%u)",
 				gcp->idx);
-			return upstream_s5_fail(w, gcp, -EACCES);
+			return upstream_fail(w, gcp, -EACCES);
 		}
 		return upstream_s5_send_connect(w, gcp);
 	}
@@ -1125,10 +1154,51 @@ static int upstream_s5_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
 }
 
+/* Kick off an upstream HTTP proxy handshake: send CONNECT, await the 2xx. */
+static int upstream_http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream *up = &w->ctx->upstream;
+	char authority[300];
+	size_t len = 0;
+	int r;
+
+	r = gwp_upstream_finalize_dst(w, gcp);
+	if (unlikely(r)) {
+		pr_err(&w->ctx->lh, "Failed to prepare upstream destination (idx=%u): %s",
+			gcp->idx, strerror(-r));
+		return r;
+	}
+
+	r = gwp_upstream_authority(&gcp->up_dst, authority, sizeof(authority));
+	if (unlikely(r))
+		return r;
+
+	r = gwp_http_cli_build_connect(authority,
+				       up->has_auth ? up->user : NULL, up->ulen,
+				       up->pass, up->plen, gcp->target.buf,
+				       gcp->target.cap, &len);
+	if (unlikely(r))
+		return r;
+
+	gcp->target.len = (uint32_t)len;
+	gcp->up_tx = true;
+	gcp->conn_state = CONN_STATE_UPSTREAM_HTTP_CONNECT;
+	pr_dbg(&w->ctx->lh, "Upstream HTTP CONNECT started (idx=%u, dst=%s)",
+		gcp->idx, authority);
+	return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
+}
+
+static int upstream_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	if (w->ctx->upstream.type == GWP_UPSTREAM_HTTP)
+		return upstream_http_start(w, gcp);
+	return upstream_s5_start(w, gcp);
+}
+
 __hot
-static int handle_ev_upstream_socks5(struct gwp_wrk *w,
-				     struct gwp_conn_pair *gcp,
-				     struct epoll_event *ev)
+static int handle_ev_upstream(struct gwp_wrk *w,
+			      struct gwp_conn_pair *gcp,
+			      struct epoll_event *ev)
 {
 	ssize_t sr;
 	int r;
@@ -1162,7 +1232,11 @@ static int handle_ev_upstream_socks5(struct gwp_wrk *w,
 			return -ECONNRESET;
 	}
 
-	r = upstream_s5_parse(w, gcp);
+	if (gcp->conn_state >= CONN_STATE_UPSTREAM_HTTP_MIN &&
+	    gcp->conn_state <= CONN_STATE_UPSTREAM_HTTP_MAX)
+		r = upstream_http_parse(w, gcp);
+	else
+		r = upstream_s5_parse(w, gcp);
 	if (r == -EAGAIN) {
 		if (ev->events & (EPOLLRDHUP | EPOLLHUP))
 			return -ECONNRESET;
@@ -1205,7 +1279,7 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 	 * before forwarding; the connect timer is kept to bound it.
 	 */
 	if (ctx->upstream.enabled)
-		return upstream_s5_start(w, gcp);
+		return upstream_start(w, gcp);
 
 	if (gcp->timer_fd >= 0) {
 		__sys_close(gcp->timer_fd);
@@ -1312,8 +1386,8 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		int cs = gcp->conn_state;
 
 		if (cs >= CONN_STATE_UPSTREAM_S5_MIN &&
-		    cs <= CONN_STATE_UPSTREAM_S5_MAX)
-			return handle_ev_upstream_socks5(w, gcp, ev);
+		    cs <= CONN_STATE_UPSTREAM_HTTP_MAX)
+			return handle_ev_upstream(w, gcp, ev);
 
 		return handle_ev_target_conn_result(w, gcp);
 	}

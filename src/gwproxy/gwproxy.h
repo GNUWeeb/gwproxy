@@ -70,15 +70,23 @@ struct gwp_cfg {
 
 struct gwp_ctx;
 
+enum {
+	GWP_UPSTREAM_SOCKS5	= 0,
+	GWP_UPSTREAM_HTTP	= 1,
+};
+
 /*
  * Parsed form of the --upstream-proxy option. When @enabled, every outgoing
- * connection is routed through this upstream SOCKS5 proxy instead of being
- * connected to directly. Populated once at startup and shared read-only by
- * all workers.
+ * connection is routed through this upstream proxy instead of being connected
+ * to directly. The URL scheme picks @type (socks5[h]:// vs http[s]://) and, for
+ * HTTP, whether the hop to the proxy is TLS (@use_tls, https://). Populated once
+ * at startup and shared read-only by all workers.
  */
 struct gwp_upstream {
 	bool			enabled;
+	uint8_t			type;		/* GWP_UPSTREAM_SOCKS5 / HTTP */
 	bool			remote_dns;	/* socks5h:// (proxy resolves) */
+	bool			use_tls;	/* https:// (TLS to the proxy) */
 	bool			has_auth;
 	uint8_t			ulen;
 	uint8_t			plen;
@@ -166,6 +174,14 @@ enum {
 	CONN_STATE_UPSTREAM_S5_AUTH	= 202,	/* await user/pass status    */
 	CONN_STATE_UPSTREAM_S5_CONNECT	= 203,	/* await CONNECT reply       */
 	CONN_STATE_UPSTREAM_S5_MAX	= 299,
+
+	/*
+	 * The target socket is connected to an upstream HTTP proxy and we are
+	 * performing an HTTP CONNECT to it before forwarding.
+	 */
+	CONN_STATE_UPSTREAM_HTTP_MIN	= 300,
+	CONN_STATE_UPSTREAM_HTTP_CONNECT = 301,	/* await "HTTP/1.x 2xx"      */
+	CONN_STATE_UPSTREAM_HTTP_MAX	= 399,
 
 	CONN_STATE_HTTP_MIN		= 400,
 	CONN_STATE_HTTP_HDR		= 401,
@@ -404,6 +420,8 @@ int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				   int err, void *out, size_t *out_len);
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
+			   size_t cap);
 
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);

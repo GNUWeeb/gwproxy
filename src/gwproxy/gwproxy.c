@@ -146,9 +146,10 @@ static void show_help(const char *app)
 	printf("  -m, --log-level=level           Set log level (0=none, 1=error, 2=warning, 3=info, 4=debug, default: %d)\n", default_opts.log_level);
 	printf("  -f, --log-file=file             Log to the specified file (default: %s)\n", default_opts.log_file);
 	printf("  -p, --pid-file=file             Write PID to the specified file (default is no pid file)\n");
-	printf("  -x, --upstream-proxy=url       Route outgoing connections through an upstream SOCKS5 proxy\n");
-	printf("                                  URL: socks5://[user:pass@]host:port (local DNS) or\n");
+	printf("  -x, --upstream-proxy=url       Route outgoing connections through an upstream proxy\n");
+	printf("                                  URL: socks5://[user:pass@]host:port  (local DNS)\n");
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
+	printf("                                       http://[user:pass@]host:port    (HTTP CONNECT)\n");
 	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN; 0 = off)\n");
 	printf("  -R, --as-transparent=0|1        Transparent proxy: take the target from SO_ORIGINAL_DST (iptables REDIRECT) (default: %d)\n", default_opts.as_transparent);
 #ifdef CONFIG_HTTPS
@@ -1091,14 +1092,17 @@ static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
  *
  *    socks5://[user:pass@]host:port     (gwproxy resolves the target)
  *    socks5h://[user:pass@]host:port    (the upstream proxy resolves it)
+ *    http://[user:pass@]host:port       (HTTP CONNECT, cleartext to the proxy)
+ *    https://[user:pass@]host:port      (HTTP CONNECT, TLS to the proxy)
  *
- * The port is optional and defaults to 1080.
+ * The port is optional and defaults to 1080 for socks5 and 8080 for http.
  */
 __cold
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 {
 	char buf[512], *at, *host;
 	const char *rest;
+	uint16_t def_port;
 	bool has_port;
 	size_t n;
 	int r;
@@ -1106,11 +1110,26 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 	memset(up, 0, sizeof(*up));
 
 	if (!strncmp(url, "socks5h://", 10)) {
+		up->type = GWP_UPSTREAM_SOCKS5;
 		up->remote_dns = true;
 		rest = url + 10;
+		def_port = 1080;
 	} else if (!strncmp(url, "socks5://", 9)) {
+		up->type = GWP_UPSTREAM_SOCKS5;
 		up->remote_dns = false;
 		rest = url + 9;
+		def_port = 1080;
+	} else if (!strncmp(url, "https://", 8)) {
+		up->type = GWP_UPSTREAM_HTTP;
+		up->use_tls = true;
+		up->remote_dns = true;	/* the HTTP proxy resolves the CONNECT host */
+		rest = url + 8;
+		def_port = 8080;
+	} else if (!strncmp(url, "http://", 7)) {
+		up->type = GWP_UPSTREAM_HTTP;
+		up->remote_dns = true;
+		rest = url + 7;
+		def_port = 8080;
 	} else {
 		return -EINVAL;
 	}
@@ -1150,8 +1169,8 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 
 	/*
 	 * convert_str_to_ssaddr() ignores an explicit port in the string when
-	 * a non-zero default_port is passed, so only pass the 1080 default
-	 * when the host has no port of its own.
+	 * a non-zero default_port is passed, so only pass the default when the
+	 * host has no port of its own.
 	 */
 	if (host[0] == '[') {
 		char *rb = strchr(host, ']');
@@ -1160,7 +1179,7 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 		has_port = strchr(host, ':') != NULL;
 	}
 
-	r = convert_str_to_ssaddr(host, &up->addr, has_port ? 0 : 1080);
+	r = convert_str_to_ssaddr(host, &up->addr, has_port ? 0 : def_port);
 	if (r)
 		return r;
 
@@ -1231,7 +1250,13 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 			       ctx->cfg.upstream_proxy);
 			goto out_free_log;
 		}
-		pr_info(&ctx->lh, "Routing outgoing connections via upstream SOCKS5 proxy %s (%s DNS)",
+		if (ctx->upstream.use_tls) {
+			pr_err(&ctx->lh, "An https:// (TLS) upstream proxy is not supported yet; use http:// or socks5[h]://");
+			r = -ENOTSUP;
+			goto out_free_log;
+		}
+		pr_info(&ctx->lh, "Routing outgoing connections via upstream %s proxy %s (%s DNS)",
+			ctx->upstream.type == GWP_UPSTREAM_HTTP ? "HTTP" : "SOCKS5",
 			ip_to_str(&ctx->upstream.addr),
 			ctx->upstream.remote_dns ? "remote" : "local");
 	}
@@ -1853,6 +1878,40 @@ static int upstream_dst_from_hostport(const char *hostport,
  * target IP (socks5://), or from the configured --target host for plain mode
  * with socks5h://.
  */
+/*
+ * Format gcp->up_dst as an HTTP authority ("host:port" or "[ipv6]:port") for an
+ * upstream CONNECT request. Returns 0 on success, -EINVAL on a bad address.
+ */
+int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
+			   size_t cap)
+{
+	uint16_t port = ntohs(dst->port);
+	char ip[INET6_ADDRSTRLEN];
+	int n;
+
+	switch (dst->ver) {
+	case GWP_SOCKS5_ATYP_DOMAIN:
+		n = snprintf(buf, cap, "%s:%u", dst->domain.str, port);
+		break;
+	case GWP_SOCKS5_ATYP_IPV4:
+		if (!inet_ntop(AF_INET, dst->ip4, ip, sizeof(ip)))
+			return -EINVAL;
+		n = snprintf(buf, cap, "%s:%u", ip, port);
+		break;
+	case GWP_SOCKS5_ATYP_IPV6:
+		if (!inet_ntop(AF_INET6, dst->ip6, ip, sizeof(ip)))
+			return -EINVAL;
+		n = snprintf(buf, cap, "[%s]:%u", ip, port);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (n < 0 || (size_t)n >= cap)
+		return -EINVAL;
+	return 0;
+}
+
 int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;

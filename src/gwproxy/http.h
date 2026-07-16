@@ -15,6 +15,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 struct gwp_auth;
 struct gwp_http_conn;
@@ -75,5 +76,27 @@ int gwp_http_build_connect_reply(const struct gwp_http_conn *hc, void *out,
  * @return	Number of bytes written to @out, or -ENOBUFS if too small.
  */
 int gwp_http_build_auth_required_reply(void *out, size_t out_cap);
+
+/**
+ * Build an upstream "CONNECT <authority> HTTP/1.1" request (used when chaining
+ * through an upstream HTTP proxy), with an optional Basic Proxy-Authorization
+ * header. @authority is a "host:port" or "[ipv6]:port" string.
+ *
+ * @return	0 with *out_len set on success, -ENOBUFS if @out_cap is too
+ *		small, or -EINVAL on a formatting error.
+ */
+int gwp_http_cli_build_connect(const char *authority, const char *user,
+			       uint8_t ulen, const char *pass, uint8_t plen,
+			       void *out, size_t out_cap, size_t *out_len);
+
+/**
+ * Parse an upstream HTTP CONNECT reply.
+ *
+ * @return	0 with *status (HTTP code) and *consumed (bytes through the
+ *		"\r\n\r\n") set once the header block has arrived; -EAGAIN if
+ *		more data is needed; -EINVAL on a malformed status line.
+ */
+int gwp_http_cli_parse_connect_reply(const void *buf, size_t len, int *status,
+				     size_t *consumed);
 
 #endif /* #ifndef GWPROXY__HTTP_H */
