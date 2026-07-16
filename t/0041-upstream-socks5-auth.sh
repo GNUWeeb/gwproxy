@@ -23,7 +23,7 @@ start_httpd "$hp" "$WORK" "1.1"
 
 # The upstream SOCKS5 proxy requires one RFC1929 "username:password" line.
 printf 'up:pw\n' >"$WORK/auth"
-gwp_start "[::1]:$up" --as-socks5=1 --socks5-auth-file="$WORK/auth" \
+gwp_start "[::1]:$up" --as-socks5=1 --auth-file="$WORK/auth" \
 	--event-loop=epoll --nr-workers=2
 
 # (a) Front configured with the CORRECT upstream credentials: the transfer

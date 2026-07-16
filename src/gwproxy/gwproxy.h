@@ -41,11 +41,11 @@ struct gwp_cfg {
 	const char	*target;
 	bool		as_socks5;
 	bool		as_http;
-	bool		socks5_prefer_ipv6;
+	bool		prefer_ipv6;
 	bool		use_raw_dns;
 	int		protocol_timeout;
 	const char	*auth_file;
-	int		socks5_dns_cache_secs;
+	int		dns_cache_secs;
 	int		nr_workers;
 	int		nr_dns_workers;
 	int		connect_timeout;

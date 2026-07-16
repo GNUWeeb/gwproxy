@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # SOCKS5 username/password authentication (RFC1929): a proxy started with a
-# --socks5-auth-file must (a) accept a client that presents the correct
+# --auth-file must (a) accept a client that presents the correct
 # username/password and relay the payload byte-exact, (b) reject a client
 # with a wrong password, and (c) reject a client that presents no
 # credentials at all. Exercised on every available event loop.
@@ -23,7 +23,7 @@ for loop in epoll io_uring; do
 	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
 
 	pp="$(pick_port)"
-	gwp_start "[::1]:$pp" --as-socks5=1 --socks5-auth-file="$WORK/auth" \
+	gwp_start "[::1]:$pp" --as-socks5=1 --auth-file="$WORK/auth" \
 		--event-loop="$loop" --nr-workers=2
 
 	# (a) Correct credentials: the transfer succeeds and the bytes are intact.

@@ -52,11 +52,10 @@ static const struct option long_opts[] = {
 	{ "target",		required_argument,	NULL,	't' },
 	{ "as-socks5",		required_argument,	NULL,	'S' },
 	{ "as-http",		required_argument,	NULL,	'H' },
-	{ "socks5-prefer-ipv6",	required_argument,	NULL,	'Q' },
+	{ "prefer-ipv6",	required_argument,	NULL,	'Q' },
 	{ "protocol-timeout",	required_argument,	NULL,	'o' },
-	{ "socks5-auth-file",	required_argument,	NULL,	'A' },
 	{ "auth-file",		required_argument,	NULL,	'A' },
-	{ "socks5-dns-cache-secs",	required_argument,	NULL,	'L' },
+	{ "dns-cache-secs",	required_argument,	NULL,	'L' },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
 	{ "connect-timeout",	required_argument,	NULL,	'c' },
@@ -91,11 +90,11 @@ static const struct gwp_cfg default_opts = {
 	.target			= NULL,
 	.as_socks5		= false,
 	.as_http		= false,
-	.socks5_prefer_ipv6	= false,
+	.prefer_ipv6		= false,
 	.use_raw_dns		= false,
 	.protocol_timeout	= 10,
 	.auth_file		= NULL,
-	.socks5_dns_cache_secs	= 0,
+	.dns_cache_secs		= 0,
 	.nr_workers		= 4,
 	.nr_dns_workers		= 4,
 	.connect_timeout	= 5,
@@ -128,11 +127,10 @@ static void show_help(const char *app)
 	printf("  -t, --target=addr_port          Target address to connect to\n");
 	printf("  -S, --as-socks5=0|1             Run as a SOCKS5 proxy (default: %d)\n", default_opts.as_socks5);
 	printf("  -H, --as-http=0|1               Run as an HTTP proxy (default: %d)\n", default_opts.as_http);
-	printf("  -Q, --socks5-prefer-ipv6=0|1    Prefer IPv6 for SOCKS5 DNS queries (default: %d)\n", default_opts.socks5_prefer_ipv6);
+	printf("  -Q, --prefer-ipv6=0|1           Prefer IPv6 for proxy DNS queries (default: %d)\n", default_opts.prefer_ipv6);
 	printf("  -o, --protocol-timeout=sec      Timeout for protocol handshake process (default: %d)\n", default_opts.protocol_timeout);
 	printf("  -A, --auth-file=file            File with username:password credentials for SOCKS5 and HTTP auth (default: no auth)\n");
-	printf("      --socks5-auth-file=file     Alias for --auth-file\n");
-	printf("  -L, --socks5-dns-cache-secs=sec SOCKS5 DNS cache duration in seconds (default: %d)\n", default_opts.socks5_dns_cache_secs);
+	printf("  -L, --dns-cache-secs=sec        Proxy DNS cache duration in seconds (default: %d)\n", default_opts.dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
 	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads for SOCKS5 (default: %d)\n", default_opts.nr_dns_workers);
@@ -221,7 +219,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->as_http = !!atoi(optarg);
 			break;
 		case 'Q':
-			cfg->socks5_prefer_ipv6 = !!atoi(optarg);
+			cfg->prefer_ipv6 = !!atoi(optarg);
 			break;
 		case 'o':
 			cfg->protocol_timeout = atoi(optarg);
@@ -230,7 +228,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->auth_file = optarg;
 			break;
 		case 'L':
-			cfg->socks5_dns_cache_secs = atoi(optarg);
+			cfg->dns_cache_secs = atoi(optarg);
 			break;
 		case 'w':
 			cfg->nr_workers = atoi(optarg);
@@ -310,8 +308,8 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		goto einval;
 	}
 
-	if (cfg->use_raw_dns && cfg->socks5_dns_cache_secs) {
-		fprintf(stderr, ERR_WRAP "Error: The -L/--socks5-dns-cache-secs option is not supported with the raw DNS feature\n" ERR_WRAP);
+	if (cfg->use_raw_dns && cfg->dns_cache_secs) {
+		fprintf(stderr, ERR_WRAP "Error: The -L/--dns-cache-secs option is not supported with the raw DNS feature\n" ERR_WRAP);
 		goto einval;
 	}
 
@@ -468,7 +466,7 @@ static int gwp_raw_dns_resolve(struct gwp_wrk *w,
 		goto out_err;
 	}
 
-	gdp->restyp = w->ctx->cfg.socks5_prefer_ipv6 ?
+	gdp->restyp = w->ctx->cfg.prefer_ipv6 ?
 		GWP_DNS_RESTYP_PREFER_IPV6 :
 		GWP_DNS_RESTYP_PREFER_IPV4;
 
@@ -986,8 +984,8 @@ static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 {
 	struct gwp_cfg *cfg = &ctx->cfg;
 	const struct gwp_dns_cfg dns_cfg = {
-		.cache_expiry = cfg->socks5_dns_cache_secs,
-		.restyp = cfg->socks5_prefer_ipv6 ? GWP_DNS_RESTYP_PREFER_IPV6 : 0,
+		.cache_expiry = cfg->dns_cache_secs,
+		.restyp = cfg->prefer_ipv6 ? GWP_DNS_RESTYP_PREFER_IPV6 : 0,
 		.nr_workers = cfg->nr_dns_workers
 	};
 	int r;
