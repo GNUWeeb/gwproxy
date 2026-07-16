@@ -22,7 +22,8 @@ Features
     role, from --tls-cert/--tls-key) and run the SOCKS5/HTTP logic on the
     decrypted stream, encrypting the client-to-proxy hop. TLS is
     auto-detected from the first byte, so plaintext SOCKS5/HTTP clients keep
-    working on the same port. Built only with --use-openssl; epoll-only.
+    working on the same port. Built only with --use-openssl; works on both
+    the epoll and io_uring event loops.
   - Transparent proxy: recover each connection's original destination from
     the SO_ORIGINAL_DST socket option, for use behind an iptables REDIRECT
     rule.

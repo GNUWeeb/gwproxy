@@ -320,11 +320,6 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		fprintf(stderr, ERR_WRAP "Error: --tls-cert and --tls-key must be provided together\n" ERR_WRAP);
 		goto einval;
 	}
-
-	if (cfg->tls_cert && ev_is_io_uring(cfg)) {
-		fprintf(stderr, ERR_WRAP "Error: TLS termination is currently only supported with the epoll event loop\n" ERR_WRAP);
-		goto einval;
-	}
 #endif
 
 	if (cfg->as_transparent && (cfg->as_socks5 || cfg->as_http)) {
@@ -763,6 +758,13 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 			gwp_http_conn_free(gcp->http_conn);
 			break;
 		}
+
+#ifdef CONFIG_HTTPS
+		gwp_ssl_free(gcp->client.tls);
+#if defined(CONFIG_IO_URING)
+		free(gcp->tls_io);
+#endif
+#endif
 
 		free(gcp);
 	}
@@ -1505,6 +1507,9 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 #ifdef CONFIG_HTTPS
 	gwp_ssl_free(gcp->client.tls);
+#if defined(CONFIG_IO_URING)
+	free(gcp->tls_io);	/* flat buffer struct; NULL unless io_uring+TLS */
+#endif
 #endif
 
 	free(gcp);

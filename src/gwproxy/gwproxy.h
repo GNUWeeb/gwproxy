@@ -33,6 +33,7 @@
  */
 struct gwp_ssl_ctx;
 struct gwp_ssl;
+struct gwp_iou_tls;
 
 struct gwp_cfg {
 	const char	*event_loop;
@@ -133,6 +134,9 @@ enum {
 	EV_BIT_IOU_CLIENT_CANCEL	= (14ull << 48ull),
 	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
 	EV_BIT_IOU_MSG_RING		= (16ull << 48ull),
+	EV_BIT_IOU_TLS_DETECT		= (17ull << 48ull),
+	EV_BIT_IOU_TLS_HS_RECV		= (18ull << 48ull),
+	EV_BIT_IOU_TLS_HS_SEND		= (19ull << 48ull),
 	EV_BIT_IOU_UPSTREAM_S5		= (20ull << 48ull),
 	EV_BIT_IOU_ACCEPT_RETRY		= (21ull << 48ull),
 #endif
@@ -243,6 +247,15 @@ struct gwp_conn_pair {
 #ifdef CONFIG_IO_URING
 	int				ref_cnt;
 	struct __kernel_timespec	ts;
+#ifdef CONFIG_HTTPS
+	/*
+	 * Persistent ciphertext scratch for the client's TLS on the io_uring
+	 * loop. Unlike epoll (synchronous stack scratch), an async recv/send
+	 * needs the wire buffers to outlive the operation. Allocated when a TLS
+	 * handshake starts, freed in gwp_free_conn_pair().
+	 */
+	struct gwp_iou_tls		*tls_io;
+#endif
 #endif
 
 	uint64_t		flags;

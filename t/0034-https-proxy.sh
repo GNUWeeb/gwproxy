@@ -5,10 +5,9 @@
 # role, from --tls-cert/--tls-key) and runs the existing SOCKS5/HTTP logic on
 # the decrypted stream. Because TLS is auto-detected from the first byte, a
 # single port serves both TLS ("curl -x https://proxy") and plaintext
-# ("curl -x http://proxy" / "socks5h://proxy") clients. Verify: forward-proxy
-# over TLS, CONNECT tunnelling over TLS, plaintext coexistence on the same
-# port, and Basic auth over TLS. TLS is epoll-only in this cut, so the io_uring
-# loop must refuse a TLS listener.
+# ("curl -x http://proxy" / "socks5h://proxy") clients. Verify, on every
+# available event loop: forward-proxy over TLS, CONNECT tunnelling over TLS,
+# plaintext coexistence on the same port, and Basic auth over TLS.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -35,76 +34,70 @@ start_httpd "$hp" "$WORK" "1.1"
 
 printf 'testuser:s3cr3t\n' >"$WORK/auth"
 
-pp="$(pick_port)"
-gwp_start "127.0.0.1:$pp" --as-http=1 --as-socks5=1 \
-	--tls-cert="$WORK/cert.pem" --tls-key="$WORK/key.pem" --nr-workers=2
+for loop in epoll io_uring; do
+	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
 
-# (1) HTTP forward proxy over TLS: curl speaks TLS to the proxy, which
-#     terminates it and relays the absolute-form GET to the origin.
-curl -s --max-time 20 --proxy-insecure -x "https://127.0.0.1:$pp" \
-	"http://127.0.0.1:$hp/payload.bin" -o "$WORK/fwd.bin" \
-	|| fail "curl HTTP-forward over TLS proxy failed"
-assert_files_equal "$WORK/payload.bin" "$WORK/fwd.bin" \
-	"HTTP forward over TLS corrupted the payload"
-
-# (2) CONNECT tunnel over TLS: --proxytunnel forces a CONNECT, which the
-#     TLS-terminated proxy blind-tunnels to the origin.
-curl -s --max-time 20 --proxytunnel --proxy-insecure -x "https://127.0.0.1:$pp" \
-	"http://127.0.0.1:$hp/payload.bin" -o "$WORK/connect.bin" \
-	|| fail "curl CONNECT over TLS proxy failed"
-assert_files_equal "$WORK/payload.bin" "$WORK/connect.bin" \
-	"CONNECT over TLS corrupted the payload"
-
-# (3) Coexistence: a plaintext HTTP-forward client on the very same port.
-curl -s --max-time 20 -x "http://127.0.0.1:$pp" \
-	"http://127.0.0.1:$hp/payload.bin" -o "$WORK/plain_http.bin" \
-	|| fail "plaintext HTTP client on the TLS port failed"
-assert_files_equal "$WORK/payload.bin" "$WORK/plain_http.bin" \
-	"plaintext HTTP coexistence corrupted the payload"
-
-# (4) Coexistence: a plaintext SOCKS5 client on the very same port.
-curl -s --max-time 20 -x "socks5h://127.0.0.1:$pp" \
-	"http://127.0.0.1:$hp/payload.bin" -o "$WORK/plain_socks5.bin" \
-	|| fail "plaintext SOCKS5 client on the TLS port failed"
-assert_files_equal "$WORK/payload.bin" "$WORK/plain_socks5.bin" \
-	"plaintext SOCKS5 coexistence corrupted the payload"
-
-kill "$GWP_PID" 2>/dev/null
-
-# (5) Basic auth over TLS: reject without credentials, accept with them.
-pp="$(pick_port)"
-gwp_start "127.0.0.1:$pp" --as-http=1 --auth-file="$WORK/auth" \
-	--tls-cert="$WORK/cert.pem" --tls-key="$WORK/key.pem" --nr-workers=2
-
-rm -f "$WORK/noauth.bin"
-# --fail turns the 407 challenge (a "successful" HTTP transaction for a plain
-# forward GET) into a non-zero exit so we can assert the request was refused.
-if curl -s --fail --max-time 20 --proxy-insecure -x "https://127.0.0.1:$pp" \
-	"http://127.0.0.1:$hp/payload.bin" -o "$WORK/noauth.bin"; then
-	fail "unauthenticated client over TLS unexpectedly succeeded"
-fi
-if cmp -s "$WORK/payload.bin" "$WORK/noauth.bin"; then
-	fail "unauthenticated client over TLS received the payload"
-fi
-
-curl -s --max-time 20 --proxy-insecure -x "https://testuser:s3cr3t@127.0.0.1:$pp" \
-	"http://127.0.0.1:$hp/payload.bin" -o "$WORK/auth.bin" \
-	|| fail "authenticated client over TLS failed"
-assert_files_equal "$WORK/payload.bin" "$WORK/auth.bin" \
-	"authenticated HTTP-forward over TLS corrupted the payload"
-
-kill "$GWP_PID" 2>/dev/null
-
-# (6) TLS is epoll-only here: the io_uring loop must refuse a TLS listener.
-if grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null; then
 	pp="$(pick_port)"
-	if "$GWPROXY" --bind="127.0.0.1:$pp" --as-http=1 --event-loop=io_uring \
-		--tls-cert="$WORK/cert.pem" --tls-key="$WORK/key.pem" \
-		>"$WORK/iou.log" 2>&1; then
-		fail "io_uring loop accepted a TLS listener (should be rejected)"
+	gwp_start "127.0.0.1:$pp" --as-http=1 --as-socks5=1 --event-loop="$loop" \
+		--tls-cert="$WORK/cert.pem" --tls-key="$WORK/key.pem" --nr-workers=2
+
+	# (1) HTTP forward proxy over TLS: curl speaks TLS to the proxy, which
+	#     terminates it and relays the absolute-form GET to the origin.
+	curl -s --max-time 20 --proxy-insecure -x "https://127.0.0.1:$pp" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/fwd.bin" \
+		|| fail "[$loop] curl HTTP-forward over TLS proxy failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/fwd.bin" \
+		"[$loop] HTTP forward over TLS corrupted the payload"
+
+	# (2) CONNECT tunnel over TLS: --proxytunnel forces a CONNECT, which the
+	#     TLS-terminated proxy blind-tunnels to the origin.
+	curl -s --max-time 20 --proxytunnel --proxy-insecure -x "https://127.0.0.1:$pp" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/connect.bin" \
+		|| fail "[$loop] curl CONNECT over TLS proxy failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/connect.bin" \
+		"[$loop] CONNECT over TLS corrupted the payload"
+
+	# (3) Coexistence: a plaintext HTTP-forward client on the very same port.
+	curl -s --max-time 20 -x "http://127.0.0.1:$pp" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/plain_http.bin" \
+		|| fail "[$loop] plaintext HTTP client on the TLS port failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/plain_http.bin" \
+		"[$loop] plaintext HTTP coexistence corrupted the payload"
+
+	# (4) Coexistence: a plaintext SOCKS5 client on the very same port.
+	curl -s --max-time 20 -x "socks5h://127.0.0.1:$pp" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/plain_socks5.bin" \
+		|| fail "[$loop] plaintext SOCKS5 client on the TLS port failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/plain_socks5.bin" \
+		"[$loop] plaintext SOCKS5 coexistence corrupted the payload"
+
+	kill "$GWP_PID" 2>/dev/null
+
+	# (5) Basic auth over TLS: reject without credentials, accept with them.
+	pp="$(pick_port)"
+	gwp_start "127.0.0.1:$pp" --as-http=1 --auth-file="$WORK/auth" \
+		--event-loop="$loop" \
+		--tls-cert="$WORK/cert.pem" --tls-key="$WORK/key.pem" --nr-workers=2
+
+	rm -f "$WORK/noauth.bin"
+	# --fail turns the 407 challenge (a "successful" HTTP transaction for a
+	# plain forward GET) into a non-zero exit so we can assert the refusal.
+	if curl -s --fail --max-time 20 --proxy-insecure -x "https://127.0.0.1:$pp" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/noauth.bin"; then
+		fail "[$loop] unauthenticated client over TLS unexpectedly succeeded"
 	fi
-	grep -qi 'epoll' "$WORK/iou.log" \
-		|| fail "io_uring+TLS rejection lacked a clear diagnostic"
-fi
+	if cmp -s "$WORK/payload.bin" "$WORK/noauth.bin"; then
+		fail "[$loop] unauthenticated client over TLS received the payload"
+	fi
+
+	curl -s --max-time 20 --proxy-insecure \
+		-x "https://testuser:s3cr3t@127.0.0.1:$pp" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/auth.bin" \
+		|| fail "[$loop] authenticated client over TLS failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/auth.bin" \
+		"[$loop] authenticated HTTP-forward over TLS corrupted the payload"
+
+	kill "$GWP_PID" 2>/dev/null
+done
 
 pass
