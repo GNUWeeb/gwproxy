@@ -942,7 +942,7 @@ static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 static int upstream_s5_send_userpass(struct gwp_wrk *w,
 				     struct gwp_conn_pair *gcp)
 {
-	struct gwp_upstream_s5 *up = &w->ctx->upstream;
+	struct gwp_upstream *up = &w->ctx->upstream;
 	size_t len = gcp->target.cap;
 	int r;
 

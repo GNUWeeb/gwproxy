@@ -70,7 +70,7 @@ static const struct option long_opts[] = {
 	{ "log-level",		required_argument,	NULL,	'm' },
 	{ "log-file",		required_argument,	NULL,	'f' },
 	{ "pid-file",		required_argument,	NULL,	'p' },
-	{ "upstream-socks5",	required_argument,	NULL,	'x' },
+	{ "upstream-proxy",	required_argument,	NULL,	'x' },
 	{ "mark",		required_argument,	NULL,	'M' },
 	{ "as-transparent",	required_argument,	NULL,	'R' },
 #ifdef CONFIG_HTTPS
@@ -110,7 +110,7 @@ static const struct gwp_cfg default_opts = {
 	.log_file		= "/dev/stdout",
 	.pid_file		= NULL,
 	.dns_servers		= "1.1.1.1",
-	.upstream_socks5	= NULL,
+	.upstream_proxy	= NULL,
 	.mark			= 0,
 	.as_transparent		= false
 };
@@ -146,7 +146,7 @@ static void show_help(const char *app)
 	printf("  -m, --log-level=level           Set log level (0=none, 1=error, 2=warning, 3=info, 4=debug, default: %d)\n", default_opts.log_level);
 	printf("  -f, --log-file=file             Log to the specified file (default: %s)\n", default_opts.log_file);
 	printf("  -p, --pid-file=file             Write PID to the specified file (default is no pid file)\n");
-	printf("  -x, --upstream-socks5=url       Route outgoing connections through an upstream SOCKS5 proxy\n");
+	printf("  -x, --upstream-proxy=url       Route outgoing connections through an upstream SOCKS5 proxy\n");
 	printf("                                  URL: socks5://[user:pass@]host:port (local DNS) or\n");
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
 	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN; 0 = off)\n");
@@ -273,7 +273,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->pid_file = optarg;
 			break;
 		case 'x':
-			cfg->upstream_socks5 = optarg;
+			cfg->upstream_proxy = optarg;
 			break;
 		case 'M':
 			cfg->mark = atoi(optarg);
@@ -1087,7 +1087,7 @@ static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
 }
 
 /*
- * Parse a --upstream-socks5 URL of the form:
+ * Parse a --upstream-proxy URL of the form:
  *
  *    socks5://[user:pass@]host:port     (gwproxy resolves the target)
  *    socks5h://[user:pass@]host:port    (the upstream proxy resolves it)
@@ -1095,7 +1095,7 @@ static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
  * The port is optional and defaults to 1080.
  */
 __cold
-int gwp_parse_upstream_socks5(const char *url, struct gwp_upstream_s5 *up)
+int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 {
 	char buf[512], *at, *host;
 	const char *rest;
@@ -1223,12 +1223,12 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (r < 0)
 		goto out_free_log;
 
-	if (ctx->cfg.upstream_socks5) {
-		r = gwp_parse_upstream_socks5(ctx->cfg.upstream_socks5,
+	if (ctx->cfg.upstream_proxy) {
+		r = gwp_parse_upstream(ctx->cfg.upstream_proxy,
 					      &ctx->upstream);
 		if (r) {
-			pr_err(&ctx->lh, "Invalid --upstream-socks5 value '%s'",
-			       ctx->cfg.upstream_socks5);
+			pr_err(&ctx->lh, "Invalid --upstream-proxy value '%s'",
+			       ctx->cfg.upstream_proxy);
 			goto out_free_log;
 		}
 		pr_info(&ctx->lh, "Routing outgoing connections via upstream SOCKS5 proxy %s (%s DNS)",

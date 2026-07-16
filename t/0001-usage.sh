@@ -19,12 +19,12 @@ if timeout 5 "$GWPROXY" --bind="127.0.0.1:$(pick_port)" >/dev/null 2>&1; then
 	fail "missing --target / proxy mode was accepted"
 fi
 
-# A malformed --upstream-socks5 URL must be rejected at startup.
-if require_opt "--upstream-socks5" 2>/dev/null; then :; fi
-if "$GWPROXY" --help 2>&1 | grep -q -- "--upstream-socks5"; then
+# A malformed --upstream-proxy URL must be rejected at startup.
+if require_opt "--upstream-proxy" 2>/dev/null; then :; fi
+if "$GWPROXY" --help 2>&1 | grep -q -- "--upstream-proxy"; then
 	if timeout 5 "$GWPROXY" --as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
-			--upstream-socks5="http://nope:1080" >/dev/null 2>&1; then
-		fail "malformed --upstream-socks5 URL was accepted"
+			--upstream-proxy="http://nope:1080" >/dev/null 2>&1; then
+		fail "malformed --upstream-proxy URL was accepted"
 	fi
 fi
 

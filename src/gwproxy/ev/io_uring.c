@@ -993,7 +993,7 @@ static struct io_uring_sqe *prep_upstream_recv(struct gwp_wrk *w,
 static int upstream_iou_send_userpass(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp)
 {
-	struct gwp_upstream_s5 *up = &w->ctx->upstream;
+	struct gwp_upstream *up = &w->ctx->upstream;
 	size_t len = gcp->target.cap;
 	int r;
 

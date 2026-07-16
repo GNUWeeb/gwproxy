@@ -61,7 +61,7 @@ struct gwp_cfg {
 	const char	*log_file;
 	const char	*pid_file;
 	const char	*dns_servers;
-	const char	*upstream_socks5;
+	const char	*upstream_proxy;
 	int		mark;
 	bool		as_transparent;
 	const char	*tls_cert;
@@ -71,12 +71,12 @@ struct gwp_cfg {
 struct gwp_ctx;
 
 /*
- * Parsed form of the --upstream-socks5 option. When @enabled, every outgoing
+ * Parsed form of the --upstream-proxy option. When @enabled, every outgoing
  * connection is routed through this upstream SOCKS5 proxy instead of being
  * connected to directly. Populated once at startup and shared read-only by
  * all workers.
  */
-struct gwp_upstream_s5 {
+struct gwp_upstream {
 	bool			enabled;
 	bool			remote_dns;	/* socks5h:// (proxy resolves) */
 	bool			has_auth;
@@ -87,7 +87,7 @@ struct gwp_upstream_s5 {
 	char			pass[256];
 };
 
-int gwp_parse_upstream_socks5(const char *url, struct gwp_upstream_s5 *up);
+int gwp_parse_upstream(const char *url, struct gwp_upstream *up);
 
 enum {
 	EV_BIT_ACCEPT			= (1ull << 48ull),
@@ -363,7 +363,7 @@ struct gwp_ctx {
 	struct gwp_auth			*auth;
 	struct gwp_ssl_ctx		*ssl_ctx;
 	struct gwp_dns_ctx		*dns;
-	struct gwp_upstream_s5		upstream;
+	struct gwp_upstream		upstream;
 	struct gwp_cfg			cfg;
 	int				ino_fd;
 	char				*ino_buf;
