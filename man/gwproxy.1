@@ -188,15 +188,19 @@ the system resolver. Requires a build with the new DNS resolver. Default:
 .BR 0 .
 .SS Upstream proxy chaining
 .TP
-.BR \-x ", " \-\-upstream\-socks5=\fIurl\fR
-Route every outgoing connection through a next\-hop SOCKS5 proxy. The URL form
-is
+.BR \-x ", " \-\-upstream\-proxy=\fIurl\fR
+Route every outgoing connection through a next\-hop proxy. The URL scheme
+selects the proxy type:
 .BR socks5://[user:pass@]host:port ,
-which resolves target hostnames locally, or
+a SOCKS5 proxy that resolves target hostnames locally;
 .BR socks5h://[user:pass@]host:port ,
-which asks the upstream proxy to resolve them. Optional
+a SOCKS5 proxy that resolves them itself; or
+.BR http://[user:pass@]host:port ,
+an HTTP proxy reached with an HTTP CONNECT request. Optional
 .B user:pass
-supplies username/password authentication to the upstream.
+supplies username/password authentication to the upstream (RFC\ 1929 for
+SOCKS5, HTTP Basic for HTTP). The port defaults to 1080 for SOCKS5 and 8080
+for HTTP.
 .SS Networking
 .TP
 .BR \-M ", " \-\-mark=\fInr\fR
@@ -369,14 +373,19 @@ and installing the iptables rules requires the corresponding privileges;
 both typically need root.
 .SH UPSTREAM CHAINING
 With
-.BR \-\-upstream\-socks5 ,
-every outgoing connection is made through a next\-hop SOCKS5 proxy rather than
-directly. The
+.BR \-\-upstream\-proxy ,
+every outgoing connection is made through a next\-hop proxy rather than
+directly. A
 .B socks5://
-scheme resolves target hostnames locally before connecting, while
+upstream resolves target hostnames locally before connecting, while
 .B socks5h://
-defers name resolution to the upstream proxy. Credentials embedded in the URL
-authenticate to the upstream.
+defers name resolution to the upstream proxy. An
+.B http://
+upstream is reached with an HTTP CONNECT request, which likewise resolves the
+host at the proxy. Credentials embedded in the URL authenticate to the upstream.
+An
+.B https://
+upstream (TLS to the proxy) is not supported yet.
 .SH EVENT LOOPS
 Each worker uses one event loop, selected with
 .BR \-\-event\-loop .
@@ -451,11 +460,11 @@ curl \-x https://127.0.0.1:8080 http://example.com/
 .EE
 .RE
 .PP
-Chain every outgoing connection through an upstream SOCKS5 proxy:
+Chain every outgoing connection through an upstream proxy (SOCKS5 or HTTP):
 .RS 4
 .EX
 gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \\
-    \-\-upstream\-socks5=socks5h://user:pass@1.2.3.4:1080
+    \-\-upstream\-proxy=socks5h://user:pass@1.2.3.4:1080
 .EE
 .RE
 .PP
