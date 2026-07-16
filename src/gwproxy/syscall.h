@@ -35,6 +35,15 @@
  *     `rax`, `rcx`, `r11`, and `memory`. While libc function
  *     calls clobber `rax`, `rdi`, `rsi`, `rdx`, `r10`, `r8`,
  *     `r9`, `rcx`, `r11`, and `memory`.
+ *
+ * WARNING: do NOT pass the address of a `__thread` (thread-local) object as a
+ * buffer/pointer argument to these wrappers. Because gwproxy is built -fPIC,
+ * resolving a TLS address emits a hidden `call __tls_get_addr@PLT`; GCC (11-13
+ * at least) then drops the `register asm` operands that carry syscall args 4-6
+ * (r10/r8/r9), so e.g. recv() runs with a garbage `flags`. clang is fine; so is
+ * -O0 or a non-TLS buffer. Use a stack, heap, or plain global buffer instead.
+ * (This is why ev/epoll.c's TLS scratch buffers are on the stack, not __thread.)
+ * GCC bug: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=126290
  */
 #ifdef __x86_64__
 #define __do_syscall0(NUM) ({			\
