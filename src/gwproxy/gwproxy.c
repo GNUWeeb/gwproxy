@@ -11,6 +11,9 @@
 #ifdef CONFIG_IO_URING
 #include <gwproxy/ev/io_uring.h>
 #endif
+#ifdef CONFIG_HTTPS
+#include <gwproxy/ssl.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,11 +52,10 @@ static const struct option long_opts[] = {
 	{ "target",		required_argument,	NULL,	't' },
 	{ "as-socks5",		required_argument,	NULL,	'S' },
 	{ "as-http",		required_argument,	NULL,	'H' },
-	{ "socks5-prefer-ipv6",	required_argument,	NULL,	'Q' },
+	{ "prefer-ipv6",	required_argument,	NULL,	'Q' },
 	{ "protocol-timeout",	required_argument,	NULL,	'o' },
-	{ "socks5-auth-file",	required_argument,	NULL,	'A' },
 	{ "auth-file",		required_argument,	NULL,	'A' },
-	{ "socks5-dns-cache-secs",	required_argument,	NULL,	'L' },
+	{ "dns-cache-secs",	required_argument,	NULL,	'L' },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
 	{ "connect-timeout",	required_argument,	NULL,	'c' },
@@ -71,6 +73,10 @@ static const struct option long_opts[] = {
 	{ "upstream-socks5",	required_argument,	NULL,	'x' },
 	{ "mark",		required_argument,	NULL,	'M' },
 	{ "as-transparent",	required_argument,	NULL,	'R' },
+#ifdef CONFIG_HTTPS
+	{ "tls-cert",		required_argument,	NULL,	'E' },
+	{ "tls-key",		required_argument,	NULL,	'Y' },
+#endif
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	{ "dns-server",		required_argument,	NULL,	'j' },
 	{ "raw-dns",		required_argument,	NULL,	'r' },
@@ -84,11 +90,11 @@ static const struct gwp_cfg default_opts = {
 	.target			= NULL,
 	.as_socks5		= false,
 	.as_http		= false,
-	.socks5_prefer_ipv6	= false,
+	.prefer_ipv6		= false,
 	.use_raw_dns		= false,
 	.protocol_timeout	= 10,
 	.auth_file		= NULL,
-	.socks5_dns_cache_secs	= 0,
+	.dns_cache_secs		= 0,
 	.nr_workers		= 4,
 	.nr_dns_workers		= 4,
 	.connect_timeout	= 5,
@@ -121,11 +127,10 @@ static void show_help(const char *app)
 	printf("  -t, --target=addr_port          Target address to connect to\n");
 	printf("  -S, --as-socks5=0|1             Run as a SOCKS5 proxy (default: %d)\n", default_opts.as_socks5);
 	printf("  -H, --as-http=0|1               Run as an HTTP proxy (default: %d)\n", default_opts.as_http);
-	printf("  -Q, --socks5-prefer-ipv6=0|1    Prefer IPv6 for SOCKS5 DNS queries (default: %d)\n", default_opts.socks5_prefer_ipv6);
+	printf("  -Q, --prefer-ipv6=0|1           Prefer IPv6 for proxy DNS queries (default: %d)\n", default_opts.prefer_ipv6);
 	printf("  -o, --protocol-timeout=sec      Timeout for protocol handshake process (default: %d)\n", default_opts.protocol_timeout);
 	printf("  -A, --auth-file=file            File with username:password credentials for SOCKS5 and HTTP auth (default: no auth)\n");
-	printf("      --socks5-auth-file=file     Alias for --auth-file\n");
-	printf("  -L, --socks5-dns-cache-secs=sec SOCKS5 DNS cache duration in seconds (default: %d)\n", default_opts.socks5_dns_cache_secs);
+	printf("  -L, --dns-cache-secs=sec        Proxy DNS cache duration in seconds (default: %d)\n", default_opts.dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
 	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads for SOCKS5 (default: %d)\n", default_opts.nr_dns_workers);
@@ -146,6 +151,10 @@ static void show_help(const char *app)
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
 	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN; 0 = off)\n");
 	printf("  -R, --as-transparent=0|1        Transparent proxy: take the target from SO_ORIGINAL_DST (iptables REDIRECT) (default: %d)\n", default_opts.as_transparent);
+#ifdef CONFIG_HTTPS
+	printf("  -E, --tls-cert=file             PEM certificate chain; enables TLS termination on the listener (auto-detected per connection)\n");
+	printf("  -Y, --tls-key=file              PEM private key matching --tls-cert\n");
+#endif
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	printf("  -j, --dns-server=addr:port      DNS server address (default: system resolver)\n");
 	printf("  -r, --raw-dns=0|1               Use raw DNS for SOCKS5 (default: %d)\n", default_opts.use_raw_dns);
@@ -210,7 +219,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->as_http = !!atoi(optarg);
 			break;
 		case 'Q':
-			cfg->socks5_prefer_ipv6 = !!atoi(optarg);
+			cfg->prefer_ipv6 = !!atoi(optarg);
 			break;
 		case 'o':
 			cfg->protocol_timeout = atoi(optarg);
@@ -219,7 +228,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->auth_file = optarg;
 			break;
 		case 'L':
-			cfg->socks5_dns_cache_secs = atoi(optarg);
+			cfg->dns_cache_secs = atoi(optarg);
 			break;
 		case 'w':
 			cfg->nr_workers = atoi(optarg);
@@ -272,6 +281,14 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'R':
 			cfg->as_transparent = !!atoi(optarg);
 			break;
+#ifdef CONFIG_HTTPS
+		case 'E':
+			cfg->tls_cert = optarg;
+			break;
+		case 'Y':
+			cfg->tls_key = optarg;
+			break;
+#endif
 		case 'j':
 			cfg->dns_servers = optarg;
 			break;
@@ -291,10 +308,17 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		goto einval;
 	}
 
-	if (cfg->use_raw_dns && cfg->socks5_dns_cache_secs) {
-		fprintf(stderr, ERR_WRAP "Error: The -L/--socks5-dns-cache-secs option is not supported with the raw DNS feature\n" ERR_WRAP);
+	if (cfg->use_raw_dns && cfg->dns_cache_secs) {
+		fprintf(stderr, ERR_WRAP "Error: The -L/--dns-cache-secs option is not supported with the raw DNS feature\n" ERR_WRAP);
 		goto einval;
 	}
+
+#ifdef CONFIG_HTTPS
+	if ((cfg->tls_cert != NULL) != (cfg->tls_key != NULL)) {
+		fprintf(stderr, ERR_WRAP "Error: --tls-cert and --tls-key must be provided together\n" ERR_WRAP);
+		goto einval;
+	}
+#endif
 
 	if (cfg->as_transparent && (cfg->as_socks5 || cfg->as_http)) {
 		fprintf(stderr, ERR_WRAP "Error: --as-transparent cannot be combined with --as-socks5 or --as-http\n" ERR_WRAP);
@@ -442,7 +466,7 @@ static int gwp_raw_dns_resolve(struct gwp_wrk *w,
 		goto out_err;
 	}
 
-	gdp->restyp = w->ctx->cfg.socks5_prefer_ipv6 ?
+	gdp->restyp = w->ctx->cfg.prefer_ipv6 ?
 		GWP_DNS_RESTYP_PREFER_IPV6 :
 		GWP_DNS_RESTYP_PREFER_IPV4;
 
@@ -719,8 +743,26 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		if (gcp->timer_fd >= 0)
 			__sys_close(gcp->timer_fd);
 
-		if (gcp->s5_conn)
+		/*
+		 * s5_conn and http_conn share a union, so the protocol object
+		 * must be freed through the correct type; freeing an http_conn
+		 * as a SOCKS5 conn corrupts memory. Mirror gwp_free_conn_pair().
+		 */
+		switch (gcp->prot_type) {
+		case GWP_PROT_TYPE_SOCKS5:
 			gwp_socks5_conn_free(gcp->s5_conn);
+			break;
+		case GWP_PROT_TYPE_HTTP:
+			gwp_http_conn_free(gcp->http_conn);
+			break;
+		}
+
+#ifdef CONFIG_HTTPS
+		gwp_ssl_free(gcp->client.tls);
+#if defined(CONFIG_IO_URING)
+		free(gcp->tls_io);
+#endif
+#endif
 
 		free(gcp);
 	}
@@ -942,8 +984,8 @@ static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 {
 	struct gwp_cfg *cfg = &ctx->cfg;
 	const struct gwp_dns_cfg dns_cfg = {
-		.cache_expiry = cfg->socks5_dns_cache_secs,
-		.restyp = cfg->socks5_prefer_ipv6 ? GWP_DNS_RESTYP_PREFER_IPV6 : 0,
+		.cache_expiry = cfg->dns_cache_secs,
+		.restyp = cfg->prefer_ipv6 ? GWP_DNS_RESTYP_PREFER_IPV6 : 0,
 		.nr_workers = cfg->nr_dns_workers
 	};
 	int r;
@@ -1126,6 +1168,48 @@ int gwp_parse_upstream_socks5(const char *url, struct gwp_upstream_s5 *up)
 	return 0;
 }
 
+#ifdef CONFIG_HTTPS
+__cold
+static int gwp_ctx_init_tls(struct gwp_ctx *ctx)
+{
+	struct gwp_cfg *cfg = &ctx->cfg;
+	int r;
+
+	ctx->ssl_ctx = NULL;
+	if (!cfg->tls_cert)	/* validated: cert and key are both set or both unset */
+		return 0;
+
+	r = gwp_ssl_ctx_server_create(&ctx->ssl_ctx, cfg->tls_cert, cfg->tls_key);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to load TLS cert/key ('%s' / '%s'): %s",
+		       cfg->tls_cert, cfg->tls_key, gwp_ssl_errstr());
+		return r;
+	}
+
+	pr_info(&ctx->lh, "TLS termination enabled on the listener (cert=%s)",
+		cfg->tls_cert);
+	return 0;
+}
+
+__cold
+static void gwp_ctx_free_tls(struct gwp_ctx *ctx)
+{
+	gwp_ssl_ctx_free(ctx->ssl_ctx);
+	ctx->ssl_ctx = NULL;
+}
+#else /* !CONFIG_HTTPS */
+static int gwp_ctx_init_tls(struct gwp_ctx *ctx)
+{
+	ctx->ssl_ctx = NULL;
+	return 0;
+}
+
+static void gwp_ctx_free_tls(struct gwp_ctx *ctx)
+{
+	(void)ctx;
+}
+#endif /* CONFIG_HTTPS */
+
 __cold
 static int gwp_ctx_init(struct gwp_ctx *ctx)
 {
@@ -1192,9 +1276,13 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (ctx->cfg.pid_file)
 		gwp_ctx_init_pid_file(ctx);
 
-	r = gwp_ctx_init_prot(ctx);
+	r = gwp_ctx_init_tls(ctx);
 	if (r < 0)
 		goto out_free_log;
+
+	r = gwp_ctx_init_prot(ctx);
+	if (r < 0)
+		goto out_free_tls;
 
 	r = gwp_ctx_init_dns(ctx);
 	if (r < 0)
@@ -1212,6 +1300,8 @@ out_free_dns:
 	gwp_ctx_free_dns(ctx);
 out_free_prot:
 	gwp_ctx_free_prot(ctx);
+out_free_tls:
+	gwp_ctx_free_tls(ctx);
 out_free_log:
 	gwp_ctx_free_log(ctx);
 	return r;
@@ -1231,6 +1321,7 @@ static void gwp_ctx_free(struct gwp_ctx *ctx)
 	gwp_ctx_free_threads(ctx);
 	gwp_ctx_free_dns(ctx);
 	gwp_ctx_free_prot(ctx);
+	gwp_ctx_free_tls(ctx);
 	gwp_ctx_free_log(ctx);
 }
 
@@ -1411,6 +1502,13 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gwp_http_conn_free(gcp->http_conn);
 		break;
 	}
+
+#ifdef CONFIG_HTTPS
+	gwp_ssl_free(gcp->client.tls);
+#if defined(CONFIG_IO_URING)
+	free(gcp->tls_io);	/* flat buffer struct; NULL unless io_uring+TLS */
+#endif
+#endif
 
 	free(gcp);
 	shrink_conn_slot(w);

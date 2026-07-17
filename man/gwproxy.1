@@ -1,0 +1,519 @@
+.\" SPDX-License-Identifier: GPL-2.0-only
+.TH GWPROXY 1 "July 2026" "gwproxy" "User Commands"
+.SH NAME
+gwproxy \- fast multi-threaded TCP, SOCKS5, HTTP and HTTPS proxy for GNU/Linux
+.SH SYNOPSIS
+.B gwproxy
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B gwproxy
+(the GNU/Weeb Proxy) is a fast, multi-threaded TCP proxy for GNU/Linux. A
+single instance can act as any combination of:
+.IP \(bu 3
+a plain TCP\-to\-TCP forwarder to a fixed
+.BR \-\-target ;
+.IP \(bu 3
+a
+.B SOCKS5
+proxy (RFC 1928) with IPv4, IPv6 and domain\-name targets and optional
+username/password authentication (RFC 1929);
+.IP \(bu 3
+an
+.B HTTP
+proxy supporting both CONNECT tunnelling and forwarding of ordinary
+absolute\-form requests ("GET http://host/path"), with optional "Basic" proxy
+authentication (RFC 7617);
+.IP \(bu 3
+an
+.B HTTPS
+proxy that terminates the client's TLS on the listener (see
+.B TLS TERMINATION
+below), when built with OpenSSL support;
+.IP \(bu 3
+a
+.B transparent
+proxy that recovers each connection's original destination from
+.BR SO_ORIGINAL_DST .
+.PP
+SOCKS5 and HTTP can be enabled together on one listening port; the protocol is
+auto\-detected per connection from the client's first bytes, and both share a
+single credential store. When TLS termination is enabled, a TLS ClientHello is
+likewise auto\-detected, so plaintext and TLS clients coexist on the same port.
+.PP
+gwproxy runs a configurable number of worker threads that each accept
+connections through
+.B SO_REUSEPORT
+and drive I/O with either the
+.B epoll
+(default) or
+.B io_uring
+event loop. It recovers gracefully from file\-descriptor exhaustion
+(EMFILE/ENFILE), caches DNS answers for hostname targets, and can mark its own
+outgoing connections with
+.BR SO_MARK .
+.SH OPTIONS
+Every boolean option takes an explicit
+.B 0
+or
+.B 1
+argument. Long options and their single\-letter equivalents are interchangeable.
+.SS General
+.TP
+.BR \-h ", " \-\-help
+Show a usage summary and exit.
+.TP
+.BR \-e ", " \-\-event\-loop=\fIname\fR
+Event loop to use:
+.B epoll
+or
+.BR io_uring .
+The
+.B io_uring
+loop is only available when gwproxy was built with io_uring support (see
+.BR "AVAILABILITY" ).
+Default:
+.BR epoll .
+.TP
+.BR \-b ", " \-\-bind=\fIaddr:port\fR
+Address and port to listen on. IPv6 literals are written in brackets, e.g.
+.BR [::1]:1080 " or " 0.0.0.0:8080 .
+The default,
+.BR [::]:1080 ,
+listens on the dual\-stack IPv4/IPv6 wildcard.
+.TP
+.BR \-t ", " \-\-target=\fIaddr:port\fR
+For plain TCP forwarding, the fixed destination every accepted connection is
+proxied to. Ignored in SOCKS5/HTTP/transparent modes, where the destination
+comes from the protocol or the socket.
+.TP
+.BR \-w ", " \-\-nr\-workers=\fInr\fR
+Number of worker threads, each with its own
+.B SO_REUSEPORT
+listener. Default:
+.BR 4 .
+.TP
+.BR \-o ", " \-\-protocol\-timeout=\fIsec\fR
+Seconds allowed for a client to complete the SOCKS5/HTTP (and, if enabled, TLS)
+handshake before the connection is dropped. Default:
+.BR 10 .
+.TP
+.BR \-c ", " \-\-connect\-timeout=\fIsec\fR
+Seconds allowed to establish the connection to the target (or upstream proxy)
+before giving up. Default:
+.BR 5 .
+.TP
+.BR \-p ", " \-\-pid\-file=\fIfile\fR
+Write the process ID to
+.IR file .
+Not written by default.
+.SS Proxy mode selection
+.TP
+.BR \-S ", " \-\-as\-socks5=\fI0|1\fR
+Run as a SOCKS5 proxy. Default:
+.BR 0 .
+.TP
+.BR \-H ", " \-\-as\-http=\fI0|1\fR
+Run as an HTTP proxy (CONNECT and forwarding). Default:
+.BR 0 .
+.TP
+.BR \-R ", " \-\-as\-transparent=\fI0|1\fR
+Run as a transparent proxy, taking the target from
+.B SO_ORIGINAL_DST
+(see
+.BR "TRANSPARENT PROXY" ).
+Cannot be combined with
+.B \-\-as\-socks5
+or
+.BR \-\-as\-http .
+Default:
+.BR 0 .
+.PP
+.RS
+If none of the above is set and
+.B \-\-target
+is given, gwproxy is a plain TCP forwarder.
+.B \-\-as\-socks5
+and
+.B \-\-as\-http
+may be set together to serve both protocols on one port.
+.RE
+.SS Authentication
+.TP
+.BR \-A ", " \-\-auth\-file=\fIfile\fR
+File of
+.B username:password
+credentials, one per line, shared by SOCKS5 (RFC 1929) and HTTP "Basic" (RFC
+7617) authentication. When set, clients of either protocol must present valid
+credentials. The file is watched and hot\-reloaded on change. Without it, no
+authentication is required (see
+.BR "AUTHENTICATION" ).
+.SS TLS termination (HTTPS proxy)
+These options require a build with OpenSSL support (see
+.BR "AVAILABILITY" ).
+.TP
+.BR \-E ", " \-\-tls\-cert=\fIfile\fR
+PEM certificate chain presented to TLS clients. Providing it (together with
+.BR \-\-tls\-key )
+enables TLS termination on the listener.
+.TP
+.BR \-Y ", " \-\-tls\-key=\fIfile\fR
+PEM private key matching
+.BR \-\-tls\-cert .
+Both must be given together.
+.SS DNS resolution
+.TP
+.BR \-Q ", " \-\-prefer\-ipv6=\fI0|1\fR
+Prefer IPv6 addresses when resolving proxy hostname targets. Default:
+.BR 0 .
+.TP
+.BR \-L ", " \-\-dns\-cache\-secs=\fIsec\fR
+Cache proxy DNS answers for this many seconds.
+.B 0
+or negative disables caching. Default:
+.BR 0 .
+.TP
+.BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
+Number of DNS resolver worker threads. Default:
+.BR 4 .
+.TP
+.BR \-j ", " \-\-dns\-server=\fIaddr:port\fR
+Upstream DNS server for the built\-in raw resolver (see
+.BR \-\-raw\-dns ).
+Requires a build with the new DNS resolver. Default:
+.BR 1.1.1.1 .
+.TP
+.BR \-r ", " \-\-raw\-dns=\fI0|1\fR
+Use the built\-in raw DNS resolver for SOCKS5/HTTP hostname targets instead of
+the system resolver. Requires a build with the new DNS resolver. Default:
+.BR 0 .
+.SS Upstream proxy chaining
+.TP
+.BR \-x ", " \-\-upstream\-socks5=\fIurl\fR
+Route every outgoing connection through a next\-hop SOCKS5 proxy. The URL form
+is
+.BR socks5://[user:pass@]host:port ,
+which resolves target hostnames locally, or
+.BR socks5h://[user:pass@]host:port ,
+which asks the upstream proxy to resolve them. Optional
+.B user:pass
+supplies username/password authentication to the upstream.
+.SS Networking
+.TP
+.BR \-M ", " \-\-mark=\fInr\fR
+Set
+.B SO_MARK
+(fwmark) on outgoing connections, for policy routing and iptables matching.
+Requires
+.BR CAP_NET_ADMIN .
+.B 0
+disables it. Default:
+.BR 0 .
+.TP
+.BR \-T ", " \-\-target\-buf\-size=\fInr\fR
+Size in bytes of the per\-connection buffer for target\(->client data. Default:
+.BR 2048 .
+.TP
+.BR \-C ", " \-\-client\-buf\-size=\fInr\fR
+Size in bytes of the per\-connection buffer for client\(->target data. Default:
+.BR 2048 .
+.TP
+.BR \-d ", " \-\-tcp\-nodelay=\fI0|1\fR
+Enable
+.B TCP_NODELAY
+on connections. Default:
+.BR 1 .
+.TP
+.BR \-K ", " \-\-tcp\-quickack=\fI0|1\fR
+Enable
+.B TCP_QUICKACK
+on connections. Default:
+.BR 1 .
+.TP
+.BR \-k ", " \-\-tcp\-keepalive=\fI0|1\fR
+Enable
+.B TCP
+keepalive on connections. Default:
+.BR 1 .
+.TP
+.BR \-i ", " \-\-tcp\-keepidle=\fIsec\fR
+.B TCP_KEEPIDLE
+in seconds. Default:
+.BR 60 .
+.TP
+.BR \-l ", " \-\-tcp\-keepintvl=\fIsec\fR
+.B TCP_KEEPINTVL
+in seconds. Default:
+.BR 10 .
+.TP
+.BR \-g ", " \-\-tcp\-keepcnt=\fInr\fR
+.B TCP_KEEPCNT
+probe count. Default:
+.BR 5 .
+.SS Logging
+.TP
+.BR \-m ", " \-\-log\-level=\fIlevel\fR
+Verbosity:
+.B 0
+none,
+.B 1
+error,
+.B 2
+warning,
+.B 3
+info,
+.B 4
+debug. Default:
+.BR 3 .
+.TP
+.BR \-f ", " \-\-log\-file=\fIfile\fR
+Write logs to
+.IR file .
+Default:
+.BR /dev/stdout .
+.SH PROXY MODES
+.SS Plain TCP forwarding
+With no proxy mode selected and
+.B \-\-target
+set, every accepted connection is spliced to the fixed target address. This is
+a straight byte forwarder with no protocol handling.
+.SS SOCKS5
+.RB ( \-\-as\-socks5=1 )
+Implements the SOCKS5 CONNECT command (RFC 1928) for IPv4, IPv6 and
+domain\-name (ATYP) targets. With
+.B \-\-auth\-file
+set, the username/password method (RFC 1929) is required; otherwise the
+no\-authentication method is offered.
+.SS HTTP
+.RB ( \-\-as\-http=1 )
+Handles two request styles on the same port:
+.IP \(bu 3
+.B CONNECT
+requests, tunnelling arbitrary TCP (typically end\-to\-end TLS) to the named
+host and port;
+.IP \(bu 3
+.B forwarding
+of ordinary absolute\-form requests such as "GET http://host/path", which
+gwproxy rewrites to origin form, fetches from the origin and relays back, one
+request per connection.
+.PP
+With
+.B \-\-auth\-file
+set, "Basic" proxy authentication (RFC 7617) is required and a missing or wrong
+credential is answered with "407 Proxy Authentication Required".
+.SS Combined SOCKS5 + HTTP
+Setting both
+.B \-\-as\-socks5=1
+and
+.B \-\-as\-http=1
+serves both protocols on the same listening port. The protocol is detected from
+the client's first bytes, and both share the same credential store.
+.SH TLS TERMINATION
+When built with OpenSSL and started with
+.B \-\-tls\-cert
+and
+.BR \-\-tls\-key ,
+gwproxy can terminate a client's TLS session on its own listener (an "HTTPS
+proxy"), then run the ordinary SOCKS5/HTTP logic on the decrypted stream. This
+encrypts the client\(->proxy hop, protecting proxy credentials and, for cleartext
+.B http://
+targets, the request and URL.
+.PP
+TLS is applied per connection by auto\-detecting the first byte: a value of
+.B 0x16
+(a TLS ClientHello) starts a handshake, while SOCKS5, SOCKS4 and HTTP first
+bytes do not, so
+.B plaintext SOCKS5/HTTP clients keep working unchanged on the same port.
+gwproxy advertises only the "http/1.1" ALPN protocol, cleanly downgrading an
+HTTP/2\-preferring client. The OpenSSL engine is driven entirely through memory
+BIOs and never touches the socket directly. TLS termination works on both the
+epoll and io_uring event loops.
+.PP
+This is distinct from an HTTP
+.B CONNECT
+tunnel to an
+.B https://
+origin, which gwproxy blind\-tunnels end\-to\-end without terminating TLS, and
+which needs no certificate.
+.SH AUTHENTICATION
+The credential file named by
+.B \-\-auth\-file
+holds one
+.B username:password
+entry per line. The same store backs SOCKS5 (RFC 1929) and HTTP "Basic" (RFC
+7617) authentication; whenever it is configured, clients of either protocol
+must authenticate. gwproxy watches the file and reloads it automatically when it
+changes, so credentials can be updated without a restart.
+.SH TRANSPARENT PROXY
+.RB ( \-\-as\-transparent=1 )
+Transparent mode takes each connection's original destination from the
+.B SO_ORIGINAL_DST
+socket option, so it must sit behind an iptables
+.B REDIRECT
+rule. To avoid a redirect loop, gwproxy's own outgoing connections can be marked
+(with
+.BR \-\-mark )
+and excluded from the REDIRECT:
+.PP
+.RS 4
+.EX
+gwproxy \-\-bind=127.0.0.1:1080 \-\-as\-transparent=1 \-\-mark=1
+iptables \-t nat \-A OUTPUT \-p tcp \-\-dport 80 \-m mark ! \-\-mark 1 \\
+    \-j REDIRECT \-\-to\-ports 1080
+.EE
+.RE
+.PP
+.B \-\-mark
+requires
+.BR CAP_NET_ADMIN ,
+and installing the iptables rules requires the corresponding privileges;
+both typically need root.
+.SH UPSTREAM CHAINING
+With
+.BR \-\-upstream\-socks5 ,
+every outgoing connection is made through a next\-hop SOCKS5 proxy rather than
+directly. The
+.B socks5://
+scheme resolves target hostnames locally before connecting, while
+.B socks5h://
+defers name resolution to the upstream proxy. Credentials embedded in the URL
+authenticate to the upstream.
+.SH EVENT LOOPS
+Each worker uses one event loop, selected with
+.BR \-\-event\-loop .
+.B epoll
+is always available and is the default.
+.B io_uring
+is available only in builds configured with io_uring support and is selected at
+run time. All proxy features, including TLS termination, work on both loops.
+.SH SIGNALS
+.TP
+.BR SIGINT ", " SIGTERM
+Begin a graceful shutdown: stop accepting new connections, let workers drain,
+and exit.
+.TP
+.B SIGPIPE
+Ignored, so a peer closing a connection cannot terminate the process.
+.SH EXIT STATUS
+.B gwproxy
+exits
+.B 0
+on a clean shutdown and non\-zero if the configuration is invalid or a fatal
+runtime error occurs.
+.SH FILES
+.TP
+.I auth\-file
+Line\-oriented
+.B username:password
+credential store (see
+.BR \-\-auth\-file ).
+.TP
+.I pid\-file
+Process\-ID file written when
+.B \-\-pid\-file
+is given.
+.SH EXAMPLES
+Plain TCP forwarder,
+.BR [::]:8080 " \(-> " 127.0.0.1:80 :
+.RS 4
+.EX
+gwproxy \-\-bind='[::]:8080' \-\-target=127.0.0.1:80
+.EE
+.RE
+.PP
+SOCKS5 proxy with username/password authentication:
+.RS 4
+.EX
+gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \-\-auth\-file=auth.txt
+.EE
+.RE
+.PP
+HTTP proxy (CONNECT and forwarding) on port 8080:
+.RS 4
+.EX
+gwproxy \-\-bind='[::]:8080' \-\-as\-http=1
+.EE
+.RE
+.PP
+SOCKS5 and HTTP on the same port, sharing one credential file:
+.RS 4
+.EX
+gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \-\-as\-http=1 \-\-auth\-file=auth.txt
+.EE
+.RE
+.PP
+HTTPS proxy terminating client TLS (plaintext clients still work on the same
+port):
+.RS 4
+.EX
+gwproxy \-\-bind='[::]:8080' \-\-as\-http=1 \-\-as\-socks5=1 \\
+    \-\-tls\-cert=cert.pem \-\-tls\-key=key.pem
+curl \-x https://127.0.0.1:8080 http://example.com/
+.EE
+.RE
+.PP
+Chain every outgoing connection through an upstream SOCKS5 proxy:
+.RS 4
+.EX
+gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \\
+    \-\-upstream\-socks5=socks5h://user:pass@1.2.3.4:1080
+.EE
+.RE
+.PP
+Use the io_uring event loop and set SO_MARK 100 on outgoing packets:
+.RS 4
+.EX
+gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \-\-event\-loop=io_uring \-\-mark=100
+.EE
+.RE
+.SH AVAILABILITY
+Some features are enabled at build time by
+.BR ./configure :
+.IP \(bu 3
+.B \-\-use\-io\-uring
+builds the io_uring event loop, then selectable with
+.BR \-\-event\-loop=io_uring .
+.IP \(bu 3
+.B \-\-use\-openssl
+builds TLS termination; without it the
+.B \-\-tls\-cert
+and
+.B \-\-tls\-key
+options are absent.
+.IP \(bu 3
+.B \-\-use\-new\-dns\-resolver
+builds the raw DNS resolver, enabling
+.B \-\-raw\-dns
+and
+.BR \-\-dns\-server .
+.PP
+Options for features not compiled in are rejected. Run
+.B ./configure \-\-help
+for the full list.
+.SH NOTES
+.B \-\-mark
+requires
+.BR CAP_NET_ADMIN .
+Transparent mode requires iptables REDIRECT rules, which typically need root.
+Binding to a privileged port (< 1024) requires
+.B CAP_NET_BIND_SERVICE
+or root.
+.SH SEE ALSO
+.BR curl (1),
+.BR iptables (8),
+.BR io_uring (7),
+.BR tcp (7),
+.BR socket (7),
+.BR capabilities (7)
+.PP
+Project home:
+.UR https://github.com/GNUWeeb/gwproxy
+.UE
+.SH REPORTING BUGS
+Send patches and bug reports to the GNU/Weeb Mailing List
+<gwml@vger.gnuweeb.org>.
+.SH AUTHORS
+gwproxy is maintained by Ammar Faizi <ammarfaizi2@gnuweeb.org>.
+.SH COPYRIGHT
+Copyright (C) 2025 Ammar Faizi <ammarfaizi2@gnuweeb.org>
+.PP
+This program is licensed under GPL\-2.0\-only.

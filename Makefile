@@ -104,6 +104,15 @@ GWPROXY_CC_SOURCES += \
 	$(GWPROXY_DIR)/dns_resolver.c
 endif
 
+ifeq ($(CONFIG_HTTPS),y)
+GWPROXY_CC_SOURCES += $(GWPROXY_DIR)/ssl.c
+SSL_TEST_TARGET = $(GWPROXY_DIR)/tests/ssl.t
+SSL_TEST_OBJECTS = $(GWPROXY_DIR)/tests/ssl.c.o
+ALL_TEST_TARGETS += $(SSL_TEST_TARGET)
+ALL_OBJECTS += $(SSL_TEST_OBJECTS)
+RUN_SSL_TEST = @echo "Testing ssl..."; $(IE) ./$(SSL_TEST_TARGET);
+endif
+
 ifeq ($(CONFIG_IO_URING),y)
 	GWPROXY_CC_SOURCES += $(GWPROXY_DIR)/ev/io_uring.c
 	ALL_GWPROXY_OBJECTS += $(LIBURING_TARGET)
@@ -147,6 +156,11 @@ $(LIBGWHTTP1_TEST_TARGET): $(GWPROXY_DIR)/http1.c $(GWPROXY_DIR)/http1.h $(GWPRO
 $(LIBGWHTTP_TEST_TARGET): $(LIBGWHTTP_OBJECTS) $(LIBGWHTTP_TEST_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+ifeq ($(CONFIG_HTTPS),y)
+$(SSL_TEST_TARGET): $(GWPROXY_DIR)/ssl.c.o $(SSL_TEST_OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+endif
+
 %.c.o: %.c $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
@@ -164,7 +178,7 @@ IE=LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):$(shell pwd)
 test: test-unit test-integration
 	@echo "All tests completed successfully.";
 
-test-unit: $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET) $(LIBGWHTTP1_TEST_TARGET) $(LIBGWHTTP_TEST_TARGET)
+test-unit: $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET) $(LIBGWHTTP1_TEST_TARGET) $(LIBGWHTTP_TEST_TARGET) $(SSL_TEST_TARGET)
 	@echo "Running unit tests...";
 	@echo "Testing libgwdns...";
 	@$(IE) ./$(LIBGWDNS_TEST_TARGET);
@@ -174,6 +188,7 @@ test-unit: $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET) $(LIBGWHTTP1_TEST
 	@$(IE) ./$(LIBGWHTTP1_TEST_TARGET);
 	@echo "Testing http...";
 	@$(IE) ./$(LIBGWHTTP_TEST_TARGET);
+	$(RUN_SSL_TEST)
 	@echo "Unit tests completed.";
 
 test-integration: $(GWPROXY_TARGET)

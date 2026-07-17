@@ -26,17 +26,26 @@
 
 #include <gwproxy/http1.h>
 
+/*
+ * Forward declarations for the optional TLS module (src/gwproxy/ssl.c, built
+ * only under CONFIG_HTTPS). The pointers below are always present but stay NULL
+ * and unused unless TLS is compiled in and configured.
+ */
+struct gwp_ssl_ctx;
+struct gwp_ssl;
+struct gwp_iou_tls;
+
 struct gwp_cfg {
 	const char	*event_loop;
 	const char	*bind;
 	const char	*target;
 	bool		as_socks5;
 	bool		as_http;
-	bool		socks5_prefer_ipv6;
+	bool		prefer_ipv6;
 	bool		use_raw_dns;
 	int		protocol_timeout;
 	const char	*auth_file;
-	int		socks5_dns_cache_secs;
+	int		dns_cache_secs;
 	int		nr_workers;
 	int		nr_dns_workers;
 	int		connect_timeout;
@@ -55,6 +64,8 @@ struct gwp_cfg {
 	const char	*upstream_socks5;
 	int		mark;
 	bool		as_transparent;
+	const char	*tls_cert;
+	const char	*tls_key;
 };
 
 struct gwp_ctx;
@@ -123,6 +134,9 @@ enum {
 	EV_BIT_IOU_CLIENT_CANCEL	= (14ull << 48ull),
 	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
 	EV_BIT_IOU_MSG_RING		= (16ull << 48ull),
+	EV_BIT_IOU_TLS_DETECT		= (17ull << 48ull),
+	EV_BIT_IOU_TLS_HS_RECV		= (18ull << 48ull),
+	EV_BIT_IOU_TLS_HS_SEND		= (19ull << 48ull),
 	EV_BIT_IOU_UPSTREAM_S5		= (20ull << 48ull),
 	EV_BIT_IOU_ACCEPT_RETRY		= (21ull << 48ull),
 #endif
@@ -165,6 +179,18 @@ enum {
 	 *    - HTTP
 	 */
 	CONN_STATE_PROT			= 500,
+
+	/*
+	 * HTTPS proxy: the listener may speak TLS. TLS_DETECT peeks the first
+	 * byte to tell a TLS ClientHello (0x16) from a plaintext SOCKS5/HTTP
+	 * client; TLS_HANDSHAKE runs the server-side handshake. Both are
+	 * serviced under EV_BIT_CLIENT_PROT (EPOLLIN and EPOLLOUT). On success
+	 * the connection continues at CONN_STATE_PROT on the decrypted stream.
+	 */
+	CONN_STATE_TLS_MIN		= 600,
+	CONN_STATE_TLS_DETECT		= 601,
+	CONN_STATE_TLS_HANDSHAKE	= 602,
+	CONN_STATE_TLS_MAX		= 699,
 };
 
 struct gwp_conn {
@@ -184,6 +210,15 @@ struct gwp_conn {
 	 */
 	bool		rd_eof;
 	bool		wr_shut;
+
+	/*
+	 * TLS state for this endpoint (HTTPS proxy). NULL for a plaintext
+	 * endpoint; only the client side is ever TLS in this cut. Once set and
+	 * the handshake has completed, __do_recv()/__do_send() transparently
+	 * decrypt/encrypt through it. Owned here and released in
+	 * gwp_free_conn_pair().
+	 */
+	struct gwp_ssl	*tls;
 };
 
 enum {
@@ -212,6 +247,15 @@ struct gwp_conn_pair {
 #ifdef CONFIG_IO_URING
 	int				ref_cnt;
 	struct __kernel_timespec	ts;
+#ifdef CONFIG_HTTPS
+	/*
+	 * Persistent ciphertext scratch for the client's TLS on the io_uring
+	 * loop. Unlike epoll (synchronous stack scratch), an async recv/send
+	 * needs the wire buffers to outlive the operation. Allocated when a TLS
+	 * handshake starts, freed in gwp_free_conn_pair().
+	 */
+	struct gwp_iou_tls		*tls_io;
+#endif
 #endif
 
 	uint64_t		flags;
@@ -317,6 +361,7 @@ struct gwp_ctx {
 	struct gwp_sockaddr		target_addr;
 	struct gwp_socks5_ctx		*socks5;
 	struct gwp_auth			*auth;
+	struct gwp_ssl_ctx		*ssl_ctx;
 	struct gwp_dns_ctx		*dns;
 	struct gwp_upstream_s5		upstream;
 	struct gwp_cfg			cfg;
