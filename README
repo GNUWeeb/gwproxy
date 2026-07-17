@@ -28,9 +28,10 @@ Features
   - Transparent proxy: recover each connection's original destination from
     the SO_ORIGINAL_DST socket option, for use behind an iptables REDIRECT
     rule.
-  - Upstream SOCKS5 chaining: route every outgoing connection through a
-    next-hop SOCKS5 proxy, with local (socks5://) or remote (socks5h://)
-    name resolution and optional username/password auth.
+  - Upstream proxy chaining: route every outgoing connection through a
+    next-hop SOCKS5 proxy (socks5:// local or socks5h:// remote name
+    resolution) or HTTP CONNECT proxy (http://), with optional
+    username/password auth.
   - SO_MARK (fwmark) on outgoing connections, for policy routing / iptables
     matching.
   - Two event loops: epoll (default) and io_uring (optional, enabled at
@@ -102,7 +103,7 @@ Run './gwproxy --help' for the complete list of options. A few examples:
 
   # Chain every outgoing connection through an upstream SOCKS5 proxy
   ./gwproxy --bind='[::]:1080' --as-socks5=1 \
-      --upstream-socks5=socks5h://user:pass@1.2.3.4:1080
+      --upstream-proxy=socks5h://user:pass@1.2.3.4:1080
 
   # Use the io_uring event loop, and set SO_MARK 100 on outgoing packets
   ./gwproxy --bind='[::]:1080' --as-socks5=1 --event-loop=io_uring --mark=100

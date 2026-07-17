@@ -4,7 +4,7 @@
 # Upstream SOCKS5 chaining with authentication: a front SOCKS5 proxy routes
 # every outgoing connection through an upstream SOCKS5 proxy that enforces
 # RFC1929 username/password auth. The front carries the upstream credentials
-# embedded in its --upstream-socks5 URL. Verify that (a) a front presenting the
+# embedded in its --upstream-proxy URL. Verify that (a) a front presenting the
 # CORRECT upstream credentials relays a payload through the chain byte-exact,
 # and (b) a front presenting the WRONG upstream password cannot complete the
 # fetch. The client speaks plain (unauthenticated) SOCKS5 to the front; only
@@ -14,7 +14,7 @@
 require curl
 require python3
 require cmp
-require_opt "--upstream-socks5"
+require_opt "--upstream-proxy"
 
 hp="$(pick_port)"
 up="$(pick_port)"
@@ -30,7 +30,7 @@ gwp_start "[::1]:$up" --as-socks5=1 --auth-file="$WORK/auth" \
 # succeeds and the bytes survive the whole chain intact.
 fp="$(pick_port)"
 gwp_start "[::1]:$fp" --as-socks5=1 --event-loop=epoll --nr-workers=2 \
-	--upstream-socks5="socks5://up:pw@[::1]:$up"
+	--upstream-proxy="socks5://up:pw@[::1]:$up"
 curl -s --max-time 20 --proxy "socks5h://[::1]:$fp" \
 	"http://127.0.0.1:$hp/payload.bin" -o "$WORK/ok.bin" \
 	|| fail "curl through authenticated SOCKS5 chain failed"
@@ -43,7 +43,7 @@ kill "$GWP_PID" 2>/dev/null
 # payload.
 fp="$(pick_port)"
 gwp_start "[::1]:$fp" --as-socks5=1 --event-loop=epoll --nr-workers=2 \
-	--upstream-socks5="socks5://up:bad@[::1]:$up"
+	--upstream-proxy="socks5://up:bad@[::1]:$up"
 rm -f "$WORK/bad.bin"
 if curl -s --max-time 20 --proxy "socks5h://[::1]:$fp" \
 	"http://127.0.0.1:$hp/payload.bin" -o "$WORK/bad.bin"; then
