@@ -846,8 +846,10 @@ static int upstream_s5_complete(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (unlikely(r))
 			return r;
 	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		memcpy(rbuf, "HTTP/1.1 200 OK\r\n\r\n", 19);
-		rlen = 19;
+		r = gwp_http_build_connect_reply(gcp->http_conn, rbuf, sizeof(rbuf));
+		if (unlikely(r < 0))
+			return r;
+		rlen = (size_t)r;
 	}
 
 	/* Drop the proxy's CONNECT reply, keep any early destination data. */
@@ -1064,10 +1066,17 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 		if (r)
 			return r;
 	} else if (gcp->conn_state == CONN_STATE_HTTP_CONNECT) {
-		if (gcp->target.cap < 19)
-			return -ENOBUFS;
-		memcpy(gcp->target.buf, "HTTP/1.1 200 OK\r\n\r\n", 19);
-		gcp->target.len = 19;
+		/*
+		 * "200 OK" for a CONNECT tunnel, nothing for a forwarding
+		 * request -- whose rewritten origin-form request is already
+		 * queued in client.buf and flushed to the origin below, with the
+		 * origin's response relayed back.
+		 */
+		r = gwp_http_build_connect_reply(gcp->http_conn, gcp->target.buf,
+						 gcp->target.cap);
+		if (r < 0)
+			return r;
+		gcp->target.len = (uint32_t)r;
 	}
 
 	gcp->is_target_alive = true;
@@ -1386,13 +1395,12 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return r;
 }
 
-static int handle_ev_socks5_auth_file(struct gwp_wrk *w)
+static int handle_ev_auth_file(struct gwp_wrk *w)
 {
 	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
 	ssize_t r;
 
-	assert(w->ctx->cfg.as_socks5);
-	assert(w->ctx->socks5);
+	assert(w->ctx->auth);
 
 	r = __sys_read(w->ctx->ino_fd, w->ctx->ino_buf, l);
 	if (unlikely(r < 0)) {
@@ -1403,8 +1411,8 @@ static int handle_ev_socks5_auth_file(struct gwp_wrk *w)
 		return (int)r;
 	}
 
-	gwp_socks5_auth_reload(w->ctx->socks5);
-	pr_info(&w->ctx->lh, "Reloaded SOCKS5 authentication file");
+	gwp_auth_reload(w->ctx->auth);
+	pr_info(&w->ctx->lh, "Reloaded authentication file");
 	return 0;
 }
 
@@ -1595,7 +1603,7 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		r = handle_ev_dns_query(w, udata);
 		break;
 	case EV_BIT_SOCKS5_AUTH_FILE:
-		r = handle_ev_socks5_auth_file(w);
+		r = handle_ev_auth_file(w);
 		break;
 	case EV_BIT_RAW_DNS_QUERY:
 		r = handle_ev_raw_dns_query(w);

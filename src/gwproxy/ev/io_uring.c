@@ -435,11 +435,24 @@ static int do_prep_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * handle_ev_target_connect().
 	 */
 	if (!ctx->upstream.enabled) {
-		s->flags |= IOSQE_IO_LINK;
-		prep_recv_client(w, gcp);
+		bool http_fwd = (gcp->prot_type == GWP_PROT_TYPE_HTTP &&
+				 gcp->http_conn &&
+				 gwp_http_conn_is_forward(gcp->http_conn));
 
 		/*
-		 * In SOCKS5/HTTP mode a connect reply (SOCKS5 reply or
+		 * A forwarding-proxy request queues its rewritten request in
+		 * client.buf; that is sent to the origin from
+		 * handle_ev_target_connect() after connect, and only then is the
+		 * client recv armed (for the request body). Arming it here would
+		 * race with that send on client.buf.
+		 */
+		if (!http_fwd) {
+			s->flags |= IOSQE_IO_LINK;
+			prep_recv_client(w, gcp);
+		}
+
+		/*
+		 * In SOCKS5/HTTP CONNECT mode a connect reply (SOCKS5 reply or
 		 * "HTTP/1.1 200 OK") is written into target.buf after connect
 		 * completes; arming the target recv here would race with it and
 		 * splice stale reply bytes into the forwarded stream. Defer it
@@ -688,8 +701,10 @@ static int upstream_iou_complete(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (unlikely(r))
 			return r;
 	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		memcpy(rbuf, "HTTP/1.1 200 OK\r\n\r\n", 19);
-		rlen = 19;
+		r = gwp_http_build_connect_reply(gcp->http_conn, rbuf, sizeof(rbuf));
+		if (unlikely(r < 0))
+			return r;
+		rlen = (size_t)r;
 	}
 
 	/* Drop the proxy's CONNECT reply, keep any early destination data. */
@@ -874,13 +889,24 @@ static int handle_ev_target_connect(struct gwp_wrk *w, void *udata, int res)
 		if (r)
 			return r;
 	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		static const char ok[] = "HTTP/1.1 200 OK\r\n\r\n";
-		size_t oklen = sizeof(ok) - 1;
+		if (gwp_http_conn_is_forward(gcp->http_conn)) {
+			/*
+			 * Forwarding proxy: no reply to the client. Send the
+			 * rewritten request (queued in client.buf) to the origin
+			 * and read the response; handle_ev_target_send() arms the
+			 * client recv for any request body once it is drained.
+			 */
+			gcp->conn_state = CONN_STATE_FORWARDING;
+			prep_send_target(w, gcp);
+			prep_recv_target(w, gcp);
+			return 0;
+		}
 
-		if (gcp->target.cap < oklen)
-			return -ENOBUFS;
-		memcpy(gcp->target.buf, ok, oklen);
-		gcp->target.len = (uint32_t)oklen;
+		r = gwp_http_build_connect_reply(gcp->http_conn, gcp->target.buf,
+						 gcp->target.cap);
+		if (r < 0)
+			return r;
+		gcp->target.len = (uint32_t)r;
 	}
 
 	if (gcp->prot_type != GWP_PROT_TYPE_NONE) {
@@ -1180,25 +1206,25 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 	return handle_prot_connect_target(w, gcp);
 }
 
-static void prep_socks5_auth_reload(struct gwp_wrk *w)
+static void prep_auth_reload(struct gwp_wrk *w)
 {
 	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
 	struct gwp_ctx *ctx = w->ctx;
 	struct io_uring_sqe *s;
 
-	assert(ctx->socks5);
+	assert(ctx->auth);
 	s = get_sqe_nofail(w);
 	io_uring_prep_read(s, ctx->ino_fd, ctx->ino_buf, l, 0);
 	s->user_data = EV_BIT_IOU_SOCKS5_AUTH_FILE;
 }
 
-static int handle_ev_socks5_auth_file(struct gwp_wrk *w)
+static int handle_ev_auth_file(struct gwp_wrk *w)
 {
 	struct gwp_ctx *ctx = w->ctx;
 
-	prep_socks5_auth_reload(w);
-	gwp_socks5_auth_reload(ctx->socks5);
-	pr_info(&ctx->lh, "Reloaded SOCKS5 authentication file");
+	prep_auth_reload(w);
+	gwp_auth_reload(ctx->auth);
+	pr_info(&ctx->lh, "Reloaded authentication file");
 	return 0;
 }
 
@@ -1257,7 +1283,7 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		break;
 	case EV_BIT_IOU_SOCKS5_AUTH_FILE:
 		pr_dbg(&ctx->lh, "Handling SOCKS5 auth file reload event: %d", cqe->res);
-		return handle_ev_socks5_auth_file(w);
+		return handle_ev_auth_file(w);
 	case EV_BIT_IOU_TARGET_CANCEL:
 		gcp = udata;
 		pr_dbg(&ctx->lh, "Handling target cancel event: %d", cqe->res);
@@ -1353,8 +1379,8 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 
 	pr_info(&ctx->lh, "Worker %u started (io_uring)", w->idx);
 
-	if (w->idx == 0 && ctx->cfg.as_socks5 && ctx->ino_fd >= 0)
-		prep_socks5_auth_reload(w);
+	if (w->idx == 0 && ctx->ino_fd >= 0)
+		prep_auth_reload(w);
 
 	io_uring_set_iowait(&w->iou->ring, false);
 	arm_accept(w);

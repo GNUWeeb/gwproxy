@@ -11,6 +11,8 @@
 
 #include <gwproxy/syscall.h>
 #include <gwproxy/socks5.h>
+#include <gwproxy/auth.h>
+#include <gwproxy/http.h>
 #include <gwproxy/dns.h>
 #include <gwproxy/log.h>
 #include <assert.h>
@@ -33,7 +35,7 @@ struct gwp_cfg {
 	bool		socks5_prefer_ipv6;
 	bool		use_raw_dns;
 	int		protocol_timeout;
-	const char	*socks5_auth_file;
+	const char	*auth_file;
 	int		socks5_dns_cache_secs;
 	int		nr_workers;
 	int		nr_dns_workers;
@@ -199,11 +201,6 @@ enum {
 	GWP_PROT_TYPE_HTTP	= 2,
 };
 
-struct gwp_http_conn {
-	struct gwnet_http_hdr_pctx	ctx_hdr;
-	struct gwnet_http_req_hdr	req_hdr;
-};
-
 struct gwp_dns_packet;
 
 struct gwp_conn_pair {
@@ -319,6 +316,7 @@ struct gwp_ctx {
 	struct gwp_wrk			*workers;
 	struct gwp_sockaddr		target_addr;
 	struct gwp_socks5_ctx		*socks5;
+	struct gwp_auth			*auth;
 	struct gwp_dns_ctx		*dns;
 	struct gwp_upstream_s5		upstream;
 	struct gwp_cfg			cfg;
@@ -362,8 +360,6 @@ int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
-struct gwp_http_conn *gwp_http_conn_alloc(void);
-void gwp_http_conn_free(struct gwp_http_conn *conn);
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp);

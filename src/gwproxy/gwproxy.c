@@ -52,6 +52,7 @@ static const struct option long_opts[] = {
 	{ "socks5-prefer-ipv6",	required_argument,	NULL,	'Q' },
 	{ "protocol-timeout",	required_argument,	NULL,	'o' },
 	{ "socks5-auth-file",	required_argument,	NULL,	'A' },
+	{ "auth-file",		required_argument,	NULL,	'A' },
 	{ "socks5-dns-cache-secs",	required_argument,	NULL,	'L' },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
@@ -86,7 +87,7 @@ static const struct gwp_cfg default_opts = {
 	.socks5_prefer_ipv6	= false,
 	.use_raw_dns		= false,
 	.protocol_timeout	= 10,
-	.socks5_auth_file	= NULL,
+	.auth_file		= NULL,
 	.socks5_dns_cache_secs	= 0,
 	.nr_workers		= 4,
 	.nr_dns_workers		= 4,
@@ -122,7 +123,8 @@ static void show_help(const char *app)
 	printf("  -H, --as-http=0|1               Run as an HTTP proxy (default: %d)\n", default_opts.as_http);
 	printf("  -Q, --socks5-prefer-ipv6=0|1    Prefer IPv6 for SOCKS5 DNS queries (default: %d)\n", default_opts.socks5_prefer_ipv6);
 	printf("  -o, --protocol-timeout=sec      Timeout for protocol handshake process (default: %d)\n", default_opts.protocol_timeout);
-	printf("  -A, --socks5-auth-file=file     File containing username:password for SOCKS5 auth (default: no auth)\n");
+	printf("  -A, --auth-file=file            File with username:password credentials for SOCKS5 and HTTP auth (default: no auth)\n");
+	printf("      --socks5-auth-file=file     Alias for --auth-file\n");
 	printf("  -L, --socks5-dns-cache-secs=sec SOCKS5 DNS cache duration in seconds (default: %d)\n", default_opts.socks5_dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
@@ -214,7 +216,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->protocol_timeout = atoi(optarg);
 			break;
 		case 'A':
-			cfg->socks5_auth_file = optarg;
+			cfg->auth_file = optarg;
 			break;
 		case 'L':
 			cfg->socks5_dns_cache_secs = atoi(optarg);
@@ -828,27 +830,31 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 	ctx->workers = NULL;
 }
 
-static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
+/*
+ * Load the shared credential store from the auth file (if configured) and set
+ * up an inotify watch so it is hot-reloaded on change. The store is shared by
+ * the SOCKS5 and HTTP CONNECT front-ends. Leaves ctx->auth NULL (and the
+ * inotify fields disabled) when no auth file is configured.
+ */
+static int gwp_ctx_init_auth(struct gwp_ctx *ctx)
 {
 	struct gwp_cfg *cfg = &ctx->cfg;
-	struct gwp_socks5_cfg s5cfg;
 	int r;
 
-	pr_dbg(&ctx->lh, "Initializing SOCKS5 context");
-	memset(&s5cfg, 0, sizeof(s5cfg));
-	s5cfg.auth_file = (char *)cfg->socks5_auth_file;
-	r = gwp_socks5_ctx_init(&ctx->socks5, &s5cfg);
-	if (r < 0) {
-		pr_err(&ctx->lh, "Failed to initialize SOCKS5 context: %s",
-			strerror(-r));
-		return r;
+	ctx->auth = NULL;
+	ctx->ino_fd = -1;
+	ctx->ino_buf = NULL;
+
+	if (!cfg->auth_file || !*cfg->auth_file) {
+		pr_dbg(&ctx->lh, "Authentication disabled (no auth file)");
+		return 0;
 	}
 
-	if (!s5cfg.auth_file || !*s5cfg.auth_file) {
-		pr_dbg(&ctx->lh, "SOCKS5 context initialized without auth file");
-		ctx->ino_buf = NULL;
-		ctx->ino_fd = -1;
-		return 0;
+	r = gwp_auth_create(&ctx->auth, cfg->auth_file);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to load auth file '%s': %s",
+			cfg->auth_file, strerror(-r));
+		return r;
 	}
 
 	r = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -860,14 +866,14 @@ static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
 	pr_dbg(&ctx->lh, "Inotify file descriptor initialized (fd=%d)", r);
 
 	ctx->ino_fd = r;
-	r = inotify_add_watch(ctx->ino_fd, cfg->socks5_auth_file,
+	r = inotify_add_watch(ctx->ino_fd, cfg->auth_file,
 			      IN_DELETE | IN_CLOSE_WRITE);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to add inotify watch: %s", strerror(-r));
 		goto out_err;
 	}
 
-	pr_dbg(&ctx->lh, "Inotify watch added for '%s' (wd=%d)", cfg->socks5_auth_file, r);
+	pr_dbg(&ctx->lh, "Inotify watch added for '%s' (wd=%d)", cfg->auth_file, r);
 
 	ctx->ino_buf = malloc(sizeof(struct inotify_event) + NAME_MAX + 1);
 	if (!ctx->ino_buf) {
@@ -879,13 +885,49 @@ static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
 	return 0;
 
 out_err:
-	gwp_socks5_ctx_free(ctx->socks5);
-	ctx->socks5 = NULL;
 	if (ctx->ino_fd >= 0) {
 		__sys_close(ctx->ino_fd);
 		ctx->ino_fd = -1;
 	}
+	gwp_auth_destroy(ctx->auth);
+	ctx->auth = NULL;
 	return r;
+}
+
+static void gwp_ctx_free_auth(struct gwp_ctx *ctx)
+{
+	if (ctx->ino_buf) {
+		free(ctx->ino_buf);
+		ctx->ino_buf = NULL;
+		pr_dbg(&ctx->lh, "Inotify buffer freed");
+	}
+
+	if (ctx->ino_fd >= 0) {
+		__sys_close(ctx->ino_fd);
+		ctx->ino_fd = -1;
+		pr_dbg(&ctx->lh, "Inotify file descriptor closed");
+	}
+
+	gwp_auth_destroy(ctx->auth);
+	ctx->auth = NULL;
+}
+
+static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
+{
+	struct gwp_socks5_cfg s5cfg;
+	int r;
+
+	pr_dbg(&ctx->lh, "Initializing SOCKS5 context");
+	memset(&s5cfg, 0, sizeof(s5cfg));
+	s5cfg.auth = ctx->auth;
+	r = gwp_socks5_ctx_init(&ctx->socks5, &s5cfg);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to initialize SOCKS5 context: %s",
+			strerror(-r));
+		return r;
+	}
+
+	return 0;
 }
 
 static void gwp_ctx_free_socks5(struct gwp_ctx *ctx)
@@ -894,18 +936,6 @@ static void gwp_ctx_free_socks5(struct gwp_ctx *ctx)
 	gwp_socks5_ctx_free(ctx->socks5);
 	ctx->socks5 = NULL;
 	pr_dbg(&ctx->lh, "SOCKS5 context freed");
-
-	if (ctx->ino_fd >= 0) {
-		__sys_close(ctx->ino_fd);
-		ctx->ino_fd = -1;
-		pr_dbg(&ctx->lh, "Inotify file descriptor closed");
-	}
-
-	if (ctx->ino_buf) {
-		free(ctx->ino_buf);
-		ctx->ino_buf = NULL;
-		pr_dbg(&ctx->lh, "Inotify buffer freed");
-	}
 }
 
 static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
@@ -970,18 +1000,33 @@ __cold
 static int gwp_ctx_init_prot(struct gwp_ctx *ctx)
 {
 	struct gwp_cfg *cfg = &ctx->cfg;
+	int r;
+
+	ctx->socks5 = NULL;
+	ctx->auth = NULL;
+	ctx->ino_fd = -1;
+	ctx->ino_buf = NULL;
 
 	/*
 	 * SOCKS5 and HTTP may run together on the same port: the connection
 	 * protocol handler tries SOCKS5 first and falls back to HTTP (see
-	 * gwp_handle_conn_state_prot()). Only SOCKS5 needs context set up here;
-	 * HTTP state is allocated per connection.
+	 * gwp_handle_conn_state_prot()). Authentication credentials are shared
+	 * between the two, so the store is set up here (once) whenever a proxy
+	 * front-end is enabled; HTTP per-connection state is allocated lazily.
 	 */
+	if (!cfg->as_socks5 && !cfg->as_http)
+		return 0;
+
+	r = gwp_ctx_init_auth(ctx);
+	if (r < 0)
+		return r;
+
 	if (cfg->as_socks5) {
-		return gwp_ctx_init_socks5(ctx);
-	} else {
-		ctx->socks5 = NULL;
-		ctx->ino_fd = -1;
+		r = gwp_ctx_init_socks5(ctx);
+		if (r < 0) {
+			gwp_ctx_free_auth(ctx);
+			return r;
+		}
 	}
 
 	return 0;
@@ -994,6 +1039,9 @@ static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
 
 	if (cfg->as_socks5)
 		gwp_ctx_free_socks5(ctx);
+
+	if (cfg->as_socks5 || cfg->as_http)
+		gwp_ctx_free_auth(ctx);
 }
 
 /*
@@ -1821,23 +1869,6 @@ int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
 	return (r == -EAGAIN) ? 0 : r;
 }
 
-struct gwp_http_conn *gwp_http_conn_alloc(void)
-{
-	struct gwp_http_conn *ghc = malloc(sizeof(*ghc));
-	int r;
-
-	if (!ghc)
-		return NULL;
-
-	r = gwnet_http_hdr_pctx_init(&ghc->ctx_hdr);
-	if (r < 0) {
-		free(ghc);
-		return NULL;
-	}
-
-	return ghc;
-}
-
 static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
@@ -1899,114 +1930,111 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return r;
 }
 
-static int handle_http_hdr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/*
+ * Queue the HTTP 407 "Proxy Authentication Required" reply for the client. It
+ * is written into the client-bound buffer; the event loop flushes it before
+ * tearing the connection down (the same path as SOCKS5 error replies). Returns
+ * a negative error so the caller drops the connection.
+ */
+static int http_reject_unauthorized(struct gwp_conn_pair *gcp)
 {
-	struct gwnet_http_hdr_pctx *ctx_hdr;
-	struct gwnet_http_req_hdr *req_hdr;
-	struct gwp_ctx *ctx = w->ctx;
-	struct gwp_http_conn *conn;
-	int r;
+	int r = gwp_http_build_auth_required_reply(gcp->target.buf + gcp->target.len,
+						   gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
 
-	conn = gcp->http_conn;
-	ctx_hdr = &conn->ctx_hdr;
-	req_hdr = &conn->req_hdr;
-	ctx_hdr->buf = gcp->client.buf;
-	ctx_hdr->len = gcp->client.len;
-	ctx_hdr->off = 0;
-	r = gwnet_http_req_hdr_parse(ctx_hdr, req_hdr);
-	gwp_conn_buf_advance(&gcp->client, ctx_hdr->off);
-	if (r < 0) {
-		if (r == -EAGAIN)
-			return 0;
-		pr_dbg(&ctx->lh, "Invalid HTTP header: %s", strerror(-r));
-		return r;
-	}
+	gcp->target.len += (uint32_t)r;
+	return -EACCES;
+}
 
-	gcp->prot_type = GWP_PROT_TYPE_HTTP;
+/*
+ * Prepend a rewritten origin-form forward request to any request-body bytes
+ * already buffered in client.buf, so the forwarding path streams it to the
+ * origin.
+ */
+static int http_inject_forward_request(struct gwp_conn_pair *gcp,
+				       const char *req, size_t req_len)
+{
+	if (req_len > (size_t)(gcp->client.cap - gcp->client.len))
+		return -E2BIG;
+
+	if (gcp->client.len)
+		memmove(gcp->client.buf + req_len, gcp->client.buf, gcp->client.len);
+	memcpy(gcp->client.buf, req, req_len);
+	gcp->client.len += (uint32_t)req_len;
 	return 0;
 }
 
-static int handle_http_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/* Resolve and connect to @host:@port, setting the HTTP connect/DNS state. */
+static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			       const char *host, const char *port)
 {
-	struct gwp_ctx *ctx = w->ctx;
-	int r;
+	int r = prepare_target_addr_domain(w, gcp, host, port);
 
-	gcp->http_conn = gwp_http_conn_alloc();
-	if (!gcp->http_conn) {
-		pr_err(&ctx->lh, "Failed to allocate HTTP connection");
-		return -ENOMEM;
-	}
-
-	gcp->conn_state = CONN_STATE_HTTP_HDR;
-	r = handle_http_hdr(w, gcp);
-	if (r)
-		return r;
-
-	return 0;
-}
-
-int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
-{
-	struct gwnet_http_req_hdr *req_hdr;
-	bool port_found = false;
-	char *host, *port, *lc;
-	int r, ct;
-
-	ct = gcp->conn_state;
-	if (ct == CONN_STATE_PROT) {
-		r = handle_http_prot(w, gcp);
-	} else if (ct == CONN_STATE_HTTP_HDR) {
-		r = handle_http_hdr(w, gcp);
-	} else {
-		assert(0 && "Invalid HTTP connection state");
-		return -EINVAL;
-	}
-
-	if (r == -EAGAIN)
-		return r;
-
-	req_hdr = &gcp->http_conn->req_hdr;
-
-	/*
-	 * TODO(ammarfaizi2): Support non-HTTP CONNECT methods.
-	 */
-	if (req_hdr->method != GWNET_HTTP_METHOD_CONNECT)
-		return -EINVAL;
-
-	host = req_hdr->uri;
-	port = strlen(host) + host;
-	while (port > host) {
-		if (*port == ':') {
-			lc = port - 1;
-			port_found = true;
-			*port = '\0';
-			port++;
-			break;
-		}
-		port--;
-	}
-
-	if (!port_found)
-		return -EINVAL;
-
-	if (lc < host)
-		return -EINVAL;
-
-	/*
-	 * Cut IPv6 brackets.
-	 */
-	if (*host == '[' && *lc == ']') {
-		host++;
-		*lc = '\0';
-	}
-
-	r = prepare_target_addr_domain(w, gcp, host, port);
 	if (r == -EINPROGRESS)
 		gcp->conn_state = CONN_STATE_HTTP_DNS_QUERY;
 	else if (!r)
 		gcp->conn_state = CONN_STATE_HTTP_CONNECT;
 
 	return r;
+}
+
+int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	const char *req = NULL;
+	size_t in_len, req_len = 0;
+	char *host, *port;
+	int r;
+
+	if (gcp->conn_state == CONN_STATE_PROT) {
+		gcp->http_conn = gwp_http_conn_alloc();
+		if (!gcp->http_conn) {
+			pr_err(&ctx->lh, "Failed to allocate HTTP connection");
+			return -ENOMEM;
+		}
+		/*
+		 * Claim the connection as HTTP now, so a teardown while the
+		 * header is still arriving frees http_conn (gwp_free_conn_pair
+		 * switches on prot_type).
+		 */
+		gcp->prot_type = GWP_PROT_TYPE_HTTP;
+		gcp->conn_state = CONN_STATE_HTTP_HDR;
+	} else if (gcp->conn_state != CONN_STATE_HTTP_HDR) {
+		assert(0 && "Invalid HTTP connection state");
+		return -EINVAL;
+	}
+
+	in_len = gcp->client.len;
+	r = gwp_http_conn_process(gcp->http_conn, ctx->auth, gcp->client.buf,
+				  &in_len, &host, &port, &req, &req_len);
+	gwp_conn_buf_advance(&gcp->client, in_len);
+
+	switch (r) {
+	case GWP_HTTP_NEED_MORE:
+		/*
+		 * Header still incomplete. If the client buffer is already full
+		 * the parser can never accumulate the rest (a header line longer
+		 * than the buffer), so reject rather than ask a full,
+		 * level-triggered socket to be read again -- which would
+		 * busy-spin until the protocol timeout fires.
+		 */
+		if (gcp->client.len >= gcp->client.cap)
+			return -E2BIG;
+		return 0;
+	case GWP_HTTP_NEED_AUTH:
+		return http_reject_unauthorized(gcp);
+	case GWP_HTTP_CONNECT:
+		return http_connect_target(w, gcp, host, port);
+	case GWP_HTTP_FORWARD:
+		r = http_inject_forward_request(gcp, req, req_len);
+		if (r < 0)
+			return r;
+		return http_connect_target(w, gcp, host, port);
+	default:	/* GWP_HTTP_ERR */
+		pr_dbg(&ctx->lh, "Invalid HTTP request (fd=%d)", gcp->client.fd);
+		return -EINVAL;
+	}
 }
 
 int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -2049,12 +2077,6 @@ int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	return r;
-}
-
-void gwp_http_conn_free(struct gwp_http_conn *conn)
-{
-	gwnet_http_hdr_pctx_free(&conn->ctx_hdr);
-	free(conn);
 }
 
 noinline

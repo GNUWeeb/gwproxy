@@ -81,6 +81,11 @@ static inline int is_vchar(int c)
 	return 0;
 }
 
+static inline int is_alpha(int c)
+{
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
 /**
  * Check if the given HTTP header field key is one of the standard
  * headers that are allowed to appear multiple times in a message and
@@ -255,7 +260,14 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	 */
 	if (method_code != GWNET_HTTP_METHOD_CONNECT &&
 	    method_code != GWNET_HTTP_METHOD_OPTIONS) {
-		if (buf[off] != '/')
+		/*
+		 * Origin-form starts with '/'. absolute-form (which a client
+		 * uses to address a forwarding proxy, RFC 7230 Section 5.3.2)
+		 * starts with a scheme, i.e. an alphabetic character; it is
+		 * validated in full once the whole request-target has been
+		 * captured below.
+		 */
+		if (buf[off] != '/' && !is_alpha(buf[off]))
 			return -EINVAL;
 	} else {
 		if (!is_vchar(buf[off]))
@@ -311,6 +323,30 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 		if (path_len == 1)
 			break; /* Keep at least one slash. */
 		path_len--;
+	}
+
+	/*
+	 * A non-origin-form target on a non-CONNECT/OPTIONS request must be
+	 * absolute-form: scheme "://" host [...]. Require the "://" delimiter
+	 * so a bare target that is neither origin- nor absolute-form (e.g.
+	 * "GET foo HTTP/1.1") is still rejected. The proxy layer parses out the
+	 * host/port/path from the captured uri.
+	 */
+	if (method_code != GWNET_HTTP_METHOD_CONNECT &&
+	    method_code != GWNET_HTTP_METHOD_OPTIONS && uri[0] != '/') {
+		uint32_t k;
+		bool abs_form = false;
+
+		for (k = 0; k + 2 < uri_len; k++) {
+			if (uri[k] == ':' && uri[k + 1] == '/' &&
+			    uri[k + 2] == '/') {
+				abs_form = true;
+				break;
+			}
+		}
+
+		if (!abs_form)
+			return -EINVAL;
 	}
 
 	/*
@@ -1347,6 +1383,59 @@ static void test_req_hdr_simple(void)
 	ASSERT_HDRF(&hdr.fields.ff[1], "User-Agent", "gwhttp");
 	ASSERT_HDRF(&hdr.fields.ff[2], "Accept", "*/*");
 	ASSERT_HDRF(&hdr.fields.ff[3], "Connection", "keep-alive");
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_absolute_form(void)
+{
+	static const char buf[] =
+		"GET http://example.com:8080/path?q=1 HTTP/1.1\r\n"
+		"Host: example.com:8080\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
+	assert(hdr.method == GWNET_HTTP_METHOD_GET);
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	/* The full absolute-form target is preserved in uri. */
+	assert(!strcmp(hdr.uri, "http://example.com:8080/path?q=1"));
+	assert(hdr.fields.nr == 1);
+	ASSERT_HDRF(&hdr.fields.ff[0], "Host", "example.com:8080");
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_bare_target_rejected(void)
+{
+	/* A target that is neither origin-form nor absolute-form is invalid. */
+	static const char buf[] =
+		"GET foo HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
 	gwnet_http_req_hdr_free(&hdr);
 	gwnet_http_hdr_pctx_free(&ctx);
 	PRTEST_OK();
@@ -2595,6 +2684,8 @@ void gwnet_http_run_tests(void)
 	size_t i;
 	for (i = 0; i < 5000; i++) {
 		test_req_hdr_simple();
+		test_req_hdr_absolute_form();
+		test_req_hdr_bare_target_rejected();
 		test_res_hdr_simple();
 		test_req_hdr_query_string();
 		test_req_hdr_query_string_empty();

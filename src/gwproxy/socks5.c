@@ -6,315 +6,33 @@
 #define _GNU_SOURCE
 #endif
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
 #include <errno.h>
 #include <assert.h>
-#include <pthread.h>
 
 #include "socks5.h"
-
-static int copy_cfg(struct gwp_socks5_cfg *dst,
-		    const struct gwp_socks5_cfg *src)
-{
-	if (!src)
-		return 0;
-
-	if (src->auth_file && *src->auth_file) {
-		dst->auth_file = strdup(src->auth_file);
-		if (!dst->auth_file)
-			return -ENOMEM;
-	}
-
-	return 0;
-}
-
-static void free_cfg(struct gwp_socks5_cfg *cfg)
-{
-	if (!cfg)
-		return;
-
-	if (cfg->auth_file)
-		free(cfg->auth_file);
-}
-
-struct auth_entry {
-	char	*u, *p;
-	uint8_t	ulen, plen;
-};
-
-struct gwp_socks5_auth {
-	FILE			*fp;
-	pthread_rwlock_t	lock;
-	struct auth_entry	*entries;
-	size_t			nr;
-	size_t			cap;
-};
-
-static bool is_space(unsigned char c)
-{
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
-static char *trim_str(char *str)
-{
-	char *end;
-
-	while (is_space((unsigned char)*str))
-		str++;
-
-	/*
-	 * Nothing left after trimming leading whitespace. Return early so we
-	 * don't form the pointer "str - 1" below, which is undefined behaviour
-	 * when str already points at the start of the buffer.
-	 */
-	if (*str == '\0')
-		return str;
-
-	end = str + strlen(str) - 1;
-	while (end > str && is_space((unsigned char)*end))
-		end--;
-
-	end[1] = '\0';
-	return str;
-}
-
-static void free_auth_entries(struct gwp_socks5_auth *auth)
-{
-	size_t i;
-
-	if (!auth)
-		return;
-
-	for (i = 0; i < auth->nr; i++)
-		free(auth->entries[i].u);
-
-	free(auth->entries);
-	auth->entries = NULL;
-	auth->nr = 0;
-	auth->cap = 0;
-}
-
-static int add_auth_entry(struct gwp_socks5_auth *auth, const char *line,
-			  size_t len)
-{
-	struct auth_entry *ae;
-	size_t ulen, plen;
-	char *u, *p;
-
-	if (auth->nr >= auth->cap) {
-		size_t new_cap = auth->cap ? auth->cap * 2 : 16;
-		struct auth_entry *new_entries;
-
-		new_entries = realloc(auth->entries,
-				      new_cap * sizeof(*new_entries));
-		if (!new_entries)
-			return -ENOMEM;
-
-		auth->entries = new_entries;
-		auth->cap = new_cap;
-	}
-
-	u = malloc(len + 1);
-	if (!u)
-		return -ENOMEM;
-
-	memcpy(u, line, len);
-	u[len] = '\0';
-
-	p = strchr(u, ':');
-	if (p)
-		*p++ = '\0';
-
-	ulen = strlen(u);
-	if (ulen > 255)
-		goto out_free_u;
-
-	plen = p ? strlen(p) : 0;
-	if (plen > 255)
-		goto out_free_u;
-
-	ae = &auth->entries[auth->nr++];
-	ae->u = u;
-	ae->p = p;
-	ae->ulen = ulen;
-	ae->plen = plen;
-	return 0;
-
-out_free_u:
-	free(u);
-	return -EINVAL;
-}
-
-/*
- * Constant-time byte comparison for credential checks. Unlike memcmp() it does
- * not short-circuit on the first mismatch, so it does not leak (via timing) how
- * many leading bytes of a supplied username/password are correct. A zero length
- * compares equal without dereferencing either pointer, which also makes the
- * empty-password case (p == NULL) well-defined rather than UB.
- */
-static bool ct_bytes_eq(const void *a, const void *b, size_t len)
-{
-	const volatile unsigned char *pa = a;
-	const volatile unsigned char *pb = b;
-	unsigned char diff = 0;
-	size_t i;
-
-	for (i = 0; i < len; i++)
-		diff |= pa[i] ^ pb[i];
-
-	return diff == 0;
-}
-
-bool gwp_socks5_auth_check(struct gwp_socks5_ctx *ctx, const char *u,
-			   size_t ulen, const char *p, size_t plen)
-{
-	struct gwp_socks5_auth *auth = ctx->auth;
-	bool ret = false;
-	size_t i;
-
-	if (!auth)
-		return false;
-
-	/*
-	 * Read the entry set under the lock; a concurrent
-	 * gwp_socks5_auth_reload() frees and rebuilds it under the write lock.
-	 * When there are no entries nr is 0 and the loop simply does not run.
-	 */
-	pthread_rwlock_rdlock(&auth->lock);
-	for (i = 0; i < auth->nr; i++) {
-		const struct auth_entry *ae = &auth->entries[i];
-		if (ulen != ae->ulen)
-			continue;
-		if (plen != ae->plen)
-			continue;
-		if (!ct_bytes_eq(u, ae->u, ulen))
-			continue;
-		if (!ct_bytes_eq(p, ae->p, plen))
-			continue;
-		ret = true;
-		break;
-	}
-	pthread_rwlock_unlock(&auth->lock);
-	return ret;
-}
-
-int gwp_socks5_auth_reload(struct gwp_socks5_ctx *ctx)
-{
-	struct gwp_socks5_auth *auth = ctx->auth;
-	char buf[4096], *t;
-	size_t l;
-	int r = 0;
-
-	if (!auth || !auth->fp)
-		return -ENOSYS;
-
-	pthread_rwlock_wrlock(&auth->lock);
-	free_auth_entries(auth);
-	while (1) {
-		t = fgets(buf, sizeof(buf), auth->fp);
-		if (!t)
-			break;
-
-		t = trim_str(buf);
-		l = strlen(t);
-		if (!l)
-			continue;
-
-		r = add_auth_entry(auth, t, l);
-		if (r < 0)
-			break;
-	}
-	rewind(auth->fp);
-	pthread_rwlock_unlock(&auth->lock);
-	return r;
-}
-
-static int open_auth_file(struct gwp_socks5_ctx *ctx)
-{
-	const char *af = ctx->cfg.auth_file;
-	struct gwp_socks5_auth *auth = NULL;
-	FILE *fp;
-	int r;
-
-	if (!af || !*af) {
-		ctx->auth = NULL;
-		return 0;
-	}
-
-	auth = calloc(1, sizeof(*auth));
-	if (!auth)
-		return -ENOMEM;
-
-	r = pthread_rwlock_init(&auth->lock, NULL);
-	if (r) {
-		free(auth);
-		return -r;
-	}
-
-	fp = fopen(af, "rb");
-	if (!fp) {
-		r = -errno;
-		goto out_destroy_lock;
-	}
-
-	auth->fp = fp;
-	ctx->auth = auth;
-	r = gwp_socks5_auth_reload(ctx);
-	if (r < 0)
-		goto out_free_auth_ent;
-
-	return 0;
-
-out_free_auth_ent:
-	free_auth_entries(auth);
-	fclose(auth->fp);
-out_destroy_lock:
-	pthread_rwlock_destroy(&auth->lock);
-	free(auth);
-	ctx->auth = NULL;
-	return r;
-}
-
-static void free_auth(struct gwp_socks5_auth *auth)
-{
-	if (!auth)
-		return;
-
-	pthread_rwlock_destroy(&auth->lock);
-	free_auth_entries(auth);
-	fclose(auth->fp);
-	free(auth);
-}
+#include "auth.h"
 
 int gwp_socks5_ctx_init(struct gwp_socks5_ctx **ctx_p,
 			const struct gwp_socks5_cfg *cfg)
 {
 	struct gwp_socks5_ctx *ctx;
-	int r;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx)
 		return -ENOMEM;
 
-	r = copy_cfg(&ctx->cfg, cfg);
-	if (r < 0)
-		goto out_free_ctx;
-
-	r = open_auth_file(ctx);
-	if (r < 0)
-		goto out_free_cfg;
+	/*
+	 * The credential store is owned by the caller (shared with the HTTP
+	 * proxy front-end); we only borrow the pointer.
+	 */
+	if (cfg)
+		ctx->auth = cfg->auth;
 
 	*ctx_p = ctx;
 	return 0;
-
-out_free_cfg:
-	free_cfg(&ctx->cfg);
-out_free_ctx:
-	free(ctx);
-	return r;
 }
 
 void gwp_socks5_ctx_free(struct gwp_socks5_ctx *ctx)
@@ -322,8 +40,6 @@ void gwp_socks5_ctx_free(struct gwp_socks5_ctx *ctx)
 	if (!ctx)
 		return;
 
-	free_auth(ctx->auth);
-	free_cfg(&ctx->cfg);
 	free(ctx);
 }
 
@@ -591,7 +307,7 @@ static int handle_state_auth_userpass(struct data_arg *d)
 	p = plen ? (const char *)&buf[2 + ulen + 1] : NULL;
 
 	resp[0] = 0x01; /* VER */
-	if (gwp_socks5_auth_check(d->ctx, u, ulen, p, plen)) {
+	if (gwp_auth_check(d->ctx->auth, u, ulen, p, plen)) {
 		/* STATUS = 0x00 (success) */
 		resp[1] = 0x00;
 		d->conn->state = GWP_SOCKS5_ST_CMD;

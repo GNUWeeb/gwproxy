@@ -10,9 +10,13 @@ Features
   - SOCKS5 CONNECT proxy (RFC 1928):
       - IPv4, IPv6 and domain-name (ATYP) targets.
       - Username/password authentication (RFC 1929), or no authentication.
-  - HTTP CONNECT proxy (tunneling).
+  - HTTP proxy:
+      - CONNECT tunneling.
+      - Forwarding of ordinary absolute-form requests
+        ("GET http://host/path"), one request per connection.
+      - "Basic" proxy authentication (RFC 7617), or no authentication.
   - Combined SOCKS5 + HTTP on a single listening port (auto-detected per
-    connection).
+    connection), sharing one credential store.
   - Transparent proxy: recover each connection's original destination from
     the SO_ORIGINAL_DST socket option, for use behind an iptables REDIRECT
     rule.
@@ -63,13 +67,17 @@ Run './gwproxy --help' for the complete list of options. A few examples:
   ./gwproxy --bind='[::]:1080' --as-socks5=1
 
   # SOCKS5 proxy with username/password authentication
-  ./gwproxy --bind='[::]:1080' --as-socks5=1 --socks5-auth-file=auth.txt
+  ./gwproxy --bind='[::]:1080' --as-socks5=1 --auth-file=auth.txt
 
-  # HTTP CONNECT proxy on port 8080
+  # HTTP proxy on port 8080 (handles both CONNECT tunnels and forwarding
+  # of ordinary "GET http://host/path" requests)
   ./gwproxy --bind='[::]:8080' --as-http=1
 
-  # SOCKS5 and HTTP CONNECT on the same port
-  ./gwproxy --bind='[::]:1080' --as-socks5=1 --as-http=1
+  # HTTP CONNECT proxy requiring "Basic" authentication
+  ./gwproxy --bind='[::]:8080' --as-http=1 --auth-file=auth.txt
+
+  # SOCKS5 and HTTP CONNECT on the same port, sharing one credential file
+  ./gwproxy --bind='[::]:1080' --as-socks5=1 --as-http=1 --auth-file=auth.txt
 
   # Chain every outgoing connection through an upstream SOCKS5 proxy
   ./gwproxy --bind='[::]:1080' --as-socks5=1 \
@@ -78,8 +86,11 @@ Run './gwproxy --help' for the complete list of options. A few examples:
   # Use the io_uring event loop, and set SO_MARK 100 on outgoing packets
   ./gwproxy --bind='[::]:1080' --as-socks5=1 --event-loop=io_uring --mark=100
 
-The SOCKS5 authentication file holds one "username:password" entry per
-line.
+The authentication file (--auth-file, also spelled --socks5-auth-file)
+holds one "username:password" entry per line. The same file is used for
+both SOCKS5 (RFC 1929) and HTTP CONNECT ("Basic", RFC 7617) auth; when it
+is set, clients of either protocol must present valid credentials. It is
+re-read automatically when the file changes.
 
 Transparent proxy mode takes each connection's original destination from
 SO_ORIGINAL_DST, so it must sit behind an iptables REDIRECT rule. gwproxy
