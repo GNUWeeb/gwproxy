@@ -1,0 +1,147 @@
+.TH DNS_CACHE 3 "January 2025" "GWPROXY DNS library" "Library Functions Manual"
+.SH NAME
+gwp_dns_cache_init, gwp_dns_cache_free, gwp_dns_cache_housekeep, gwp_dns_cache_getent, gwp_dns_cache_putent, gwp_dns_cache_insert, gwp_dns_cache_entget_i4, gwp_dns_cache_entget_i6 \- DNS cache management functions
+.SH SYNOPSIS
+.nf
+.B #include <gwproxy/dns_cache.h>
+.PP
+.BI "struct gwp_dns_cache_entry {"
+.br
+.BI "    uint8_t  name_len;"
+.br
+.BI "    uint8_t  nr_i4;"
+.br
+.BI "    uint8_t  nr_i6;"
+.br
+.BI "    uint8_t  block[];"
+.br
+.BI "};"
+.PP
+.BI "int gwp_dns_cache_init(struct gwp_dns_cache **" cache_p ", uint32_t " nr_buckets ");"
+.PP
+.BI "void gwp_dns_cache_free(struct gwp_dns_cache *" cache ");"
+.PP
+.BI "void gwp_dns_cache_housekeep(struct gwp_dns_cache *" cache ");"
+.PP
+.BI "int gwp_dns_cache_getent(struct gwp_dns_cache *" cache ", const char *" key ","
+.br
+.BI "                         struct gwp_dns_cache_entry **" ep ");"
+.PP
+.BI "void gwp_dns_cache_putent(struct gwp_dns_cache_entry *" e ");"
+.PP
+.BI "int gwp_dns_cache_insert(struct gwp_dns_cache *" cache ", const char *" key ","
+.br
+.BI "                         const struct addrinfo *" ai ", time_t " expired_at ");"
+.PP
+.BI "uint8_t *gwp_dns_cache_entget_i4(struct gwp_dns_cache_entry *" e ");"
+.PP
+.BI "uint8_t *gwp_dns_cache_entget_i6(struct gwp_dns_cache_entry *" e ");"
+.fi
+.SH DESCRIPTION
+These functions provide a high-performance DNS cache implementation for the GWPROXY DNS library.
+The cache uses a hash map structure with reference counting for safe concurrent access.
+.SS Cache Entry Structure
+The
+.B struct gwp_dns_cache_entry
+represents a cached DNS resolution result. It uses a compact layout where:
+.RS 4
+.TP
+.B name_len
+Length of the domain name including null terminator
+.TP
+.B nr_i4
+Number of IPv4 addresses stored
+.TP
+.B nr_i6
+Number of IPv6 addresses stored
+.TP
+.B block[]
+Flexible array containing the domain name followed by IPv4 addresses (4 bytes each) and IPv6 addresses (16 bytes each)
+.RE
+.SS Cache Management Functions
+.TP
+.BR gwp_dns_cache_init ()
+Initializes a new DNS cache with the specified number of hash buckets. The cache pointer is stored in
+.IR *cache_p .
+More buckets provide better distribution but use more memory. The cache must be freed with
+.BR gwp_dns_cache_free ()
+when no longer needed.
+.TP
+.BR gwp_dns_cache_free ()
+Releases all resources associated with the DNS cache, including all cached entries and internal structures.
+.TP
+.BR gwp_dns_cache_housekeep ()
+Scans the cache and removes expired entries to reclaim memory. This function should be called periodically
+to maintain optimal cache performance.
+.SS Entry Access Functions
+.TP
+.BR gwp_dns_cache_getent ()
+Looks up a DNS entry by its key (typically a domain name). If found, increments the reference count
+and stores the entry pointer in
+.IR *ep .
+The entry can be safely used even after the cache is freed, but
+.BR gwp_dns_cache_putent ()
+must be called to release the reference when done.
+.TP
+.BR gwp_dns_cache_putent ()
+Decrements the reference count of a cache entry. When the count reaches zero, the entry is freed.
+This function must be called for every entry obtained via
+.BR gwp_dns_cache_getent ().
+.TP
+.BR gwp_dns_cache_insert ()
+Inserts a new DNS resolution result into the cache. If an entry with the same key already exists,
+it is replaced. The
+.I ai
+parameter contains the address information, and
+.I expired_at
+specifies when the entry should expire.
+.SS Address Extraction Functions
+.TP
+.BR gwp_dns_cache_entget_i4 ()
+Returns a pointer to the IPv4 addresses in the cache entry, or NULL if no IPv4 addresses are present.
+Each address is 4 bytes in network byte order.
+.TP
+.BR gwp_dns_cache_entget_i6 ()
+Returns a pointer to the IPv6 addresses in the cache entry, or NULL if no IPv6 addresses are present.
+Each address is 16 bytes in network byte order.
+.SH RETURN VALUES
+.BR gwp_dns_cache_init ()
+returns 0 on success, or a negative error code on failure.
+.PP
+.BR gwp_dns_cache_getent ()
+returns 0 on success, or a negative error code:
+.RS 4
+.TP
+.B -ENOENT
+Entry not found in the cache.
+.RE
+.PP
+.BR gwp_dns_cache_insert ()
+returns 0 on success, or a negative error code on failure.
+.PP
+.BR gwp_dns_cache_entget_i4 ()
+and
+.BR gwp_dns_cache_entget_i6 ()
+return a pointer to the address data, or NULL if no addresses of the requested type are present.
+.PP
+.BR gwp_dns_cache_free (),
+.BR gwp_dns_cache_housekeep (),
+and
+.BR gwp_dns_cache_putent ()
+do not return values.
+.SH NOTES
+The DNS cache implementation is thread-safe and designed for high-performance concurrent access.
+Reference counting ensures that cache entries remain valid even when the cache is freed while
+entries are still in use.
+.PP
+Cache entries use a compact binary format to minimize memory usage and improve cache locality.
+The flexible array member allows storing variable-length domain names and address lists in a
+single allocation.
+.SH SEE ALSO
+.BR gwp_dns_ctx_init (3),
+.BR gwp_dns_queue (3),
+.BR gwp_dns_cache_lookup (3)
+.SH COPYRIGHT
+Copyright (C) 2025 Ammar Faizi <ammarfaizi2@gnuweeb.org>
+.PP
+This library is licensed under GPL-2.0-only.
