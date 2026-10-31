@@ -41,6 +41,12 @@ TOPDIR="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
 # apt.llvm.org release installed when a matrix row asks for the "clang"
 # package. Bumping this here (not in the YAML) keeps older commits pinned to
 # the clang they were tested with.
+#
+# It is tied to the runner's distribution, which is pinned in the YAML rather
+# than here: apt.llvm.org does not carry the same releases for every codename,
+# and 23 is one of the ones it publishes for noble and not for jammy. So
+# changing runs-on can invalidate this line without touching it. Check
+# https://apt.llvm.org/<codename>/dists/ when moving either.
 CLANG_VERSION="23"
 
 # Extra Debian packages needed by the --use-openssl and --use-pcre variants.
@@ -283,6 +289,18 @@ cmd_build()
 	if [ "${arch}" != "x86_64" ]; then
 		return 0
 	fi
+
+	# The raw DNS resolver. It needs no extra library, so the only reason
+	# it sits below the x86_64 guard rather than beside the io_uring rows
+	# is that this is where "make test" runs, and t/0027 -- the only thing
+	# that exercises the response parser -- has to execute to be worth
+	# anything. Widening it to the cross rows would add the endianness
+	# coverage that a packet parser wants; nobody has checked it builds
+	# there yet, and a matrix row that cannot compile is worse than one
+	# that is missing.
+	build_variant "new-dns-resolver" 1 "${run_tests}" \
+		"--cc=${cc}" --use-new-dns-resolver \
+		${san[@]+"${san[@]}"}
 
 	build_variant "openssl" 1 "${run_tests}" \
 		"--cc=${cc}" --use-openssl \

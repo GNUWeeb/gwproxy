@@ -14,6 +14,8 @@ Features
         the epoll and io_uring loops). Datagrams to domain-name targets
         are dropped (no per-datagram DNS yet), and the command is refused
         when an upstream proxy is configured (UDP is not chained).
+        Replies are relayed only from an address and port the client
+        has sent to (and the ACL still allows).
       - Username/password authentication (RFC 1929), or no authentication.
   - HTTP proxy:
       - CONNECT tunneling.
@@ -31,7 +33,8 @@ Features
     --use-openssl; works on both the epoll and io_uring event loops.
   - Transparent proxy: recover each connection's original destination from
     the SO_ORIGINAL_DST socket option, for use behind an iptables REDIRECT
-    rule.
+    rule. Keep the listener out of direct reach: a connection that was not
+    redirected names the proxy itself as its destination, so it is refused.
   - Upstream proxy chaining: route every outgoing connection through a
     next-hop SOCKS5 proxy (socks5:// local or socks5h:// remote name
     resolution) or HTTP CONNECT proxy (http://), with optional
@@ -49,14 +52,32 @@ Features
     ACCEPT/REJECT/DNAT actions, watched and hot-reloaded on change. The
     MARK and BIND modifiers normally keep matching; "--accept" makes one
     terminal, so a rule can set the mark or source bind and accept in a
-    single match rather than repeating the same condition twice.
+    single match rather than repeating the same condition twice. A
+    "-m statistic --mode nth --every N" match selects one connection in
+    every N, which combines with any other criterion and lets a set of
+    rules share traffic between them -- see gwproxy(1) for the descending
+    --every counts an even split needs. With an upstream proxy that
+    resolves the name itself (socks5h:// and http://), -d rules only see
+    targets given as IP literals, however they are spelled: what a name
+    resolves to over there is beyond them, so filter such names with
+    "-m domain" rules (the built-in default ACL refuses "localhost").
+  - Address-family control: --outgoing-family=any|ipv4|ipv6 restricts what
+    the proxy dials (DNS resolves that family only; a literal target of the
+    other family is refused with SOCKS5 0x08 / HTTP 502), and
+    --bind-ipv6-only decides whether a [::] bind also accepts IPv4 clients.
+    Note --outgoing-family cannot reach past an upstream proxy that resolves
+    the name itself (socks5h:// and http://).
   - Two event loops: epoll (default) and io_uring (optional, enabled at
     build time and selected at run time).
   - Multi-threaded workers using SO_REUSEPORT, with graceful recovery from
     file-descriptor exhaustion (EMFILE/ENFILE).
   - Opt-in DNS caching for SOCKS5/HTTP hostname targets (--dns-cache-secs),
     bounded by --dns-cache-max-entries; cached IPs are still ACL-checked.
-  - Per-socket tuning: TCP_NODELAY, TCP_QUICKACK and TCP keepalive.
+  - Per-socket tuning: TCP_NODELAY and TCP keepalive.
+  - Optional idle timeout (--idle-timeout) that closes tunnels and UDP
+    associations which have moved no data for that long.
+  - Optional per-client connection cap (--max-conns-per-ip), counted per
+    IPv4 address or IPv6 /64 across all workers.
   - Dual-stack IPv4/IPv6 listening.
   - Configurable log level and log file, and an optional PID file.
 
@@ -129,6 +150,12 @@ Run './gwproxy --help' for the complete list of options. A few examples:
   # Chain every outgoing connection through an upstream SOCKS5 proxy
   ./gwproxy --bind='[::]:1080' --as-socks5=1 \
       --upstream-proxy=socks5h://user:pass@1.2.3.4:1080
+
+  # The same, with the credentials kept out of the command line (where
+  # every local user can read them): up-auth.txt holds "user:pass"
+  ./gwproxy --bind='[::]:1080' --as-socks5=1 \
+      --upstream-proxy=socks5h://1.2.3.4:1080 \
+      --upstream-proxy-auth-file=up-auth.txt
 
   # Use the io_uring event loop, and set SO_MARK 100 on outgoing packets
   ./gwproxy --bind='[::]:1080' --as-socks5=1 --event-loop=io_uring --mark=100

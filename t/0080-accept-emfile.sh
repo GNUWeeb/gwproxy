@@ -8,6 +8,7 @@
 # EMFILE. The worker must PAUSE accepting rather than die; once the flood is
 # released and descriptors free up, it must resume serving new connections.
 # ENFILE is handled by the very same path, so exercising EMFILE covers it too.
+# Both loops log the pause and the resumption in the same words.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -129,6 +130,10 @@ run_leg()
 		|| { sed 's/^/# gwp: /' "$glog" >&2; fail "[$ev] never hit EMFILE; test inconclusive"; }
 	[ "$recovered" = 1 ] \
 		|| { sed 's/^/# gwp: /' "$glog" >&2; fail "[$ev] did not recover after fds were freed"; }
+	grep -q "Too many open files, pausing accept (tidx=0)" "$glog" \
+		|| { sed 's/^/# gwp: /' "$glog" >&2; fail "[$ev] the accept pause was not logged"; }
+	grep -q "Resumed accepting new connections (tidx=0)" "$glog" \
+		|| { sed 's/^/# gwp: /' "$glog" >&2; fail "[$ev] the accept resumption was not logged"; }
 
 	kill "$origin_pid" 2>/dev/null
 	wait "$origin_pid" 2>/dev/null

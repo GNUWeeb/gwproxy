@@ -14,24 +14,10 @@ hp="$(pick_port)"
 make_payload "$WORK/payload.bin" 20000
 start_httpd "$hp" "$WORK" "1.1"
 
-# Wait for a UDP socket to be bound, rather than assuming a fixed delay was
-# long enough -- on a loaded machine it is not, and the failure looks like a
-# relay bug rather than a slow start.
-wait_udp_bound()			# $1=port
-{
-	local i
-	for i in $(seq 1 50); do
-		ss -uanH "sport = :$1" 2>/dev/null | grep -q . && return 0
-		sleep 0.1
-	done
-	fail "UDP server did not bind on $1"
-}
 
 # A UDP echo server for the UDP-relay ACL checks.
-ep="$(pick_port)"
-python3 "$SERVERS_DIR/udp_echo.py" 127.0.0.1 "$ep" >"$WORK/udp_echo.log" 2>&1 &
-_PIDS+=("$!")
-wait_udp_bound "$ep"
+start_udp_echo 127.0.0.1
+ep="$UDP_ECHO_PORT"
 
 # A malformed ACL is rejected at startup (gwproxy exits non-zero, no listener).
 printf -- '-A OUTPUT -j BOGUS\n' >"$WORK/bad.acl"
@@ -41,6 +27,17 @@ if "$GWPROXY" --bind="127.0.0.1:$bp" --as-socks5=1 \
 	fail "gwproxy accepted a malformed ACL file"
 fi
 grep -qi 'ACL' "$WORK/bad.log" || fail "malformed ACL startup lacked an error"
+
+# So is an empty one: it is what a writer that truncates and refills the file
+# leaves in between, not a rule set. If it were accepted, gwproxy would keep
+# running; the timeout turns that into a failure instead of a hang.
+: >"$WORK/empty.acl"
+ec=0
+timeout 10 "$GWPROXY" --bind="127.0.0.1:$(pick_port)" --as-socks5=1 \
+	--acl-file="$WORK/empty.acl" >"$WORK/empty.log" 2>&1 || ec=$?
+{ [ "$ec" -ne 0 ] && [ "$ec" -ne 124 ]; } || \
+	fail "gwproxy accepted an empty ACL file (exit $ec)"
+grep -qi 'ACL' "$WORK/empty.log" || fail "empty ACL startup lacked an error"
 
 # A valid ACL loads and proxying still works, on every available loop.
 printf -- '%s\n' \
@@ -161,6 +158,11 @@ for loop in epoll io_uring; do
 		"http://localhost:$hp/payload.bin" -o /dev/null 2>/dev/null; then
 		fail "$loop -m domain rule did not block the hostname request"
 	fi
+	# The same name with a trailing dot is the same name to the resolver.
+	rep="$(python3 "$SERVERS_DIR/socks5_probe.py" --host 127.0.0.1 \
+		--atyp domain --dst localhost. "$dp" "$hp")"
+	[ "$rep" = "REP=0x02" ] \
+		|| fail "$loop -m domain rule let 'localhost.' through ($rep)"
 	curl -s --max-time 20 -x "socks5://127.0.0.1:$dp" \
 		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/dom.out" \
 		|| fail "$loop literal-IP request wrongly blocked by -m domain"
@@ -181,6 +183,10 @@ for loop in epoll io_uring; do
 			"http://localhost:$hp/payload.bin" -o /dev/null 2>/dev/null; then
 			fail "$loop --domain-regexp did not block the hostname"
 		fi
+		rep="$(python3 "$SERVERS_DIR/socks5_probe.py" --host 127.0.0.1 \
+			--atyp domain --dst localhost. "$rp" "$hp")"
+		[ "$rep" = "REP=0x02" ] \
+			|| fail "$loop --domain-regexp let 'localhost.' through ($rep)"
 		curl -s --max-time 20 -x "socks5://127.0.0.1:$rp" \
 			"http://127.0.0.1:$hp/payload.bin" -o "$WORK/domre.out" \
 			|| fail "$loop literal-IP wrongly blocked by --domain-regexp"
@@ -231,7 +237,7 @@ for loop in epoll io_uring; do
 	python3 "$SERVERS_DIR/peer_addr.py" 127.0.0.1 "$pa" \
 		>"$WORK/peer.log" 2>&1 &
 	_PIDS+=("$!")
-	wait_listen "$pa" || fail "$loop peer_addr server did not listen"
+	wait_listen "$pa" "$!" || fail "$loop peer_addr server did not listen"
 	printf -- '%s\n' '-A OUTPUT -j BIND --to-source 127.0.0.2' \
 		'-P OUTPUT ACCEPT' >"$WORK/bind.acl"
 	bpp="$(pick_port)"
@@ -444,6 +450,36 @@ for loop in epoll io_uring; do
 	curl -s --max-time 20 -x "socks5h://127.0.0.1:$up" \
 		"http://127.0.0.1:$hp/payload.bin" -o /dev/null \
 		|| fail "$loop TCP wrongly blocked by a -p udp INPUT rule"
+	kill "$GWP_PID" 2>/dev/null
+
+	# -m statistic --mode nth. The unit tests cover the arithmetic; what
+	# this proves is that the module is wired through the real binary --
+	# parsed at startup, evaluated per connection, and enforced.
+	#
+	# A literal IP target on purpose: a name could resolve to several
+	# candidate addresses, and the OUTPUT chain runs once per candidate, so
+	# the count would not be one per connection.
+	printf -- '%s\n' \
+		'-A OUTPUT --dports 9 -m statistic --mode nth --every 2 -j REJECT' \
+		'-P OUTPUT ACCEPT' >"$WORK/nth.acl"
+	np="$(pick_port)"
+	gwp_start "127.0.0.1:$np" --as-socks5=1 --event-loop="$loop" \
+		--acl-file="$WORK/nth.acl"
+	rejected=0
+	for i in 1 2 3 4 5 6 7 8; do
+		rep="$(socks5_connect_rep "$np" 127.0.0.1 9)"
+		[ "$rep" = 2 ] && rejected=$((rejected + 1))
+	done
+	[ "$rejected" = 4 ] || \
+		fail "$loop -m statistic --every 2 rejected $rejected of 8 (want 4)"
+
+	# The same proxy, a port the rule does not match: never rejected, and
+	# those connections must not consume the counter either.
+	for i in 1 2 3 4; do
+		rep="$(socks5_connect_rep "$np" 127.0.0.1 "$hp")"
+		[ "$rep" = 0 ] || \
+			fail "$loop -m statistic leaked onto an unmatched port (REP $rep)"
+	done
 	kill "$GWP_PID" 2>/dev/null
 done
 

@@ -61,7 +61,9 @@ Every boolean option takes an explicit
 .B 0
 or
 .B 1
-argument. Long options and their single\-letter equivalents are interchangeable.
+argument. A numeric argument must be a whole decimal integer; anything else,
+or a value out of the option's range, is rejected at startup.
+Long options and their single\-letter equivalents are interchangeable.
 .SS General
 .TP
 .BR \-h ", " \-\-help
@@ -84,7 +86,11 @@ Address and port to listen on. IPv6 literals are written in brackets, e.g.
 .BR [::1]:1080 " or " 0.0.0.0:8080 .
 The default,
 .BR [::]:1080 ,
-listens on the dual\-stack IPv4/IPv6 wildcard.
+listens on the dual\-stack IPv4/IPv6 wildcard. A SOCKS5 or HTTP proxy
+listening on anything but loopback without
+.B \-\-auth\-file
+is open to every client that can reach it; gwproxy logs a warning at startup
+when it is configured that way.
 .TP
 .BR \-t ", " \-\-target=\fIaddr:port\fR
 For plain TCP forwarding, the fixed destination every accepted connection is
@@ -94,7 +100,7 @@ comes from the protocol or the socket.
 .BR \-w ", " \-\-nr\-workers=\fInr\fR
 Number of worker threads, each with its own
 .B SO_REUSEPORT
-listener. Default:
+listener, from 1 to 1024. Default:
 .BR 4 .
 .TP
 .BR \-o ", " \-\-protocol\-timeout=\fIsec\fR
@@ -109,6 +115,18 @@ for the same name (see
 .BR "TARGET ADDRESS SELECTION" ).
 Default:
 .BR 5 .
+.TP
+.BR \-\-idle\-timeout=\fIsec\fR
+Close an established tunnel, or a SOCKS5 UDP association, once no data has
+moved in either direction for this many seconds. Any traffic restarts the
+count, so a tunnel that keeps moving data is never closed, however long it
+lives; a UDP association counts as active while datagrams go either way.
+The check runs on a coarse per\-worker clock, so a pair can outlive the timeout
+by up to about a second.
+.B 0
+(or a negative value) never closes an idle connection, which keeps long quiet
+tunnels such as SSH sessions working. Default:
+.BR 0 .
 .TP
 .BR \-D ", " \-\-connect\-attempt\-delay=\fIms\fR
 Milliseconds to wait before racing the next address of a multi\-homed target,
@@ -196,12 +214,23 @@ Load an iptables\-style access\-control list that filters incoming clients
 and outgoing targets
 .RB ( OUTPUT " chain)."
 The file is watched and hot\-reloaded on change, and a malformed file is
-rejected (at startup, or by keeping the previous rules on reload). When
+rejected (at startup, or by keeping the previous rules on reload); so is an
+empty file, one with a NUL byte, and one that changes while it is read. A file
+that is rewritten in place can still be reloaded half written; replace it
+atomically instead: write the new rules to a temporary file in the same
+directory and rename it over the old one. When
 .B \-\-acl\-file
 is not given, a built\-in default ACL is applied instead (see
 .BR \-\-acl\-allow\-all
 below). Each line is one directive, evaluated top\-to\-bottom
-with first\-match\-wins; a chain's policy applies when nothing matches:
+with first\-match\-wins; a chain's policy applies when nothing matches.
+A word that starts with
+.B #
+begins a comment that runs to the end of the line; a
+.B #
+inside a word (a regexp such as
+.BR ^[^#]+$ )
+is part of that word. The directives are:
 .RS
 .IP \(bu 3
 .BI "\-P " "chain target"
@@ -393,6 +422,71 @@ The
 option, like
 .BR \-\-domain\-regexp ,
 requires a PCRE2 build.
+.IP
+.BR "\-m statistic \-\-mode nth \-\-every" " " \fIn\fR " [" \-\-packet " " \fIp\fR ]
+matches one evaluation in every
+.IR n ,
+the one whose index modulo
+.I n
+equals
+.I p
+(default 0), and is how several rules are made to share traffic between them.
+.I p
+must be less than
+.IR n .
+Only
+.B nth
+mode exists so far;
+.B random
+is rejected rather than approximated. The match may be negated
+.RB ( "! \-\-every" ),
+which selects the other
+.IR n \-1
+in
+.IR n .
+The negation belongs to
+.B \-\-every
+alone: a
+.B !
+before
+.B \-\-mode
+or
+.B \-\-packet
+is rejected rather than passed on to the option after it.
+The match composes with every other criterion \(em the counter advances only
+for connections the rest of the rule already matched, so
+.B "\-d 10.0.0.0/8 \-m statistic \-\-mode nth \-\-every 2"
+splits that prefix's traffic and leaves everything else alone.
+.IP
+Splitting
+.I k
+ways needs descending counts, not
+.I k
+equal ones: a rule is only consulted for what the rules above it passed on. For
+an even three-way split write
+.BR "\-\-every 3" ,
+then
+.BR "\-\-every 2" ,
+then no statistic match at all:
+.IP
+.EX
+\-A OUTPUT \-m statistic \-\-mode nth \-\-every 3 \-j BIND \-\-to\-source 10.0.0.1 \-\-accept
+\-A OUTPUT \-m statistic \-\-mode nth \-\-every 2 \-j BIND \-\-to\-source 10.0.0.2 \-\-accept
+\-A OUTPUT \-j BIND \-\-to\-source 10.0.0.3 \-\-accept
+.EE
+.IP
+Three rules all saying
+.B "\-\-every 3"
+would instead give 1/3, 2/9 and 4/9, because the second only ever sees the two
+thirds the first declined.
+.IP
+Two properties worth knowing. The counter counts evaluations rather than
+connections, and the
+.B OUTPUT
+chain runs once per candidate address, so a target that resolves to several
+addresses is counted more than once \(em pin the split to literal addresses, or
+accept that it is per attempt. And the counters live in the rules, so reloading
+the ACL file restarts every split from zero.
 .TP
 .B \-\-acl\-allow\-all
 Do not apply the built\-in default ACL; allow all targets (the behaviour before
@@ -405,22 +499,65 @@ When neither
 .B \-\-acl\-file
 nor
 .B \-\-acl\-allow\-all
-is given, gwproxy applies a built\-in default ACL that rejects outgoing
-connections to loopback and private address ranges (SSRF hardening) while
-accepting all clients:
+is given, gwproxy applies a built\-in default ACL (SSRF hardening) that
+accepts all clients but rejects outgoing connections to anything other than
+public unicast addresses: the unspecified addresses (on Linux a connection to
+0.0.0.0 or :: reaches the local host), loopback, private and shared (CGNAT)
+space, link\-local (including the cloud metadata service at 169.254.169.254),
+benchmarking, multicast, reserved and broadcast addresses, and the IPv6
+prefixes that embed an IPv4 address (IPv4\-compatible, NAT64, 6to4). An
+IPv4\-mapped target (::ffff:a.b.c.d) is matched as the IPv4 address it
+carries, so the IPv4 rules cover it too. A hostname is checked per resolved
+address, so a name such as
+.B localhost
+is refused for both its 127.0.0.1 and its ::1 address:
 .RS
 .nf
 \-P INPUT ACCEPT
+\-A OUTPUT \-d 0.0.0.0/8 \-j REJECT
 \-A OUTPUT \-d 10.0.0.0/8 \-j REJECT
+\-A OUTPUT \-d 100.64.0.0/10 \-j REJECT
 \-A OUTPUT \-d 127.0.0.0/8 \-j REJECT
-\-A OUTPUT \-d 192.168.0.0/16 \-j REJECT
+\-A OUTPUT \-d 169.254.0.0/16 \-j REJECT
 \-A OUTPUT \-d 172.16.0.0/12 \-j REJECT
-\-A OUTPUT \-d fe80::/10 \-j REJECT
+\-A OUTPUT \-d 192.0.0.0/24 \-j REJECT
+\-A OUTPUT \-d 192.168.0.0/16 \-j REJECT
+\-A OUTPUT \-d 198.18.0.0/15 \-j REJECT
+\-A OUTPUT \-d 224.0.0.0/4 \-j REJECT
+\-A OUTPUT \-d 240.0.0.0/4 \-j REJECT
+\-A OUTPUT \-d ::/128 \-j REJECT
+\-A OUTPUT \-d ::1/128 \-j REJECT
+\-A OUTPUT \-d ::/96 \-j REJECT
+\-A OUTPUT \-d 64:ff9b::/96 \-j REJECT
+\-A OUTPUT \-d 64:ff9b:1::/48 \-j REJECT
+\-A OUTPUT \-d 2002::/16 \-j REJECT
 \-A OUTPUT \-d fc00::/7 \-j REJECT
+\-A OUTPUT \-d fe80::/10 \-j REJECT
+\-A OUTPUT \-d fec0::/10 \-j REJECT
+\-A OUTPUT \-d ff00::/8 \-j REJECT
 \-P OUTPUT ACCEPT
 .fi
 .RE
 .RE
+.TP
+.BR \-\-max\-conns\-per\-ip=\fInr\fR
+Hold at most
+.I nr
+client connections at once from one client, counted across all worker threads
+and every proxy mode. An IPv4 client, and an IPv4\-mapped IPv6 one
+(::ffff:a.b.c.d, as a dual\-stack listener sees IPv4 clients), is one client per
+address; a native IPv6 client is one client per /64 prefix, since a single
+IPv6 host normally owns a whole /64 and could otherwise pick a new address for
+each connection. A connection over the cap is closed as soon as it is accepted,
+before anything is read from it, and logged as a warning with the client's
+address, at most once a second per client, with the number refused since the
+previous line. A client that the
+.B INPUT
+chain rejects is not counted. A connection counts until it is closed, for any
+reason, which makes room for the next one.
+.B 0
+means no cap. Default:
+.BR 0 .
 .SS TLS termination (HTTPS proxy)
 These options require a build with OpenSSL support (see
 .BR "AVAILABILITY" ).
@@ -456,6 +593,93 @@ queried first \(em A, falling back to AAAA, or the reverse with
 Default:
 .BR 0 .
 .TP
+.BR \-\-outgoing\-family=\fIany|ipv4|ipv6\fR
+Restrict outgoing (target) connections to one address family. Unlike
+.BR \-\-prefer\-ipv6 ,
+which only reorders candidates, this is a hard restriction with two effects:
+proxy DNS resolves that family only, and a literal target of the other family
+is refused before any socket is created \(em SOCKS5 reply
+.B 0x08
+.RB ( "address type not supported" ),
+HTTP
+.BR 502 .
+Relayed UDP datagrams to a target of the wrong family are dropped. Default:
+.BR any .
+.IP
+The restriction is enforced where the outgoing socket is created, which is
+after the ACL has run, so a
+.B \-j DNAT
+rule that rewrites a destination into the forbidden family is caught as well.
+It also covers the hop to an
+.BR \-\-upstream\-proxy ,
+so an upstream whose own address is of the forbidden family is rejected at
+startup rather than failing on every connection. Likewise
+.B \-\-prefer\-ipv6=1
+with
+.BR \-\-outgoing\-family=ipv4 ,
+and a
+.B \-\-bind\-source
+of the forbidden family, are refused at startup as contradictions.
+.IP
+.B Pitfalls.
+This controls what
+.I this
+proxy dials; it is not a guarantee that no IPv6 is used end to end.
+.RS
+.IP \(bu 2
+With
+.B \-\-upstream\-proxy=socks5h://
+or
+.BR http:// ,
+the hostname is handed to the upstream and that proxy resolves it. gwproxy
+never sees the address, so the upstream may well connect over IPv6. Only the
+hop to the upstream itself is restricted. With
+.B socks5://
+the name is resolved locally, so the restriction does apply.
+.IP \(bu 2
+A domain target in a relayed UDP datagram is dropped for unrelated reasons
+(no per\-datagram DNS), so the family restriction never sees it.
+.IP \(bu 2
+It does not touch the listener. Use
+.B \-\-bind\-ipv6\-only
+to control which families may reach the proxy; the two are independent.
+.IP \(bu 2
+A name with only AAAA records becomes unresolvable under
+.BR ipv4 ,
+and the client is told the host could not be reached. That is the point, but
+it turns a working destination into a failing one, so expect it.
+.IP \(bu 2
+NAT64/DNS64 networks synthesise AAAA for IPv4\-only destinations.
+.B ipv4
+there refuses the synthesised address and leaves no route to the destination
+at all.
+.RE
+.TP
+.BR \-\-bind\-ipv6\-only=\fI0|1\fR
+Set
+.B IPV6_V6ONLY
+on the listening socket. With the default
+.BR 0 ,
+a wildcard
+.B [::]
+bind also accepts IPv4 clients, which appear as
+.RI ::ffff: a.b.c.d
+(an ACL
+.B \-s 10.0.0.0/8
+still matches such a client, since addresses are compared in their canonical
+form). With
+.BR 1 ,
+those connections are refused and only IPv6 clients can reach the proxy.
+.IP
+The value is applied explicitly in both directions rather than only when the
+option is given, so behaviour does not depend on the host's
+.B net.ipv6.bindv6only
+sysctl. It has no effect when
+.B \-\-bind
+names an IPv4 address. It applies to the listener only: the SOCKS5 UDP relay
+socket stays dual\-stack on purpose, because a single\-family bind cannot
+egress the other family, so UDP ASSOCIATE to IPv4 targets keeps working.
+.TP
 .BR \-L ", " \-\-dns\-cache\-secs=\fIsec\fR
 Cache proxy DNS answers for this many seconds.
 .B 0
@@ -478,7 +702,7 @@ means unlimited. Default:
 .BR 65536 .
 .TP
 .BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
-Number of DNS resolver worker threads. Default:
+Number of DNS resolver worker threads, at most 1024. Default:
 .BR 4 .
 .TP
 .BR \-j ", " \-\-dns\-server=\fIaddr:port\fR
@@ -515,12 +739,39 @@ an HTTP proxy reached with an HTTP CONNECT request. Optional
 supplies username/password authentication to the upstream (RFC\ 1929 for
 SOCKS5, HTTP Basic for HTTP). The port defaults to 1080 for SOCKS5 and 8080
 for HTTP.
+gwproxy overwrites the password in its command line with
+.B ***
+as soon as it has read it, but other local users can still catch it there in
+the moment before, and it stays in shell history and service definitions;
+.B \-\-upstream\-proxy\-auth\-file
+keeps it out of the command line altogether.
+.TP
+.BR \-\-upstream\-proxy\-auth\-file=\fIfile\fR
+Read the upstream credentials from the first line of
+.I file
+instead of the
+.B \-\-upstream\-proxy
+URL, as
+.B user:pass
+(split at the first colon) or a bare
+.BR user ,
+each part at most 255 bytes. The command line is readable by every local
+user (\fBps\fR(1), \fI/proc/<pid>/cmdline\fR), so this keeps the password
+out of it; make the file readable only by the user gwproxy runs as. The
+password may contain any character except a line break, including
+.B @
+and
+.BR : .
+The URL must not carry credentials of its own when this option is given.
 .SS Networking
 .TP
 .BR \-M ", " \-\-mark=\fInr\fR
 Set
 .B SO_MARK
 (fwmark) on outgoing connections, for policy routing and iptables matching.
+The mark is a 32\-bit value, written in decimal or, with a
+.B 0x
+prefix, in hexadecimal.
 Requires
 .B CAP_NET_ADMIN
 or, since Linux 5.11,
@@ -592,18 +843,23 @@ replaces rather than merges with
 .TP
 .BR \-T ", " \-\-target\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for target\(->client data. Default:
-.BR 16384 .
+.BR 65536 .
 .TP
 .BR \-C ", " \-\-client\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for client\(->target data. Default:
-.BR 16384 .
+.BR 65536 .
 .IP
-Each connection allocates both, so the pair costs
-.B 32
-KiB of buffer; 10,000 concurrent connections is about
-.B 312
-MiB. Lower them if memory matters more than syscall count, raise them for
-fewer, larger reads and writes.
+Each wakeup reads at most one buffer and writes it out, so the buffer size
+sets the syscalls per byte of a bulk transfer: 64 KiB takes about 40%
+less CPU per byte than 16 KiB on loopback, and larger sizes gain little
+more. Each connection allocates both buffers, so the pair reserves
+.B 128
+KiB of address space; 10,000 concurrent connections reserve about
+.B 1.2
+GiB. Only the pages a connection has actually used count towards the
+resident memory, so idle and short request/response connections stay at a
+few KiB each. Lower the sizes if memory matters more than syscall count,
+raise them for fewer, larger reads and writes.
 .TP
 .BR \-d ", " \-\-tcp\-nodelay=\fI0|1\fR
 Enable
@@ -612,10 +868,10 @@ on connections. Default:
 .BR 1 .
 .TP
 .BR \-K ", " \-\-tcp\-quickack=\fI0|1\fR
-Enable
-.B TCP_QUICKACK
-on connections. Default:
-.BR 1 .
+Obsolete and ignored, with a warning. It never set
+.BR TCP_QUICKACK ,
+which the kernel clears again by itself, so it cannot be set once per
+connection. It is still accepted so that existing command lines start.
 .TP
 .BR \-k ", " \-\-tcp\-keepalive=\fI0|1\fR
 Enable
@@ -683,6 +939,32 @@ host and port;
 of ordinary absolute\-form requests such as "GET http://host/path", which
 gwproxy rewrites to origin form, fetches from the origin and relays back, one
 request per connection.
+.PP
+Only that one request reaches the origin: its body, delimited by Content\-Length
+or chunked Transfer\-Encoding, is forwarded, and anything the client sends after
+it is discarded. A request gwproxy cannot delimit unambiguously (both framing
+headers, a Transfer\-Encoding other than "chunked", an invalid Content\-Length,
+or a Connection header naming Content\-Length, Transfer\-Encoding or Host) is
+answered with "400 Bad Request"; a malformed chunked body closes the connection.
+.PP
+The origin's response header is rewritten before the client sees it: its
+hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
+does not send another request on the connection, and the connection is closed
+once the origin has finished. A response that is not valid HTTP/1.x, one whose
+header is too large, and a 407 from the origin, which would invite the client
+to hand over its proxy credentials, are answered with "502 Bad Gateway"
+instead. The response header, together with any interim (1xx) responses before
+it that the client has not yet received, may take at most
+.B \-\-target\-buf\-size
+minus 64 bytes, and must still fit in
+.B \-\-target\-buf\-size
+once rewritten (bare LF line ends become CRLF).
+.PP
+A request header may take at most 16384 bytes, and must fit in
+.B \-\-client\-buf\-size
+as a whole (a forwarding request also once rewritten); a larger one, or one
+with more than 128 field lines, is answered with "431 Request Header Fields
+Too Large".
 .PP
 With
 .B \-\-auth\-file

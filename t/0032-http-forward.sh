@@ -21,10 +21,10 @@ hlog="$WORK/host.log"
 python3 "$SERVERS_DIR/header_origin.py" "$op" "$hlog" Host \
 	>"$WORK/header_origin.log" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$op" || fail "header origin did not listen on $op"
+wait_listen "$op" "$!" || fail "header origin did not listen on $op"
 
 # About the size of an ordinary browser's cookie jar: too big for a 2 KiB
-# client buffer, comfortably inside the 16 KiB default.
+# client buffer, comfortably inside the 64 KiB default.
 bigval="$(printf 'a%.0s' $(seq 1 3000))"
 
 for loop in epoll io_uring; do
@@ -84,7 +84,7 @@ except OSError:
 		|| fail "[$loop] oversized header at 2048 got $code (want 431)"
 
 	# ... and the same request goes straight through on the default buffer,
-	# which is the point of the 16 KiB default: an ordinary browser request
+	# which is the point of the large default: an ordinary browser request
 	# should not need tuning.
 	code="$(curl -s -o "$WORK/big.bin" -w '%{http_code}' --max-time 20 \
 		-x "http://[::1]:$pp" -H "Cookie: c=$bigval" \

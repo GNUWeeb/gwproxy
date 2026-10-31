@@ -32,23 +32,37 @@ int convert_str_to_ssaddr(const char *str,
 			return -EINVAL;
 		l = p - str;
 		p++;
+		/* Only a ":port" may follow the closing bracket. */
+		if (*p && *p != ':')
+			return -EINVAL;
 	} else {
 		p = strchr(str, ':');
-		l = p - str;
+		l = p ? (size_t)(p - str) : strlen(str);
 	}
 
-	if (!p || *p != ':') {
-		if (default_port)
-			l = strlen(str);
-		else
-			return -EINVAL;
-	}
+	/*
+	 * No port in the string: fall back to the default. @l already spans
+	 * the host, without the brackets of an IPv6 literal.
+	 */
+	if ((!p || *p != ':') && !default_port)
+		return -EINVAL;
 
 	if (l >= sizeof(host))
 		return -EINVAL;
 
 	strncpy(host, str, l);
 	host[l] = '\0';
+	/*
+	 * A host name or IP literal holds nothing but letters, digits and
+	 * "-._" (plus ':' and '%' for an IPv6 literal and its zone). Refuse
+	 * anything else here: what getaddrinfo() makes of, say, a space is up
+	 * to the C library, and musl sends such a name to the DNS server and
+	 * waits for its timeout where glibc refuses it at once.
+	 */
+	if (!*host || host[strspn(host, "abcdefghijklmnopqrstuvwxyz"
+				     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+				     "0123456789-._:%")])
+		return -EINVAL;
 	if (default_port) {
 		snprintf(port, 6, "%hu", default_port);
 	} else {

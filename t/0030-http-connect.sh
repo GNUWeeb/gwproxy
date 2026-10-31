@@ -4,7 +4,8 @@
 # HTTP CONNECT proxy: force curl to open a CONNECT tunnel through gwproxy's
 # HTTP mode and verify the tunneled payload arrives intact, on every available
 # event loop. Both an IPv4-literal target and a hostname target (which makes
-# gwproxy resolve the name itself) are exercised.
+# gwproxy resolve the name itself) are exercised, as is a client that sends
+# the first tunnel bytes in the same write as its CONNECT request.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -33,6 +34,10 @@ for loop in epoll io_uring; do
 		|| fail "[$loop] curl via HTTP CONNECT to hostname target failed"
 	assert_files_equal "$WORK/payload.bin" "$WORK/out2.bin" \
 		"[$loop] HTTP CONNECT proxy corrupted the payload (hostname)"
+
+	# Tunnel bytes pipelined behind the request must reach the origin.
+	timeout 30 python3 "$SERVERS_DIR/pipelined_connect.py" ::1 "$pp" \
+		|| fail "[$loop] bytes sent with the CONNECT were not forwarded"
 
 	kill "$GWP_PID" 2>/dev/null
 done

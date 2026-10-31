@@ -22,7 +22,6 @@ do {							\
 	assert(!__r);					\
 	assert(*__ctx);					\
 	assert((*__ctx)->auth == NULL);			\
-	assert((*__ctx)->nr_clients == 0);		\
 } while (0)
 
 #define test_socks5_alloc_conn(CTX) ({			\
@@ -116,7 +115,6 @@ static void test_connect_ipv4(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\xaa\xaa", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 
 	/*
 	 * All good!
@@ -186,7 +184,6 @@ static void test_connect_ipv6(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[20], "\xaa\xaa", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 
 	/*
 	 * All good!
@@ -252,7 +249,6 @@ static int test_connect_domain(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\xaa\xaa", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 
 	/*
 	 * All good!
@@ -292,13 +288,11 @@ static void test_short_recv(void)
 	assert(!r);
 	assert(ctx);
 	assert(ctx->auth == NULL);
-	assert(ctx->nr_clients == 0);
 
 	conn = gwp_socks5_conn_alloc(ctx);
 	assert(conn);
 	assert(conn->state == GWP_SOCKS5_ST_INIT);
 	assert(conn->ctx == ctx);
-	assert(ctx->nr_clients == 1);
 
 	inb = in;
 	for (i = 0; i < 3; i++) {
@@ -365,7 +359,6 @@ static void test_short_recv(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\xaa\xaa", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 }
@@ -430,13 +423,11 @@ static void test_auth_userpass(void)
 	assert(!r);
 	assert(ctx);
 	assert(ctx->auth == auth);
-	assert(ctx->nr_clients == 0);
 
 	conn = gwp_socks5_conn_alloc(ctx);
 	assert(conn);
 	assert(conn->state == GWP_SOCKS5_ST_INIT);
 	assert(conn->ctx == ctx);
-	assert(ctx->nr_clients == 1);
 
 	inb = in;
 	in_len = 4; /* VER, NMETHODS, {USER/PASS} */
@@ -495,7 +486,6 @@ static void test_auth_userpass(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\x00\x00", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 	gwp_auth_destroy(auth);
@@ -503,10 +493,93 @@ static void test_auth_userpass(void)
 }
 
 /*
- * Auth entry with an empty password ("user" with no ':' in the file). The
- * client sends PLEN == 0, so gwp_socks5_auth_check() is called with p == NULL
- * and plen == 0. This must authenticate successfully without dereferencing the
- * NULL password pointer (a plain memcmp(NULL, ..., 0) is UB and trips UBSan).
+ * Load a credential file made of @data; returns gwp_auth_create()'s result
+ * and destroys the store again.
+ */
+static int try_cred_file(const char *data)
+{
+	char cred_file[] = "/tmp/gwp_socks5_auth.XXXXXX";
+	struct gwp_auth *auth = NULL;
+	ssize_t w;
+	int r;
+
+	w = write_temp_file(cred_file, data, strlen(data));
+	assert(w == (ssize_t)strlen(data));
+	r = gwp_auth_create(&auth, cred_file);
+	if (!r)
+		gwp_auth_destroy(auth);
+	unlink(cred_file);
+	return r;
+}
+
+/*
+ * The credential file takes "user:password" lines, both parts 1 to 255
+ * bytes, plus comments and blank lines. A line with no colon used to become
+ * a user with an empty password, which a client could log in as by sending
+ * none (PLEN 0); a comment line did the same.
+ */
+/*
+ * The password comparison walks a fixed number of positions whatever the
+ * lengths; it must still match only the exact password: no prefix, no
+ * extension, nothing longer than any stored password, and the longest one
+ * a store can hold.
+ */
+static void test_auth_check_lengths(void)
+{
+	char cred_file[] = "/tmp/gwp_socks5_auth.XXXXXX";
+	char data[16 + 256 + 1], pw[300];
+	struct gwp_auth *auth;
+	ssize_t r;
+	int n;
+
+	memset(pw, 'q', sizeof(pw));
+	n = snprintf(data, sizeof(data), "user:pass\nlong:%.*s\n", 255, pw);
+	assert(n > 0 && (size_t)n < sizeof(data));
+	r = write_temp_file(cred_file, data, (size_t)n);
+	assert(r == n);
+	r = gwp_auth_create(&auth, cred_file);
+	assert(!r);
+
+	assert(gwp_auth_check(auth, "user", 4, "pass", 4));
+	assert(!gwp_auth_check(auth, "user", 4, "pas", 3));
+	assert(!gwp_auth_check(auth, "user", 4, "passs", 5));
+	assert(!gwp_auth_check(auth, "user", 4, "pasS", 4));
+	assert(!gwp_auth_check(auth, "user", 4, NULL, 0));
+	assert(!gwp_auth_check(auth, "nouser", 6, "pass", 4));
+
+	assert(gwp_auth_check(auth, "long", 4, pw, 255));
+	assert(!gwp_auth_check(auth, "long", 4, pw, 254));
+	assert(!gwp_auth_check(auth, "long", 4, pw, 256));
+	assert(!gwp_auth_check(auth, "long", 4, pw, sizeof(pw)));
+	pw[254] = 'r';
+	assert(!gwp_auth_check(auth, "long", 4, pw, 255));
+
+	gwp_auth_destroy(auth);
+	unlink(cred_file);
+}
+
+static void test_auth_file_lines(void)
+{
+	char longline[5000];
+
+	assert(!try_cred_file("# admins\n\nuser:pw\n  # indented\n"));
+	assert(try_cred_file("user\n") == -EINVAL);
+	assert(try_cred_file("user:pw\n#\nother\n") == -EINVAL);
+	assert(try_cred_file("user:\n") == -EINVAL);
+	assert(try_cred_file(":pw\n") == -EINVAL);
+
+	/* Too long for one read: an error, not two entries. */
+	memset(longline, 'a', sizeof(longline) - 2);
+	longline[sizeof(longline) - 2] = '\n';
+	longline[sizeof(longline) - 1] = '\0';
+	memcpy(longline + 4100, ":pw", 3);
+	assert(try_cred_file(longline) == -EINVAL);
+}
+
+/*
+ * A client that sends no password (PLEN == 0) is refused, and the check is
+ * made with p == NULL and plen == 0 without dereferencing the NULL password
+ * pointer (a plain memcmp(NULL, ..., 0) is UB and trips UBSan).
  */
 static void test_auth_userpass_empty_password(void)
 {
@@ -518,7 +591,7 @@ static void test_auth_userpass_empty_password(void)
 		'u', 's', 'e', 'r',	/* UNAME */
 		0x00,			/* PLEN = 0 (no password) */
 	};
-	static const char cred_data[] = "user\n";
+	static const char cred_data[] = "user:pw\n";
 	char cred_file[] = "/tmp/gwp_socks5_auth.XXXXXX";
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
@@ -563,8 +636,17 @@ static void test_auth_userpass_empty_password(void)
 	assert(in_len == 7);
 	assert(out_len == 2);
 	assert(out[0] == 0x01);
-	assert(out[1] == 0x00); /* STATUS: success */
-	assert(conn->state == GWP_SOCKS5_ST_CMD);
+	assert(out[1] == 0x01); /* STATUS: failure */
+	assert(conn->state == GWP_SOCKS5_ST_ERR);
+	/* The rejected name is kept for the log, not as the user. */
+	assert(!gwp_socks5_conn_username(conn));
+	{
+		const char *bad;
+		size_t blen = 0;
+
+		bad = gwp_socks5_conn_rejected_user(conn, &blen);
+		assert(bad && blen == 4 && !memcmp(bad, "user", 4));
+	}
 
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
@@ -597,9 +679,7 @@ static void test_offered_methods_no_match(void)
 	/* REP: no acceptable methods */
 	assert(out[1] == 0xff);
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -639,9 +719,7 @@ static void test_err_state_pipelined_byte(void)
 	/* METHOD: no acceptable methods */
 	assert(out[1] == 0xff);
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -666,9 +744,7 @@ static void test_invalid_version(void)
 	assert(in_len == 0);
 	assert(out_len == 0);
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -705,9 +781,7 @@ static void test_invalid_connect_addr_type(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\x00\x00", 2));
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -746,9 +820,7 @@ static void test_invalid_command(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\x00\x00", 2));
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -803,9 +875,7 @@ static void test_multi_state_at_once(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\x00\x00", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -837,7 +907,7 @@ static void test_enobufs(void)
 	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
 	assert(r == -ENOBUFS);
 	assert(in_len == 0);
-	assert(out_len == 2);
+	assert(out_len == 0);
 
 	in_len = 3;
 	out_len = 2;
@@ -870,13 +940,11 @@ static void test_enobufs(void)
 						    GWP_SOCKS5_REP_SUCCESS, out,
 						    &out_len);
 		assert(r == -ENOBUFS);
-		assert(out_len == 10);
+		assert(out_len == 0);
 		assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
 	}
 
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -918,13 +986,11 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	assert(!r);
 	assert(ctx);
 	assert(ctx->auth == auth);
-	assert(ctx->nr_clients == 0);
 
 	conn = gwp_socks5_conn_alloc(ctx);
 	assert(conn);
 	assert(conn->state == GWP_SOCKS5_ST_INIT);
 	assert(conn->ctx == ctx);
-	assert(ctx->nr_clients == 1);
 
 	for (i = 0; i < 4; i++) {
 		in_len = sizeof(in);
@@ -932,10 +998,8 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 		r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
 		assert(r == -ENOBUFS);
 		assert(in_len == 0);
-		if (i < 2)
-			assert(out_len == 2);
-		else
-			assert(out_len == 4);
+		/* Nothing is consumed, so nothing is reported written. */
+		assert(out_len == 0);
 		assert(conn->state == GWP_SOCKS5_ST_INIT);
 	}
 
@@ -948,6 +1012,8 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	assert(out[0] == 0x05); /* VER */
 	assert(out[1] == 0x02); /* METHOD: USER/PASS */
 	assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
+	assert(!strcmp(gwp_socks5_conn_username(conn), "user"));
+	assert(!gwp_socks5_conn_rejected_user(conn, &in_len));
 	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_IPV4);
 	assert(!memcmp(conn->dst_addr.ip4, "\x7f\x00\x00\x01", 4));
 	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));
@@ -959,7 +1025,7 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 						    GWP_SOCKS5_REP_SUCCESS, out,
 						    &out_len);
 		assert(r == -ENOBUFS);
-		assert(out_len == 10);
+		assert(out_len == 0);
 		assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
 	}
 
@@ -982,7 +1048,6 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\x00\x00", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 	gwp_auth_destroy(auth);
@@ -1034,7 +1099,6 @@ static void test_udp_associate(void)
 	assert(!memcmp(&out[4], "\x7f\x00\x00\x01", 4));	/* BND.ADDR */
 	assert(!memcmp(&out[8], "\xaa\xaa", 2));		/* BND.PORT */
 	assert(conn->state == GWP_SOCKS5_ST_UDP_ASSOCIATED);
-	assert(ctx->nr_clients == 1);
 
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
@@ -1112,6 +1176,10 @@ static void test_udp_hdr_codec(void)
 static void gwp_socks5_run_tests(void)
 {
 	size_t i;
+
+	/* Once: each refused file prints its parse error. */
+	test_auth_file_lines();
+	test_auth_check_lengths();
 
 	for (i = 0; i < 5000; i++) {
 		test_udp_associate();

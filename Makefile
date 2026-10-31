@@ -30,6 +30,7 @@ GWPROXY_CC_SOURCES = \
 	$(GWPROXY_DIR)/gwproxy.c \
 	$(GWPROXY_DIR)/log.c \
 	$(GWPROXY_DIR)/net.c \
+	$(GWPROXY_DIR)/iplimit.c \
 	$(GWPROXY_DIR)/upstream.c \
 	$(GWPROXY_DIR)/ev/epoll.c \
 	$(GWPROXY_DIR)/http1.c \
@@ -58,6 +59,10 @@ LIBGWDNS_TEST_TARGET = $(GWPROXY_DIR)/tests/dns.t
 LIBGWDNS_TEST_CC_SOURCES = $(GWPROXY_DIR)/tests/dns.c
 LIBGWDNS_TEST_OBJECTS = $(LIBGWDNS_TEST_CC_SOURCES:%.c=%.c.o)
 
+# White-box test of the DNS cache's hash table: it #includes dns_cache.c, so it
+# is built straight from its source, like http1's self-test below.
+LIBGWDNS_CACHE_TEST_TARGET = $(GWPROXY_DIR)/tests/dns_cache.t
+
 # http1's unit tests are embedded in http1.c, gated by the
 # GWNET_HTTP1_TESTS/GWNET_HTTP1_RUN_TESTS macros, so the self-test binary
 # is built straight from http1.c rather than a separate test source.
@@ -71,10 +76,27 @@ LIBGWHTTP_TEST_OBJECTS = $(LIBGWHTTP_TEST_CC_SOURCES:%.c=%.c.o)
 LIBGWHTTP_OBJECTS = $(GWPROXY_DIR)/http.c.o $(GWPROXY_DIR)/http1.c.o \
 		    $(GWPROXY_DIR)/auth.c.o
 
-ALL_TEST_TARGETS = $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET) \
+# The logger (log.c), linked straight into its unit test.
+LIBGWLOG_TEST_TARGET = $(GWPROXY_DIR)/tests/log.t
+LIBGWLOG_TEST_CC_SOURCES = $(GWPROXY_DIR)/tests/log.c
+LIBGWLOG_TEST_OBJECTS = $(LIBGWLOG_TEST_CC_SOURCES:%.c=%.c.o)
+
+# The per-client-address connection counter (iplimit.c), linked straight into
+# its unit test.
+LIBGWIPLIM_TEST_TARGET = $(GWPROXY_DIR)/tests/iplimit.t
+LIBGWIPLIM_TEST_CC_SOURCES = $(GWPROXY_DIR)/tests/iplimit.c
+LIBGWIPLIM_TEST_OBJECTS = $(LIBGWIPLIM_TEST_CC_SOURCES:%.c=%.c.o)
+
+# The epoll loop's timer heap (ev/tmr.h) is header-only, so its unit test is
+# built straight from its source.
+GWTMR_TEST_TARGET = $(GWPROXY_DIR)/tests/tmr.t
+
+ALL_TEST_TARGETS = $(LIBGWDNS_TEST_TARGET) $(LIBGWDNS_CACHE_TEST_TARGET) \
+		   $(LIBGWPSOCKS5_TEST_TARGET) \
 		   $(LIBGWHTTP1_TEST_TARGET) $(LIBGWHTTP_TEST_TARGET) \
-		   $(LIBGWACL_TEST_TARGET)
-ALL_OBJECTS = $(GWPROXY_OBJECTS) $(LIBGWPSOCKS5_OBJECTS) $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWPSOCKS5_TEST_OBJECTS) $(LIBGWHTTP_TEST_OBJECTS) $(LIBGWACL_OBJECTS) $(LIBGWACL_TEST_OBJECTS)
+		   $(LIBGWACL_TEST_TARGET) $(LIBGWLOG_TEST_TARGET) \
+		   $(LIBGWIPLIM_TEST_TARGET) $(GWTMR_TEST_TARGET)
+ALL_OBJECTS = $(GWPROXY_OBJECTS) $(LIBGWPSOCKS5_OBJECTS) $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWPSOCKS5_TEST_OBJECTS) $(LIBGWHTTP_TEST_OBJECTS) $(LIBGWACL_OBJECTS) $(LIBGWACL_TEST_OBJECTS) $(LIBGWLOG_TEST_OBJECTS) $(LIBGWIPLIM_TEST_OBJECTS)
 ALL_TARGETS = $(GWPROXY_TARGET) $(LIBGWPSOCKS5_TARGET) $(LIBGWDNS_TARGET) $(ALL_TEST_TARGETS)
 ALL_DEPFILES = $(ALL_OBJECTS:.o=.o.d)
 
@@ -111,6 +133,10 @@ ifeq ($(CONFIG_NEW_DNS_RESOLVER),y)
 GWPROXY_CC_SOURCES += \
 	$(GWPROXY_DIR)/dns_parser.c \
 	$(GWPROXY_DIR)/dns_resolver.c
+
+# The raw DNS parser's self-test is embedded in dns_parser.c (RUNTEST).
+DNS_PARSER_TEST_TARGET = $(GWPROXY_DIR)/tests/dns_parser.t
+ALL_TEST_TARGETS += $(DNS_PARSER_TEST_TARGET)
 endif
 
 ifeq ($(CONFIG_HTTPS),y)
@@ -132,7 +158,29 @@ ifeq ($(CONFIG_IO_URING),y)
 $(LIBURING_DIR)/Makefile:
 	git submodule update --init --recursive;
 
-$(LIBURING_TARGET): $(LIBURING_DIR)/Makefile
+#
+# liburing keeps its own configuration, in config-host.mak, and it outlives
+# ours: "make clean" here only descends into the submodule while
+# CONFIG_IO_URING is still set, and a caller that removes config.make first --
+# .github/scripts/ci.sh does, deliberately -- leaves both that file and
+# liburing.a behind. Only the sanitized branch below ever wrote the submodule's
+# configuration, and nothing put it back afterwards: once a tree had built with
+# --sanitize, every later build reused an instrumented liburing, and the first
+# one without --sanitize failed to link against it with a few thousand
+# undefined __asan_*/__ubsan_* symbols.
+#
+# So depend on config.make, which is rewritten whenever this tree is
+# reconfigured, and start from a clean submodule each time. liburing's own
+# clean removes config-host.mak and its Makefile regenerates it with defaults,
+# so the unsanitized case needs nothing here -- it just must not inherit the
+# old one.
+#
+# The cost is rebuilding liburing on every reconfigure. It is a small library,
+# and the alternative is a build whose correctness depends on the order the
+# variants happened to run in.
+#
+$(LIBURING_TARGET): $(LIBURING_DIR)/Makefile config.make
+	@$(MAKE) -C $(LIBURING_DIR) clean
 ifeq ($(CONFIG_SANITIZE),y)
 	cd $(LIBURING_DIR) && ./configure --enable-sanitizer;
 endif
@@ -162,11 +210,26 @@ $(LIBGWDNS_TARGET): $(LIBGWDNS_OBJECTS)
 $(LIBGWDNS_TEST_TARGET): $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWDNS_TARGET)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+$(GWPROXY_DIR)/tests/dns_parser.t: $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/dns_parser.h $(GWPROXY_DIR)/net.c $(EXTRA_DEPS)
+	$(CC) $(CFLAGS) -DRUNTEST $(LDFLAGS) -o $@ $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/net.c $(LIBS)
+
+$(LIBGWDNS_CACHE_TEST_TARGET): $(GWPROXY_DIR)/tests/dns_cache.c $(GWPROXY_DIR)/dns_cache.c $(GWPROXY_DIR)/dns_cache.h $(EXTRA_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+
 $(LIBGWHTTP1_TEST_TARGET): $(GWPROXY_DIR)/http1.c $(GWPROXY_DIR)/http1.h $(GWPROXY_DIR)/common.h $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) -DGWNET_HTTP1_TESTS -DGWNET_HTTP1_RUN_TESTS $(LDFLAGS) -o $@ $< $(LIBS)
 
 $(LIBGWHTTP_TEST_TARGET): $(LIBGWHTTP_OBJECTS) $(LIBGWHTTP_TEST_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+$(LIBGWLOG_TEST_TARGET): $(GWPROXY_DIR)/log.c.o $(LIBGWLOG_TEST_OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+$(LIBGWIPLIM_TEST_TARGET): $(GWPROXY_DIR)/iplimit.c.o $(LIBGWIPLIM_TEST_OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+$(GWTMR_TEST_TARGET): $(GWPROXY_DIR)/tests/tmr.c $(GWPROXY_DIR)/ev/tmr.h $(GWPROXY_DIR)/gwproxy.h $(EXTRA_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
 ifeq ($(CONFIG_HTTPS),y)
 $(SSL_TEST_TARGET): $(GWPROXY_DIR)/ssl.c.o $(SSL_TEST_OBJECTS)

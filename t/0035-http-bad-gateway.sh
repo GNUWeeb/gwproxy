@@ -19,9 +19,8 @@ make_payload "$WORK/payload.bin" 1024
 start_httpd "$hp" "$WORK" "1.1"
 
 # A port with nothing listening: connect() is refused rather than timing out.
-closed="$(python3 -c 'import socket
-s = socket.socket(); s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1]); s.close()')"
+closed_port
+closed="$CLOSED_PORT"
 
 # Status line the proxy returns for a CONNECT. curl cannot report the status of
 # a failed CONNECT tunnel (it is not the final response), so this reads the wire
@@ -83,6 +82,16 @@ for loop in epoll io_uring; do
 	NOREPLY)	fail "[$loop] CONNECT to a refused target got no reply at all" ;;
 	*)		fail "[$loop] CONNECT to a refused target got '$st' (want 502)" ;;
 	esac
+
+	# A port that is not one is the client's mistake, not the origin's:
+	# 400, and nothing is looked up. Service names are not ports either.
+	for auth in "localhost:99999" "localhost:http" "localhost:+80"; do
+		st="$(raw_status "$pp" "$auth")"
+		case "$st" in
+		"HTTP/1.1 400"*)	;;
+		*)	fail "[$loop] CONNECT $auth got '$st' (want 400)" ;;
+		esac
+	done
 
 	kill "$GWP_PID" 2>/dev/null
 done

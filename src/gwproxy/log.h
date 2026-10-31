@@ -20,6 +20,21 @@
 __attribute__((__format__(printf, 3, 4)))
 void __pr_log(FILE *handle, int level, const char *fmt, ...);
 
+/*
+ * The room gwp_log_escape() needs for @len bytes: each may become "\xHH",
+ * and the terminating NUL.
+ */
+#define GWP_LOG_ESC_SIZE(len) ((len) * 4 + 1)
+
+/*
+ * Copy the @len bytes at @src, which may be any bytes NUL included, into @dst
+ * as a NUL-terminated string fit to quote in a log message: every byte outside
+ * printable ASCII, and '"' and '\', is written as "\xHH", so the value reads
+ * back unambiguously between double quotes. @dst must hold
+ * GWP_LOG_ESC_SIZE(@len) bytes. Returns @dst.
+ */
+char *gwp_log_escape(char *dst, const void *src, size_t len);
+
 struct log_handle {
 	FILE *handle;
 	int level;

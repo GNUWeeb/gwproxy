@@ -39,6 +39,9 @@ void gwp_auth_destroy(struct gwp_auth *auth);
 
 /**
  * Re-read the credential file, atomically replacing the in-memory entries.
+ * The path is opened afresh, so a file replaced by rename is picked up. On
+ * any error (unreadable file, malformed line, OOM) the current entries stay
+ * in place.
  *
  * @param auth	The store to reload. Must have been created from a file.
  * @return	0 on success, or a negative error code on failure.
@@ -77,5 +80,17 @@ bool gwp_auth_check_basic(struct gwp_auth *auth, const char *hdr_val);
  */
 bool gwp_auth_check_basic_ex(struct gwp_auth *auth, const char *hdr_val,
 			     char *user_out, size_t user_cap);
+
+/**
+ * Take the username out of a "Basic" credential header value without checking
+ * it, e.g. to log a failed login.
+ *
+ * @param hdr_val	The raw header value.
+ * @param user_out	Receives the username: any bytes, not NUL-terminated,
+ *			cut at @user_cap bytes.
+ * @return		The number of bytes copied, or -1 if @hdr_val is not a
+ *			well-formed Basic credential.
+ */
+int gwp_auth_basic_user(const char *hdr_val, char *user_out, size_t user_cap);
 
 #endif /* #ifndef GWPROXY__AUTH_H */

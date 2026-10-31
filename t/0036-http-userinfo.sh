@@ -26,7 +26,7 @@ hlog="$WORK/host.log"
 python3 "$SERVERS_DIR/header_origin.py" "$op" "$hlog" Host \
 	>"$WORK/header_origin.log" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$op" || fail "header origin did not listen on $op"
+wait_listen "$op" "$!" || fail "header origin did not listen on $op"
 
 # Send one raw absolute-form request through the proxy, print the status line.
 # NOTE: <<- strips leading tabs, so the python below indents with spaces.
@@ -79,7 +79,7 @@ for loop in epoll io_uring; do
 	python3 "$SERVERS_DIR/recording_proxy.py" socks5 127.0.0.1 "$rp" "$rlog" \
 		>"$WORK/rec.$loop.err" 2>&1 &
 	_PIDS+=("$!")
-	wait_listen "$rp" || fail "recording upstream did not listen"
+	wait_listen "$rp" "$!" || fail "recording upstream did not listen"
 
 	fp="$(pick_port)"
 	gwp_start "127.0.0.1:$fp" --as-http=1 --event-loop="$loop" \

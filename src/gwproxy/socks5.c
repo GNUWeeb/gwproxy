@@ -60,7 +60,6 @@ struct gwp_socks5_conn *gwp_socks5_conn_alloc(struct gwp_socks5_ctx *ctx)
 
 	conn->state = GWP_SOCKS5_ST_INIT;
 	conn->ctx = ctx;
-	atomic_fetch_add(&ctx->nr_clients, 1);
 	return conn;
 }
 
@@ -69,13 +68,22 @@ void gwp_socks5_conn_free(struct gwp_socks5_conn *conn)
 	if (!conn)
 		return;
 
-	atomic_fetch_sub(&conn->ctx->nr_clients, 1);
 	free(conn);
 }
 
 const char *gwp_socks5_conn_username(const struct gwp_socks5_conn *conn)
 {
 	return (conn && conn->user_len) ? conn->user : NULL;
+}
+
+const char *gwp_socks5_conn_rejected_user(const struct gwp_socks5_conn *conn,
+					  size_t *len)
+{
+	if (!conn || !conn->bad_user_len)
+		return NULL;
+
+	*len = conn->bad_user_len;
+	return conn->user;
 }
 
 struct data_arg {
@@ -95,12 +103,16 @@ static int append_out_buf(struct data_arg *d, const void *buf, size_t len)
 	size_t old_len = d->tot_out_len;
 	uint8_t *dst;
 
-	d->tot_out_len += len;
-	if (d->tot_out_len > *d->out_len)
+	/*
+	 * Check before counting: a length that ran past the buffer would
+	 * reach the caller as bytes written that never were.
+	 */
+	if (len > *d->out_len - old_len)
 		return -ENOBUFS;
 
 	dst = (uint8_t *)d->out_buf + old_len;
 	memcpy(dst, buf, len);
+	d->tot_out_len += len;
 	return 0;
 }
 
@@ -324,10 +336,14 @@ static int handle_state_auth_userpass(struct data_arg *d)
 		memcpy(d->conn->user, u, ulen);
 		d->conn->user[ulen] = '\0';
 		d->conn->user_len = (uint8_t)ulen;
+		d->conn->bad_user_len = 0;
 	} else {
 		/* STATUS = 0x01 (failure) */
 		resp[1] = 0x01;
 		d->conn->state = GWP_SOCKS5_ST_ERR;
+		/* Keep the name for the caller to log the failure with. */
+		memcpy(d->conn->user, u, ulen);
+		d->conn->bad_user_len = (uint8_t)ulen;
 	}
 
 	if (append_out_buf(d, resp, sizeof(resp)))
@@ -717,14 +733,18 @@ out:
 		 * The caller will eventually get the proper state
 		 * after it calls this function again with enough
 		 * output buffer space.
+		 *
+		 * The replies of the states we went through are dropped
+		 * along with them: that call produces them again.
 		 */
 		conn->state = orig_state;
 		*in_len = 0;
+		*out_len = 0;
 	} else {
 		*in_len = arg.tot_advance;
+		*out_len = arg.tot_out_len;
 	}
 
-	*out_len = arg.tot_out_len;
 	return r;
 }
 

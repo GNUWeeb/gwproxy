@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Unit tests for the memory-BIO TLS wrapper (src/gwproxy/ssl.c).
+ * Unit tests for the TLS wrapper (src/gwproxy/ssl.c).
  *
  * A server and a client gwp_ssl are driven entirely by shuttling ciphertext
  * between their BIOs (no sockets), verifying the handshake completes and
@@ -153,6 +153,82 @@ static void test_handshake_and_roundtrip(void)
 	PRTEST_OK();
 }
 
+/*
+ * Move ciphertext the zero-copy way the epoll loop does: take it from the send
+ * queue with peek/consume in small, uneven pieces, and hand it to the receive
+ * queue through rx_space/rx_commit. Check that the plaintext arrives intact
+ * when read with a small buffer, and that rx_more() reports exactly whether
+ * another read can make progress.
+ */
+static void test_zero_copy_queues(void)
+{
+	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
+	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
+	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
+	static unsigned char out[50000];
+	size_t i, plen, len, consumed, got, total, chunk;
+	struct gwp_ssl *srv, *cli;
+	const unsigned char *p;
+	unsigned char *dst;
+	char *big;
+	int fd, r;
+
+	fd = mkstemp(cert); assert(fd >= 0); close(fd);
+	fd = mkstemp(key); assert(fd >= 0); close(fd);
+	write_file(cert, TEST_CERT);
+	write_file(key, TEST_KEY);
+	assert(!gwp_ssl_ctx_server_create(&sctx, cert, key));
+	assert(!gwp_ssl_ctx_client_create(&cctx));
+	srv = gwp_ssl_server_new(sctx);
+	cli = gwp_ssl_client_new(cctx);
+	assert(srv && cli);
+	do_handshake(cli, srv);
+	assert(!gwp_ssl_rx_more(srv));
+
+	big = malloc(sizeof(out));
+	assert(big);
+	for (i = 0; i < sizeof(out); i++)
+		big[i] = (char)(i * 13 + 5);
+	r = gwp_ssl_write(cli, big, sizeof(out), &consumed);
+	assert(r == GWP_SSL_OK && consumed == sizeof(out));
+	assert(gwp_ssl_bio_pending(cli) > sizeof(out));
+
+	for (chunk = 1; (p = gwp_ssl_bio_peek(cli, &plen)) != NULL; chunk++) {
+		size_t n = (chunk * 977) % 3001 + 1;
+
+		if (n > plen)
+			n = plen;
+		dst = gwp_ssl_rx_space(srv, n, &len);
+		assert(dst && len >= n);
+		memcpy(dst, p, n);
+		gwp_ssl_rx_commit(srv, n);
+		gwp_ssl_bio_consume(cli, n);
+	}
+	assert(gwp_ssl_bio_pending(cli) == 0);
+
+	total = 0;
+	while (gwp_ssl_rx_more(srv)) {
+		size_t want = sizeof(out) - total;
+
+		if (want > 1000)
+			want = 1000;
+		r = gwp_ssl_read(srv, out + total, want, &got);
+		assert(r == GWP_SSL_OK || r == GWP_SSL_WANT_READ);
+		total += got;
+	}
+	assert(total == sizeof(out));
+	assert(!memcmp(out, big, sizeof(out)));
+	free(big);
+
+	gwp_ssl_free(srv);
+	gwp_ssl_free(cli);
+	gwp_ssl_ctx_free(sctx);
+	gwp_ssl_ctx_free(cctx);
+	unlink(cert);
+	unlink(key);
+	PRTEST_OK();
+}
+
 static void test_bad_cert_rejected(void)
 {
 	struct gwp_ssl_ctx *sctx = NULL;
@@ -223,6 +299,7 @@ int main(void)
 
 	for (i = 0; i < 200; i++) {
 		test_handshake_and_roundtrip();
+		test_zero_copy_queues();
 		test_bad_cert_rejected();
 		test_alpn_negotiation();
 	}

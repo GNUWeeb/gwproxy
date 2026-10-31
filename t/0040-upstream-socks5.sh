@@ -54,7 +54,7 @@ for scheme in socks5 socks5h; do
 	python3 "$SERVERS_DIR/recording_proxy.py" socks5 127.0.0.1 "$rp" "$rlog" \
 		>"$WORK/rec.$scheme.err" 2>&1 &
 	_PIDS+=("$!")
-	wait_listen "$rp" || fail "recording upstream did not listen"
+	wait_listen "$rp" "$!" || fail "recording upstream did not listen"
 
 	fp="$(pick_port)"
 	gwp_start "127.0.0.1:$fp" --as-socks5=1 --nr-workers=2 \
@@ -78,5 +78,13 @@ for scheme in socks5 socks5h; do
 			|| fail "socks5h:// should forward the name, upstream saw '$got'" ;;
 	esac
 done
+
+# The port of an upstream is optional (1080 for socks5://), also for a
+# bracketed IPv6 literal. gwproxy validates the URL at startup, so a rejected
+# one never gets as far as listening. Nothing is dialled here: port 1080 is
+# not ours to use.
+fp="$(pick_port)"
+gwp_start "127.0.0.1:$fp" --as-socks5=1 --upstream-proxy="socks5://[::1]"
+kill "$GWP_PID" 2>/dev/null
 
 pass

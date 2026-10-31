@@ -8,12 +8,15 @@ on:
 
 jobs:
   get_commit_list:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # Each commit becomes 14 build jobs, and a matrix may hold 256 jobs
+      # at most. A push of more commits (a rewritten history, say) would
+      # fail before testing anything, so test only its newest 18 commits.
       - name: Get commit list
         id: get_commit_list
         run: |
@@ -22,7 +25,7 @@ jobs:
             ( \
               git log --pretty="%h" --reverse ${{github.event.commits[0].id}}^...${{github.sha}} || \
               (printf "%s" ${{github.sha}} | head -c 12) \
-            ) | awk '{ print "id" NR "=" $1 }' \
+            ) | tail -n 18 | awk '{ print "id" NR "=" $1 }' \
           ) > $GITHUB_OUTPUT;
           echo "List of tested commits:" > $GITHUB_STEP_SUMMARY;
           cat $GITHUB_OUTPUT >> $GITHUB_STEP_SUMMARY;
@@ -33,7 +36,7 @@ jobs:
 
   build:
     needs: get_commit_list
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -147,9 +150,30 @@ jobs:
             --cc=${{matrix.build_args.cc}} \
             --sanitize=${{matrix.build_args.sanitize}};
 
+      # A failing test prints only "FAIL <name> (rc=N)" and "logs in
+      # .test-out"; everything it actually captured stays in the workspace and
+      # dies with the runner. Keep it. config.make comes along because a row
+      # runs several build variants and .test-out does not record which one it
+      # belongs to -- its "Configured with" line does.
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{matrix.build_args.arch}}-${{matrix.build_args.cc}}-san${{matrix.build_args.sanitize}}-${{matrix.commit}}
+          path: |
+            .test-out/
+            config.make
+            config.h
+          # .test-out is a dot directory and upload-artifact skips hidden
+          # paths unless told otherwise. Without this the step still goes
+          # green, on an artifact holding only the two config files.
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
+
   alpine-musl-build:
     needs: get_commit_list
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
@@ -187,9 +211,27 @@ jobs:
         run: |
           ./.github/scripts/ci.sh alpine-build;
 
+      # This job runs the suite too, so it loses the same evidence. Uploaded
+      # from the host rather than the chroot -- the workspace is shared.
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-alpine-${{matrix.commit}}
+          path: |
+            .test-out/
+            config.make
+            config.h
+          # .test-out is a dot directory and upload-artifact skips hidden
+          # paths unless told otherwise. Without this the step still goes
+          # green, on an artifact holding only the two config files.
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
+
   codespell:
     needs: get_commit_list
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}

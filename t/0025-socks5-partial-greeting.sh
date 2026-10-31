@@ -71,6 +71,12 @@ for loop in epoll io_uring; do
 			fail "[$loop] proxy died on a one-byte first segment ($b)"
 	done
 
+	# The pokes closed before any target was known. The close is still
+	# logged, and an address that is not set must not reach "%s" as NULL
+	# (glibc prints "(null)"; other libcs may crash).
+	grep -F '(null)' "$WORK/gwp.$p.log" && \
+		fail "[$loop] a NULL string was logged for an unset address"
+
 	# ...and it is still serving, not merely alive.
 	out="$WORK/after.$loop"
 	curl -fsS --max-time 10 -x "socks5://127.0.0.1:$p" \

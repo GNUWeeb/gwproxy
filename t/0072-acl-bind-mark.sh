@@ -75,7 +75,7 @@ start_priv()
 		--acl-file="$3" --event-loop="$4" --nr-workers=1 \
 		--log-level=3 >"$WORK/priv.log" 2>&1 &
 	PRIV_PID=$!
-	wait_listen "$1" \
+	wait_listen "$1" "$PRIV_PID" \
 		|| { sed 's/^/# gwp: /' "$WORK/priv.log" >&2; fail "gwproxy did not listen on $1"; }
 }
 

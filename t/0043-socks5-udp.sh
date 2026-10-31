@@ -19,31 +19,16 @@ require ss
 
 udp_client() { python3 "$SERVERS_DIR/socks5_udp_client.py" "$@"; }
 
-wait_udp_bound() {			# $1=port
-	local i
-	for i in $(seq 1 50); do
-		ss -uanH "sport = :$1" 2>/dev/null | grep -q . && return 0
-		sleep 0.1
-	done
-	fail "UDP echo server did not bind on $1"
-}
-
 # IPv4 UDP echo server.
-ep="$(pick_port)"
-python3 "$SERVERS_DIR/udp_echo.py" 127.0.0.1 "$ep" \
-	>"$WORK/udp_echo.$ep.log" 2>&1 &
-_PIDS+=("$!")
-wait_udp_bound "$ep"
+start_udp_echo 127.0.0.1
+ep="$UDP_ECHO_PORT"
 
 # IPv6 UDP echo server (best-effort: skip the IPv6 cases where ::1 is absent).
 have_v6=0
-ep6="$(pick_port)"
 if python3 -c 'import socket,sys; socket.socket(socket.AF_INET6,socket.SOCK_DGRAM).bind(("::1",0))' 2>/dev/null; then
 	have_v6=1
-	python3 "$SERVERS_DIR/udp_echo.py" ::1 "$ep6" \
-		>"$WORK/udp_echo.$ep6.log" 2>&1 &
-	_PIDS+=("$!")
-	wait_udp_bound "$ep6"
+	start_udp_echo ::1
+	ep6="$UDP_ECHO_PORT"
 fi
 
 # A TCP HTTP origin for the coexisting CONNECT check.

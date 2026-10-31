@@ -78,6 +78,27 @@ int gwp_acl_reload(struct gwp_acl *acl);
 void gwp_acl_destroy(struct gwp_acl *acl);
 
 /*
+ * Per-connection memo of the address-independent (-m domain / -m user)
+ * results of the first GWP_ACL_MEMO_RULES such OUTPUT rules, so evaluating
+ * the same request against several candidate addresses does that work once.
+ * Owned by one connection; zero-initialise it, and reset it (gwp_acl_memo_reset)
+ * whenever the request's domain or user may change. gwp_acl_eval_output()
+ * discards it by itself when the ruleset is reloaded.
+ */
+#define GWP_ACL_MEMO_RULES	64
+struct gwp_acl_memo {
+	uint64_t	known;	/* bit i: slot i computed */
+	uint64_t	ok;	/* bit i: slot i's criteria hold */
+	uint32_t	gen;	/* ruleset generation of the slots */
+	bool		valid;
+};
+
+static inline void gwp_acl_memo_reset(struct gwp_acl_memo *m)
+{
+	m->valid = false;
+}
+
+/*
  * A single evaluation request, passed by pointer to the eval helpers. Bundling
  * the parameters (and results) in one struct keeps the call sites stable as new
  * match criteria are added -- extend this struct and the matcher, not every
@@ -94,6 +115,7 @@ void gwp_acl_destroy(struct gwp_acl *acl);
  *   @sport   client source port, host byte order (both chains).
  *   @dport   destination port, host byte order (OUTPUT).
  *   @proto   GWP_ACL_PROTO_TCP / _UDP.
+ *   @memo    optional struct gwp_acl_memo (OUTPUT only), or NULL.
  *
  * Outputs (set by gwp_acl_eval_output()):
  *   @dnat_applied  true if a -j DNAT rule matched; @dnat then holds the rewrite.
@@ -105,6 +127,11 @@ void gwp_acl_destroy(struct gwp_acl *acl);
  *   @bind    the source/interface from the last matched -j BIND rule (also a
  *            composable modifier, and likewise terminal with --accept);
  *            @bind.set is false when none matched.
+ *   @gen     the ruleset generation the verdict was computed against (see
+ *            gwp_acl_generation()).
+ *   @cacheable  false when the verdict must not be reused for an identical
+ *            request: the chain has a -m statistic rule, whose answer
+ *            changes from one evaluation to the next.
  */
 struct gwp_acl_req {
 	/* Inputs (pointer-sized members first). */
@@ -112,6 +139,7 @@ struct gwp_acl_req {
 	const struct gwp_sockaddr	*target;
 	const char			*domain;
 	const char			*user;
+	struct gwp_acl_memo		*memo;
 
 	/*
 	 * Outputs. DNAT, MARK and BIND are independent, composable modifiers: a
@@ -122,6 +150,7 @@ struct gwp_acl_req {
 	struct gwp_sockaddr		dnat;	/* rewrite; valid iff @dnat_applied */
 	struct gwp_acl_bind		bind;	/* bind spec; valid iff @bind.set */
 	uint32_t			mark;	/* fwmark; valid iff @mark_set */
+	uint32_t			gen;
 
 	/* Small scalars: inputs, then output flags, grouped to pack tightly. */
 	uint16_t			sport;
@@ -129,6 +158,7 @@ struct gwp_acl_req {
 	uint8_t				proto;	/* enum gwp_acl_proto */
 	bool				dnat_applied;
 	bool				mark_set;
+	bool				cacheable;
 };
 
 /*
@@ -139,10 +169,25 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 					 struct gwp_acl_req *req);
 
 /*
+ * The ACL's ruleset generation: it changes with every successful reload, so a
+ * caller that caches an OUTPUT verdict (with the @gen and @cacheable it came
+ * with) can tell whether the verdict is still current. 0 for a NULL @acl.
+ */
+uint32_t gwp_acl_generation(struct gwp_acl *acl);
+
+/*
  * Evaluate the INPUT chain (incoming client) for @req. Returns GWP_ACL_ACCEPT
  * or GWP_ACL_REJECT; a NULL @acl returns ACCEPT.
  */
 enum gwp_acl_verdict gwp_acl_eval_input(struct gwp_acl *acl,
 					struct gwp_acl_req *req);
+
+/*
+ * How many rules of @acl's current ruleset are looked up through an index
+ * instead of tested one by one: those in runs of at least 8 consecutive
+ * rules that each test only an exact -m domain, a -d or a -s (not negated)
+ * and end the evaluation when they match. For diagnostics and tests.
+ */
+uint32_t gwp_acl_nr_indexed(struct gwp_acl *acl);
 
 #endif /* #ifndef GWP_ACL_H */

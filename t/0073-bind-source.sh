@@ -52,17 +52,20 @@ pa4="$(pick_port)"
 pa6="$(pick_port)"
 pap="$(pick_port)"
 python3 "$SERVERS_DIR/peer_addr.py" 127.0.0.1 "$pa4" >"$WORK/peer4.log" 2>&1 &
-_PIDS+=("$!")
+pa4_pid=$!
+_PIDS+=("$pa4_pid")
 python3 "$SERVERS_DIR/peer_addr.py" ::1 "$pa6" >"$WORK/peer6.log" 2>&1 &
-_PIDS+=("$!")
+pa6_pid=$!
+_PIDS+=("$pa6_pid")
 # Reports "<ip> <port>", and also logs it to a file so it can double as the
 # stand-in upstream proxy below, where gwproxy is the one doing the dialling.
 python3 "$SERVERS_DIR/peer_addr.py" 127.0.0.1 "$pap" --with-port \
 	--log "$WORK/peerport.log" >"$WORK/peerp.log" 2>&1 &
-_PIDS+=("$!")
-wait_listen "$pa4" || fail "the IPv4 peer-address server did not start"
-wait_listen "$pa6" || fail "the IPv6 peer-address server did not start"
-wait_listen "$pap" || fail "the port-reporting peer-address server did not start"
+pap_pid=$!
+_PIDS+=("$pap_pid")
+wait_listen "$pa4" "$pa4_pid" || fail "the IPv4 peer-address server did not start"
+wait_listen "$pa6" "$pa6_pid" || fail "the IPv6 peer-address server did not start"
+wait_listen "$pap" "$pap_pid" || fail "the port-reporting peer-address server did not start"
 
 # The whole test rests on the origin seeing 127.0.0.1 when nothing is pinned,
 # and something else when a source is; if that is not true here, every

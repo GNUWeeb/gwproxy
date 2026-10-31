@@ -13,13 +13,14 @@
 #include <gwproxy/common.h>
 #include <gwproxy/acl.h>
 #include <stdlib.h>
+#include <stdatomic.h>
+#include <unistd.h>
 #include <inttypes.h>
 #include <sys/eventfd.h>
 #include <errno.h>
 #include <string.h>
 #include <assert.h>
 #include <limits.h>
-#include <sys/inotify.h>
 #include <liburing.h>
 #include <poll.h>
 #ifdef CONFIG_HTTPS
@@ -30,27 +31,28 @@
 
 #ifdef CONFIG_HTTPS
 /*
- * Per-connection ciphertext scratch for a TLS client. The io_uring recv/send
- * are asynchronous, so the wire buffers must persist for the whole operation
- * (unlike epoll, which decrypts synchronously into a stack buffer). @rx is
- * where the kernel deposits ciphertext to be fed to the read BIO; @tx holds
- * ciphertext pulled from the write BIO that is being sent, with @tx_sent..@tx_len
- * the not-yet-written tail. TLS records cap at ~16 KiB.
+ * Per-connection ciphertext scratch for a TLS client. The io_uring send is
+ * asynchronous, so its buffer must persist for the whole operation: @tx holds
+ * ciphertext pulled from the write BIO that is being sent, with
+ * @tx_sent..@tx_len the not-yet-written tail. It holds a whole TLS record,
+ * header and cipher overhead included, so a full record goes out in one send.
+ * Received ciphertext needs no scratch: it lands in the engine's own input
+ * queue (see __prep_recv_client()).
  */
-#define GWP_TLS_CIPHER_CAP 16384u
+#define GWP_TLS_CIPHER_CAP GWP_SSL_RECORD_MAX
 
 struct gwp_iou_tls {
 	uint32_t	tx_len;		/* ciphertext bytes queued in @tx  */
 	uint32_t	tx_sent;	/* of those, already written       */
-	bool		hs_done;	/* handshake finished              */
-	unsigned char	rx[GWP_TLS_CIPHER_CAP];
+	bool		closing;	/* close_notify queued             */
+	bool		prot_resume;	/* pump the protocol once tx is out */
 	unsigned char	tx[GWP_TLS_CIPHER_CAP];
 };
 
 /* Defined further down but referenced by earlier prep/dispatch code. */
 static int handle_sock_ret(int r);
 static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r);
-static int iou_forward_progress(struct gwp_conn_pair *gcp);
+static int iou_forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static void prep_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
@@ -93,13 +95,24 @@ int gwp_ctx_init_thread_io_uring(struct gwp_wrk *w)
 	if (!iou)
 		return -ENOMEM;
 
-	r = io_uring_queue_init(1024, &iou->ring, 0);
+	/*
+	 * Stop doorbell, see gwp_ctx_signal_all_io_uring(). Created before
+	 * the ring so a worker never exists without one.
+	 */
+	r = __sys_eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (r < 0)
 		goto err_free_iou;
+	iou->stop_efd = r;
+
+	r = io_uring_queue_init(1024, &iou->ring, 0);
+	if (r < 0)
+		goto err_close_efd;
 
 	w->iou = iou;
 	return 0;
 
+err_close_efd:
+	__sys_close(iou->stop_efd);
 err_free_iou:
 	free(iou);
 	return r;
@@ -116,62 +129,133 @@ static int io_uring_submit_eintr(struct io_uring *ring, size_t nr_attemps)
 
 	while (nr_attemps--) {
 		r = io_uring_submit(ring);
-		if (likely(r >= 0 || r != -EINTR))
+		if (likely(r != -EINTR))
 			break;
 	}
 
 	return r;
 }
 
-static struct io_uring_sqe *__get_sqe_nofail(struct io_uring *ring)
-{
-	struct io_uring_sqe *sqe;
+/* How long get_sqe_nofail() keeps retrying a failing submit, in ms. */
+#define GWP_SQE_RETRY_MS 1000
 
-	sqe = io_uring_get_sqe(ring);
-	if (unlikely(!sqe)) {
-		int r = io_uring_submit_eintr(ring, 8);
-		if (unlikely(r < 0))
-			return NULL;
-
-		sqe = io_uring_get_sqe(ring);
-		if (unlikely(!sqe))
-			return NULL;
-	}
-
-	return sqe;
-}
-
+/*
+ * Return a free SQE, submitting the queued ones to make room when the SQ is
+ * full. Every caller has already committed to its operation (taken a pair
+ * reference, moved buffers), so there is no "no SQE" result to hand back.
+ *
+ * A submit can fail for want of kernel memory (-EAGAIN, -ENOMEM), or, on
+ * older kernels, while completions sit in the CQ overflow list (-EBUSY).
+ * Those pass, so wait for them to: flush what overflowed into the CQ ring,
+ * which handle_events() keeps clear of the completions it has handled
+ * already, sleep a millisecond and submit again. Only an error that keeps
+ * coming for GWP_SQE_RETRY_MS, or one that is not transient at all (a bad
+ * ring fd, say), still aborts: the loop cannot go on without SQEs.
+ */
 static struct io_uring_sqe *get_sqe_nofail(struct gwp_wrk *w)
 {
-	struct io_uring_sqe *sqe = __get_sqe_nofail(&w->iou->ring);
+	struct io_uring *ring = &w->iou->ring;
+	struct io_uring_sqe *sqe;
+	unsigned int waited = 0;
+	int r = 0;
+
+	while (!(sqe = io_uring_get_sqe(ring))) {
+		r = io_uring_submit(ring);
+		if (likely(r > 0) || r == -EINTR)
+			continue;
+
+		if (r < 0 && r != -EAGAIN && r != -ENOMEM && r != -EBUSY)
+			break;
+		if (waited >= GWP_SQE_RETRY_MS)
+			break;
+
+		if (!waited)
+			pr_warn(&w->ctx->lh,
+				"Worker %u: io_uring_submit(): %s; retrying",
+				w->idx, strerror(r < 0 ? -r : EAGAIN));
+		io_uring_get_events(ring);
+		usleep(1000);
+		waited++;
+	}
 
 	if (likely(sqe))
 		return sqe;
 
-	pr_err(&w->ctx->lh, "Failed to get io_uring sqe for worker %u", w->idx);
+	pr_err(&w->ctx->lh, "Failed to get io_uring sqe for worker %u: %s",
+	       w->idx, strerror(r < 0 ? -r : EAGAIN));
 	abort();
+}
+
+/*
+ * Requests still in flight point into memory the caller frees next: the
+ * pairs' buffers, their sockets, this worker's iou. Closing a socket's fd
+ * does not end them, the request holds its own reference to the file, and
+ * neither does closing the ring: io_uring_queue_exit() returns while the
+ * kernel cancels what is left in the background. So cancel everything
+ * first. The synchronous cancel returns once the requests it found can no
+ * longer touch user memory (a recv waiting for data is disarmed on the
+ * spot), and it works from any thread, also for a worker that has already
+ * exited. Kernels before 6.0 lack it; there, an async cancel of everything
+ * does the same for the poll-driven socket I/O this loop uses, and its own
+ * completion says when it is done.
+ */
+__cold
+static void cancel_all_requests(struct gwp_wrk *w)
+{
+	struct io_uring_sync_cancel_reg reg = {
+		.fd = -1,
+		.flags = IORING_ASYNC_CANCEL_ANY,
+		.timeout = { .tv_sec = -1, .tv_nsec = -1 },
+	};
+	/* Unlike the stop poll's, never a value any request carries. */
+	const uint64_t tag = EV_BIT_IOU_STOP | 1;
+	struct io_uring *ring = &w->iou->ring;
+	struct io_uring_cqe *cqe;
+	struct io_uring_sqe *s;
+	int r;
+
+	r = io_uring_register_sync_cancel(ring, &reg);
+	if (r >= 0 || r == -ENOENT)
+		return;
+
+	io_uring_submit(ring);	/* never let a queued SQE go out after us */
+	s = io_uring_get_sqe(ring);
+	if (!s)
+		goto out_err;
+	io_uring_prep_cancel(s, NULL, IORING_ASYNC_CANCEL_ANY);
+	s->user_data = tag;
+	r = io_uring_submit(ring);
+	if (r < 0)
+		goto out_err;
+
+	for (;;) {
+		bool done;
+
+		r = io_uring_wait_cqe(ring, &cqe);
+		if (r == -EINTR)
+			continue;
+		if (r < 0)
+			goto out_err;
+		done = cqe->user_data == tag;
+		io_uring_cqe_seen(ring, cqe);
+		if (done)
+			return;
+	}
+
+out_err:
+	pr_err(&w->ctx->lh, "Worker %u: cannot cancel pending io_uring requests: %s",
+	       w->idx, strerror(r < 0 ? -r : EAGAIN));
 }
 
 __cold
 void gwp_ctx_free_thread_io_uring(struct gwp_wrk *w)
 {
+	cancel_all_requests(w);
 	io_uring_queue_exit(&w->iou->ring);
+	__sys_close(w->iou->stop_efd);
 	pr_dbg(&w->ctx->lh, "Worker %u io_uring queue exited", w->idx);
 	free(w->iou);
 	w->iou = NULL;
-}
-
-static int prep_nr_sqes(struct gwp_wrk *w, unsigned nr)
-{
-	if (io_uring_sq_space_left(&w->iou->ring) < nr) {
-		int r = io_uring_submit_eintr(&w->iou->ring, 8);
-		if (unlikely(r < 0)) {
-			log_submit_err(w, r);
-			return r;
-		}
-	}
-
-	return 0;
 }
 
 static void arm_accept(struct gwp_wrk *w)
@@ -187,8 +271,23 @@ static void arm_accept(struct gwp_wrk *w)
 }
 
 /*
- * accept() is paused because of fd exhaustion (EMFILE/ENFILE): arm a short
- * one-shot timer and retry the accept when it fires (see handle_ev_accept()).
+ * Watch this worker's stop doorbell. One-shot and never re-armed: the eventfd
+ * is never read, so once rung it stays readable, and a poll armed after the
+ * ring still completes at once -- a stop cannot slip in between the loop's
+ * ctx->stop test and its wait.
+ */
+static void arm_stop_poll(struct gwp_wrk *w)
+{
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	io_uring_prep_poll_add(s, w->iou->stop_efd, POLLIN);
+	s->user_data = EV_BIT_IOU_STOP;
+}
+
+/*
+ * accept() is paused because of fd exhaustion (EMFILE/ENFILE), or because it
+ * keeps failing the same way (see handle_ev_accept()): arm a short one-shot
+ * timer and retry the accept when it fires.
  * Polling this way decouples recovery from connection-teardown timing, so the
  * worker can never get permanently stuck with accepting disabled.
  */
@@ -206,11 +305,6 @@ static void arm_accept_retry(struct gwp_wrk *w)
 static void prep_close(struct gwp_wrk *w, int fd)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
-	if (unlikely(!s)) {
-		pr_err(&w->ctx->lh, "Failed to get io_uring sqe for close");
-		__sys_close(fd);
-		return;
-	}
 
 	io_uring_prep_close(s, fd);
 	s->flags |= IOSQE_CQE_SKIP_SUCCESS;
@@ -221,6 +315,50 @@ static void prep_close(struct gwp_wrk *w, int fd)
 static void get_gcp(struct gwp_conn_pair *gcp)
 {
 	gcp->ref_cnt++;
+}
+
+/*
+ * The in-flight request count of the socket that requests with selector
+ * @ev_bit operate on, or NULL when they are not I/O on one of the pair's
+ * sockets (timeouts, cancels, connect attempts, the DNS poll). The same
+ * mapping counts a request when it is queued and uncounts it when it
+ * completes, so the two cannot disagree.
+ */
+static uint8_t *nr_ops_of(struct gwp_conn_pair *gcp, uint64_t ev_bit)
+{
+	switch (ev_bit) {
+	case EV_BIT_IOU_CLIENT_RECV:
+	case EV_BIT_IOU_CLIENT_SEND:
+	case EV_BIT_IOU_CLIENT_PROT:
+	case EV_BIT_IOU_TLS_DETECT:
+	case EV_BIT_IOU_TLS_HS_RECV:
+	case EV_BIT_IOU_TLS_HS_SEND:
+		return &gcp->nr_ops_client;
+	case EV_BIT_IOU_TARGET_RECV:
+	case EV_BIT_IOU_TARGET_SEND:
+	case EV_BIT_IOU_UPSTREAM_S5:
+		return &gcp->nr_ops_target;
+	case EV_BIT_IOU_UDP_RX:
+	case EV_BIT_IOU_UDP_TX:
+		return &gcp->nr_ops_udp;
+	default:
+		return NULL;
+	}
+}
+
+/*
+ * Take the pair reference for request @s, which does I/O on one of the pair's
+ * sockets, and count it against that socket. Call it once @s->user_data
+ * carries its selector.
+ */
+static void get_gcp_io(struct gwp_conn_pair *gcp, struct io_uring_sqe *s)
+{
+	uint8_t *nr = nr_ops_of(gcp, GET_EV_BIT(s->user_data));
+
+	assert(nr);
+	if (likely(nr))
+		(*nr)++;
+	get_gcp(gcp);
 }
 
 static bool put_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -288,19 +426,13 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_sockaddr *ca;
 	struct io_uring_sqe *s;
 	socklen_t addr_len;
-	int fd, r;
+	int fd;
 
 	ca = ctx->upstream.enabled ? &ctx->upstream.addr : &gcp->target_addr;
 
 	fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, NULL, false);
 	if (unlikely(fd < 0))
 		return fd;
-
-	r = prep_nr_sqes(w, 1);
-	if (unlikely(r < 0)) {
-		__sys_close(fd);
-		return r;
-	}
 
 	gcp->attempt_fd[slot] = fd;
 	/* Post-ACL, so a -j DNAT rewrite is what gets recorded. */
@@ -343,15 +475,15 @@ static struct io_uring_sqe *prep_recv_target(struct gwp_wrk *w,
 	io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TARGET_RECV;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared recv for target fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
 	return s;
 }
 
-static struct io_uring_sqe *prep_recv_client(struct gwp_wrk *w,
-					     struct gwp_conn_pair *gcp)
+static int __prep_recv_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      uint64_t ev_bit)
 {
 	size_t len = gcp->client.cap - gcp->client.len;
 	char *buf = gcp->client.buf + gcp->client.len;
@@ -360,25 +492,32 @@ static struct io_uring_sqe *prep_recv_client(struct gwp_wrk *w,
 
 #ifdef CONFIG_HTTPS
 	/*
-	 * A TLS client receives ciphertext into the connection's rx scratch;
-	 * the completion handler decrypts it into client.buf. (During the
-	 * handshake this path is not used; see prep_tls_detect().)
+	 * A TLS client receives ciphertext straight into the engine's input
+	 * queue, with room for at least one whole record; the completion
+	 * commits it and decrypts into client.buf. The space stays put until
+	 * that commit (see gwp_ssl_rx_space()).
 	 */
 	if (client_is_tls(gcp)) {
-		buf = (char *)gcp->tls_io->rx;
-		len = sizeof(gcp->tls_io->rx);
+		buf = gwp_ssl_rx_space(gcp->client.tls, GWP_SSL_RECORD_MAX, &len);
+		if (unlikely(!buf))
+			return -ENOMEM;
 	}
 #endif
 
 	s = get_sqe_nofail(w);
 	io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_CLIENT_RECV;
-	get_gcp(gcp);
+	s->user_data |= ev_bit;
+	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared recv for client fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
-	return s;
+	return 0;
+}
+
+static int prep_recv_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	return __prep_recv_client(w, gcp, EV_BIT_IOU_CLIENT_RECV);
 }
 
 static struct io_uring_sqe *prep_send_target(struct gwp_wrk *w,
@@ -397,7 +536,7 @@ static struct io_uring_sqe *prep_send_target(struct gwp_wrk *w,
 #endif
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TARGET_SEND;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared send for target fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
@@ -412,6 +551,16 @@ static struct io_uring_sqe *__prep_send_client(struct gwp_wrk *w,
 	int fd = gcp->client.fd;
 	struct io_uring_sqe *s;
 
+	/*
+	 * A send already on its way covers the start of target.buf, and its
+	 * completion (handle_ev_client_send()) sends the rest, including what
+	 * has been appended since. In the protocol phase a client recv is
+	 * armed alongside the reply's send and may complete first; queueing
+	 * target.buf again from there would hand the client the reply twice.
+	 */
+	if (gcp->client_tx)
+		return NULL;
+
 	s = get_sqe_nofail(w);
 #if USE_SEND_ZC
 	io_uring_prep_send_zc(s, fd, buf, len, MSG_NOSIGNAL, 0);
@@ -419,7 +568,9 @@ static struct io_uring_sqe *__prep_send_client(struct gwp_wrk *w,
 	io_uring_prep_send(s, fd, buf, len, MSG_NOSIGNAL);
 #endif
 	io_uring_sqe_set_data(s, gcp);
-	get_gcp(gcp);
+	s->user_data |= EV_BIT_IOU_CLIENT_SEND;
+	gcp->client_tx = true;
+	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared send for client fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
@@ -429,8 +580,6 @@ static struct io_uring_sqe *__prep_send_client(struct gwp_wrk *w,
 static struct io_uring_sqe *prep_send_client(struct gwp_wrk *w,
 					     struct gwp_conn_pair *gcp)
 {
-	struct io_uring_sqe *s;
-
 #ifdef CONFIG_HTTPS
 	/*
 	 * A TLS client is fed encrypted bytes: send_client_tls() encrypts
@@ -443,9 +592,7 @@ static struct io_uring_sqe *prep_send_client(struct gwp_wrk *w,
 	}
 #endif
 
-	s = __prep_send_client(w, gcp);
-	s->user_data |= EV_BIT_IOU_CLIENT_SEND;
-	return s;
+	return __prep_send_client(w, gcp);
 }
 
 static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
@@ -460,10 +607,27 @@ static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TIMER;
 	get_gcp(gcp);
+	gcp->nr_timers_armed++;
 	pr_dbg(&w->ctx->lh,
 		"Prepared timer for target fd=%d, ts=%lld.%09lld, ref_cnt=%d",
 		gcp->target.fd, gcp->ts.tv_sec, gcp->ts.tv_nsec, gcp->ref_cnt);
 	return s;
+}
+
+/*
+ * The tunnel or UDP association is up and its handshake timer is being
+ * removed: with --idle-timeout, arm the idle check in its place. Queued after
+ * the removal, which matches by the same user_data but runs first.
+ */
+static void arm_idle_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int sec = w->ctx->cfg.idle_timeout;
+
+	if (sec <= 0)
+		return;
+	gcp->idle_timer = true;
+	gcp->last_act = w->now;
+	prep_timer_target(w, gcp, sec);
 }
 
 static void prep_timer_del_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -506,22 +670,12 @@ static void prep_attempt_timer_del(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * first at removal time. An already-armed timer is left alone: it fires no
  * later than the deadline a fresh one would have had.
  */
-static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static void __arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				int ms)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct io_uring_sqe *s;
-	int ms;
 
-	if (gcp->attempt_timer_armed)
-		return;
-	if (gcp->next_cand >= gcp->nr_cand)
-		return;			/* nothing left to start */
-	if (ctx->cfg.connect_attempt_delay <= 0)
-		return;			/* racing disabled: fall back only */
-	if (ctx->upstream.enabled)
-		return;			/* one proxy, nothing to race */
-
-	ms = ctx->cfg.connect_attempt_delay;
 	gcp->ats.tv_sec = ms / 1000;
 	gcp->ats.tv_nsec = (long long)(ms % 1000) * 1000000LL;
 
@@ -534,6 +688,59 @@ static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	pr_dbg(&ctx->lh,
 		"Prepared attempt timer (idx=%u, ts=%lld.%09lld, ref_cnt=%d)",
 		gcp->idx, gcp->ats.tv_sec, gcp->ats.tv_nsec, gcp->ref_cnt);
+}
+
+static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_ctx *ctx = w->ctx;
+
+	if (gcp->attempt_timer_armed)
+		return;
+	if (gcp->next_cand >= gcp->nr_cand)
+		return;			/* nothing left to start */
+	if (ctx->cfg.connect_attempt_delay <= 0)
+		return;			/* racing disabled: fall back only */
+	if (ctx->upstream.enabled)
+		return;			/* one proxy, nothing to race */
+
+	__arm_attempt_timer(w, gcp, ctx->cfg.connect_attempt_delay);
+}
+
+/* How long a connect waits for a free descriptor before it tries again, in ms. */
+#define GWP_FD_RETRY_MS 100
+
+/*
+ * The target socket of a plain or transparent forwarding pair could not be
+ * created because the descriptor table is full. That passes as connections
+ * close, and the client, which has done nothing wrong, is already accepted:
+ * keep it, and try the same candidate again once the attempt timer fires.
+ * The connect timeout still bounds the wait. accept() itself runs out of
+ * descriptors too, and pauses (handle_ev_accept()), so no further client
+ * piles up behind this one in the meantime.
+ *
+ * Only while no other attempt is racing: one that is may well connect, and
+ * the attempt timer is then needed for the race. Plain forwarding has a
+ * single candidate, so this is the case there.
+ */
+static bool wait_for_fd(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
+{
+	if (err != -EMFILE && err != -ENFILE)
+		return false;
+	if (gcp->prot_type != GWP_PROT_TYPE_NONE)
+		return false;
+	if (has_inflight_attempt(gcp) || gcp->attempt_timer_armed)
+		return false;
+
+	if (!(gcp->flags & GWP_CONN_FLAG_FD_WAIT)) {
+		gcp->flags |= GWP_CONN_FLAG_FD_WAIT;
+		pr_warn(&w->ctx->lh,
+			"Too many open files, retrying the target connect (idx=%u, ca=%s)",
+			gcp->idx, ip_to_str(&gcp->client_addr));
+	}
+
+	gcp->next_cand--;
+	__arm_attempt_timer(w, gcp, GWP_FD_RETRY_MS);
+	return true;
 }
 
 /*
@@ -579,15 +786,30 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	prep_attempt_timer_del(w, gcp);
 
 	/*
-	 * IORING_ASYNC_CANCEL_ALL: an fd can carry more than one in-flight
-	 * request -- the plain forwarding path arms a target recv while the
-	 * connect is still pending, and a relay may have a recv and a send
-	 * outstanding at once. Without it the kernel cancels exactly one, and
-	 * every survivor keeps a reference that stops put_gcp() from ever
-	 * reaching zero, leaking the pair and both fds for the process's life.
+	 * The protocol and connect timeouts hold a reference too. Left armed,
+	 * they keep the pair -- and the client socket -- open until they
+	 * expire, so a client that was just sent an error reply (a 407, say)
+	 * would sit on an open connection for the whole protocol timeout. A
+	 * removal that finds the timeout already gone completes with -ENOENT,
+	 * which handle_ev_timer() ignores.
 	 */
-	if (gcp->target.fd >= 0) {
-		pr_dbg(&ctx->lh, "Cancelling target recv (fd=%d)", gcp->target.fd);
+	for (i = 0; i < gcp->nr_timers_armed; i++)
+		prep_timer_del_target(w, gcp);
+
+	/*
+	 * Cancel what is still in flight on the pair's sockets. Only where
+	 * there is something: a pair usually ends because both directions
+	 * hit EOF, with nothing armed on either socket, and a cancel then
+	 * costs an SQE and a CQE for nothing. IORING_ASYNC_CANCEL_ALL, since
+	 * a socket can carry more than one request -- a forwarding pair has a
+	 * recv and a send outstanding on one fd at once, as may the UDP
+	 * relay. Without it the kernel cancels exactly one, and every
+	 * survivor keeps a reference that stops put_gcp() from ever reaching
+	 * zero, leaking the pair and both fds for the process's life.
+	 */
+	if (gcp->target.fd >= 0 && gcp->nr_ops_target) {
+		pr_dbg(&ctx->lh, "Cancelling target I/O (fd=%d, nr=%u)",
+		       gcp->target.fd, gcp->nr_ops_target);
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->target.fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
@@ -595,8 +817,9 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		get_gcp(gcp);
 	}
 
-	if (gcp->client.fd >= 0) {
-		pr_dbg(&ctx->lh, "Cancelling client recv (fd=%d)", gcp->client.fd);
+	if (gcp->client.fd >= 0 && gcp->nr_ops_client) {
+		pr_dbg(&ctx->lh, "Cancelling client I/O (fd=%d, nr=%u)",
+		       gcp->client.fd, gcp->nr_ops_client);
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->client.fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
@@ -604,8 +827,9 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		get_gcp(gcp);
 	}
 
-	if (gcp->udp_fd >= 0) {
-		pr_dbg(&ctx->lh, "Cancelling UDP relay (fd=%d)", gcp->udp_fd);
+	if (gcp->udp_fd >= 0 && gcp->nr_ops_udp) {
+		pr_dbg(&ctx->lh, "Cancelling UDP relay (fd=%d, nr=%u)",
+		       gcp->udp_fd, gcp->nr_ops_udp);
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->udp_fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
@@ -616,13 +840,9 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->flags |= GWP_CONN_FLAG_IS_CANCEL;
 }
 
-static struct io_uring_sqe *prep_recv_client_prot(struct gwp_wrk *w,
-						  struct gwp_conn_pair *gcp)
+static int prep_recv_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct io_uring_sqe *s = prep_recv_client(w, gcp);
-	s->user_data &= ~EV_BIT_ALL;
-	s->user_data |= EV_BIT_IOU_CLIENT_PROT;
-	return s;
+	return __prep_recv_client(w, gcp, EV_BIT_IOU_CLIENT_PROT);
 }
 
 #ifdef CONFIG_HTTPS
@@ -631,26 +851,14 @@ static struct io_uring_sqe *prep_recv_client_prot(struct gwp_wrk *w,
  * HTTPS proxy: client-side TLS termination on the io_uring loop.
  *
  * Only the client wire speaks TLS; the target side stays plaintext. Ciphertext
- * is shuttled through the connection's gwp_iou_tls scratch (rx/tx), because an
- * async recv/send must own a stable buffer for the whole operation (epoll
- * decrypts synchronously into a stack buffer instead). Once the handshake
- * completes, the connection runs the normal SOCKS5/HTTP logic on the decrypted
- * client.buf, exactly like the plaintext path. TLS is auto-detected from the
+ * is received straight into the engine's input queue and sent from the
+ * connection's gwp_iou_tls scratch, because an async send must own a stable
+ * buffer for the whole operation. Once the handshake completes, the
+ * connection runs the normal SOCKS5/HTTP logic on the decrypted client.buf,
+ * exactly like the plaintext path. TLS is auto-detected from the
  * client's first byte so plaintext clients keep working on the same port.
  * ------------------------------------------------------------------------
  */
-
-static void prep_recv_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-				    uint64_t ev_bit)
-{
-	struct gwp_iou_tls *t = gcp->tls_io;
-	struct io_uring_sqe *s = get_sqe_nofail(w);
-
-	io_uring_prep_recv(s, gcp->client.fd, t->rx, sizeof(t->rx), MSG_NOSIGNAL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= ev_bit;
-	get_gcp(gcp);
-}
 
 static void prep_send_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				    uint64_t ev_bit)
@@ -662,12 +870,12 @@ static void prep_send_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 			   t->tx_len - t->tx_sent, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= ev_bit;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 }
 
 /*
  * Encrypt as much of target.buf as the engine accepts, pull the resulting
- * ciphertext into the tx scratch, and queue it. With a memory write-BIO
+ * ciphertext into the tx scratch, and queue it. With an in-memory write queue
  * SSL_write() never blocks, so target.buf drains fully; a record never exceeds
  * the scratch. If there is nothing to send (no plaintext, no queued
  * ciphertext), fall back to the plaintext post-send action (read the target).
@@ -677,6 +885,14 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_iou_tls *t = gcp->tls_io;
 	struct gwp_ssl *ssl = gcp->client.tls;
 	int n;
+
+	/*
+	 * The tx scratch is still being sent. Its completion
+	 * (handle_ev_client_send()) comes back here for what has been added
+	 * to target.buf since, as for a plaintext client (__prep_send_client()).
+	 */
+	if (t->tx_sent < t->tx_len)
+		return;
 
 	while (gcp->target.len) {
 		size_t consumed = 0;
@@ -698,7 +914,7 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (t->tx_len)
 		prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
-	else if (gcp->target.fd >= 0)
+	else if (gcp->target.fd >= 0 && !gcp->target.rd_eof)
 		prep_recv_target(w, gcp);
 }
 
@@ -712,6 +928,7 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
 	size_t space = c->cap - c->len, got = 0;
+	uint32_t from = c->len;
 	int sr;
 
 	if (space) {
@@ -720,46 +937,79 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return -EIO;
 		if (sr == GWP_SSL_OK && got == 0) {	/* clean close_notify */
 			c->rd_eof = true;
-			return iou_forward_progress(gcp);
+			return iou_forward_progress(w, gcp);
 		}
 		c->len += (uint32_t)got;
 	}
 
-	if (c->len)
-		prep_send_target(w, gcp);
-	else
-		prep_recv_client(w, gcp);
+	if (gwp_http_fwd_active(gcp)) {
+		sr = gwp_http_fwd_in(w, gcp, c, from);
+		if (sr)
+			return sr;
+	}
+
+	if (!c->len)
+		return prep_recv_client(w, gcp);
+	prep_send_target(w, gcp);
 	return 0;
 }
 
-/* Decrypt a freshly received ciphertext chunk and run the protocol on it. */
+/*
+ * Decrypt what the engine holds into client.buf and run the protocol on it.
+ * One gwp_ssl_read() yields at most one record, and records that arrived
+ * together are all off the socket already: take every one of them now, as a
+ * plaintext recv of the same segment would, since no completion will come
+ * for them later.
+ *
+ * Not while a reply is on its way to the client, though: a protocol pass
+ * may queue another reply, and the tx scratch it would be encrypted into is
+ * still being sent. Neither is a recv armed then, since the records the
+ * engine may hold would not complete one. handle_ev_client_send() picks the
+ * pump up again once the reply is out.
+ */
 static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
-	size_t space = c->cap - c->len, got = 0;
+	struct gwp_iou_tls *t = gcp->tls_io;
+	uint32_t from = c->len;
+	size_t got;
 	int sr;
 
-	if (!space) {
-		/* Buffer full mid-handshake: let the protocol drain it. */
-		return process_client_prot(w, gcp);
-	}
-
-	sr = gwp_ssl_read(c->tls, c->buf + c->len, space, &got);
-	if (sr == GWP_SSL_ERROR)
-		return -EIO;
-	if (sr == GWP_SSL_OK && got == 0) {	/* client sent close_notify */
-		prep_recv_client_prot(w, gcp);
+	if (t->tx_sent < t->tx_len) {
+		t->prot_resume = true;
 		return 0;
 	}
 
-	if (got == 0) {
-		/* Need more ciphertext to complete a record. */
-		prep_recv_client_prot(w, gcp);
-		return 0;
+	while (c->len < c->cap) {
+		got = 0;
+		sr = gwp_ssl_read(c->tls, c->buf + c->len, c->cap - c->len,
+				  &got);
+		if (sr == GWP_SSL_ERROR)
+			return -EIO;
+		/* Need more ciphertext, or the client sent close_notify. */
+		if (!got)
+			break;
+		c->len += (uint32_t)got;
 	}
 
-	c->len += (uint32_t)got;
+	/* Nothing new, and room for more: wait for the client. */
+	if (c->len == from && c->len < c->cap)
+		return prep_recv_client_prot(w, gcp);
+
 	return process_client_prot(w, gcp);
+}
+
+/*
+ * Whether the protocol should be fed from the engine rather than the socket:
+ * it still holds records and client.buf has room for them. With a reply
+ * still being sent, tls_prot_pump() waits for that send to complete.
+ */
+static bool tls_prot_more(struct gwp_conn_pair *gcp)
+{
+	struct gwp_conn *c = &gcp->client;
+
+	return client_is_tls(gcp) && c->len < c->cap &&
+	       gwp_ssl_rx_more(c->tls);
 }
 
 /* Handshake done: switch to the plaintext protocol path on the decrypted stream. */
@@ -767,7 +1017,6 @@ static int tls_hs_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	pr_dbg(&w->ctx->lh, "TLS handshake complete (cfd=%d, alpn=%s)",
 	       gcp->client.fd, gwp_ssl_alpn(gcp->client.tls) ?: "none");
-	gcp->tls_io->hs_done = true;
 	gcp->conn_state = CONN_STATE_PROT;
 	/* App data may already sit in the engine from the last handshake recv. */
 	return tls_prot_pump(w, gcp);
@@ -803,8 +1052,7 @@ static int tls_hs_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (hs == GWP_SSL_OK)
 		return tls_hs_finish(w, gcp);
 
-	prep_recv_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_RECV);
-	return 0;
+	return __prep_recv_client(w, gcp, EV_BIT_IOU_TLS_HS_RECV);
 }
 
 static int handle_ev_tls_hs_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -813,18 +1061,15 @@ static int handle_ev_tls_hs_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 
 	if (r < 0) {
-		if (r == -EAGAIN || r == -EINTR) {
-			prep_recv_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_RECV);
-			return 0;
-		}
+		if (r == -EAGAIN || r == -EINTR)
+			return __prep_recv_client(w, gcp,
+						  EV_BIT_IOU_TLS_HS_RECV);
 		return r;
 	}
 	if (r == 0)
 		return -ECONNRESET;	/* peer closed mid-handshake */
 
-	if (gwp_ssl_bio_write(gcp->client.tls, gcp->tls_io->rx, (size_t)r) < 0)
-		return -EIO;
-
+	gwp_ssl_rx_commit(gcp->client.tls, (size_t)r);
 	return tls_hs_step(w, gcp);
 }
 
@@ -861,7 +1106,7 @@ static void prep_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			   MSG_PEEK | MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TLS_DETECT;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 }
 
 static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -883,21 +1128,24 @@ static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if ((unsigned char)gcp->client.buf[0] != 0x16) {
 		/* Plaintext client: proceed as usual, peeked byte still queued. */
 		gcp->conn_state = CONN_STATE_PROT;
-		prep_recv_client_prot(w, gcp);
-		return 0;
+		return prep_recv_client_prot(w, gcp);
 	}
 
-	gcp->tls_io = calloc(1, sizeof(*gcp->tls_io));
+	/* Only the header needs zeroing; tx is scratch. */
+	gcp->tls_io = malloc(sizeof(*gcp->tls_io));
 	if (unlikely(!gcp->tls_io))
 		return -ENOMEM;
+	gcp->tls_io->tx_len = 0;
+	gcp->tls_io->tx_sent = 0;
+	gcp->tls_io->closing = false;
+	gcp->tls_io->prot_resume = false;
 
 	gcp->client.tls = gwp_ssl_server_new(ctx->ssl_ctx);
 	if (unlikely(!gcp->client.tls))
 		return -ENOMEM;
 
 	gcp->conn_state = CONN_STATE_TLS_HANDSHAKE;
-	prep_recv_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_RECV);
-	return 0;
+	return __prep_recv_client(w, gcp, EV_BIT_IOU_TLS_HS_RECV);
 }
 #endif /* CONFIG_HTTPS */
 
@@ -911,13 +1159,6 @@ static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 static int arm_gcp_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
-	int r;
-
-	r = prep_nr_sqes(w, 4);
-	if (unlikely(r < 0)) {
-		pr_err(&w->ctx->lh, "Failed to prepare sqes for connection pair");
-		return r;
-	}
 
 	gcp->conn_state = CONN_STATE_PROT;
 #ifdef CONFIG_HTTPS
@@ -947,12 +1188,6 @@ static int do_prep_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	int r;
-
-	r = prep_nr_sqes(w, 4);
-	if (unlikely(r < 0)) {
-		pr_err(&w->ctx->lh, "Failed to prepare sqes for connection pair");
-		return r;
-	}
 
 	/*
 	 * Take the first candidate the ACL allows; the same helper walks the
@@ -1018,14 +1253,22 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		return 0;
 	}
 
+	/* --max-conns-per-ip: before anything is read or set up. */
+	if (unlikely(ctx->iplim) &&
+	    !gwp_ctx_iplim_get(w, &w->iou->accept_addr)) {
+		prep_close(w, fd);
+		return 0;
+	}
+
 	/* Transparent proxy: take the target from SO_ORIGINAL_DST. */
 	if (transparent) {
 		r = gwp_get_orig_dst(fd, &w->iou->accept_addr, &tdst);
 		if (r) {
 			pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
-				ip_to_str(&w->iou->accept_addr), strerror(-r));
-			prep_close(w, fd);
-			return 0;
+				ip_to_str(&w->iou->accept_addr),
+				r == -ELOOP ? "it is this proxy" : strerror(-r));
+			r = 0;
+			goto out_uncount;
 		}
 	}
 
@@ -1042,13 +1285,16 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	if (unlikely(!gcp)) {
 		pr_err(&ctx->lh, "Allocate connection pair: %s", strerror(ENOMEM));
 		r = -ENOMEM;
-		goto out_close;
+		goto out_uncount;
 	}
 
 	gcp->ref_cnt = 0;
 
 	gcp->client.fd = fd;
 	gcp->client_addr = w->iou->accept_addr;
+	/* From here on, freeing the pair uncounts the client. */
+	if (ctx->iplim)
+		gcp->flags |= GWP_CONN_FLAG_IPLIM;
 	gwp_conn_set_single_candidate(gcp, &fwd_target);
 	gcp->is_target_alive = false;
 	r = arm_gcp(w, gcp);
@@ -1082,10 +1328,31 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 out_free_pair:
 	gcp->client.fd = gcp->target.fd = gcp->timer_fd = -1;
 	gwp_free_conn_pair(w, gcp);
+	goto out_close;
+out_uncount:
+	if (ctx->iplim)
+		gwp_ctx_iplim_put(ctx, &w->iou->accept_addr);
 out_close:
-	if (fd >= 0)
-		prep_close(w, fd);
-	return r ? r : -ENOMEM;
+	prep_close(w, fd);
+	return r;
+}
+
+/*
+ * accept(2) errors that say the listening socket itself is unusable, as
+ * opposed to the one connection being accepted.
+ */
+static bool is_listener_error(int r)
+{
+	switch (r) {
+	case -EBADF:
+	case -EFAULT:
+	case -EINVAL:
+	case -ENOTSOCK:
+	case -EOPNOTSUPP:
+		return true;
+	default:
+		return false;
+	}
 }
 
 static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
@@ -1110,8 +1377,51 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 			return 0;
 		}
 
-		pr_err(&w->ctx->lh, "Failed to handle accept event: %s", strerror(-r));
-		return r;
+		/*
+		 * Errors that come back the same at once if accept is simply
+		 * re-armed: the kernel is short of socket memory (ENOBUFS), or
+		 * a security module refuses the connection (EPERM, EACCES),
+		 * which leaves it at the head of the backlog for the next
+		 * accept to be refused again. Re-arming at once spins the
+		 * worker and floods the log; pause on the retry timer instead,
+		 * logged once until an accept succeeds.
+		 */
+		if (cqe->res < 0 &&
+		    (r == -ENOBUFS || r == -EPERM || r == -EACCES)) {
+			if (!w->accept_is_stopped) {
+				w->accept_is_stopped = true;
+				pr_warn(&w->ctx->lh,
+					"Failed to accept new connection: %s, pausing accept (tidx=%u)",
+					strerror(-r), w->idx);
+			}
+			arm_accept_retry(w);
+			return 0;
+		}
+
+		/*
+		 * Only a listener that is itself broken is worth stopping
+		 * for: re-arming accept on it would fail the same way
+		 * forever. Everything else concerns one connection -- an
+		 * accept(2) the man page says to retry (ECONNABORTED and
+		 * friends), or a pair that failed after a successful accept,
+		 * such as a strict --bind-iface naming a device that is not
+		 * there -- and has been logged and freed already. Returning
+		 * it would stop this worker, and gwp_ctx_thread_entry() would
+		 * then stop the whole proxy, so one client could take every
+		 * live connection down with it. The epoll loop already keeps
+		 * going in this case.
+		 */
+		if (cqe->res < 0 && is_listener_error(r)) {
+			pr_err(&w->ctx->lh, "Failed to accept new connection: %s",
+			       strerror(-r));
+			return r;
+		}
+
+		if (cqe->res < 0)
+			pr_warn(&w->ctx->lh, "Failed to accept new connection: %s",
+				strerror(-r));
+		arm_accept(w);
+		return 0;
 	}
 
 	if (unlikely(w->accept_is_stopped)) {
@@ -1148,7 +1458,7 @@ static struct io_uring_sqe *prep_upstream_send(struct gwp_wrk *w,
 			   MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UPSTREAM_S5;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 	return s;
 }
 
@@ -1162,7 +1472,7 @@ static struct io_uring_sqe *prep_upstream_recv(struct gwp_wrk *w,
 	io_uring_prep_recv(s, gcp->target.fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UPSTREAM_S5;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 	return s;
 }
 
@@ -1170,14 +1480,21 @@ static struct io_uring_sqe *prep_upstream_recv(struct gwp_wrk *w,
 static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
+	int r;
 
 	prep_timer_del_target(w, gcp);
+	arm_idle_timer(w, gcp);
 	gcp->up_tx = false;
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
 
-	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s)",
-		gcp->idx, ip_to_str(&gcp->client_addr));
+	r = gwp_http_fwd_begin(w, gcp);
+	if (r)
+		return r;
+
+	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
+		gcp->idx, ip_to_str(&gcp->client_addr),
+		gwp_upstream_dst_str(gcp));
 
 	/* Start forwarding. */
 	if (gcp->target.len)
@@ -1191,10 +1508,9 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * request in client.buf, which the origin must receive. The send
 	 * completion arms the next client recv.
 	 */
-	if (gcp->client.len)
-		prep_send_target(w, gcp);
-	else
-		prep_recv_client(w, gcp);
+	if (!gcp->client.len)
+		return prep_recv_client(w, gcp);
+	prep_send_target(w, gcp);
 	return 0;
 }
 
@@ -1210,10 +1526,37 @@ static int upstream_iou_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return r;	/* negative errno */
 }
 
+/*
+ * Whether a send to the client is still on its way. The plaintext send reads
+ * target.buf, a TLS client's the tx scratch; either way its completion
+ * (handle_ev_client_send()) goes on to work on target.buf.
+ */
+static bool client_send_busy(struct gwp_conn_pair *gcp)
+{
+#ifdef CONFIG_HTTPS
+	if (client_is_tls(gcp))
+		return gcp->tls_io->tx_sent < gcp->tls_io->tx_len;
+#endif
+	return gcp->client_tx;
+}
+
+/*
+ * Connected to the upstream proxy, but the handshake with it has not begun:
+ * finish_target_connect() left that to the completion of a client send.
+ */
+static bool upstream_start_held(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return w->ctx->upstream.enabled && gcp->target.fd >= 0 &&
+	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
+}
+
 static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
 	int r = handle_sock_ret(cqe->res);
+	bool notify;
 
 	if (r < 0)
 		return r;
@@ -1237,8 +1580,7 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (r > 0)
 		gcp->target.len += (uint32_t)r;
 
-	/* io_uring does not notify the downstream client on failure (NULL). */
-	r = gwp_upstream_hs_on_reply(w, gcp, NULL);
+	r = gwp_upstream_hs_on_reply(w, gcp, &notify);
 	switch (r) {
 	case GWP_UPSTREAM_IO_SEND:
 		prep_upstream_send(w, gcp);
@@ -1248,9 +1590,15 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 	case GWP_UPSTREAM_IO_DONE:
 		return upstream_iou_finish(w, gcp);
-	default:			/* negative errno */
-		return r;
 	}
+
+	/*
+	 * Negative errno. Tell the client when the upstream turned us down;
+	 * the reply's send goes out ahead of the teardown's cancels.
+	 */
+	if (notify && gwp_upstream_fail_reply(w, gcp, r) > 0)
+		prep_send_client(w, gcp);
+	return r;
 }
 
 /*
@@ -1298,11 +1646,22 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * Connected to the upstream proxy: run the client handshake before
 	 * forwarding. The connect timer is kept to bound the handshake, and the
 	 * normal recv/send SQEs stay unarmed so they cannot collide with it.
+	 *
+	 * The handshake builds its requests in target.buf, which a SOCKS5
+	 * method or auth reply to the client may still be sent from: the
+	 * client was answered and asked to connect in one go, and the send
+	 * has not completed (out of socket memory, say). Its completion would
+	 * also take the request for what is left of the reply. Leave the
+	 * handshake to that completion (handle_ev_client_send()).
 	 */
-	if (w->ctx->upstream.enabled)
+	if (w->ctx->upstream.enabled) {
+		if (client_send_busy(gcp))
+			return 0;
 		return upstream_iou_start(w, gcp);
+	}
 
 	prep_timer_del_target(w, gcp);
+	arm_idle_timer(w, gcp);
 	gcp->is_target_alive = true;
 	pr_info(&w->ctx->lh,
 		"Target socket connected (fd=%d, idx=%u, ca=%s, ta=%s)",
@@ -1318,9 +1677,26 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * client.buf; that goes to the origin below, and the client recv is
 	 * armed only once it has drained (handle_ev_target_send()). Arming it
 	 * here would race with that send on client.buf.
+	 *
+	 * Otherwise, what the client sent right behind its request is still in
+	 * client.buf. Send it first, since the client may wait for an answer
+	 * to it before it sends anything else; the send completion arms the
+	 * client recv.
 	 */
-	if (!http_fwd)
-		prep_recv_client(w, gcp);
+	if (!http_fwd && gcp->client.len) {
+		prep_send_target(w, gcp);
+#ifdef CONFIG_HTTPS
+	} else if (!http_fwd && client_is_tls(gcp)) {
+		/* The engine may hold more of it; tunnel that first. */
+		r = tls_forward_pump(w, gcp);
+		if (r)
+			return r;
+#endif
+	} else if (!http_fwd) {
+		r = prep_recv_client(w, gcp);
+		if (r)
+			return r;
+	}
 
 	/*
 	 * SOCKS5/HTTP: write the connect reply into target.buf and flush it to
@@ -1340,6 +1716,9 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			 * and read the response.
 			 */
 			gcp->conn_state = CONN_STATE_FORWARDING;
+			r = gwp_http_fwd_begin(w, gcp);
+			if (r)
+				return r;
 			prep_send_target(w, gcp);
 			prep_recv_target(w, gcp);
 			return 0;
@@ -1418,6 +1797,32 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_ctx *ctx = w->ctx;
 	int r = 0;
 
+	/* The timeout's own completion: it fired or was removed. */
+	if (!is_timer_del && gcp->nr_timers_armed)
+		gcp->nr_timers_armed--;
+
+	/*
+	 * Idle check: close the pair if nothing moved for the whole timeout,
+	 * else look again once the rest of it has passed. Only one timeout
+	 * may carry the check: a handshake timer that fired just as the
+	 * tunnel came up arrives here too, and must not start a second one.
+	 */
+	if (gcp->idle_timer && !is_timer_del && res == -ETIME &&
+	    !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL)) {
+		int sec = ctx->cfg.idle_timeout;
+		uint32_t idle = w->now - gcp->last_act;
+
+		if (idle >= (uint32_t)sec) {
+			pr_info(&ctx->lh, "Idle timeout (idx=%u, ca=%s, ta=%s)",
+				gcp->idx, ip_to_str(&gcp->client_addr),
+				ip_to_str(&gcp->target_addr));
+			return -ETIMEDOUT;
+		}
+		if (!gcp->nr_timers_armed)
+			prep_timer_target(w, gcp, sec - (int)idle);
+		return 0;
+	}
+
 	if (!gcp->is_target_alive && res == -ETIME) {
 		assert(is_timer_del == false);
 		r = -ETIME;
@@ -1434,10 +1839,23 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * handshake, where nothing has been requested yet. During a
 		 * race there is no target fd yet, so the in-flight attempts
 		 * count as one.
+		 *
+		 * Send only what gwp_conn_fail_reply() added: plain forwarding
+		 * has no reply to give, and a stalled upstream handshake leaves
+		 * its own bytes in target.buf, which are dropped first.
 		 */
-		if ((gcp->target.fd >= 0 || has_inflight_attempt(gcp)) &&
-		    !gwp_conn_fail_reply(w, gcp, r) && gcp->target.len)
-			prep_send_client(w, gcp);
+		if (gcp->target.fd >= 0 || has_inflight_attempt(gcp)) {
+			uint32_t len;
+
+			if (gwp_in_upstream_hs(gcp)) {
+				gcp->target.len = 0;
+				gwp_conn_buf_compact(&gcp->target);
+			}
+			len = gcp->target.len;
+			if (!gwp_conn_fail_reply(w, gcp, r) &&
+			    gcp->target.len > len)
+				prep_send_client(w, gcp);
+		}
 	}
 
 	pr_dbg(&ctx->lh,
@@ -1471,19 +1889,73 @@ static int handle_sock_ret(int r)
  * The pair is torn down only after both directions have been shut, so a client
  * that half-closes its write side still receives the whole response.
  */
-static int iou_forward_progress(struct gwp_conn_pair *gcp)
+#ifdef CONFIG_HTTPS
+/*
+ * A TLS client is owed a close_notify before the FIN, as the epoll loop sends
+ * one: without it the client cannot tell the end of a response that is
+ * delimited by the connection closing from a truncation, and strict clients
+ * (OpenSSL 3, curl) report the read as failed. Queue it through the normal
+ * ciphertext send. Returns true once nothing of ours is left to send, so the
+ * write side can be shut; false while ciphertext is still on its way, whose
+ * send completion comes back through iou_forward_progress().
+ */
+static bool tls_close_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
+	struct gwp_iou_tls *t = gcp->tls_io;
+	int n;
+
+	if (t->tx_sent < t->tx_len)
+		return false;
+	if (t->closing)
+		return true;
+
+	t->closing = true;
+	gwp_ssl_shutdown(gcp->client.tls);
+	n = gwp_ssl_bio_read(gcp->client.tls, t->tx, sizeof(t->tx));
+	if (n <= 0)
+		return true;
+
+	t->tx_len = (uint32_t)n;
+	t->tx_sent = 0;
+	prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
+	return false;
+}
+#endif
+
+static int iou_forward_progress(struct gwp_wrk __unused *w,
+				struct gwp_conn_pair *gcp)
+{
+	bool shut_client = false, shut_target = false, done;
+
 	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
-		__sys_shutdown(gcp->client.fd, SHUT_WR);
+#ifdef CONFIG_HTTPS
+		if (client_is_tls(gcp) && !tls_close_client(w, gcp))
+			return 0;
+#endif
+		shut_client = true;
 		gcp->client.wr_shut = true;
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
-		__sys_shutdown(gcp->target.fd, SHUT_WR);
+		shut_target = true;
 		gcp->target.wr_shut = true;
 	}
 
-	if (gcp->client.wr_shut && gcp->target.wr_shut)
+	/*
+	 * Once both directions are done the pair is torn down, and closing
+	 * its sockets sends the FINs. A shutdown() right before that close
+	 * only costs a syscall, provided nothing is left unread on the
+	 * socket: close() answers unread data with an RST instead of a FIN.
+	 * Here a write side is shut only after the other socket's read side
+	 * reached EOF, so when both are done both sockets have been read to
+	 * EOF; the test is kept explicit, as in the epoll loop.
+	 */
+	done = gcp->client.wr_shut && gcp->target.wr_shut;
+	if (shut_client && !(done && gcp->client.rd_eof))
+		__sys_shutdown(gcp->client.fd, SHUT_WR);
+	if (shut_target && !(done && gcp->target.rd_eof))
+		__sys_shutdown(gcp->target.fd, SHUT_WR);
+	if (done)
 		return -ECONNRESET;
 
 	return 0;
@@ -1493,12 +1965,11 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
 	int r = cqe->res;
+	uint32_t from;
 
 	if (r < 0) {
-		if (r == -EAGAIN || r == -EINTR) {
-			prep_recv_client(w, gcp);
-			return 0;
-		}
+		if (r == -EAGAIN || r == -EINTR)
+			return prep_recv_client(w, gcp);
 		return r;
 	}
 
@@ -1506,11 +1977,9 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (client_is_tls(gcp)) {
 		if (r == 0) {
 			gcp->client.rd_eof = true;
-			return iou_forward_progress(gcp);
+			return iou_forward_progress(w, gcp);
 		}
-		if (gwp_ssl_bio_write(gcp->client.tls, gcp->tls_io->rx,
-				      (size_t)r) < 0)
-			return -EIO;
+		gwp_ssl_rx_commit(gcp->client.tls, (size_t)r);
 		return tls_forward_pump(w, gcp);
 	}
 #endif
@@ -1522,10 +1991,20 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * target's response until it too is done.
 		 */
 		gcp->client.rd_eof = true;
-		return iou_forward_progress(gcp);
+		return iou_forward_progress(w, gcp);
 	}
 
+	from = gcp->client.len;
 	gcp->client.len += (uint32_t)r;
+	if (gwp_http_fwd_active(gcp)) {
+		r = gwp_http_fwd_in(w, gcp, &gcp->client, from);
+		if (r)
+			return r;
+	}
+
+	/* An HTTP forwarding filter may have dropped all of it. */
+	if (!gcp->client.len)
+		return prep_recv_client(w, gcp);
 	prep_send_target(w, gcp);
 	return 0;
 }
@@ -1534,6 +2013,7 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
 	int r = cqe->res;
+	uint32_t from;
 
 	if (r < 0) {
 		if (r == -EAGAIN || r == -EINTR) {
@@ -1543,13 +2023,30 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return r;
 	}
 
-	if (r == 0) {
+	from = gcp->target.len;
+	if (r == 0)
 		gcp->target.rd_eof = true;
-		return iou_forward_progress(gcp);
+	else
+		gcp->target.len += (uint32_t)r;
+
+	if (gwp_http_fwd_active(gcp)) {
+		r = gwp_http_fwd_in(w, gcp, &gcp->target, from);
+		if (r)
+			return r;
 	}
 
-	gcp->target.len += (uint32_t)r;
-	prep_send_client(w, gcp);
+	/*
+	 * Usually what was read is sent on, but an HTTP forwarding filter may
+	 * have held all of it back, and at EOF it may have a reply to deliver.
+	 */
+	if (gcp->target.len) {
+		prep_send_client(w, gcp);
+		return 0;
+	}
+	if (gcp->target.rd_eof)
+		return iou_forward_progress(w, gcp);
+
+	prep_recv_target(w, gcp);
 	return 0;
 }
 
@@ -1558,6 +2055,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int r = cqe->res;
 
+	gcp->client_tx = false;
 	r = handle_sock_ret(r);
 	if (r < 0)
 		return r;
@@ -1571,18 +2069,29 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
 			return 0;
 		}
-		/* Ciphertext flushed; encrypt/queue more, else read the target. */
+		/*
+		 * Ciphertext flushed; encrypt/queue more, else go back to the
+		 * protocol pass this reply held up, else read the target.
+		 */
 		if (gcp->target.len > 0 ||
-		    gwp_ssl_bio_pending(gcp->client.tls) > 0)
+		    gwp_ssl_bio_pending(gcp->client.tls) > 0) {
 			send_client_tls(w, gcp);
-		else if (gcp->target.fd >= 0)
+		} else if (upstream_start_held(w, gcp)) {
+			return upstream_iou_start(w, gcp);
+		} else if (t->prot_resume) {
+			t->prot_resume = false;
+			return tls_prot_pump(w, gcp);
+		} else if (gcp->target.rd_eof) {
+			return iou_forward_progress(w, gcp);
+		} else if (gcp->target.fd >= 0) {
 			prep_recv_target(w, gcp);
+		}
 		return 0;
 	}
 #endif
 
 	if (r > 0)
-		gwp_conn_buf_advance(&gcp->target, (size_t)r);
+		gwp_conn_buf_consume(&gcp->target, (size_t)r);
 
 	/*
 	 * A short send leaves unsent bytes in target.buf; flush the remainder
@@ -1593,6 +2102,17 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		prep_send_client(w, gcp);
 		return 0;
 	}
+
+	/* The reply is out; the upstream handshake may use target.buf now. */
+	if (upstream_start_held(w, gcp))
+		return upstream_iou_start(w, gcp);
+
+	/*
+	 * The target may have finished while this send was in flight: the HTTP
+	 * forwarding filter delivers its own reply after the origin's EOF.
+	 */
+	if (gcp->target.rd_eof)
+		return iou_forward_progress(w, gcp);
 
 	if (gcp->target.fd >= 0)
 		prep_recv_target(w, gcp);
@@ -1609,7 +2129,7 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return r;
 
 	if (r > 0)
-		gwp_conn_buf_advance(&gcp->client, (size_t)r);
+		gwp_conn_buf_consume(&gcp->client, (size_t)r);
 
 	/* Short send: flush the rest before reading more from the client. */
 	if (gcp->client.len > 0) {
@@ -1623,8 +2143,7 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return tls_forward_pump(w, gcp);
 #endif
 
-	prep_recv_client(w, gcp);
-	return 0;
+	return prep_recv_client(w, gcp);
 }
 
 /*
@@ -1702,6 +2221,9 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		pr_dbg(&w->ctx->lh, "Target %s did not start: %s (idx=%u)",
 			ip_to_str(&gcp->target_addr), strerror(-err), gcp->idx);
 
+		if (wait_for_fd(w, gcp, err))
+			return 0;
+
 		/*
 		 * Chaining: every attempt dials the same upstream proxy, so
 		 * walking the target's addresses would just repeat the same
@@ -1770,23 +2292,32 @@ static int handle_ev_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return connect_next_candidate(w, gcp, -EINPROGRESS);
 }
 
+/*
+ * A lookup is pending; its result arrives on the worker's DNS completion
+ * queue (handle_ev_dns_cq()). Hold a reference for it, as an SQE would, so
+ * the pair outlives the wait.
+ */
 static int prep_domain_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_dns_entry *gde = gcp->gde;
 	struct gwp_ctx *ctx = w->ctx;
-	struct io_uring_sqe *s;
 
 	assert(gde);
-	s = get_sqe_nofail(w);
-	io_uring_prep_poll_add(s, gde->ev_fd, POLLIN);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_DNS_QUERY;
 	get_gcp(gcp);
 	pr_dbg(&ctx->lh,
-		"Prepared DNS query for domain '%s' (fd=%d, idx=%u, ref_cnt=%d)",
-		gde->name, gde->ev_fd, gcp->idx, gcp->ref_cnt);
+		"Queued DNS query for domain '%s' (idx=%u, ref_cnt=%d)",
+		gde->name, gcp->idx, gcp->ref_cnt);
 
 	return 0;
+}
+
+/* Watch the worker's DNS completion queue; one-shot, re-armed per wakeup. */
+static void arm_dns_cq_poll(struct gwp_wrk *w)
+{
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	io_uring_prep_poll_add(s, gwp_dns_cq_fd(w->ctx->dns, w->idx), POLLIN);
+	s->user_data = EV_BIT_IOU_DNS_QUERY;
 }
 
 /* Arm the next relay recvmsg into the front-padded scratch buffer. */
@@ -1805,7 +2336,7 @@ static void prep_udp_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	io_uring_prep_recvmsg(s, gcp->udp_fd, &u->mh, 0);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UDP_RX;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 }
 
 /* Arm a relay sendmsg of @buf[0..len) to @dst (part of the same scratch). */
@@ -1827,17 +2358,17 @@ static void prep_udp_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	io_uring_prep_sendmsg(s, gcp->udp_fd, &u->mh, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UDP_TX;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 }
 
 /*
  * A relay recvmsg completed. Decide direction by source (the same logic as the
  * epoll handle_ev_udp_relay): a datagram from the pinned client is unwrapped
- * and forwarded to its target; any other source is a target reply, wrapped and
- * sent to the client. A forwarded datagram issues one sendmsg and the relay
- * re-arms the recv only once that completes (handle_ev_udp_tx); a dropped
- * datagram re-arms the recv immediately. See the epoll handler for the design
- * limitations (stateless replies, same-family targets, no domain targets).
+ * and forwarded to its target; one from a target the client has sent to is a
+ * reply, wrapped and sent to the client. A forwarded datagram issues one sendmsg
+ * and the relay re-arms the recv only once that completes (handle_ev_udp_tx); a
+ * dropped datagram re-arms the recv immediately. See the epoll handler for the
+ * design limitations.
  */
 static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			       struct io_uring_cqe *cqe)
@@ -1896,10 +2427,6 @@ static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (unlikely(!gcp->udp_iou))
 		return -ENOMEM;
 
-	r = prep_nr_sqes(w, 3);
-	if (unlikely(r < 0))
-		return r;
-
 	if (w->ctx->cfg.protocol_timeout > 0) {
 		/*
 		 * Mark the pair alive before removing the timer so a timeout
@@ -1909,8 +2436,11 @@ static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gcp->is_target_alive = true;
 		prep_timer_del_target(w, gcp);
 	}
+	arm_idle_timer(w, gcp);
 
-	prep_recv_client_prot(w, gcp);
+	r = prep_recv_client_prot(w, gcp);
+	if (r)
+		return r;
 	prep_udp_recv(w, gcp);
 	return 0;
 }
@@ -1936,10 +2466,13 @@ static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 	if (r == 0 && ct == CONN_STATE_SOCKS5_UDP_ASSOCIATE)
 		return arm_udp_relay(w, gcp);
 
+	/* Handshake incomplete; read more from the client. */
 	if (r == 0 || r == -EAGAIN) {
-		/* Handshake incomplete; read more from the client. */
-		prep_recv_client_prot(w, gcp);
-		return 0;
+#ifdef CONFIG_HTTPS
+		if (tls_prot_more(gcp))
+			return tls_prot_pump(w, gcp);
+#endif
+		return prep_recv_client_prot(w, gcp);
 	}
 
 	return r;
@@ -1975,12 +2508,10 @@ static int handle_ev_client_prot(struct gwp_wrk *w,
 {
 	int r = handle_sock_ret(cqe->res);
 
-	if (r < 0) {
+	if (r < 0)
 		return r;
-	} else if (!r) {
-		prep_recv_client_prot(w, gcp);
-		return 0;
-	}
+	else if (!r)
+		return prep_recv_client_prot(w, gcp);
 
 	/*
 	 * Once the UDP association is up the TCP control connection is idle and
@@ -1989,16 +2520,13 @@ static int handle_ev_client_prot(struct gwp_wrk *w,
 	 */
 	if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE) {
 		gcp->client.len = 0;
-		prep_recv_client_prot(w, gcp);
-		return 0;
+		return prep_recv_client_prot(w, gcp);
 	}
 
 #ifdef CONFIG_HTTPS
 	if (client_is_tls(gcp)) {
 		/* Decrypt the ciphertext chunk, then run the protocol on it. */
-		if (gwp_ssl_bio_write(gcp->client.tls, gcp->tls_io->rx,
-				      (size_t)r) < 0)
-			return -EIO;
+		gwp_ssl_rx_commit(gcp->client.tls, (size_t)r);
 		return tls_prot_pump(w, gcp);
 	}
 #endif
@@ -2018,7 +2546,7 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 
 		pr_info(&ctx->lh, "Failed to resolve domain '%s': %d",
 			gde->name, res);
-		gwp_dns_entry_put(gde);
+		gwp_dns_entry_free(gde);
 		gcp->gde = NULL;
 
 		/*
@@ -2038,62 +2566,45 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 		gde->name, ip_to_str(&gcp->target_addr), gcp->nr_cand,
 		gcp->target.fd, gcp->idx);
 
-	gwp_dns_entry_put(gde);
+	gwp_dns_entry_free(gde);
 	gcp->gde = NULL;
 	return do_prep_connect(w, gcp);
 }
 
-static void prep_auth_reload(struct gwp_wrk *w)
+/*
+ * Finished getaddrinfo() lookups of this worker; one wakeup may carry many.
+ * Each pair holds a reference for its lookup (prep_domain_resolution()),
+ * dropped here once the result is used, exactly as an SQE's completion does.
+ */
+static int handle_ev_dns_cq(struct gwp_wrk *w)
 {
-	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
-	struct gwp_ctx *ctx = w->ctx;
-	struct io_uring_sqe *s;
+	struct gwp_dns_entry *e, *next;
+	int r;
 
-	assert(ctx->auth);
-	s = get_sqe_nofail(w);
-	io_uring_prep_read(s, ctx->ino_fd, ctx->ino_buf, l, 0);
-	s->user_data = EV_BIT_IOU_SOCKS5_AUTH_FILE;
-}
+	e = gwp_dns_cq_pop(w->ctx->dns, w->idx);
+	for (; e; e = next) {
+		struct gwp_conn_pair *gcp = e->udata;
 
-static int handle_ev_auth_file(struct gwp_wrk *w, int res)
-{
-	struct gwp_ctx *ctx = w->ctx;
+		next = e->next;
+		/* Defensive: the pair holds a reference until we put it. */
+		if (unlikely(gwp_dns_entry_cancelled(e))) {
+			gwp_dns_entry_free(e);
+			continue;
+		}
 
-	prep_auth_reload(w);
-	if (res <= 0 || !gwp_inotify_event_matches(ctx->ino_buf, (size_t)res,
-						   ctx->cfg.auth_file))
-		return 0;
+		assert(gcp->gde == e);
+		if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL) {
+			gcp->gde = NULL;
+			gwp_dns_entry_free(e);
+		} else {
+			r = handle_ev_dns_query(w, gcp);
+			if (r && !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL))
+				shutdown_gcp(w, gcp);
+		}
+		put_gcp(w, gcp);
+	}
 
-	gwp_auth_reload(ctx->auth);
-	pr_info(&ctx->lh, "Reloaded authentication file");
-	return 0;
-}
-
-static void prep_acl_reload(struct gwp_wrk *w)
-{
-	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
-	struct gwp_ctx *ctx = w->ctx;
-	struct io_uring_sqe *s;
-
-	assert(ctx->acl);
-	s = get_sqe_nofail(w);
-	io_uring_prep_read(s, ctx->acl_ino_fd, ctx->acl_ino_buf, l, 0);
-	s->user_data = EV_BIT_IOU_ACL_FILE;
-}
-
-static int handle_ev_acl_file(struct gwp_wrk *w, int res)
-{
-	struct gwp_ctx *ctx = w->ctx;
-
-	prep_acl_reload(w);
-	if (res <= 0 || !gwp_inotify_event_matches(ctx->acl_ino_buf, (size_t)res,
-						   ctx->cfg.acl_file))
-		return 0;
-
-	if (gwp_acl_reload(ctx->acl))
-		pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
-	else
-		pr_info(&ctx->lh, "Reloaded ACL file");
+	arm_dns_cq_poll(w);
 	return 0;
 }
 
@@ -2103,8 +2614,31 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	uint64_t ev_bit = GET_EV_BIT(cqe->user_data);
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_conn_pair *gcp;
-	const char *inv_op;
+	uint8_t *nr_ops;
 	int r;
+
+	/* I/O on one of the pair's sockets: it is no longer in flight. */
+	nr_ops = nr_ops_of(udata, ev_bit);
+	if (nr_ops) {
+		assert(*nr_ops);
+		(*nr_ops)--;
+		/* Activity, for --idle-timeout. */
+		((struct gwp_conn_pair *)udata)->last_act = w->now;
+
+		/*
+		 * The pair is being torn down and its cancels are queued, so
+		 * nothing may queue more I/O on it. Its handler would carry on
+		 * with the connection regardless: the send of the reply to a
+		 * timeout, completing, armed a recv on the upstream socket that
+		 * no cancel would ever reach, and that recv's reference kept the
+		 * pair and both sockets open for as long as the worker ran.
+		 */
+		gcp = udata;
+		if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL) {
+			put_gcp(w, gcp);
+			return 0;
+		}
+	}
 
 	/*
 	 * A racing connect carries its attempt slot in the selector, so the
@@ -2203,12 +2737,6 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		pr_dbg(&ctx->lh, "Handling upstream SOCKS5 handshake event: %d", cqe->res);
 		r = handle_ev_upstream_s5(w, udata, cqe);
 		break;
-	case EV_BIT_IOU_SOCKS5_AUTH_FILE:
-		pr_dbg(&ctx->lh, "Handling SOCKS5 auth file reload event: %d", cqe->res);
-		return handle_ev_auth_file(w, cqe->res);
-	case EV_BIT_IOU_ACL_FILE:
-		pr_dbg(&ctx->lh, "Handling ACL file reload event: %d", cqe->res);
-		return handle_ev_acl_file(w, cqe->res);
 	case EV_BIT_IOU_TARGET_CANCEL:
 		gcp = udata;
 		pr_dbg(&ctx->lh, "Handling target cancel event: %d", cqe->res);
@@ -2222,14 +2750,23 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		r = 0;
 		break;
 	case EV_BIT_IOU_DNS_QUERY:
-		pr_dbg(&ctx->lh, "Handling DNS query event: %d", cqe->res);
-		r = handle_ev_dns_query(w, udata);
-		break;
-	case EV_BIT_IOU_MSG_RING:
+		pr_dbg(&ctx->lh, "Handling DNS completion event: %d", cqe->res);
+		return handle_ev_dns_cq(w);
+	case EV_BIT_IOU_STOP:
+		pr_dbg(&ctx->lh, "Handling stop doorbell: %d", cqe->res);
 		return 0;
 	case EV_BIT_IOU_CLOSE:
-		inv_op = "close";
-		goto out_bug;
+		/*
+		 * Closes are queued with IOSQE_CQE_SKIP_SUCCESS, so only a
+		 * failure gets here. The descriptor is gone either way (close
+		 * releases it even when it reports an error), and nothing
+		 * waits on it, so this concerns no connection but its own:
+		 * report it and keep serving the others.
+		 */
+		pr_warn(&ctx->lh, "close(%u) failed: %s",
+			(unsigned)CLEAR_EV_BIT(cqe->user_data),
+			strerror(-cqe->res));
+		return 0;
 	default:
 		pr_err(&ctx->lh, "Unknown event bit: %" PRIu64 "; res=%d", ev_bit, cqe->res);
 		return -EINVAL;
@@ -2242,49 +2779,75 @@ out:
 
 	put_gcp(w, gcp);
 	return 0;
-
-out_bug:
-	pr_err(&ctx->lh, "Bug, invalid %s: res=%d, udata=%" PRIu64 ", s=%s", inv_op,
-		cqe->res, PTR_TO_U64(udata), strerror(-cqe->res));
-	return cqe->res;
 }
 
 static int handle_events(struct gwp_wrk *w)
 {
 	struct iou *iou = w->iou;
 	struct io_uring_cqe *cqe;
-	unsigned head, i = 0;
+	unsigned head;
 	int r = 0;
 
+	/*
+	 * Release each CQE before handling it, so the slots of the ones
+	 * handled so far are free while a handler runs. A handler that
+	 * finds the SQ full submits from inside this loop, and on kernels
+	 * that refuse submission while completions are waiting in the CQ
+	 * overflow list, get_sqe_nofail() needs that room to flush them.
+	 */
 	io_uring_for_each_cqe(&iou->ring, head, cqe) {
-		i++;
-		r = handle_event(w, cqe);
+		struct io_uring_cqe c = *cqe;
+
+		io_uring_cq_advance(&iou->ring, 1);
+		r = handle_event(w, &c);
 		if (unlikely(r))
 			break;
 	}
 
-	if (i)
-		io_uring_cq_advance(&iou->ring, i);
-
 	return r;
 }
 
+/*
+ * Submit what is queued and wait for a completion.
+ *
+ * The submit can fail for want of kernel memory (-EAGAIN, -ENOMEM), or, on
+ * older kernels, while completions sit in the CQ overflow list (-EBUSY), as
+ * get_sqe_nofail() describes. None of that is a reason to stop the worker,
+ * which would stop the proxy and drop every live connection: flush what
+ * overflowed into the CQ ring for handle_events() to reap, back off for a
+ * millisecond and go round again. The queued SQEs stay in the SQ ring and go
+ * out with the next submit.
+ */
 static int fish_events(struct gwp_wrk *w)
 {
 	struct iou *iou = w->iou;
 	int r;
 
 	r = io_uring_submit_and_wait(&iou->ring, 1);
-	if (unlikely(r < 0)) {
-		if (r != -EINTR) {
-			log_submit_err(w, r);
-			return r;
-		}
-
-		pr_info(&w->ctx->lh, "io_uring_submit_and_wait() interrupted");
+	w->now = gwp_now_sec();
+	if (likely(r >= 0)) {
+		iou->submit_stalled = false;
+		return 0;
 	}
 
-	return 0;
+	if (r == -EINTR) {
+		pr_info(&w->ctx->lh, "io_uring_submit_and_wait() interrupted");
+		return 0;
+	}
+
+	if (r == -EAGAIN || r == -ENOMEM || r == -EBUSY) {
+		if (!iou->submit_stalled)
+			pr_warn(&w->ctx->lh,
+				"Worker %u: io_uring_submit_and_wait(): %s; retrying",
+				w->idx, strerror(-r));
+		iou->submit_stalled = true;
+		io_uring_get_events(&iou->ring);
+		usleep(1000);
+		return 0;
+	}
+
+	pr_err(&w->ctx->lh, "io_uring_submit_and_wait(): %s", strerror(-r));
+	return r;
 }
 
 static void submit_unconsumed_sqes(struct gwp_wrk *w)
@@ -2305,13 +2868,10 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 
 	pr_info(&ctx->lh, "Worker %u started (io_uring)", w->idx);
 
-	if (w->idx == 0 && ctx->ino_fd >= 0)
-		prep_auth_reload(w);
-
-	if (w->idx == 0 && ctx->acl_ino_fd >= 0)
-		prep_acl_reload(w);
-
 	io_uring_set_iowait(&w->iou->ring, false);
+	arm_stop_poll(w);
+	if (ctx->dns)
+		arm_dns_cq_poll(w);
 	arm_accept(w);
 	while (!ctx->stop) {
 		r = fish_events(w);
@@ -2332,22 +2892,35 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 	return r;
 }
 
+/*
+ * Ask every worker to stop. Each worker is woken through its own eventfd,
+ * which its own ring polls (arm_stop_poll()), so no thread ever touches another
+ * thread's ring, and the only things done here are an atomic exchange and one
+ * write(2) per worker: both async-signal-safe, so sig_handler() can call this.
+ *
+ * Every exiting worker calls this again, as do gwp_ctx_stop() and
+ * gwp_ctx_free_threads(), so ring the doorbells only on the first call. That
+ * also keeps a late signal away from the workers once gwp_ctx_free_threads()
+ * has started tearing them down: by then the flag is set.
+ */
 __cold
 void gwp_ctx_signal_all_io_uring(struct gwp_ctx *ctx)
 {
-	struct gwp_wrk *we = &ctx->workers[0];
+	static const uint64_t one = 1;
 	int i;
 
 	ctx->stop = true;
-	for (i = 0; i < ctx->cfg.nr_workers; i++) {
-		struct io_uring_sqe *s = __get_sqe_nofail(&we->iou->ring);
-		struct gwp_wrk *wo = &ctx->workers[i];
-		int fd = wo->iou->ring.ring_fd;
-		io_uring_prep_msg_ring(s, fd, 0, EV_BIT_IOU_MSG_RING, 0);
-		s->user_data = EV_BIT_IOU_MSG_RING;
-	}
+	if (atomic_exchange(&ctx->stop_signalled, true))
+		return;
 
-	io_uring_submit_eintr(&we->iou->ring, 8);
+	for (i = 0; i < ctx->cfg.nr_workers; i++) {
+		int fd = ctx->workers[i].iou->stop_efd;
+		ssize_t r;
+
+		do {
+			r = __sys_write(fd, &one, sizeof(one));
+		} while (r == -EINTR);
+	}
 }
 
 #endif // CONFIG_IO_URING

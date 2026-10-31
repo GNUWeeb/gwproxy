@@ -15,8 +15,11 @@
 #include <gwproxy/http.h>
 #include <gwproxy/dns.h>
 #include <gwproxy/acl.h>
+#include <gwproxy/iplimit.h>
 #include <gwproxy/log.h>
 #include <assert.h>
+#include <stdatomic.h>
+#include <time.h>
 #ifdef CONFIG_IO_URING
 #include <liburing.h>
 #endif
@@ -38,6 +41,17 @@ struct gwp_iou_tls;
 struct gwp_iou_udp;
 struct gwp_acl;
 
+/*
+ * Which address family outgoing (target) connections may use. IPv4/IPv6 force
+ * DNS to resolve that family only and refuse a literal target of the other one;
+ * ANY leaves the choice to DNS and --prefer-ipv6.
+ */
+enum {
+	GWP_OUT_FAMILY_ANY	= 0,
+	GWP_OUT_FAMILY_IPV4	= 1,
+	GWP_OUT_FAMILY_IPV6	= 2,
+};
+
 struct gwp_cfg {
 	const char	*event_loop;
 	const char	*bind;
@@ -46,6 +60,8 @@ struct gwp_cfg {
 	bool		as_http;
 	bool		udp_associate;	/* allow SOCKS5 UDP ASSOCIATE (default on) */
 	bool		prefer_ipv6;
+	uint8_t		outgoing_family;/* enum GWP_OUT_FAMILY_* */
+	bool		bind_ipv6_only;	/* IPV6_V6ONLY on the listener */
 	bool		use_raw_dns;
 	int		protocol_timeout;
 	const char	*auth_file;
@@ -57,6 +73,16 @@ struct gwp_cfg {
 	int		nr_dns_workers;
 	int		connect_timeout;
 	/*
+	 * Close a tunnel or UDP association that has moved no data for this
+	 * many seconds; 0 keeps them for as long as both ends do.
+	 */
+	int		idle_timeout;
+	/*
+	 * Most client connections held at once per client address (IPv4) or
+	 * /64 (IPv6), see iplimit.h; 0 for no cap.
+	 */
+	int		max_conns_per_ip;
+	/*
 	 * Happy Eyeballs Connection Attempt Delay in milliseconds (RFC 8305
 	 * Section 5): how long before the next candidate address joins the
 	 * race. 0 disables racing, leaving plain sequential fallback.
@@ -65,7 +91,6 @@ struct gwp_cfg {
 	int		target_buf_size;
 	int		client_buf_size;
 	bool		tcp_nodelay;
-	bool		tcp_quickack;
 	bool		tcp_keepalive;
 	int		tcp_keepidle;
 	int		tcp_keepintvl;
@@ -75,7 +100,8 @@ struct gwp_cfg {
 	const char	*pid_file;
 	const char	*dns_servers;
 	const char	*upstream_proxy;
-	int		mark;
+	const char	*upstream_auth_file;	/* user:pass for the upstream */
+	uint32_t	mark;
 	/*
 	 * Global default for the ACL's -j BIND: the source address
 	 * (--bind-source, "ip[:port]") and/or interface (--bind-iface) to pin
@@ -133,7 +159,10 @@ enum {
 	EV_BIT_TIMER			= (5ull << 48ull),
 	EV_BIT_CLIENT_SOCKS5		= (6ull << 48ull),
 	EV_BIT_DNS_QUERY		= (7ull << 48ull),
-	EV_BIT_SOCKS5_AUTH_FILE		= (8ull << 48ull),
+	/*
+	 * 8 was the inotify watch for the auth and ACL files, now polled by
+	 * the reload thread instead of worker 0.
+	 */
 
 	/*
 	 * Raw DNS resolver socket (--raw-dns), epoll only. Values 9-21 belong
@@ -148,11 +177,7 @@ enum {
 	 */
 	EV_BIT_UDP_RELAY		= (22ull << 48ull),
 
-	/*
-	 * inotify watch for the ACL rule file (--acl-file); 23-24 are the
-	 * io_uring UDP relay aliases below, so use 25.
-	 */
-	EV_BIT_ACL_FILE			= (25ull << 48ull),
+	/* 25 was the ACL file's own inotify watch. */
 
 	/*
 	 * This ev_bit is used for user_data masking during protocol
@@ -173,7 +198,11 @@ enum {
 	 */
 	EV_BIT_TARGET_ATTEMPT		= (32ull << 48ull),
 
-	/* Fires when it is time to start the next attempt in the race. */
+	/*
+	 * Fires when it is time to start the next attempt in the race. Only
+	 * the io_uring loop has timer events; the epoll loop runs its timers
+	 * from a heap (ev/tmr.h).
+	 */
 	EV_BIT_ATTEMPT_TIMER		= (48ull << 48ull),
 
 	EV_BIT_CLIENT_PROT		= (1000ull << 48ull),
@@ -183,7 +212,6 @@ enum {
 	 * Only used by io_uring.
 	 */
 	EV_BIT_IOU_DNS_QUERY		= EV_BIT_DNS_QUERY,
-	EV_BIT_IOU_SOCKS5_AUTH_FILE	= EV_BIT_SOCKS5_AUTH_FILE,
 	EV_BIT_IOU_TIMER		= EV_BIT_TIMER,
 	EV_BIT_IOU_ACCEPT		= EV_BIT_ACCEPT,
 	EV_BIT_IOU_CLIENT_PROT		= EV_BIT_CLIENT_SOCKS5,
@@ -196,7 +224,7 @@ enum {
 	EV_BIT_IOU_TARGET_CANCEL	= (13ull << 48ull),
 	EV_BIT_IOU_CLIENT_CANCEL	= (14ull << 48ull),
 	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
-	EV_BIT_IOU_MSG_RING		= (16ull << 48ull),
+	EV_BIT_IOU_STOP			= (16ull << 48ull),
 	EV_BIT_IOU_TLS_DETECT		= (17ull << 48ull),
 	EV_BIT_IOU_TLS_HS_RECV		= (18ull << 48ull),
 	EV_BIT_IOU_TLS_HS_SEND		= (19ull << 48ull),
@@ -211,7 +239,6 @@ enum {
 	EV_BIT_IOU_UDP_RX		= EV_BIT_UDP_RELAY,
 	EV_BIT_IOU_UDP_TX		= (23ull << 48ull),
 	EV_BIT_IOU_UDP_CANCEL		= (24ull << 48ull),
-	EV_BIT_IOU_ACL_FILE		= EV_BIT_ACL_FILE,
 
 	/*
 	 * Happy Eyeballs on io_uring. The attempt-delay timeout shares the
@@ -320,8 +347,17 @@ enum {
 
 struct gwp_conn {
 	int		fd;
+	/*
+	 * @buf points at the first byte not consumed yet and holds @len bytes
+	 * of data, with room for @cap bytes from @buf. @off bytes in front of
+	 * @buf were already consumed (the allocation starts at buf - off).
+	 * gwp_conn_buf_consume() only moves @buf forward, so a partial send
+	 * does not shift the rest of the data down; gwp_conn_buf_compact()
+	 * moves it back to the start of the allocation.
+	 */
 	uint32_t	len;
 	uint32_t	cap;
+	uint32_t	off;
 	char		*buf;
 	uint32_t	ep_mask;
 
@@ -360,6 +396,19 @@ enum {
 	 * attempt, and a local would only remember the most recent walk.
 	 */
 	GWP_CONN_FLAG_ACL_CAND_OK	= (1ull << 3ull),
+	/*
+	 * The target socket could not be created for want of descriptors and
+	 * the connect is being retried; set so that this is logged once per
+	 * pair rather than on every retry. io_uring only: the epoll loop logs
+	 * when it puts the pair on its own wait list (gwp_wrk::tgt_wait) and
+	 * retries from that list, so it never logs a retry and needs no flag.
+	 */
+	GWP_CONN_FLAG_FD_WAIT		= (1ull << 4ull),
+	/*
+	 * The client is counted in gwp_ctx::iplim, so freeing the pair must
+	 * uncount it (gwp_ctx_iplim_put()).
+	 */
+	GWP_CONN_FLAG_IPLIM		= (1ull << 5ull),
 };
 
 enum {
@@ -380,6 +429,35 @@ struct gwp_conn_sockopt {
 	bool			mark_set;	/* -j MARK: use @mark, not cfg.mark */
 	uint32_t		mark;		/* SO_MARK value */
 	struct gwp_acl_bind	bind;		/* -j BIND: bind.set when present */
+};
+
+/*
+ * A UDP association's last client->target ACL verdict: @ok for @dst, valid
+ * while @valid and the ACL is still at generation @gen.
+ */
+struct gwp_udp_acl_cache {
+	struct gwp_sockaddr	dst;
+	uint32_t		gen;
+	bool			valid;
+	bool			ok;
+};
+
+/*
+ * The targets a UDP association's client has sent to, the only sources the
+ * relay accepts replies from. Each entry is an exact address and port whose
+ * last datagram the ACL accepted at generation @gen[i]; @seq[i] records when
+ * the client last sent to it, so a full table evicts the least recently
+ * used. Allocated on the association's first relayed datagram.
+ */
+#define GWP_UDP_MAX_PEERS	32
+
+struct gwp_udp_peers {
+	struct gwp_sockaddr	addr[GWP_UDP_MAX_PEERS];
+	uint32_t		gen[GWP_UDP_MAX_PEERS];
+	uint32_t		seq[GWP_UDP_MAX_PEERS];
+	uint32_t		next_seq;
+	uint8_t			nr;
+	uint8_t			last;	/* index of the last hit */
 };
 
 struct gwp_conn_pair {
@@ -431,6 +509,8 @@ struct gwp_conn_pair {
 	 * into the per-worker udp_buf.
 	 */
 	struct gwp_iou_udp	*udp_iou;
+	/* Targets a UDP association may hear from; NULL until it sends. */
+	struct gwp_udp_peers	*udp_peers;
 
 	/*
 	 * The hostname the client asked for, when it used a domain target
@@ -449,11 +529,13 @@ struct gwp_conn_pair {
 	 */
 	int			udp_fd;
 	/*
-	 * @attempt_timer_fd fires when the next connect attempt should be
-	 * started. It is separate from timer_fd, which bounds the whole
-	 * connect.
+	 * The epoll loop's timers of this pair (GWP_TMR_*): where each sits in
+	 * the worker's timer heap, plus one, or 0 while it is not armed. The
+	 * protocol, connect and idle timeouts share GWP_TMR_CONN; the delay
+	 * before the next connect attempt joins the race is GWP_TMR_ATTEMPT,
+	 * separate because it runs alongside the connect timeout.
 	 */
-	int			attempt_timer_fd;
+	uint32_t		tmr_pos[2];
 	uint32_t		idx;
 #ifdef CONFIG_IO_URING
 	int			ref_cnt;
@@ -469,10 +551,12 @@ struct gwp_conn_pair {
 
 	/*
 	 * @udp_peer is the UDP client's source address, pinned from its first
-	 * datagram (@udp_pinned); datagrams from other sources are treated as
-	 * replies from targets.
+	 * datagram (@udp_pinned); datagrams from other sources are replies,
+	 * relayed only from a target in @udp_peers.
 	 */
 	struct gwp_sockaddr	udp_peer;
+	/* Last client->target datagram's ACL verdict; see udp_target_allowed(). */
+	struct gwp_udp_acl_cache	udp_acl;
 	struct gwp_sockaddr	client_addr;
 	struct gwp_sockaddr	target_addr;
 
@@ -504,6 +588,8 @@ struct gwp_conn_pair {
 	 * target socket is created.
 	 */
 	struct gwp_conn_sockopt	acl_sockopt;
+	/* -m domain/-m user results shared by this candidate list's ACL checks. */
+	struct gwp_acl_memo	acl_memo;
 
 	/*
 	 * Destination requested from the upstream SOCKS5 proxy. Only used
@@ -516,8 +602,23 @@ struct gwp_conn_pair {
 	 */
 	struct gwp_socks5_addr	up_dst;
 
+	/*
+	 * When the pair last had I/O (gwp_wrk::now), and so how long it has
+	 * been idle once @idle_timer has replaced the handshake's timer.
+	 */
+	uint32_t		last_act;
+
+	/*
+	 * How much of an http:// upstream's CONNECT reply has been searched
+	 * for the end of its header, so a reply arriving in pieces is not
+	 * searched from its start again on every read.
+	 */
+	uint32_t		up_scan;
+
 	/* One-byte scalars last, so they pack instead of each opening a hole. */
 	bool			is_target_alive;
+	/* The pair's timer is now the --idle-timeout check. */
+	bool			idle_timer;
 	uint8_t			prot_type;
 	bool			udp_pinned;
 	/*
@@ -530,6 +631,29 @@ struct gwp_conn_pair {
 	uint8_t			next_cand;
 #ifdef CONFIG_IO_URING
 	bool			attempt_timer_armed;
+	/*
+	 * Protocol/connect timeouts (EV_BIT_IOU_TIMER) still outstanding. Each
+	 * holds a reference, so teardown has to remove them or the pair, and
+	 * the client socket with it, stays open until they expire. A count
+	 * rather than a flag: the protocol timer can still be pending when the
+	 * connect timer is armed.
+	 */
+	uint8_t			nr_timers_armed;
+	/*
+	 * Requests in flight on the client, target and UDP relay sockets
+	 * (recv, send, poll; not timeouts or cancels), so that teardown
+	 * cancels only on the sockets that still have any.
+	 */
+	uint8_t			nr_ops_client;
+	uint8_t			nr_ops_target;
+	uint8_t			nr_ops_udp;
+	/*
+	 * A plaintext send of target.buf to the client is in flight. It
+	 * covers the bytes that were there when it was queued, so another
+	 * send must not be queued over them; its completion sends whatever
+	 * was appended in the meantime.
+	 */
+	bool			client_tx;
 #endif
 };
 
@@ -551,6 +675,19 @@ struct iou {
 	 * due to fd exhaustion (EMFILE/ENFILE). Must outlive SQE submission.
 	 */
 	struct __kernel_timespec accept_retry_ts;
+
+	/*
+	 * Stop doorbell: gwp_ctx_signal_all_io_uring() writes it, and a poll
+	 * in this worker's own ring wakes the worker up.
+	 */
+	int			stop_efd;
+
+	/*
+	 * The last io_uring_submit_and_wait() failed with a transient error
+	 * and is being retried (see fish_events()), so that it is logged
+	 * once per episode rather than on every retry.
+	 */
+	bool			submit_stalled;
 };
 #endif
 
@@ -559,6 +696,38 @@ struct gwp_dns_resolver;
 struct gwp_wrk_dns {
 	struct gwp_dns_resolver		*resolvers;
 	uint32_t			nr;
+};
+
+/*
+ * Each worker owns its own cache lines: the conn slot fields are written on
+ * every accept and close, and the loop fields next to them are read on every
+ * iteration, so a worker must not share a line with its neighbour in the
+ * workers array (which is allocated GWP_CACHELINE aligned).
+ */
+#define GWP_CACHELINE	64
+
+/* What a timer of the epoll loop does when it expires. */
+enum {
+	/* The protocol, connect or idle timeout of the pair. */
+	GWP_TMR_CONN		= 0,
+	/* The next connect attempt joins the race. */
+	GWP_TMR_ATTEMPT		= 1,
+};
+
+/* An entry of the epoll loop's per-worker timer heap. */
+struct gwp_tmr {
+	/* When it expires, in CLOCK_MONOTONIC milliseconds. */
+	uint64_t		at_ms;
+	struct gwp_conn_pair	*gcp;
+	/* GWP_TMR_*, also the index into gcp->tmr_pos. */
+	uint32_t		kind;
+};
+
+/* A binary min-heap of timers on gwp_tmr::at_ms (ev/tmr.h). */
+struct gwp_tmr_heap {
+	struct gwp_tmr		*tmr;
+	uint32_t		nr;
+	uint32_t		cap;
 };
 
 struct gwp_wrk {
@@ -570,12 +739,54 @@ struct gwp_wrk {
 			int			ep_fd;
 			int			ev_fd;
 			struct epoll_event	*events;
+			/*
+			 * Pairs torn down while the current batch of events is
+			 * handled. They are only marked dying then, and freed
+			 * once the batch is done, because a later event in the
+			 * same batch may still point at them.
+			 */
+			struct gwp_conn_pair	**dead;
+			/*
+			 * The timers of every pair of this worker (see
+			 * ev/tmr.h). They drive the epoll_wait() timeout, so
+			 * a timer costs no descriptor and no system call.
+			 */
+			struct gwp_tmr_heap	tmrs;
+			/*
+			 * When to retry what is waiting on a timed pause
+			 * (accept, see handle_accept_error(), or a target
+			 * socket, see wait_for_target()), in CLOCK_MONOTONIC
+			 * milliseconds; 0 while nothing is.
+			 */
+			uint64_t		retry_at_ms;
+			/*
+			 * Plain and transparent forwarding clients whose
+			 * target socket could not be created for want of
+			 * descriptors, retried by run_retries().
+			 */
+			struct gwp_conn_pair	**tgt_wait;
+			uint32_t		nr_tgt_wait;
+			uint32_t		tgt_wait_cap;
 			uint16_t		evsz;
+			uint16_t		nr_dead;
+			uint16_t		dead_cap;
 			/*
 			 * If it's true, the worker MUST call epoll_wait() again
-			 * before continue iterating over the events.
+			 * before continue iterating over the events. Only set
+			 * when @dead is full and a pair had to be freed at once.
 			 */
 			bool			ev_need_reload;
+			/*
+			 * accept() failed for a reason that closing
+			 * descriptors does not cure: the listener is out of
+			 * the epoll set until retry_at_ms (accept_retry).
+			 * Any accept pause, this one or the one for running
+			 * out of descriptors (accept_is_stopped), is logged
+			 * once, until a connection is accepted again
+			 * (accept_paused).
+			 */
+			bool			accept_retry;
+			bool			accept_paused;
 		};
 #ifdef CONFIG_IO_URING
 		struct iou	*iou;
@@ -586,6 +797,11 @@ struct gwp_wrk {
 	bool			need_join;
 	struct gwp_ctx		*ctx;
 	uint32_t		idx;
+	/*
+	 * Coarse monotonic seconds, taken once per wakeup of the loop: cheap
+	 * enough to stamp every event with (gwp_conn_pair::last_act).
+	 */
+	uint32_t		now;
 	pthread_t		thread;
 
 	/*
@@ -599,7 +815,7 @@ struct gwp_wrk {
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	struct gwp_wrk_dns	*dns;
 #endif
-};
+} __attribute__((__aligned__(GWP_CACHELINE)));
 
 enum {
 	GWP_EV_EPOLL,
@@ -607,7 +823,12 @@ enum {
 };
 
 struct gwp_ctx {
-	volatile bool			stop;
+	/*
+	 * Set from the signal handler and from any worker that exits, read by
+	 * every worker loop: an atomic, which volatile is not. Lock-free, so it
+	 * is also safe to store from a signal handler.
+	 */
+	_Atomic(bool)			stop;
 	uint8_t				ev_used;
 	struct log_handle		lh;
 	struct gwp_wrk			*workers;
@@ -626,23 +847,40 @@ struct gwp_ctx {
 	 */
 	struct gwp_acl_bind		bind_def;
 	struct gwp_cfg			cfg;
+	/* The locked --pid-file, removed on exit; -1 when there is none. */
+	int				pid_fd;
+	/*
+	 * One inotify instance watching the auth file and the ACL file (their
+	 * parent directories, see add_reload_watch()); -1 when neither is
+	 * configured. @reload_thread polls it and reloads the files, off the
+	 * workers; @reload_efd tells it to exit. @reload_running: the thread
+	 * was started and still needs a join.
+	 */
 	int				ino_fd;
-	char				*ino_buf;
-	/* ACL rule store (--acl-file) and its own inotify watch. Global to all
-	 * proxy modes, unlike @auth which is prot-only. */
+	int				reload_efd;
+	pthread_t			reload_thread;
+	bool				reload_running;
+	/* ACL rule store. Global to all proxy modes, unlike @auth which is
+	 * prot-only. @acl_watched: loaded from --acl-file (so reloadable),
+	 * not the built-in default rules. */
 	struct gwp_acl			*acl;
-	int				acl_ino_fd;
-	char				*acl_ino_buf;
+	bool				acl_watched;
+	/* Client connections per address, for --max-conns-per-ip; NULL when
+	 * there is no cap, so the accept path costs nothing then. */
+	struct gwp_iplim		*iplim;
 	_Atomic(int32_t)		nr_fd_closed;
 	_Atomic(int32_t)		nr_accept_stopped;
+	/* The workers' stop doorbells have been rung (io_uring). */
+	_Atomic(bool)			stop_signalled;
 };
 
 struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w);
+bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
+void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
-int gwp_create_timer(int fd, int sec, int nsec);
 void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd);
 
 /*
@@ -698,8 +936,9 @@ struct gwp_udp_out {
  *                       to the encapsulated target.
  *   GWP_UDP_TO_CLIENT - target reply: prepend a SOCKS5 header in the slack, send
  *                       @out back to the pinned client.
- *   GWP_UDP_DROP      - unpinned/wrong source, bad header, domain target, or ACL
- *                       denial.
+ *   GWP_UDP_DROP      - unpinned/wrong source, bad header, domain target, ACL
+ *                       denial, or a "reply" from a source the client has not
+ *                       sent to (or that the ACL no longer accepts).
  * On a forward verdict @out holds the buffer + destination; each loop performs
  * the send with its own I/O primitive.
  */
@@ -710,17 +949,10 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 					struct gwp_udp_out *out);
 
 /* True if the ACL OUTPUT chain permits a @proto connection from @client to
- * @target (allow-all when no ACL is loaded or @target has no resolved IP).
- * @user is the authenticated username for "-m user", or NULL when the
- * connection is unauthenticated. */
-bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
-				const struct gwp_sockaddr *client,
-				const struct gwp_sockaddr *target,
-				const char *user, enum gwp_acl_proto proto);
-
-/* As gwp_ctx_acl_output_allowed(), but a matching -j DNAT rewrites *@target and
- * any -j MARK/-j BIND modifiers are written to *@so (ignored when @so is NULL).
- * For the accept-time plain/transparent path, which has no gwp_conn_pair. */
+ * @target (allow-all when no ACL is loaded). A matching -j DNAT rewrites
+ * *@target and any -j MARK/-j BIND modifiers are written to *@so (ignored when
+ * @so is NULL). For the accept-time plain/transparent path, which has no
+ * gwp_conn_pair. */
 bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     const struct gwp_sockaddr *client,
 			     struct gwp_sockaddr *target,
@@ -741,10 +973,9 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
 				   const struct gwp_sockaddr *addr);
 
 /*
- * Close every connect attempt still in flight and the attempt timer, e.g. once
- * one attempt has won the race or the pair is being torn down. Returns how many
- * descriptors were closed, which the epoll loop credits to its accept-rearm
- * accounting.
+ * Close every connect attempt still in flight, e.g. once one attempt has won
+ * the race or the pair is being torn down. Returns how many descriptors were
+ * closed, which the epoll loop credits to its accept-rearm accounting.
  */
 int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
 
@@ -753,28 +984,95 @@ int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
 bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *client,
 				enum gwp_acl_proto proto);
+/*
+ * True when @a may be dialled under --outgoing-family. v4-mapped aware, so a
+ * ::ffff:a.b.c.d target from the UDP relay counts as IPv4.
+ */
+bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *a);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
 
-/* True when a drained inotify buffer names the basename of @path. The auth/ACL
- * reload watches sit on the parent directory (so atomic renames still fire), so
- * the reload handlers use this to reload only for their own file. */
-bool gwp_inotify_event_matches(const void *buf, size_t len, const char *path);
-
-static inline void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
+/* Monotonic seconds, at the coarse clock's resolution (a few ms). */
+static inline uint32_t gwp_now_sec(void)
 {
-	assert(len <= conn->len);
-	conn->len -= len;
-	if (conn->len)
-		memmove(conn->buf, conn->buf + len, conn->len);
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC_COARSE, &t);
+	return (uint32_t)t.tv_sec;
 }
 
+/*
+ * Is the target socket carrying the upstream proxy handshake? Until the tunnel
+ * is up, gcp->target is that handshake's I/O buffer: whatever it holds (our
+ * unsent request, a partial or refusing reply) belongs to the upstream proxy
+ * and must never be relayed to the client.
+ */
+static inline bool gwp_in_upstream_hs(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs >= CONN_STATE_UPSTREAM_S5_MIN &&
+	       cs <= CONN_STATE_UPSTREAM_HTTP_MAX;
+}
+
+/* Move the data back to the start of the buffer, regaining the room in front. */
+static inline void gwp_conn_buf_compact(struct gwp_conn *conn)
+{
+	if (!conn->off)
+		return;
+	if (conn->len)
+		memmove(conn->buf - conn->off, conn->buf, conn->len);
+	conn->buf -= conn->off;
+	conn->cap += conn->off;
+	conn->off = 0;
+}
+
+static inline void __gwp_conn_buf_skip(struct gwp_conn *conn, size_t len)
+{
+	assert(len <= conn->len);
+	conn->buf += len;
+	conn->len -= (uint32_t)len;
+	conn->cap -= (uint32_t)len;
+	conn->off += (uint32_t)len;
+}
+
+/*
+ * Drop @len bytes from the front and keep the rest at the start of the
+ * buffer. For the protocol parsers, which want the next message at the start
+ * and the whole buffer behind it.
+ */
+static inline void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
+{
+	__gwp_conn_buf_skip(conn, len);
+	gwp_conn_buf_compact(conn);
+}
+
+/*
+ * Drop @len bytes from the front after they were sent. The rest stays where
+ * it is: it is compacted only once the buffer is empty (which costs nothing)
+ * or once at least half of it lies consumed in front of the data, so the
+ * bytes moved never exceed the bytes sent. Moving the rest down on every
+ * partial send copied up to a whole buffer each time.
+ */
+static inline void gwp_conn_buf_consume(struct gwp_conn *conn, size_t len)
+{
+	__gwp_conn_buf_skip(conn, len);
+	if (!conn->len || conn->off >= conn->cap)
+		gwp_conn_buf_compact(conn);
+}
+
+/*
+ * Debug, not info: at the default level every connection already logs
+ * "Target socket connected" (fds, both addresses) and "Closing connection
+ * pair" (idx, fds, both addresses), so this line only repeated them.
+ */
 static inline
 void log_conn_pair_created(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
-	pr_info(&ctx->lh, "New connection pair created (idx=%u, cfd=%d, tfd=%d, ca=%s, ta=%s)",
+	pr_dbg(&ctx->lh, "New connection pair created (idx=%u, cfd=%d, tfd=%d, ca=%s, ta=%s)",
 		gcp->idx, gcp->client.fd, gcp->target.fd,
 		ip_to_str(&gcp->client_addr), ip_to_str(&gcp->target_addr));
 }
@@ -849,9 +1147,44 @@ int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			     bool *notify);
 
+/*
+ * The upstream handshake failed with @err and the client is to be told: put
+ * its failure reply in target.buf in place of whatever the upstream sent --
+ * SOCKS5 REP 0x05 for a refused CONNECT and 0x01 for anything else, an HTTP
+ * client a 502. Returns the number of bytes to send to the client (0 for
+ * plain forwarding, which has no reply to give), or a negative errno.
+ */
+int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    int err);
+
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * HTTP forwarding-proxy requests (absolute-form "GET http://..."), unlike
+ * every other mode, are not relayed blindly once the target is up: what
+ * passes between client and origin is filtered by gwp_http_fwd_in(). Both
+ * event loops call gwp_http_fwd_begin() when such a pair starts forwarding,
+ * and gwp_http_fwd_in() after every read into either buffer while
+ * gwp_http_fwd_active() holds.
+ */
+static inline bool gwp_http_fwd_active(const struct gwp_conn_pair *gcp)
+{
+	return gcp->prot_type == GWP_PROT_TYPE_HTTP && gcp->http_conn &&
+	       gwp_http_conn_is_forward(gcp->http_conn);
+}
+
+int gwp_http_fwd_begin(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * @c (&gcp->client or &gcp->target) has just had bytes appended at
+ * c->buf[@from..c->len), or reached EOF (c->rd_eof). The bytes may be
+ * rewritten, held back or dropped, so c->len and c->cap can change. Returns
+ * 0 or a negative errno that tears the pair down.
+ */
+int gwp_http_fwd_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		    struct gwp_conn *c, uint32_t from);
 
 #endif /* #ifndef GWPROXY_H */

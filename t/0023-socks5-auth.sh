@@ -5,7 +5,9 @@
 # --auth-file must (a) accept a client that presents the correct
 # username/password and relay the payload byte-exact, (b) reject a client
 # with a wrong password, and (c) reject a client that presents no
-# credentials at all. Exercised on every available event loop.
+# credentials at all. Exercised on every available event loop. The
+# credential file takes comment lines, and refuses a line that is not
+# "user:password" instead of reading it as a user with no password.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -58,5 +60,35 @@ for loop in epoll io_uring; do
 
 	kill "$GWP_PID" 2>/dev/null
 done
+
+# (d) Comment lines are not users. A line with no ':' used to become a user
+#     with an empty password, comments included, so "# admins" with no
+#     password logged in.
+printf '# admins\n\ntestuser:s3cr3t\n' >"$WORK/auth.comment"
+pp="$(pick_port)"
+gwp_start "127.0.0.1:$pp" --as-socks5=1 --auth-file="$WORK/auth.comment"
+rep="$(python3 "$SERVERS_DIR/socks5_probe.py" --user '# admins' --pass '' \
+	"$pp" "$hp")"
+[ "$rep" = AUTHFAIL ] || fail "a comment line logged in with no password ($rep)"
+rep="$(python3 "$SERVERS_DIR/socks5_probe.py" --user testuser --pass s3cr3t \
+	"$pp" "$hp")"
+[ "$rep" = REP=0x00 ] || fail "the user after a comment line was refused ($rep)"
+kill "$GWP_PID" 2>/dev/null
+
+# (e) A line that is not "user:password" refuses the whole file, rather than
+#     creating a user with an empty password.
+printf 'testuser:s3cr3t\nnopass\n' >"$WORK/auth.bad"
+pp="$(pick_port)"
+"$GWPROXY" --bind="127.0.0.1:$pp" --as-socks5=1 --auth-file="$WORK/auth.bad" \
+	--acl-allow-all >"$WORK/bad.log" 2>&1 &
+bad_pid=$!
+_PIDS+=("$bad_pid")
+for _ in $(seq 1 50); do
+	kill -0 "$bad_pid" 2>/dev/null || break
+	sleep 0.1
+done
+kill -0 "$bad_pid" 2>/dev/null && fail "gwproxy started with a malformed auth file"
+grep -q 'line 2' "$WORK/bad.log" \
+	|| fail "the malformed auth file line was not reported: $(cat "$WORK/bad.log")"
 
 pass

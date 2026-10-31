@@ -16,23 +16,37 @@
 #include <errno.h>
 #include <netdb.h>
 #include <assert.h>
-#include <stdatomic.h>
 #include <unistd.h>
-#ifdef CONFIG_HAVE_GETRANDOM
-#include <sys/random.h>
-#endif
 #include <gwproxy/dns_cache.h>
+#include <gwproxy/dns_hash.h>
 #include <arpa/inet.h>
 
-#ifndef container_of
-#define container_of(ptr, type, member) \
-	((type *)((char *)(ptr) - offsetof(type, member)))
-#endif
+struct gwp_dns_cache_entry {
+	/**
+	 * Super compact domain name and IP address list.
+	 *
+	 * - name_len: length of the domain name (including null terminator).
+	 * - nr_i4: number of IPv4 addresses.
+	 * - nr_i6: number of IPv6 addresses.
+	 * - block: flexible array member that contains:
+	 *     - The first name_len octets are the domain name.
+	 *     - The next nr_i4 * 4 octets are IPv4 addresses.
+	 *     - The next nr_i6 * 16 octets are IPv6 addresses.
+	 */
+	uint8_t		name_len;
+	uint8_t		nr_i4;
+	uint8_t		nr_i6;
+	uint8_t		block[];
+};
 
+/*
+ * Entries are only ever reached under the cache lock: a hit copies the
+ * addresses out before unlocking, so an entry has no other owner than the
+ * table and is freed as soon as it is unlinked.
+ */
 struct dns_cache_entry {
 	struct dns_cache_entry		*next;
 	time_t				expired_at;
-	_Atomic(int)			ref_cnt;
 	struct gwp_dns_cache_entry	e;
 };
 
@@ -41,83 +55,24 @@ struct dns_hash_map {
 	size_t			nr_buckets;
 	size_t			nr_entries;
 	size_t			max_entries;	/* 0 = unlimited */
-	uint64_t		seed;		/* per-cache random hash seed */
+	uint64_t		key[2];		/* per-cache random SipHash key */
 };
 
 struct gwp_dns_cache {
 	pthread_rwlock_t	lock;
 	struct dns_hash_map	map;
-	/*
-	 * Rate-limits the lookup-triggered expiry sweep (see throttled_housekeep).
-	 * A 32-bit seconds counter, not time_t: an 8-byte atomic is not lock-free
-	 * on 32-bit targets and would pull in libatomic. Unsigned wrap of the
-	 * delta is fine for a 1-second throttle.
-	 */
-	_Atomic(uint32_t)	last_housekeep;
 };
 
-/* Minimum seconds between two lookup-triggered full sweeps. */
-#define GWP_DNS_HOUSEKEEP_MIN_INTERVAL 1
-
 /*
- * A per-process random hash seed so an attacker cannot precompute hostnames
- * that collide into one bucket (offline hash-flooding). getrandom() is
- * preferred; the fallback mixes time/pid/address, which is not cryptographic
- * but still unpredictable to a remote attacker.
- *
- * The fallback covers two cases: getrandom() failing at run time, and libcs
- * that do not provide it at all (Termux on Android, say), where calling it
- * would not even compile -- hence the configure probe rather than a bare
- * __has_include or a version check.
+ * Buckets swept per write-lock hold in gwp_dns_cache_housekeep(). Lookups
+ * from the event loops get the lock between two chunks, so a sweep of a large
+ * table never stalls them for the whole pass.
  */
-static uint64_t gen_hash_seed(void)
+#define GWP_DNS_HOUSEKEEP_CHUNK	1024
+
+static uint64_t hash_key(const uint64_t key[2], const char *name, size_t len)
 {
-	uint64_t s;
-
-#ifdef CONFIG_HAVE_GETRANDOM
-	if (getrandom(&s, sizeof(s), 0) == (ssize_t)sizeof(s))
-		return s;
-#endif
-
-	s = (uint64_t)time(NULL);
-	s ^= (uint64_t)getpid() * 0x9e3779b97f4a7c15ULL;
-	s ^= (uint64_t)(uintptr_t)&s;
-	return s ? s : 0x9e3779b97f4a7c15ULL;
-}
-
-/**
- * DJB2 Hash function, seeded to defeat offline collision precomputation.
- */
-static uint64_t hash_key(uint64_t seed, const unsigned char *key)
-{
-	uint64_t hash = seed;
-	int c;
-
-	while ((c = *key++))
-		hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
-
-	return hash;
-}
-
-/*
- * ASCII-lowercase @key into @buf (capacity @cap) and return the length incl. the
- * NUL terminator, or 0 if it does not fit. DNS is case-insensitive, so keying on
- * the folded name avoids duplicate entries (and lookup misses) for case-varied
- * requests. Only A-Z is folded (hostnames are ASCII; avoids locale tolower()).
- */
-static size_t normalize_key(const char *key, char *buf, size_t cap)
-{
-	size_t i;
-
-	for (i = 0; key[i]; i++) {
-		unsigned char c = (unsigned char)key[i];
-
-		if (i + 1 >= cap)
-			return 0;
-		buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : (char)c;
-	}
-	buf[i] = '\0';
-	return i + 1;
+	return gwp_siphash13(key, name, len);
 }
 
 static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
@@ -130,23 +85,13 @@ static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
 	map->nr_buckets = nr_buckets;
 	map->nr_entries = 0;
 	map->max_entries = max_entries;
-	map->seed = gen_hash_seed();
+	gwp_dns_gen_hash_key(map->key);
 	return 0;
 }
 
 static void put_dns_entry(struct dns_cache_entry *e)
 {
-	int x = atomic_fetch_sub(&e->ref_cnt, 1);
-	assert(x > 0);
-	if (x == 1)
-		free(e);
-}
-
-static void get_dns_entry(struct dns_cache_entry *e)
-{
-	int x = atomic_fetch_add(&e->ref_cnt, 1);
-	assert(x >= 0);
-	(void)x;
+	free(e);
 }
 
 static void dns_map_free(struct dns_hash_map *map)
@@ -227,14 +172,17 @@ static int alloc_dns_entry(struct dns_cache_entry **ep, const char *key,
 	if (name_len <= 1 || name_len > 255)
 		return -EINVAL;
 
+	/* No address at all records that the name does not resolve. */
 	count_addrinfo(ai, &nr_i4, &nr_i6);
-	if (nr_i4 == 0 && nr_i6 == 0)
-		return -EINVAL;
 
-	if (nr_i4 > 255)
-		nr_i4 = 255;
-	if (nr_i6 > 255)
-		nr_i6 = 255;
+	/*
+	 * A lookup never hands back more than GWP_DNS_CACHE_MAX_ADDRS per
+	 * family, so storing more only costs memory and insert time.
+	 */
+	if (nr_i4 > GWP_DNS_CACHE_MAX_ADDRS)
+		nr_i4 = GWP_DNS_CACHE_MAX_ADDRS;
+	if (nr_i6 > GWP_DNS_CACHE_MAX_ADDRS)
+		nr_i6 = GWP_DNS_CACHE_MAX_ADDRS;
 
 	/*
 	 * e->block is a variable length array that contains:
@@ -250,7 +198,6 @@ static int alloc_dns_entry(struct dns_cache_entry **ep, const char *key,
 	de->e.name_len = name_len;
 	de->e.nr_i4 = nr_i4;
 	de->e.nr_i6 = nr_i6;
-	atomic_init(&de->ref_cnt, 1);
 	memcpy(de->e.block, key, name_len);
 	extract_i4i6(de, ai);
 	*ep = de;
@@ -266,7 +213,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	char lkey[256];
 	int r;
 
-	if (!normalize_key(key, lkey, sizeof(lkey)))
+	if (!gwp_dns_fold_name(key, lkey, sizeof(lkey)))
 		return -EINVAL;
 
 	r = alloc_dns_entry(&de, lkey, ai, expired_at);
@@ -279,7 +226,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	 *   2) Collision with the same key, replace the entry.
 	 *   3) Collision with a different key, chain the entry.
 	 */
-	hash = hash_key(map->seed, (const unsigned char *)lkey);
+	hash = hash_key(map->key, lkey, de->e.name_len - 1);
 	idx = hash % map->nr_buckets;
 	cur = map->table[idx];
 	if (!cur) {
@@ -287,7 +234,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 		 * Case 1. Best case, no collision!
 		 */
 		if (map->max_entries && map->nr_entries >= map->max_entries) {
-			free(de);	/* fresh, unshared alloc (ref_cnt == 1) */
+			free(de);	/* fresh, not linked anywhere yet */
 			return -ENOSPC;
 		}
 		map->table[idx] = de;
@@ -386,7 +333,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	 * just not cached) rather than growing without limit.
 	 */
 	if (map->max_entries && map->nr_entries >= map->max_entries) {
-		free(de);	/* fresh, unshared alloc (ref_cnt == 1) */
+		free(de);	/* fresh, not linked anywhere yet */
 		return -ENOSPC;
 	}
 	map->nr_entries++;
@@ -399,8 +346,20 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	return 0;
 }
 
-static int dns_map_lookup_and_get(struct dns_hash_map *map, const char *key,
-				  struct dns_cache_entry **ep)
+static void copy_addrs(const struct gwp_dns_cache_entry *e,
+		       struct gwp_dns_cache_addrs *out)
+{
+	const uint8_t *i4b = &e->block[e->name_len];
+	const uint8_t *i6b = &i4b[e->nr_i4 * 4];
+
+	out->nr_i4 = e->nr_i4;
+	out->nr_i6 = e->nr_i6;
+	memcpy(out->i4, i4b, (size_t)out->nr_i4 * 4);
+	memcpy(out->i6, i6b, (size_t)out->nr_i6 * 16);
+}
+
+static int dns_map_lookup(struct dns_hash_map *map, const char *key,
+			  struct gwp_dns_cache_addrs *out)
 {
 	struct dns_cache_entry *cur;
 	time_t now = time(NULL);
@@ -408,11 +367,11 @@ static int dns_map_lookup_and_get(struct dns_hash_map *map, const char *key,
 	char lkey[256];
 	size_t nl;
 
-	nl = normalize_key(key, lkey, sizeof(lkey));
+	nl = gwp_dns_fold_name(key, lkey, sizeof(lkey));
 	if (nl <= 1 || nl > 255)
 		return -EINVAL;
 
-	hash = hash_key(map->seed, (const unsigned char *)lkey);
+	hash = hash_key(map->key, lkey, nl - 1);
 	idx = hash % map->nr_buckets;
 	cur = map->table[idx];
 
@@ -422,8 +381,7 @@ static int dns_map_lookup_and_get(struct dns_hash_map *map, const char *key,
 			if (cur->expired_at <= now)
 				return -ETIMEDOUT;
 
-			get_dns_entry(cur);
-			*ep = cur;
+			copy_addrs(&cur->e, out);
 			return 0;
 		}
 		cur = cur->next;
@@ -456,7 +414,6 @@ int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets,
 	if (r)
 		goto out_destroy_lock;
 
-	atomic_init(&cache->last_housekeep, (uint32_t)0);
 	*cache_p = cache;
 	return 0;
 
@@ -487,77 +444,56 @@ int gwp_dns_cache_insert(struct gwp_dns_cache *cache, const char *key,
 	return r;
 }
 
-/*
- * Sweep expired entries, but at most once per GWP_DNS_HOUSEKEEP_MIN_INTERVAL and
- * with only one sweeper at a time. Without this, a hot name expiring makes every
- * concurrent lookup that hits it (-ETIMEDOUT) launch its own O(total) full-table
- * sweep under the write lock -- a thundering-herd stall recurring at each TTL
- * boundary. The winner of the timestamp CAS performs the sweep; the rest skip.
- */
-static void throttled_housekeep(struct gwp_dns_cache *cache)
+int gwp_dns_cache_lookup_addrs(struct gwp_dns_cache *cache, const char *key,
+			       struct gwp_dns_cache_addrs *out)
 {
-	uint32_t now = (uint32_t)time(NULL);
-	uint32_t last = atomic_load_explicit(&cache->last_housekeep,
-					     memory_order_relaxed);
-
-	if (now - last < GWP_DNS_HOUSEKEEP_MIN_INTERVAL)
-		return;
-	if (!atomic_compare_exchange_strong_explicit(&cache->last_housekeep,
-			&last, now, memory_order_relaxed, memory_order_relaxed))
-		return;
-
-	gwp_dns_cache_housekeep(cache);
-}
-
-int gwp_dns_cache_getent(struct gwp_dns_cache *cache, const char *key,
-			 struct gwp_dns_cache_entry **ep)
-{
-	struct dns_cache_entry *de = NULL;
 	int r;
 
 	pthread_rwlock_rdlock(&cache->lock);
-	r = dns_map_lookup_and_get(&cache->map, key, &de);
+	r = dns_map_lookup(&cache->map, key, out);
 	pthread_rwlock_unlock(&cache->lock);
-	if (de)
-		*ep = &de->e;
-	else if (r == -ETIMEDOUT)
-		throttled_housekeep(cache);
-
 	return r;
 }
 
-void gwp_dns_cache_putent(struct gwp_dns_cache_entry *e)
+/*
+ * Unlink and free the expired entries of buckets [@start, @start + @nr), and
+ * return the bucket after the last one swept. Chains with nothing expired are
+ * only read.
+ */
+static size_t dns_map_remove_expired(struct dns_hash_map *map, size_t start,
+				     size_t nr, time_t now)
 {
-	if (e)
-		put_dns_entry(container_of(e, struct dns_cache_entry, e));
-}
+	size_t i, end = start + nr;
 
-static void dns_map_scan_and_remove_expired(struct dns_hash_map *map)
-{
-	struct dns_cache_entry *next, *cur;
-	time_t now = time(NULL);
-	size_t i;
+	if (end > map->nr_buckets)
+		end = map->nr_buckets;
 
-	for (i = 0; i < map->nr_buckets; i++) {
-		cur = map->table[i];
-		map->table[i] = NULL;
-		while (cur) {
-			next = cur->next;
-			if (cur->expired_at <= now) {
-				map->nr_entries--;
-				put_dns_entry(cur);
-			} else {
-				cur->next = map->table[i];
-				map->table[i] = cur;
+	for (i = start; i < end; i++) {
+		struct dns_cache_entry **pp = &map->table[i], *cur;
+
+		while ((cur = *pp)) {
+			if (cur->expired_at > now) {
+				pp = &cur->next;
+				continue;
 			}
-			cur = next;
+			*pp = cur->next;
+			map->nr_entries--;
+			put_dns_entry(cur);
 		}
 	}
+
+	return end;
 }
 
 void gwp_dns_cache_housekeep(struct gwp_dns_cache *cache)
 {
-	pthread_rwlock_wrlock(&cache->lock);
-	dns_map_scan_and_remove_expired(&cache->map);
-	pthread_rwlock_unlock(&cache->lock);
+	size_t i = 0, nr_buckets = cache->map.nr_buckets;
+	time_t now = time(NULL);
+
+	while (i < nr_buckets) {
+		pthread_rwlock_wrlock(&cache->lock);
+		i = dns_map_remove_expired(&cache->map, i,
+					   GWP_DNS_HOUSEKEEP_CHUNK, now);
+		pthread_rwlock_unlock(&cache->lock);
+	}
 }

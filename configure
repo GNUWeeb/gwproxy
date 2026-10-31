@@ -326,15 +326,23 @@ add_c_flag "-Wunsafe-loop-optimizations";
 add_c_flag "-Wno-format-truncation";
 
 printf "\n%s:\n" "-f flags";
-add_c_flag "-fno-stack-protector";
+# Hardening: none of it is left to the toolchain's defaults, which differ.
+add_c_flag "-fstack-protector-strong";
+add_c_flag "-fstack-clash-protection";
+add_c_flag "-fcf-protection";
 add_c_flag "-fdata-sections";
 add_c_flag "-ffunction-sections";
 add_c_flag "-fno-strict-aliasing";
 add_c_flag "-fvisibility=hidden";
 
 printf "\n%s:\n" "Misc flags";
-LDFLAGS="-rdynamic ${LDFLAGS}";
 add_c_flag "-ggdb3" && LDFLAGS="-ggdb3 ${LDFLAGS}";
+if compile_cc "" "-Wl,-z,relro,-z,now" "-Wl,-z,relro,-z,now"; then
+	LDFLAGS="-Wl,-z,relro,-z,now ${LDFLAGS}";
+	print_config "Does LD support -z relro -z now?" "yes";
+else
+	print_config "Does LD support -z relro -z now?" "no";
+fi;
 
 # Bring it back!
 set -e;
@@ -356,6 +364,10 @@ if test "${use_sanitize}" = "yes"; then
 	LDFLAGS="${LDFLAGS} -fsanitize=address -fsanitize=undefined";
 	CFLAGS="${CFLAGS} -fsanitize=address -fsanitize=undefined";
 	CXXFLAGS="${CXXFLAGS} -fsanitize=address -fsanitize=undefined";
+else
+	# The sanitizers check the same accesses, and more of them.
+	CFLAGS="${CFLAGS} -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2";
+	CXXFLAGS="${CXXFLAGS} -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2";
 fi;
 
 if test "${use_new_dns_resolver}" = "yes"; then
@@ -417,26 +429,6 @@ if test "${use_debug}" = "yes"; then
 else
 	CFLAGS="${CFLAGS} -DNDEBUG";
 	CXXFLAGS="${CXXFLAGS} -DNDEBUG";
-fi;
-
-# ------ Check for getaddrinfo_a() ------
-cat > $tmp_c << EOF
-#include <netdb.h>
-int main(void)
-{
-	struct sigevent ev;
-	struct gaicb *gc = (void *)0;
-	getaddrinfo_a(GAI_NOWAIT, &gc, 1, &ev);
-	return 0;
-}
-EOF
-l="Do we have getaddrinfo_a()?";
-if compile_cc "" "-lanl" "getaddrinfo_a()"; then
-	add_config "CONFIG_HAVE_GETADDRINFO_A";
-	print_supp "yes" "${l}";
-	LIB_LDFLAGS="${LIB_LDFLAGS} -lanl";
-else
-	print_supp "no" "${l}";
 fi;
 
 # ------ Check for getrandom() ------

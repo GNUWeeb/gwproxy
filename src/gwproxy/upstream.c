@@ -178,11 +178,23 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify)
 
 static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify)
 {
-	size_t consumed;
+	size_t consumed, scan = gcp->up_scan;
 	int status, r;
 
 	r = gwp_http_cli_parse_connect_reply(gcp->target.buf, gcp->target.len,
-					     &status, &consumed);
+					     &scan, &status, &consumed);
+	gcp->up_scan = (uint32_t)scan;
+	/*
+	 * A reply header that fills the buffer without ending never will:
+	 * there is no room left to receive the rest. Waiting for it only
+	 * holds the client until the connect timeout, so fail it now.
+	 */
+	if (r == -EAGAIN && gcp->target.len >= gcp->target.cap) {
+		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT reply header too large (idx=%u, dst=%s)",
+			gcp->idx, gwp_upstream_dst_str(gcp));
+		*notify = true;
+		return -EMSGSIZE;
+	}
 	if (r)
 		return r == -EAGAIN ? GWP_UPSTREAM_IO_RECV : r;
 
@@ -194,6 +206,27 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify
 	}
 	r = gwp_upstream_splice_reply(w, gcp, consumed);
 	return r ? r : GWP_UPSTREAM_IO_DONE;
+}
+
+int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    int err)
+{
+	int r;
+
+	gcp->target.len = 0;
+	gwp_conn_buf_compact(&gcp->target);
+
+	/*
+	 * Only a refused CONNECT says something about the destination. An
+	 * upstream that turned down our credentials, or answered something
+	 * we cannot use, is a failure of the proxy chain: REP 0x01, not the
+	 * 0x02 "not allowed by ruleset" that -EACCES would map to.
+	 */
+	if (err != -ECONNREFUSED)
+		err = -EPROTO;
+
+	r = gwp_conn_fail_reply(w, gcp, err);
+	return r ? r : (int)gcp->target.len;
 }
 
 int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -266,6 +299,7 @@ static int http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	gcp->target.len = (uint32_t)len;
 	gcp->up_tx = true;
+	gcp->up_scan = 0;
 	gcp->conn_state = CONN_STATE_UPSTREAM_HTTP_CONNECT;
 	pr_dbg(&w->ctx->lh, "Upstream HTTP CONNECT started (idx=%u, dst=%s)",
 		gcp->idx, authority);

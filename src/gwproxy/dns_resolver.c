@@ -3,212 +3,72 @@
  */
 
 #include <gwproxy/dns_resolver.h>
+#include <gwproxy/dns_hash.h>
 #include <gwproxy/syscall.h>
 #include <gwproxy/net.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 
-struct gwp_dns_resolver_map {
-	uint32_t		cap;
-	uint32_t		sp;
-	uint16_t		*stack;
-	struct gwp_conn_pair	**sess_map;
-};
-
-static int alloc_res_map(struct gwp_dns_resolver_map **map, uint32_t cap)
+/*
+ * A fresh transaction ID for every query (RFC 5452): SipHash of a counter
+ * under a key from getrandom(), so the IDs cannot be predicted from earlier
+ * ones and cost no system call each.
+ */
+static uint16_t next_txid(struct gwp_dns_resolver *res)
 {
-	struct gwp_dns_resolver_map *m;
-	uint32_t i, local_cap = 2;
+	uint64_t n = res->txid_ctr++;
+
+	return (uint16_t)gwp_siphash13(res->txid_key, &n, sizeof(n));
+}
+
+static int parse_srv_addr(struct gwp_dns_resolver *gdr, const char *srv_addr)
+{
+	bool has_port;
 
 	/*
-	 * Keep the capacity a power of 2 for easier doubling to
-	 * max size of 65536.
+	 * convert_str_to_ssaddr() ignores an explicit port in the string when
+	 * a non-zero default_port is passed, so only pass the default when the
+	 * address has no port of its own -- the same dance
+	 * gwp_parse_upstream_socks5() does. Without it "--dns-server" silently
+	 * queried port 53 whatever the user asked for.
 	 */
-	while (local_cap < cap)
-		local_cap *= 2;
+	if (srv_addr[0] == '[') {
+		const char *rb = strchr(srv_addr, ']');
 
-	if (local_cap > 65536)
-		return -EINVAL;
-
-	m = malloc(sizeof(*m));
-	if (!m)
-		return -ENOMEM;
-
-	m->sess_map = calloc(local_cap, sizeof(*m->sess_map));
-	if (!m->sess_map)
-		goto err_m;
-
-	m->stack = malloc(local_cap * sizeof(*m->stack));
-	if (!m->stack)
-		goto err_sess;
-
-	m->cap = local_cap;
-	m->sp = 0;
-
-	/*
-	 * Fill the stack with all available indexes.
-	 */
-	i = local_cap;
-	while (i--)
-		m->stack[m->sp++] = i;
-
-	*map = m;
-	return 0;
-
-err_sess:
-	free(m->sess_map);
-err_m:
-	free(m);
-	return -ENOMEM;
-}
-
-static void free_res_map(struct gwp_dns_resolver_map *map)
-{
-	if (!map)
-		return;
-
-	free(map->stack);
-	free(map->sess_map);
-	free(map);
-}
-
-static int expand_res_map(struct gwp_dns_resolver_map *map)
-{
-	uint32_t new_cap, i, old_cap = map->cap;
-	struct gwp_conn_pair **new_sess_map;
-	uint16_t *new_stack;
-
-	new_cap = old_cap * 2;
-	if (new_cap > 65536)
-		return -ENOSPC;
-
-	new_sess_map = realloc(map->sess_map, new_cap * sizeof(*map->sess_map));
-	if (!new_sess_map)
-		return -ENOMEM;
-	map->sess_map = new_sess_map;
-	memset(&map->sess_map[old_cap], 0, old_cap * sizeof(*map->sess_map));
-
-	new_stack = realloc(map->stack, new_cap * sizeof(*map->stack));
-	if (!new_stack)
-		return -ENOMEM;
-	map->stack = new_stack;
-
-	i = new_cap;
-	while (i-- > old_cap)
-		map->stack[map->sp++] = i;
-
-	map->cap = new_cap;
-	return 0;
-}
-
-static int insert_map(struct gwp_dns_resolver_map *map,
-		      struct gwp_conn_pair *pair, uint16_t *txid)
-{
-	uint32_t x;
-	int r;
-
-	if (!map->sp) {
-		r = expand_res_map(map);
-		if (r)
-			return r;
+		has_port = rb && rb[1] == ':';
+	} else {
+		has_port = strchr(srv_addr, ':') != NULL;
 	}
 
-	x = map->stack[--map->sp];
-	map->sess_map[x] = pair;
-	*txid = x;
-	return 0;
+	return convert_str_to_ssaddr(srv_addr, &gdr->srv, has_port ? 0 : 53);
 }
 
-static struct gwp_conn_pair *lookup_map(struct gwp_dns_resolver_map *map,
-					uint16_t txid)
-{
-	if (txid >= map->cap)
-		return NULL;
-
-	return map->sess_map[txid];
-}
-
-static void try_reset_map(struct gwp_dns_resolver_map *map)
-{
-	struct gwp_conn_pair **new_sess_map;
-	uint32_t i, new_cap = 16;
-	uint16_t *new_stack;
-
-	if (map->cap <= 16)
-		return;
-
-	/*
-	 * Try to allocate a smaller map first before freeing the
-	 * existing one so we don't lose the existing map if
-	 * one of reallocations fail.
-	 */
-	new_sess_map = calloc(new_cap, sizeof(*new_sess_map));
-	if (!new_sess_map)
-		return;
-
-	new_stack = malloc(new_cap * sizeof(*new_stack));
-	if (!new_stack) {
-		free(new_sess_map);
-		return;
-	}
-
-	/*
-	 * Ok, we are good to go, free the old map and
-	 * replace with the new one.
-	 */
-	free(map->sess_map);
-	free(map->stack);
-	map->sess_map = new_sess_map;
-	map->stack = new_stack;
-	map->cap = new_cap;
-	map->sp = 0;
-
-	i = new_cap;
-	while (i--)
-		map->stack[map->sp++] = i;
-}
-
-static void delete_map(struct gwp_dns_resolver_map *map, uint16_t txid)
-{
-	if (txid >= map->cap)
-		return;
-
-	if (!map->sess_map[txid])
-		return;
-
-	map->sess_map[txid] = NULL;
-	map->stack[map->sp++] = txid;
-
-	/*
-	 * If all slots are free, try to shrink the map.
-	 */
-	if (map->sp == map->cap)
-		try_reset_map(map);
-}
-
-static int init_udp_sock(struct gwp_dns_resolver *gdr, const char *srv_addr)
+/*
+ * Every query has a socket of its own, connected to the server: the kernel
+ * gives it a random source port, and only the server can answer on it. A
+ * long-lived shared socket kept one port for the life of the worker, which
+ * left an off-path attacker only the transaction ID to guess.
+ */
+static int open_query_sock(struct gwp_dns_resolver *res)
 {
 	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
-	struct gwp_sockaddr addr;
+	socklen_t len;
 	int f, r;
 
-	r = convert_str_to_ssaddr(srv_addr, &addr, 53);
-	if (r)
-		return r;
-
-	f = __sys_socket(addr.sa.sa_family, type, 0);
+	f = __sys_socket(res->srv.sa.sa_family, type, 0);
 	if (f < 0)
 		return f;
 
-	r = __sys_connect(f, &addr.sa, sizeof(addr));
+	len = res->srv.sa.sa_family == AF_INET6 ? sizeof(res->srv.i6)
+						 : sizeof(res->srv.i4);
+	r = __sys_connect(f, &res->srv.sa, len);
 	if (r < 0) {
 		__sys_close(f);
 		return r;
 	}
 
-	gdr->udp_fd = f;
-	return 0;
+	return f;
 }
 
 int gwp_dns_res_init(struct gwp_ctx *ctx, struct gwp_dns_resolver *gdr,
@@ -216,28 +76,21 @@ int gwp_dns_res_init(struct gwp_ctx *ctx, struct gwp_dns_resolver *gdr,
 {
 	int r;
 
-	r = alloc_res_map(&gdr->sess_map, 16);
-	if (r)
-		return r;
-
 	gdr->srv_addr = strdup(srv_addr);
-	if (!gdr->srv_addr) {
-		r = -ENOMEM;
-		goto err_map;
+	if (!gdr->srv_addr)
+		return -ENOMEM;
+
+	r = parse_srv_addr(gdr, gdr->srv_addr);
+	if (r) {
+		free(gdr->srv_addr);
+		gdr->srv_addr = NULL;
+		return r;
 	}
 
-	r = init_udp_sock(gdr, gdr->srv_addr);
-	if (r)
-		goto err_srv;
-
+	gwp_dns_gen_hash_key(gdr->txid_key);
+	gdr->txid_ctr = 0;
 	(void)ctx;
 	return 0;
-
-err_srv:
-	free(gdr->srv_addr);
-err_map:
-	free_res_map(gdr->sess_map);
-	return r;
 }
 
 void gwp_dns_res_free(struct gwp_dns_resolver *res)
@@ -245,29 +98,24 @@ void gwp_dns_res_free(struct gwp_dns_resolver *res)
 	if (!res)
 		return;
 
-	free_res_map(res->sess_map);
 	free(res->srv_addr);
-	__sys_close(res->udp_fd);
 	memset(res, 0, sizeof(*res));
 }
 
 int gwp_dns_res_prep_query(struct gwp_dns_resolver *res,
 			   struct gwp_dns_packet *gdp)
 {
-	int af, ret;
 	ssize_t tmp;
+	int af;
 
 	assert(gdp->gcp);
 
-	if (!gdp->__in_fallback_attempt) {
-		ret = insert_map(res->sess_map, gdp->gcp, &gdp->txid);
-		if (ret)
-			return ret;
-	} else {
-		assert(gdp->gcp == lookup_map(res->sess_map, gdp->txid));
+	if (gdp->fd < 0) {
+		gdp->fd = open_query_sock(res);
+		if (gdp->fd < 0)
+			return gdp->fd;
 	}
 
-	ret = 0;
 	if (gdp->restyp == GWP_DNS_RESTYP_PREFER_IPV6) {
 		af = AF_INET6;
 		gdp->restyp = GWP_DNS_RESTYP_IPV4_ONLY;
@@ -277,99 +125,85 @@ int gwp_dns_res_prep_query(struct gwp_dns_resolver *res,
 		gdp->restyp = GWP_DNS_RESTYP_IPV6_ONLY;
 		gdp->__in_fallback_attempt = true;
 	} else if (gdp->restyp == GWP_DNS_RESTYP_IPV6_ONLY) {
-		ret = 0;
 		af = AF_INET6;
+		/*
+		 * The last family there is to try: if this one fails too,
+		 * the lookup fails. Left set, every unusable answer sent
+		 * the same query again, until the protocol timeout.
+		 */
+		gdp->__in_fallback_attempt = false;
 	} else if (gdp->restyp == GWP_DNS_RESTYP_IPV4_ONLY) {
-		ret = 0;
 		af = AF_INET;
+		gdp->__in_fallback_attempt = false;
 	} else {
-		ret = -EINVAL;
-		goto err;
+		return -EINVAL;
 	}
 
-	tmp = gwdns_build_query(gdp->txid, gdp->host, af, gdp->buf, gdp->buf_len);
-	if (tmp < 0) {
-		ret = (int)tmp;
-		goto err;
-	}
+	/* A new ID for the fallback query too, so no old reply passes. */
+	gdp->txid = next_txid(res);
+	tmp = gwdns_build_query(gdp->txid, gdp->host, af, gdp->buf,
+				sizeof(gdp->buf));
+	if (tmp < 0)
+		return (int)tmp;
 
 	gdp->buf_len = (uint16_t)tmp;
-	return ret;
-
-err:
-	delete_map(res->sess_map, gdp->txid);
-	return ret;
-}
-
-void gwp_dns_res_drop_query(struct gwp_dns_resolver *res,
-			    struct gwp_conn_pair *gcp, uint16_t txid)
-{
-	assert(gcp);
-
-	/*
-	 * Idempotent: only drop the slot if it still maps to @gcp. The query
-	 * may already have been completed (and thus dropped), so this is safe
-	 * to call again from connection teardown.
-	 */
-	if (lookup_map(res->sess_map, txid) != gcp)
-		return;
-
-	delete_map(res->sess_map, txid);
-}
-
-int gwp_dns_res_fetch_gcp_by_payload(struct gwp_dns_resolver *res,
-				     const uint8_t buf[UDP_MSG_LIMIT],
-				     uint16_t len,
-				     struct gwp_conn_pair **gcp_p)
-{
-	uint16_t txid;
-
-	if (len < 38)
-		return -EINVAL;
-
-	memcpy(&txid, buf, 2);
-	if (txid >= res->sess_map->cap)
-		return -EINVAL;
-
-	*gcp_p = lookup_map(res->sess_map, txid);
-	if (!*gcp_p)
-		return -ENOENT;
-
 	return 0;
+}
+
+void gwp_dns_res_drop_query(struct gwp_dns_packet *gdp)
+{
+	/* Idempotent: teardown calls it whether or not a reply came. */
+	if (gdp->fd >= 0) {
+		__sys_close(gdp->fd);
+		gdp->fd = -1;
+	}
 }
 
 int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 				struct gwp_dns_packet *gdp,
-				uint8_t buf[UDP_MSG_LIMIT],
+				uint8_t buf[DNS_EDNS_UDP_SIZE],
 				uint16_t len,
-				struct gwp_sockaddr *addr)
+				struct gwp_sockaddr *addrs, uint8_t cap,
+				uint8_t *nr_addrs)
 {
-	struct gwdns_addrinfo_node *ai = NULL;
-	char port[sizeof("65535")];
 	uint16_t txid;
 	ssize_t r;
 
-	if (len < 38)
-		return -EINVAL;
-
+	/*
+	 * Not an answer to the query in flight: an old reply to the first
+	 * family, or a forgery, which has to guess the source port and the
+	 * ID and also name what we asked about. Ignore it and keep waiting, as RFC 5452
+	 * asks, rather than let it end the lookup.
+	 */
+	if (len < 12)
+		return -ESRCH;
 	memcpy(&txid, buf, 2);
-	if (txid >= res->sess_map->cap)
-		return -EINVAL;
+	if (txid != gdp->txid)
+		return -ESRCH;
+	if (gwdns_check_question(gdp->buf, gdp->buf_len, buf, len))
+		return -ESRCH;
 
-	if (gdp->txid != txid)
-		return -EINVAL;
-
-	if (gdp->gcp != res->sess_map->sess_map[txid])
-		return -EINVAL;
-
-	snprintf(port, sizeof(port), "%hu", gdp->port);
-	r = gwdns_parse_query(txid, port, buf, len, &ai);
+	r = gwdns_parse_query(txid, gdp->port, buf, len, addrs, cap, nr_addrs);
 	if (!r) {
-		*addr = ai->ai_addr;
-		gwdns_free_parsed_query(ai);
-		gwp_dns_res_drop_query(res, gdp->gcp, txid);
+		gwp_dns_res_drop_query(gdp);
 		return 0;
 	}
+
+	/*
+	 * A datagram arrives whole, so "need more data" from the parser
+	 * means the reply is cut short. Do not pass that on as -EAGAIN,
+	 * which the caller reads as "the next query is ready to send".
+	 */
+	if (r == -EAGAIN)
+		r = -EBADMSG;
+
+	/*
+	 * A truncated answer would need a retry over TCP, which this
+	 * resolver does not do. Asking for the other family over UDP is no
+	 * answer to it either: fail the lookup.
+	 */
+	if (r == -EMSGSIZE)
+		gdp->__in_fallback_attempt = false;
 
 	if (gdp->__in_fallback_attempt) {
 		int tmp = gwp_dns_res_prep_query(res, gdp);
@@ -379,6 +213,6 @@ int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 		r = tmp;
 	}
 
-	gwp_dns_res_drop_query(res, gdp->gcp, txid);
+	gwp_dns_res_drop_query(gdp);
 	return (int)r;
 }

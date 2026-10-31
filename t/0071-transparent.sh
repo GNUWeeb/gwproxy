@@ -7,6 +7,8 @@
 # back into itself (a loop), we mark it with --mark and exclude marked packets
 # from the REDIRECT rule ("! --mark"). curl aims straight at the server; the
 # only way it can succeed is through the proxy resolving the original dst.
+# A connection that reaches the listener directly must be refused, on every
+# event loop, rather than forwarded to the proxy itself.
 # Needs CAP_NET_ADMIN (SO_MARK) and iptables, so it is skipped without root or
 # passwordless sudo.
 
@@ -59,7 +61,7 @@ count_redirect()
 $SUDO "$GWPROXY" --as-transparent=1 --mark="$MARK" --bind="127.0.0.1:$pp" \
 	--acl-allow-all --nr-workers=1 --log-level=3 >"$WORK/gwp.log" 2>&1 &
 PRIV_PID=$!
-wait_listen "$pp" \
+wait_listen "$pp" "$PRIV_PID" \
 	|| { sed 's/^/# gwp: /' "$WORK/gwp.log" >&2; fail "gwproxy did not listen on $pp"; }
 
 before="$(count_redirect)"
@@ -75,5 +77,46 @@ after="$(count_redirect)"
 diag "REDIRECT-rule counter: before=$before after=$after"
 [ "$after" -gt "$before" ] \
 	|| fail "connection was not redirected to the transparent proxy (counter $before -> $after)"
+gwp_kill_priv "$PRIV_PID"
+PRIV_PID=""
+
+# A client that reaches the transparent port directly, with no REDIRECT on
+# the way, still has a conntrack entry, and its original destination is
+# the listener itself. Forwarding there connects the proxy to itself, and
+# each new connection does the same, until descriptors run out. It must be
+# refused and closed instead.
+for loop in epoll io_uring; do
+	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+
+	dp="$(pick_port)"
+	$SUDO "$GWPROXY" --as-transparent=1 --bind="127.0.0.1:$dp" \
+		--event-loop="$loop" --acl-allow-all --nr-workers=1 \
+		--log-level=3 >"$WORK/direct.$loop.log" 2>&1 &
+	PRIV_PID=$!
+	wait_listen "$dp" "$PRIV_PID" \
+		|| { sed 's/^/# gwp: /' "$WORK/direct.$loop.log" >&2; fail "[$loop] gwproxy did not listen on $dp"; }
+
+	got="$(python3 - "$dp" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+s.settimeout(3)
+try:
+    print("closed" if s.recv(100) == b"" else "data")
+except ConnectionResetError:
+    print("closed")
+except socket.timeout:
+    print("open")
+PY
+)"
+	[ "$got" = closed ] || {
+		sed 's/^/# gwp: /' "$WORK/direct.$loop.log" | tail -5 >&2
+		fail "[$loop] a direct connection to the transparent port was not refused ($got)"
+	}
+	grep -q 'it is this proxy' "$WORK/direct.$loop.log" \
+		|| fail "[$loop] the refusal was not logged"
+	gwp_kill_priv "$PRIV_PID"
+	PRIV_PID=""
+done
 
 pass

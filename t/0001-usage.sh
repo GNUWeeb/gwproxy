@@ -44,6 +44,29 @@ expect_reject "unknown option" --as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
 # Without --target and without a proxy mode there is nothing to do; reject it.
 expect_reject "missing --target and proxy mode" --bind="127.0.0.1:$(pick_port)"
 
+# Numeric arguments are parsed whole and range-checked. atoi() used to take
+# "2x" for 2, "yes" for 0 and wrap out-of-range values, so a typo started a
+# proxy with settings nobody asked for. The rest of each command line is a
+# valid, runnable configuration, so the bad number is the only reason to fail.
+for bad in --nr-workers=2x --nr-workers=1025 --nr-dns-workers=-1 \
+	   --protocol-timeout=99999999999 --connect-timeout= \
+	   --tcp-nodelay=yes --idle-timeout=10s --mark=-1 \
+	   --mark=0x100000000 --client-buf-size=64k \
+	   --max-conns-per-ip=-1 --max-conns-per-ip=3x; do
+	expect_reject "bad numeric argument $bad" --as-socks5=1 \
+		--bind="127.0.0.1:$(pick_port)" --nr-workers=1 "$bad"
+done
+
+# Without CAP_NET_ADMIN the --mark probe fails at startup, and the error must
+# name the mark as given: one above INT_MAX used to be printed as negative.
+if [ "$(id -u)" != 0 ]; then
+	out="$(timeout 5 "$GWPROXY" --as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
+		--nr-workers=1 --mark=0xffffffff 2>&1)" && \
+		fail "--mark without CAP_NET_ADMIN: gwproxy exited successfully"
+	printf '%s\n' "$out" | grep -q -- '--mark=4294967295 ' || \
+		fail "--mark error does not show 4294967295: $out"
+fi
+
 # A malformed --upstream-proxy URL must be rejected at startup. Use URLs that
 # are structurally wrong (unsupported scheme, no scheme at all) rather than one
 # whose host merely fails to resolve: on a host with a wildcard search domain

@@ -15,19 +15,29 @@
 # Controlling which addresses a name has means controlling /etc/hosts, so the
 # body runs inside a private user+mount namespace with a hosts file bind-mounted
 # over the real one. Nothing outside the namespace is touched.
+#
+# The namespace has its own network stack too. The body listens on fixed ports
+# (it has to name them in the hosts entries' targets and in each request), and
+# on the host's network two runs of this test at once -- `make -jN` in two
+# checkouts, say -- would fight over them and fail at random.
 
 . "$(dirname "$0")/lib.sh"
 require curl
 require python3
 require unshare
+require ip
 
-# Re-exec: everything below the marker runs inside the namespace.
+# Re-exec: everything below the marker runs inside the namespace. ns_drop_setup
+# has to stay in this branch -- inside, "id -u" is the MAPPED root, and its
+# chown to the outer uid would fail with EINVAL, that uid having no mapping
+# there. See lib.sh for why the drop is needed at all.
 if [ "${1:-}" != "--inner" ]; then
-	unshare -rm --map-root-user true 2>/dev/null \
-		|| skip "no user+mount namespaces (unshare -rm) available"
+	ns_drop_setup
+	$NS_DROP unshare -rmn --map-root-user true 2>/dev/null \
+		|| skip "no user+mount+net namespaces (unshare -rmn) available"
 	out="$WORK/inner.out"
 	# Detached: a backgrounded proxy holding the pipe would wedge the read.
-	setsid unshare -rm --map-root-user "$0" --inner "$WORK" \
+	setsid $NS_DROP unshare -rmn --map-root-user "$0" --inner "$WORK" \
 		</dev/null >"$out" 2>&1 &
 	for i in $(seq 1 60); do
 		grep -q '^INNER-DONE' "$out" 2>/dev/null && break
@@ -39,7 +49,7 @@ if [ "${1:-}" != "--inner" ]; then
 fi
 
 # ---------------------------------------------------------------- inner ----
-WORK="$2"
+ns_inner_work "$2"
 GWPROXY="${GWPROXY:-$ROOT/gwproxy}"
 rc=1
 
@@ -49,11 +59,12 @@ rc=1
 cleanup_inner()
 {
 	echo "INNER-DONE rc=$rc"
+	_release_ports		# lib.sh's _cleanup, which would, is replaced
 	kill 0 2>/dev/null
 }
 trap cleanup_inner EXIT
 
-ip link set lo up 2>/dev/null
+ip link set lo up || exit 1
 
 # 127.0.0.7 is refused (nothing listens), 127.0.0.8 black-holes, 127.0.0.9 lives.
 op=39701
@@ -72,6 +83,7 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(*a): pass
 socketserver.TCPServer.allow_reuse_address = True
 socketserver.TCPServer(('127.0.0.9', $op), H).serve_forever()" >/dev/null 2>&1 &
+origin_pid=$!
 
 # The black hole: smallest backlog, then fill the accept queue so further SYNs
 # are dropped and connect() sits in SYN_SENT instead of being refused.
@@ -85,8 +97,19 @@ for _ in range(16):
     try: c.connect_ex(('127.0.0.8', $op))
     except OSError: pass
     f.append(c)
-while True: time.sleep(3600)" >/dev/null 2>&1 &
-sleep 1.5
+print('READY', flush=True)
+while True: time.sleep(3600)" >"$WORK/blackhole.out" 2>&1 &
+bh_pid=$!
+
+# Both listen on port $op, so only the pid tells whose listener ss sees. The
+# black hole is ready once its queue is full, which it reports.
+wait_listen "$op" "$origin_pid" || { echo "origin did not listen"; exit 1; }
+for i in $(seq 1 100); do
+	grep -q '^READY' "$WORK/blackhole.out" 2>/dev/null && break
+	kill -0 "$bh_pid" 2>/dev/null || break
+	sleep 0.1
+done
+grep -q '^READY' "$WORK/blackhole.out" || { echo "black hole did not start"; exit 1; }
 
 # The resolver decides the order (RFC 6724), so only run the cases whose bad
 # address really is tried first -- otherwise the test proves nothing.
@@ -118,7 +141,7 @@ for loop in epoll io_uring; do
 			--acl-allow-all --event-loop="$loop" --connect-timeout=10 \
 			>/dev/null 2>&1 &
 		gwp_pid=$!
-		sleep 1
+		wait_listen "$pp" "$gwp_pid" || { echo "[$loop] gwproxy did not listen on $pp"; exit 1; }
 		set -- $(fetch "$pp" he-refused)
 		echo "[$loop] refused-first: code=$1 elapsed=$2"
 		kill "$gwp_pid" 2>/dev/null
@@ -135,7 +158,7 @@ for loop in epoll io_uring; do
 			--acl-allow-all --event-loop="$loop" --connect-timeout=10 \
 			--connect-attempt-delay=250 >/dev/null 2>&1 &
 		gwp_pid=$!
-		sleep 1
+		wait_listen "$pp" "$gwp_pid" || { echo "[$loop] gwproxy did not listen on $pp"; exit 1; }
 		set -- $(fetch "$pp" he-blackhole)
 		echo "[$loop] blackhole-first: code=$1 elapsed=$2"
 		kill "$gwp_pid" 2>/dev/null
@@ -163,7 +186,7 @@ for loop in epoll io_uring; do
 			--acl-file="$WORK/mixed.acl" --event-loop="$loop" \
 			--connect-timeout=10 >/dev/null 2>&1 &
 		gwp_pid=$!
-		sleep 1
+		wait_listen "$pp" "$gwp_pid" || { echo "[$loop] gwproxy did not listen on $pp"; exit 1; }
 		rep=$(python3 "$ROOT/t/servers/socks5_probe.py" \
 			--atyp domain --dst he-refused "$pp" "$op")
 		echo "[$loop] refused-then-denied: $rep"
