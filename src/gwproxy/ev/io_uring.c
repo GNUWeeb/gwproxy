@@ -986,15 +986,25 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 				  &got);
 		if (sr == GWP_SSL_ERROR)
 			return -EIO;
-		/* Need more ciphertext, or the client sent close_notify. */
-		if (!got)
+		if (!got) {
+			/*
+			 * Need more ciphertext, or the client sent close_notify.
+			 * The engine reads nothing behind that, so a recv would
+			 * only pile up what the client keeps sending.
+			 */
+			c->rd_eof = sr == GWP_SSL_OK;
 			break;
+		}
 		c->len += (uint32_t)got;
 	}
 
-	/* Nothing new, and room for more: wait for the client. */
-	if (c->len == from && c->len < c->cap)
+	if (c->len == from && c->len < c->cap) {
+		/* The client gave up on its handshake, as with a FIN. */
+		if (c->rd_eof)
+			return -ECONNRESET;
+		/* Nothing new, and room for more: wait for the client. */
 		return prep_recv_client_prot(w, gcp);
+	}
 
 	return process_client_prot(w, gcp);
 }
@@ -2469,6 +2479,9 @@ static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 	/* Handshake incomplete; read more from the client. */
 	if (r == 0 || r == -EAGAIN) {
 #ifdef CONFIG_HTTPS
+		/* A close_notify behind it: the rest will never come. */
+		if (client_is_tls(gcp) && gcp->client.rd_eof)
+			return -ECONNRESET;
 		if (tls_prot_more(gcp))
 			return tls_prot_pump(w, gcp);
 #endif
