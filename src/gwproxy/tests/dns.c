@@ -167,7 +167,7 @@ static void test_basic_dns_multiple_requests(void)
 			skipped++;
 			continue;
 		}
-		earr[n] = gwp_dns_queue(ctx, 0, rt->domain, rt->port,
+		earr[n] = gwp_dns_queue(ctx, 0, rt->domain, rt->port, NULL,
 					&earr[n]);
 		ports[n] = rt->port;
 		assert(earr[n]);
@@ -212,7 +212,7 @@ static void test_dns_cache(void)
 	assert(!r);
 	assert(ctx != NULL);
 
-	e = gwp_dns_queue(ctx, 0, "localhost", 80, &e);
+	e = gwp_dns_queue(ctx, 0, "localhost", 80, NULL, &e);
 	assert(e != NULL);
 	r = wait_entries(ctx, &e, 1, 5000);
 	assert(r == 0);
@@ -402,7 +402,7 @@ static void test_addr_list(void)
 	r = gwp_dns_ctx_init(&ctx, &cfg);
 	assert(!r);
 
-	e = gwp_dns_queue(ctx, 0, "localhost", 80, &e);
+	e = gwp_dns_queue(ctx, 0, "localhost", 80, NULL, &e);
 	assert(e != NULL);
 	r = wait_entries(ctx, &e, 1, 5000);
 	assert(r == 0);
@@ -472,14 +472,14 @@ static void test_cancel(void)
 	r = gwp_dns_ctx_init(&ctx, &cfg);
 	assert(!r);
 
-	c1 = gwp_dns_queue(ctx, 0, "localhost", 80, NULL);
-	c2 = gwp_dns_queue(ctx, 0, "127.0.0.1", 80, NULL);
+	c1 = gwp_dns_queue(ctx, 0, "localhost", 80, NULL, NULL);
+	c2 = gwp_dns_queue(ctx, 0, "127.0.0.1", 80, NULL, NULL);
 	assert(c1 && c2);
 	gwp_dns_entry_cancel(c1);
 	gwp_dns_entry_cancel(c2);
 
 	/* Queued after them, so it finishes after them on the one thread. */
-	e = gwp_dns_queue(ctx, 0, "localhost", 81, &e);
+	e = gwp_dns_queue(ctx, 0, "localhost", 81, NULL, &e);
 	assert(e);
 	r = wait_entries(ctx, &e, 1, 5000);
 	assert(!r);
@@ -487,9 +487,9 @@ static void test_cancel(void)
 	gwp_dns_entry_free(e);
 
 	/* Left for gwp_dns_ctx_free(): one delivered on queue 1, unpopped. */
-	e = gwp_dns_queue(ctx, 1, "localhost", 80, NULL);
+	e = gwp_dns_queue(ctx, 1, "localhost", 80, NULL, NULL);
 	assert(e);
-	gwp_dns_queue(ctx, 1, "localhost", 80, NULL);
+	gwp_dns_queue(ctx, 1, "localhost", 80, NULL, NULL);
 	gwp_dns_ctx_free(ctx);
 }
 
@@ -510,7 +510,7 @@ static void test_shared_lookup(void)
 
 	for (i = 0; i < 20; i++) {
 		earr[i] = gwp_dns_queue(ctx, 0, i & 1 ? "LocalHost" : "localhost",
-					(uint16_t)(1000 + i), &earr[i]);
+					(uint16_t)(1000 + i), NULL, &earr[i]);
 		assert(earr[i]);
 	}
 	r = wait_entries(ctx, earr, 20, 5000);
@@ -525,7 +525,7 @@ static void test_shared_lookup(void)
 
 	memset(longname, 'a', sizeof(longname) - 1);
 	longname[sizeof(longname) - 1] = '\0';
-	bad = gwp_dns_queue(ctx, 0, longname, 80, &bad);
+	bad = gwp_dns_queue(ctx, 0, longname, 80, NULL, &bad);
 	assert(bad);
 	r = wait_entries(ctx, &bad, 1, 5000);
 	assert(!r);
@@ -564,7 +564,7 @@ static void test_negative_cache(void)
 	assert(r == -ENOENT);
 
 	/* .invalid never resolves (RFC 2606), online or not. */
-	e = gwp_dns_queue(ctx, 0, "no-such-host.invalid", 80, &e);
+	e = gwp_dns_queue(ctx, 0, "no-such-host.invalid", 80, NULL, &e);
 	assert(e);
 	r = wait_entries(ctx, &e, 1, 30000);
 	assert(!r);

@@ -3425,12 +3425,14 @@ static int queue_dns_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				const char *host, uint16_t port, int res)
 {
 	struct gwp_dns_ctx *dns = w->ctx->dns;
+	struct gwp_iplim_key client;
 	struct gwp_dns_entry *gde;
 
+	gwp_iplim_key(&gcp->client_addr, &client);
 	if (res)
 		gde = gwp_dns_queue_result(dns, w->idx, host, port, gcp, res);
 	else
-		gde = gwp_dns_queue(dns, w->idx, host, port, gcp);
+		gde = gwp_dns_queue(dns, w->idx, host, port, &client, gcp);
 	if (unlikely(!gde)) {
 		pr_err(&w->ctx->lh, "Failed to allocate DNS entry for %s:%hu", host, port);
 		return -ENOMEM;

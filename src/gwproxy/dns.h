@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <netinet/in.h>
+#include <gwproxy/iplimit.h>
 #include <gwproxy/net.h>
 #include <gwproxy/syscall.h>
 
@@ -96,11 +97,17 @@ void gwp_dns_ctx_free(struct gwp_dns_ctx *ctx);
  * @param cq_idx	Completion queue to deliver the result on.
  * @param name		Name to resolve.
  * @param port 		Port to put in the resolved addresses (host byte order).
+ * @param client	Who is asking, as gwp_iplim_key() groups them; the threads
+ *			are shared out between clients. NULL counts as one client.
  * @param udata		Caller's cookie, kept in entry->udata.
  * @return		Pointer to a gwp_dns_entry on success, NULL on failure.
+ *
+ * With too many lookups waiting, for this client or in all, the entry is
+ * delivered at once with result -EHOSTUNREACH.
  */
 struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx, uint32_t cq_idx,
 				    const char *name, uint16_t port,
+				    const struct gwp_iplim_key *client,
 				    void *udata);
 
 /*
