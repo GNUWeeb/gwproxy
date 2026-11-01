@@ -484,9 +484,15 @@ int gwp_ssl_read(struct gwp_ssl *s, void *buf, size_t len, size_t *out_len)
 		*out_len = (size_t)r;
 		return GWP_SSL_OK;
 	}
-	/* A clean close_notify reports 0 bytes, not an error. */
-	if (SSL_get_error(s->ssl, r) == SSL_ERROR_ZERO_RETURN)
+	/*
+	 * A clean close_notify reports 0 bytes, not an error. Nothing can be
+	 * decrypted after it, so whatever is still queued is not more to read
+	 * (gwp_ssl_rx_more()): a caller looping on that would never get out.
+	 */
+	if (SSL_get_error(s->ssl, r) == SSL_ERROR_ZERO_RETURN) {
+		s->rx_starved = true;
 		return GWP_SSL_OK;
+	}
 	r = map_err(s, r);
 	if (r == GWP_SSL_WANT_READ)
 		s->rx_starved = true;
