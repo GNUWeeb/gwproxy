@@ -175,6 +175,7 @@ jobs:
     needs: get_commit_list
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
 
@@ -233,6 +234,7 @@ jobs:
     needs: get_commit_list
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
 
