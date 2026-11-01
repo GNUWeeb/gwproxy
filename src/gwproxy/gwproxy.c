@@ -3019,6 +3019,9 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 #ifndef SO_MARK
 #define SO_MARK 36
 #endif
+#ifndef IP_BIND_ADDRESS_NO_PORT
+#define IP_BIND_ADDRESS_NO_PORT 24
+#endif
 #ifndef SO_ORIGINAL_DST
 #define SO_ORIGINAL_DST 80
 #endif
@@ -3119,6 +3122,7 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 	if (b->have_src) {
 		const struct gwp_sockaddr *s = &b->src;
 		socklen_t len;
+		in_port_t port;
 
 		/* The source family must match the socket/target family. */
 		if (s->sa.sa_family != dst->sa.sa_family) {
@@ -3136,6 +3140,20 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 
 		len = (s->sa.sa_family == AF_INET) ? sizeof(struct sockaddr_in)
 						   : sizeof(struct sockaddr_in6);
+
+		/*
+		 * With no port asked for, leave choosing one to connect(), which
+		 * knows the destination and only needs a unique 4-tuple. bind()
+		 * alone would take the port for every destination, TIME_WAIT
+		 * included, capping all egress from this source at one local
+		 * port range. Not fatal: only pre-4.2 kernels refuse it, and the
+		 * source is pinned either way. IPv6 sockets take it at SOL_IP too.
+		 */
+		port = (s->sa.sa_family == AF_INET) ? s->i4.sin_port
+						    : s->i6.sin6_port;
+		if (!port)
+			setskopt_int(fd, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, 1);
+
 		r = __sys_bind(fd, &s->sa, len);
 		if (unlikely(r < 0)) {
 			pr_err(&w->ctx->lh, "%s: bind(%s) failed: %s",
