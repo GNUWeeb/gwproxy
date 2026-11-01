@@ -12,6 +12,12 @@
 #       keep what it was sent. Then the same with a client that goes silent:
 #       the proxy must still hang up. A close_notify behind a complete request
 #       must not stop the request being served.
+#   dropped
+#       Send a complete bodyless forwarding request to an origin that answers
+#       only at the end of the client's stream, then many small records and a
+#       close_notify, without closing. The proxy drops those records, and must
+#       neither keep them nor stop at the first one: the origin must see the
+#       end of the stream, and the client must get the answer.
 #
 # Prints "ok" on success, or what went wrong.
 
@@ -179,9 +185,79 @@ def closenotify(port, pid):
     return served_after_close_notify(port)
 
 
+def dropped(port, pid):
+    ls = socket.socket()
+    ls.bind(("127.0.0.1", 0))
+    ls.listen(1)
+    ls.settimeout(30)
+    forwarding = threading.Event()
+    res = []
+
+    def origin():
+        try:
+            o, _ = ls.accept()
+            o.settimeout(60)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                d = o.recv(65536)
+                if not d:
+                    break
+                data += d
+            forwarding.set()
+            while True:
+                d = o.recv(65536)
+                if not d:
+                    break
+                data += d
+            res.append(data)
+            o.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n"
+                      b"Connection: close\r\n\r\nanswer")
+            o.close()
+        except OSError as e:
+            res.append(repr(e).encode())
+        forwarding.set()
+
+    t = threading.Thread(target=origin)
+    t.start()
+    c = Client(port)
+    host = b"127.0.0.1:%d" % ls.getsockname()[1]
+    c.o.write(b"GET http://%s/ HTTP/1.1\r\nHost: %s\r\n\r\n" % (host, host))
+    c.flush()
+    err = None
+    if not forwarding.wait(30):
+        err = "origin got no request"
+    before = vm_hwm(pid)
+    sent = 0
+    record = b"x" * 256
+    try:
+        while not err and sent < FLOOD:
+            for _ in range(2000):
+                c.o.write(record)
+            d = c.outb.read()
+            c.s.sendall(d)
+            sent += len(d)
+    except OSError as e:
+        err = "sending: %r" % (e,)
+    if err is None:
+        grown = vm_hwm(pid) - before
+        if grown > MAX_GROWTH:
+            err = "proxy memory grew by %d MiB" % (grown >> 20)
+    if err is None:
+        c.close_notify()
+        got = c.read_until_eof()
+        if got is None or not got.endswith(b"answer"):
+            err = "client got %r" % (got,)
+    c.close()
+    t.join()
+    ls.close()
+    if err is None and b"xxx" in res[0]:
+        err = "origin got dropped bytes"
+    return err
+
+
 def main():
     scenario, port, pid = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-    err = {"closenotify": closenotify}[scenario](port, pid)
+    err = {"closenotify": closenotify, "dropped": dropped}[scenario](port, pid)
     print(err or "ok")
 
 

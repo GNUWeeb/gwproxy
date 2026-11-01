@@ -10,7 +10,12 @@
 # the connection afterwards and with it going silent. --protocol-timeout=0
 # leaves nothing else to end the connection. A close_notify right behind a
 # complete request, on the other hand, only ends the client's sending, and
-# the request is still served. Exercised on every event loop.
+# the request is still served.
+#
+# Records behind a complete forwarding request are dropped. That must not get
+# them stuck ahead of what the client sends next: the proxy has to go through
+# all of them, up to a close_notify at the end, before it reads the socket
+# again. Exercised on every event loop.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -33,6 +38,9 @@ for loop in epoll io_uring; do
 	out="$(timeout 120 python3 "$SERVERS_DIR/tls_unread_input.py" closenotify \
 		"$pp" "$GWP_PID" 2>&1)"
 	[ "$out" = ok ] || fail "[$loop] $out"
+	out="$(timeout 120 python3 "$SERVERS_DIR/tls_unread_input.py" dropped \
+		"$pp" "$GWP_PID" 2>&1)"
+	[ "$out" = ok ] || fail "[$loop] dropped records: $out"
 	kill "$GWP_PID" 2>/dev/null
 done
 

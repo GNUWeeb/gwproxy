@@ -923,35 +923,46 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * send it to the target; if the engine has none ready, read more ciphertext.
  * Used both after a client recv completes and after target.buf drains, so
  * plaintext the engine buffered beyond one client.buf-full is not stranded.
+ *
+ * A recv is armed only once the engine has asked for more, which keeps what it
+ * holds within about two records. An HTTP forwarding filter may drop all of a
+ * record, with no send to come back here for the next one: go on to that one.
  */
 static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
-	size_t space = c->cap - c->len, got = 0;
-	uint32_t from = c->len;
 	int sr;
 
-	if (space) {
-		sr = gwp_ssl_read(c->tls, c->buf + c->len, space, &got);
-		if (sr == GWP_SSL_ERROR)
-			return -EIO;
-		if (sr == GWP_SSL_OK && got == 0) {	/* clean close_notify */
-			c->rd_eof = true;
-			return iou_forward_progress(w, gcp);
+	do {
+		size_t space = c->cap - c->len, got = 0;
+		uint32_t from = c->len;
+
+		sr = GWP_SSL_WANT_READ;
+		if (space) {
+			sr = gwp_ssl_read(c->tls, c->buf + c->len, space, &got);
+			if (sr == GWP_SSL_ERROR)
+				return -EIO;
+			if (sr == GWP_SSL_OK && got == 0) {	/* clean close_notify */
+				c->rd_eof = true;
+				return iou_forward_progress(w, gcp);
+			}
+			c->len += (uint32_t)got;
 		}
-		c->len += (uint32_t)got;
-	}
 
-	if (gwp_http_fwd_active(gcp)) {
-		sr = gwp_http_fwd_in(w, gcp, c, from);
-		if (sr)
-			return sr;
-	}
+		if (gwp_http_fwd_active(gcp)) {
+			int r = gwp_http_fwd_in(w, gcp, c, from);
 
-	if (!c->len)
-		return prep_recv_client(w, gcp);
-	prep_send_target(w, gcp);
-	return 0;
+			if (r)
+				return r;
+		}
+
+		if (c->len) {
+			prep_send_target(w, gcp);
+			return 0;
+		}
+	} while (sr == GWP_SSL_OK);
+
+	return prep_recv_client(w, gcp);
 }
 
 /*
