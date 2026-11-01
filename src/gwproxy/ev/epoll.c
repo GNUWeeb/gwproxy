@@ -2196,12 +2196,12 @@ static int handle_conn_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * on every I/O, keeps the cost to one heap update per timeout.
 	 */
 	if (gcp->idle_timer) {
-		int sec = w->ctx->cfg.idle_timeout;
-		uint32_t idle = w->now - gcp->last_act;
+		int left = gwp_idle_left(w->now, gcp->last_act,
+					 w->ctx->cfg.idle_timeout);
 
-		if (idle < (uint32_t)sec)
+		if (left)
 			return tmr_arm(w, gcp, GWP_TMR_CONN,
-				       (uint64_t)(sec - (int)idle) * 1000);
+				       (uint64_t)left * 1000);
 		pr_info(&w->ctx->lh, "Idle timeout (idx=%u, ca=%s, ta=%s)",
 			gcp->idx, ip_to_str(&gcp->client_addr),
 			ip_to_str(&gcp->target_addr));

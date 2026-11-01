@@ -1004,6 +1004,20 @@ static inline uint32_t gwp_now_sec(void)
 }
 
 /*
+ * Seconds until a pair's idle check is due again, or 0 once it has been idle
+ * for all of @sec. Both stamps are whole seconds, so a difference of @sec only
+ * proves that more than @sec - 1 have passed: activity at 10.7 and a check at
+ * 12.1 read as 2. Closing on that would drop an active pair early, so close
+ * only past @sec; an idle pair may live up to about a second longer than @sec.
+ */
+static inline int gwp_idle_left(uint32_t now, uint32_t last_act, int sec)
+{
+	uint32_t idle = now - last_act;
+
+	return idle > (uint32_t)sec ? 0 : sec + 1 - (int)idle;
+}
+
+/*
  * Is the target socket carrying the upstream proxy handshake? Until the tunnel
  * is up, gcp->target is that handshake's I/O buffer: whatever it holds (our
  * unsent request, a partial or refusing reply) belongs to the upstream proxy

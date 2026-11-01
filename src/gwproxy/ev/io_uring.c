@@ -1809,17 +1809,17 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 */
 	if (gcp->idle_timer && !is_timer_del && res == -ETIME &&
 	    !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL)) {
-		int sec = ctx->cfg.idle_timeout;
-		uint32_t idle = w->now - gcp->last_act;
+		int left = gwp_idle_left(w->now, gcp->last_act,
+					 ctx->cfg.idle_timeout);
 
-		if (idle >= (uint32_t)sec) {
+		if (!left) {
 			pr_info(&ctx->lh, "Idle timeout (idx=%u, ca=%s, ta=%s)",
 				gcp->idx, ip_to_str(&gcp->client_addr),
 				ip_to_str(&gcp->target_addr));
 			return -ETIMEDOUT;
 		}
 		if (!gcp->nr_timers_armed)
-			prep_timer_target(w, gcp, sec - (int)idle);
+			prep_timer_target(w, gcp, left);
 		return 0;
 	}
 

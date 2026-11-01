@@ -51,11 +51,17 @@ if scen == "udp":
 
 lsock = socket.socket()
 lsock.bind(("127.0.0.1", 0))
-lsock.listen(1)
+lsock.listen(8)
 def echo():
-    o, _ = lsock.accept()
     while True:
-        d = o.recv(4096)
+        o, _ = lsock.accept()
+        threading.Thread(target=echo_one, args=(o,), daemon=True).start()
+def echo_one(o):
+    while True:
+        try:
+            d = o.recv(4096)
+        except OSError:
+            break
         if not d:
             break
         o.sendall(d)
@@ -75,6 +81,42 @@ elif scen == "busy":
         if c.recv(1) != b"x":
             print("busy tunnel closed after %d s" % (i + 1)); sys.exit(0)
     print("ok" if closed_within(c, 6) else "tunnel still open once it went idle")
+elif scen == "gap":
+    # The timeout is counted in whole seconds. Connect just after a second
+    # starts, so the idle check falls just after a second two later, and
+    # leave a gap well under the timeout across it: last activity at K+0.7,
+    # check at K+2.05, next byte at K+2.3. A try the machine delayed past
+    # the next check says nothing, so it does not count.
+    c.close()
+    def until(frac):
+        now = time.monotonic()
+        base = int(now)
+        at = base + frac if now - base < frac else base + 1 + frac
+        time.sleep(at - now)
+        return int(at)
+    for attempt in range(4):
+        c = socket.create_connection(("127.0.0.1", port), timeout=3)
+        c.sendall(b"\x05\x01\x00")
+        c.recv(2)
+        k = until(0.05)
+        c.sendall(b"\x05\x01\x00\x01\x7f\x00\x00\x01" +
+                  struct.pack(">H", lsock.getsockname()[1]))
+        c.recv(10)
+        until(0.7)
+        c.sendall(b"x")
+        c.recv(1)
+        time.sleep(k + 2.3 - time.monotonic())
+        if time.monotonic() >= k + 2.8:
+            c.close()
+            continue
+        try:
+            c.sendall(b"y")
+            alive = c.recv(1) == b"y"
+        except OSError:
+            alive = False
+        print("ok" if alive else "active tunnel closed 1.6 s after its last byte")
+        sys.exit(0)
+    print("ok")
 elif scen == "off":
     print("closed without --idle-timeout" if closed_within(c, 4) else "ok")
 PY
@@ -86,7 +128,7 @@ for loop in epoll io_uring; do
 	p="$(pick_port)"
 	gwp_start "127.0.0.1:$p" --as-socks5=1 --event-loop="$loop" \
 		--nr-workers=1 --idle-timeout=2
-	for scen in idle busy udp; do
+	for scen in idle busy gap udp; do
 		got="$(client "$p" "$scen" "$uport")"
 		[ "$got" = ok ] || fail "[$loop] $scen: $got"
 	done
