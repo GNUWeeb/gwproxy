@@ -46,6 +46,7 @@ struct gwp_iou_tls {
 	uint32_t	tx_sent;	/* of those, already written       */
 	bool		closing;	/* close_notify queued             */
 	bool		prot_resume;	/* pump the protocol once tx is out */
+	bool		fwd_resume;	/* pump forwarding once tx is out */
 	unsigned char	tx[GWP_TLS_CIPHER_CAP];
 };
 
@@ -471,10 +472,19 @@ static struct io_uring_sqe *prep_recv_target(struct gwp_wrk *w,
 	int fd = gcp->target.fd;
 	struct io_uring_sqe *s;
 
+	/*
+	 * Already armed: a TLS client's engine may have had something to send
+	 * with no data from the target, and that send's completion comes here
+	 * too. target.buf is left alone meanwhile, as it stays empty.
+	 */
+	if (gcp->target_rx)
+		return NULL;
+
 	s = get_sqe_nofail(w);
 	io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TARGET_RECV;
+	gcp->target_rx = true;
 	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared recv for target fd=%d, len=%zu, buf=%p, ref_cnt=%d",
@@ -962,7 +972,33 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		}
 	} while (sr == GWP_SSL_OK);
 
+	/*
+	 * The engine may have made records of its own out of that, in answer
+	 * to a KeyUpdate, say: there may be no other send to carry them along.
+	 * A client that leaves them unread stops being read, or they would
+	 * pile up without limit (handle_ev_client_send() picks this up again).
+	 */
+	if (gwp_ssl_bio_pending(c->tls) > 0) {
+		send_client_tls(w, gcp);
+		if (gwp_ssl_tx_backlog(c->tls, gcp->target.cap)) {
+			gcp->tls_io->fwd_resume = true;
+			return 0;
+		}
+	}
+
 	return prep_recv_client(w, gcp);
+}
+
+/* Reading the client was held up in tls_forward_pump(): go on if it may. */
+static int tls_forward_resume(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_iou_tls *t = gcp->tls_io;
+
+	if (!t->fwd_resume || gwp_ssl_tx_backlog(gcp->client.tls, gcp->target.cap))
+		return 0;
+
+	t->fwd_resume = false;
+	return tls_forward_pump(w, gcp);
 }
 
 /*
@@ -1013,6 +1049,16 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		/* The client gave up on its handshake, as with a FIN. */
 		if (c->rd_eof)
 			return -ECONNRESET;
+		/*
+		 * The engine has records of its own to send, in answer to a
+		 * KeyUpdate, say. Take no more until they are out, so a client
+		 * that does not read them cannot have them pile up.
+		 */
+		if (gwp_ssl_bio_pending(c->tls) > 0) {
+			t->prot_resume = true;
+			send_client_tls(w, gcp);
+			return 0;
+		}
 		/* Nothing new, and room for more: wait for the client. */
 		return prep_recv_client_prot(w, gcp);
 	}
@@ -1022,15 +1068,16 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 /*
  * Whether the protocol should be fed from the engine rather than the socket:
- * it still holds records and client.buf has room for them. With a reply
- * still being sent, tls_prot_pump() waits for that send to complete.
+ * it still holds records and client.buf has room for them, or it has records
+ * of its own to send first. With a reply still being sent, tls_prot_pump()
+ * waits for that send to complete.
  */
 static bool tls_prot_more(struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
 
 	return client_is_tls(gcp) && c->len < c->cap &&
-	       gwp_ssl_rx_more(c->tls);
+	       (gwp_ssl_rx_more(c->tls) || gwp_ssl_bio_pending(c->tls) > 0);
 }
 
 /* Handshake done: switch to the plaintext protocol path on the decrypted stream. */
@@ -1160,6 +1207,7 @@ static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	gcp->tls_io->tx_sent = 0;
 	gcp->tls_io->closing = false;
 	gcp->tls_io->prot_resume = false;
+	gcp->tls_io->fwd_resume = false;
 
 	gcp->client.tls = gwp_ssl_server_new(ctx->ssl_ctx);
 	if (unlikely(!gcp->client.tls))
@@ -1955,6 +2003,10 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 #endif
 		shut_client = true;
 		gcp->client.wr_shut = true;
+#ifdef CONFIG_HTTPS
+		if (client_is_tls(gcp))
+			gwp_ssl_tx_close(gcp->client.tls);
+#endif
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
@@ -2036,6 +2088,7 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 	uint32_t from;
 
+	gcp->target_rx = false;
 	if (r < 0) {
 		if (r == -EAGAIN || r == -EINTR) {
 			prep_recv_target(w, gcp);
@@ -2103,11 +2156,13 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			t->prot_resume = false;
 			return tls_prot_pump(w, gcp);
 		} else if (gcp->target.rd_eof) {
-			return iou_forward_progress(w, gcp);
+			r = iou_forward_progress(w, gcp);
+			if (r)
+				return r;
 		} else if (gcp->target.fd >= 0) {
 			prep_recv_target(w, gcp);
 		}
-		return 0;
+		return tls_forward_resume(w, gcp);
 	}
 #endif
 

@@ -41,7 +41,7 @@ start_scenario()
 	runs+=("$!:$loop.$scenario")
 }
 
-for loop in epoll; do
+for loop in epoll io_uring; do
 	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
 
 	for scenario in answer noread burst shut; do
