@@ -4,6 +4,9 @@
  *
  * Copyright (C) 2025 Ammar Faizi <ammarfaizi2@gnuweeb.org>
  */
+/* Before common.h defines __unused, which musl's struct stat has a field of. */
+#include <sys/stat.h>
+
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
 #include <gwproxy/log.h>
@@ -1309,8 +1312,23 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
  * usually drains it), gwp_reload_events() turns the records into the
  * GWP_RELOAD_* files they name, and gwp_ctx_reload_files() reloads each of
  * those once.
+ *
+ * Inotify only reports changes made through the configured name in its
+ * directory. A file can also change behind a symlink, by a swap of a directory
+ * or a symlink further up the path, or by unlink and link, and neither the
+ * parent watch nor a watch on the inode sees all of those. So the thread also
+ * stat()s the paths every GWP_RELOAD_CHECK_MS and reloads a file whose
+ * gwp_file_id changed and then stayed the same for GWP_RELOAD_SETTLE_MS: inotify
+ * keeps the common case prompt, the check is what catches the other layouts.
+ *
+ * The check cannot tell a finished change from a writer that merely paused,
+ * while inotify reports the close. Hence the long wait, and it has no upper
+ * limit: reading too soon can put a half written file in force, which for an
+ * ACL can let through what the finished file rejects.
  */
 #define GWP_INO_BUF_SIZE	4096
+#define GWP_RELOAD_CHECK_MS	1000
+#define GWP_RELOAD_SETTLE_MS	5000
 #define GWP_RELOAD_AUTH		(1u << 0)
 #define GWP_RELOAD_ACL		(1u << 1)
 
@@ -1352,6 +1370,112 @@ static int add_reload_watch(int ino_fd, const char *path)
 
 	r = inotify_add_watch(ino_fd, dir, IN_CLOSE_WRITE | IN_MOVED_TO);
 	return (r < 0) ? -errno : r;
+}
+
+/*
+ * Take the identity of the file @path resolves to now. Beyond a FIFO's or a
+ * device's identity nothing is compared: writing to it is not a new version of
+ * it. The ctime is what catches a rewrite that restores the mtime, at the price
+ * of a harmless reload after a chmod or a new hard link.
+ */
+static void gwp_file_id_read(const char *path, struct gwp_file_id *id)
+{
+	struct stat st;
+
+	memset(id, 0, sizeof(*id));
+	if (stat(path, &st)) {
+		id->err = (uint64_t)errno;
+		return;
+	}
+	id->dev = (uint64_t)st.st_dev;
+	id->ino = (uint64_t)st.st_ino;
+	id->mode = (uint64_t)(st.st_mode & S_IFMT);
+	if (!S_ISREG(st.st_mode))
+		return;
+	id->size = (uint64_t)st.st_size;
+	id->mtime_sec = (uint64_t)st.st_mtim.tv_sec;
+	id->mtime_nsec = (uint64_t)st.st_mtim.tv_nsec;
+	id->ctime_sec = (uint64_t)st.st_ctim.tv_sec;
+	id->ctime_nsec = (uint64_t)st.st_ctim.tv_nsec;
+}
+
+/* Refresh @id from @path and tell whether it differs from what it was. */
+static bool gwp_file_id_changed(const char *path, struct gwp_file_id *id)
+{
+	struct gwp_file_id cur;
+
+	gwp_file_id_read(path, &cur);
+	if (!memcmp(&cur, id, sizeof(cur)))
+		return false;
+	*id = cur;
+	return true;
+}
+
+/*
+ * Tell whether the periodic check should reload @path now. A change only starts
+ * the wait for it to settle, and any further change restarts that wait. Opening
+ * a FIFO or a device could block for a writer that never comes, stopping every
+ * later reload and shutdown, so one that only the check found is left alone
+ * until the path leads to something else.
+ */
+static bool gwp_reload_check_file(struct gwp_ctx *ctx, const char *path,
+				  struct gwp_reload_file *rf, uint64_t now)
+{
+	if (gwp_file_id_changed(path, &rf->id)) {
+		rf->settle_at = now + GWP_RELOAD_SETTLE_MS;
+		return false;
+	}
+	if (!rf->settle_at)
+		return rf->retry;
+	if (now < rf->settle_at)
+		return false;
+	if (rf->id.err || rf->id.mode == S_IFREG)
+		return true;
+
+	rf->settle_at = 0;
+	rf->retry = false;
+	pr_warn(&ctx->lh, "Not reloading '%s': not a regular file; keeping its current contents",
+		path);
+	return false;
+}
+
+/* The GWP_RELOAD_* files the periodic check wants reloaded now. */
+static unsigned gwp_reload_check(struct gwp_ctx *ctx, uint64_t now)
+{
+	unsigned flags = 0;
+
+	if (ctx->auth && gwp_reload_check_file(ctx, ctx->cfg.auth_file,
+					       &ctx->auth_reload, now))
+		flags |= GWP_RELOAD_AUTH;
+	if (ctx->acl_watched && gwp_reload_check_file(ctx, ctx->cfg.acl_file,
+						      &ctx->acl_reload, now))
+		flags |= GWP_RELOAD_ACL;
+	return flags;
+}
+
+/*
+ * Record the identity right before the file is read, so a change made during
+ * or after that read differs from it and is reloaded in turn, while a file that
+ * failed to load is not read (and logged) again until it changes.
+ */
+static void gwp_reload_begin(const char *path, struct gwp_reload_file *rf)
+{
+	gwp_file_id_read(path, &rf->id);
+	rf->settle_at = 0;
+}
+
+/*
+ * Note the outcome @r of a reload and tell whether a failure is to be logged.
+ * Running out of descriptors or memory says nothing about the file, and its new
+ * contents would otherwise be lost until it changes again, so such a reload is
+ * retried at each check, logged only the first time.
+ */
+static bool gwp_reload_end(struct gwp_reload_file *rf, int r)
+{
+	bool was_retry = rf->retry;
+
+	rf->retry = r == -EMFILE || r == -ENFILE || r == -ENOMEM;
+	return r && !(was_retry && rf->retry);
 }
 
 /* True when inotify record @e names the basename of @path (NULL: never). */
@@ -1401,16 +1525,22 @@ static unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
 /* Reload the files named by @flags (GWP_RELOAD_*), logging the outcome. */
 static void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 {
+	int r;
+
 	if ((flags & GWP_RELOAD_AUTH) && ctx->auth) {
-		if (gwp_auth_reload(ctx->auth))
+		gwp_reload_begin(ctx->cfg.auth_file, &ctx->auth_reload);
+		r = gwp_auth_reload(ctx->auth);
+		if (gwp_reload_end(&ctx->auth_reload, r))
 			pr_warn(&ctx->lh, "Failed to reload authentication file; keeping current credentials");
-		else
+		else if (!r)
 			pr_info(&ctx->lh, "Reloaded authentication file");
 	}
 	if ((flags & GWP_RELOAD_ACL) && ctx->acl_watched) {
-		if (gwp_acl_reload(ctx->acl))
+		gwp_reload_begin(ctx->cfg.acl_file, &ctx->acl_reload);
+		r = gwp_acl_reload(ctx->acl);
+		if (gwp_reload_end(&ctx->acl_reload, r))
 			pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
-		else
+		else if (!r)
 			pr_info(&ctx->lh, "Reloaded ACL file");
 	}
 }
@@ -1464,6 +1594,9 @@ static uint64_t gwp_reload_now_ms(void)
  * none of its connections meanwhile, so the files are reloaded here instead.
  * The stores publish a new set under their own locks, so no worker waits for
  * more than that swap.
+ *
+ * The paths are checked every GWP_RELOAD_CHECK_MS. The first check, at once,
+ * catches a change made since the startup load.
  */
 static void *gwp_reload_thread(void *arg)
 {
@@ -1474,16 +1607,15 @@ static void *gwp_reload_thread(void *arg)
 		{ .fd = ctx->ino_fd, .events = POLLIN },
 		{ .fd = ctx->reload_efd, .events = POLLIN },
 	};
-	uint64_t now, first = 0, last = 0, due = 0;
+	uint64_t now, first = 0, due = 0, next_check = 0;
 	unsigned flags, pending = 0;
 	int r, timeout;
 
 	for (;;) {
-		timeout = -1;
-		if (pending) {
-			now = gwp_reload_now_ms();
-			timeout = due > now ? (int)(due - now) : 0;
-		}
+		uint64_t wake = pending && due < next_check ? due : next_check;
+
+		now = gwp_reload_now_ms();
+		timeout = wake > now ? (int)(wake - now) : 0;
 
 		r = poll(pfd, 2, timeout);
 		if (r < 0) {
@@ -1495,23 +1627,28 @@ static void *gwp_reload_thread(void *arg)
 		if (pfd[1].revents)
 			return NULL;
 
+		flags = 0;
 		if (pfd[0].revents) {
-			flags = 0;
 			r = gwp_reload_drain(ctx, buf, &flags);
 			if (r < 0)
 				break;
-			if (flags) {
-				last = gwp_reload_now_ms();
-				if (!pending)
-					first = last;
-				pending |= flags;
-				due = last + GWP_RELOAD_QUIET_MS;
-				if (due > first + GWP_RELOAD_MAX_WAIT_MS)
-					due = first + GWP_RELOAD_MAX_WAIT_MS;
-			}
 		}
 
-		if (!pending || gwp_reload_now_ms() < due)
+		now = gwp_reload_now_ms();
+		if (now >= next_check) {
+			flags |= gwp_reload_check(ctx, now);
+			next_check = now + GWP_RELOAD_CHECK_MS;
+		}
+		if (flags) {
+			if (!pending)
+				first = now;
+			pending |= flags;
+			due = now + GWP_RELOAD_QUIET_MS;
+			if (due > first + GWP_RELOAD_MAX_WAIT_MS)
+				due = first + GWP_RELOAD_MAX_WAIT_MS;
+		}
+
+		if (!pending || now < due)
 			continue;
 		gwp_ctx_reload_files(ctx, pending);
 		pending = 0;
@@ -1649,6 +1786,8 @@ static int gwp_ctx_init_auth(struct gwp_ctx *ctx)
 		return 0;
 	}
 
+	/* Before the load: a change made after it must differ from this. */
+	gwp_file_id_read(cfg->auth_file, &ctx->auth_reload.id);
 	r = gwp_auth_create(&ctx->auth, cfg->auth_file);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to load auth file '%s': %s",
@@ -1753,6 +1892,8 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 		return 0;
 	}
 
+	/* Before the load: a change made after it must differ from this. */
+	gwp_file_id_read(cfg->acl_file, &ctx->acl_reload.id);
 	r = gwp_acl_create(&ctx->acl, cfg->acl_file);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to load ACL file '%s': %s",

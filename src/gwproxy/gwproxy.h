@@ -822,6 +822,34 @@ enum {
 	GWP_EV_IO_URING
 };
 
+/*
+ * What stat() says about a reloadable file, or why it could not say. Only
+ * 64-bit members, so there is no padding and two can be compared with memcmp().
+ */
+struct gwp_file_id {
+	uint64_t	err;
+	uint64_t	dev;
+	uint64_t	ino;
+	uint64_t	mode;
+	uint64_t	size;
+	uint64_t	mtime_sec;
+	uint64_t	mtime_nsec;
+	uint64_t	ctime_sec;
+	uint64_t	ctime_nsec;
+};
+
+/*
+ * The reload thread's view of a reloadable file. @id: its identity when last
+ * read or checked. @settle_at: when a change only the check saw has been quiet
+ * for long enough, 0 when there is none. @retry: the last reload failed for
+ * want of a resource rather than because of the file.
+ */
+struct gwp_reload_file {
+	struct gwp_file_id	id;
+	uint64_t		settle_at;
+	bool			retry;
+};
+
 struct gwp_ctx {
 	/*
 	 * Set from the signal handler and from any worker that exits, read by
@@ -854,12 +882,16 @@ struct gwp_ctx {
 	 * parent directories, see add_reload_watch()); -1 when neither is
 	 * configured. @reload_thread polls it and reloads the files, off the
 	 * workers; @reload_efd tells it to exit. @reload_running: the thread
-	 * was started and still needs a join.
+	 * was started and still needs a join. @auth_reload, @acl_reload: the
+	 * state of each file's periodic check; owned by the thread once it
+	 * runs.
 	 */
 	int				ino_fd;
 	int				reload_efd;
 	pthread_t			reload_thread;
 	bool				reload_running;
+	struct gwp_reload_file		auth_reload;
+	struct gwp_reload_file		acl_reload;
 	/* ACL rule store. Global to all proxy modes, unlike @auth which is
 	 * prot-only. @acl_watched: loaded from --acl-file (so reloadable),
 	 * not the built-in default rules. */
