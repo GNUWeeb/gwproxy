@@ -90,6 +90,21 @@ int gwp_ssl_bio_read(struct gwp_ssl *s, void *buf, size_t len);
 /* Number of ciphertext bytes currently queued to send. */
 size_t gwp_ssl_bio_pending(struct gwp_ssl *s);
 /*
+ * Whether more ciphertext is queued to send than forwarding alone leaves there
+ * with a plaintext buffer of @buf_cap bytes, which encrypts while less than one
+ * buffer's worth is queued: the rest is what the engine produced on its own,
+ * in answer to what the peer sent (a KeyUpdate, a renegotiation attempt). A
+ * peer that makes it do so without reading the result would have it grow
+ * without limit, so stop reading that peer until this is false again.
+ */
+bool gwp_ssl_tx_backlog(struct gwp_ssl *s, size_t buf_cap);
+/*
+ * The write side of the connection is shut: from now on, drop what the engine
+ * produces. It does not stop answering at its own close_notify, and with nowhere
+ * to send those answers to they would only pile up.
+ */
+void gwp_ssl_tx_close(struct gwp_ssl *s);
+/*
  * Peek at the queued ciphertext without consuming it: returns a pointer to up
  * to *len contiguous bytes (NULL and *len == 0 when none). The pointer stays
  * valid only until the next BIO operation on this connection. After sending N

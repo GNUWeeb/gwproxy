@@ -43,6 +43,8 @@ struct gwp_ssl_q {
 	 * filled behind our back: keep @tail where it is until the commit.
 	 */
 	bool		pinned;
+	/* Nothing queued can be sent any more: drop it (gwp_ssl_tx_close()). */
+	bool		closed;
 };
 
 struct gwp_ssl {
@@ -118,6 +120,8 @@ static int q_bio_write(BIO *b, const char *in, int inl)
 	BIO_clear_retry_flags(b);
 	if (inl <= 0)
 		return 0;
+	if (q->closed)
+		return inl;
 	p = q_reserve(q, (size_t)inl);
 	if (!p)
 		return -1;
@@ -427,6 +431,21 @@ int gwp_ssl_bio_read(struct gwp_ssl *s, void *buf, size_t len)
 size_t gwp_ssl_bio_pending(struct gwp_ssl *s)
 {
 	return q_len(&s->wq);
+}
+
+void gwp_ssl_tx_close(struct gwp_ssl *s)
+{
+	s->wq.closed = true;
+	s->wq.head = s->wq.tail = 0;
+}
+
+bool gwp_ssl_tx_backlog(struct gwp_ssl *s, size_t buf_cap)
+{
+	/*
+	 * Forwarding leaves less than two buffers' worth of plaintext, plus
+	 * what the records add to it, which is far less than a third.
+	 */
+	return q_len(&s->wq) >= 3 * buf_cap + GWP_SSL_RECORD_MAX;
 }
 
 const void *gwp_ssl_bio_peek(struct gwp_ssl *s, size_t *len)

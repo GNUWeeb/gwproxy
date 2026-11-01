@@ -1023,7 +1023,22 @@ static bool adj_epl_out(struct gwp_conn *src, struct gwp_conn *dst)
 	return false;
 }
 
-static bool adj_epl_in(struct gwp_conn *src)
+/*
+ * Whether to leave the client's input alone until it has read what the TLS
+ * engine has for it (see gwp_ssl_tx_backlog()).
+ */
+static bool client_rx_held(struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	struct gwp_conn *c = &gcp->client;
+
+	if (c->tls)
+		return gwp_ssl_tx_backlog(c->tls, gcp->target.cap);
+#endif
+	return false;
+}
+
+static bool adj_epl_in(struct gwp_conn *src, bool hold)
 {
 	uint32_t desired;
 
@@ -1037,6 +1052,7 @@ static bool adj_epl_in(struct gwp_conn *src)
 	 * lost by not watching: EPOLLERR and EPOLLHUP are always reported,
 	 * and the FIN is read as recv() == 0 once there is room again, which
 	 * is also the only point at which data ordering lets us act on it.
+	 * @hold is treated like a full buffer. Its EPOLLOUT brings us back.
 	 *
 	 * EPOLLHUP cannot be masked, though, and a socket that hangs up with
 	 * unread data (its write side shut, then the peer's FIN) would spin
@@ -1049,7 +1065,7 @@ static bool adj_epl_in(struct gwp_conn *src)
 	 */
 	if (src->rd_eof)
 		desired = 0;
-	else if (src->cap - src->len)
+	else if (!hold && src->cap - src->len)
 		desired = EPOLLIN | EPOLLRDHUP;
 	else
 		desired = EPOLLET;
@@ -1078,7 +1094,7 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r;
 
 	client_need_ctl |= adj_epl_out(&gcp->target, &gcp->client);
-	client_need_ctl |= adj_epl_in(&gcp->client);
+	client_need_ctl |= adj_epl_in(&gcp->client, client_rx_held(gcp));
 
 	/*
 	 * Until the target is connected, its registration belongs to the
@@ -1091,7 +1107,7 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 */
 	if (gcp->is_target_alive) {
 		target_need_ctl |= adj_epl_out(&gcp->client, &gcp->target);
-		target_need_ctl |= adj_epl_in(&gcp->target);
+		target_need_ctl |= adj_epl_in(&gcp->target, false);
 	}
 
 	if (client_need_ctl) {
@@ -1367,7 +1383,7 @@ static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	do {
 		full = false;
-		if (do_recv) {
+		if (do_recv && !(src == &gcp->client && client_rx_held(gcp))) {
 			uint32_t from = src->len;
 
 			ret = splice_recv(src, first);
@@ -1874,6 +1890,63 @@ static int client_wr_flushed(struct gwp_conn_pair __unused *gcp)
 }
 
 /*
+ * While the client's input is held up (client_rx_held()), the engine can be left
+ * with whole records whose ciphertext has already left the socket. No EPOLLIN
+ * brings those back, and whichever send takes the hold away may be the last
+ * event for a while, so whoever gets here takes them in.
+ *
+ * This never reads the socket, which is what the EPOLLIN that adj_epl_in() gives
+ * back is for: the work is bounded by what the engine holds, however busy the
+ * client is. Doing so can put the send queue over the limit again, with the
+ * EPOLLOUT edge that took it down long used up and the mask unchanged, so always
+ * send what it produced. Either that empties the queue or the socket fills up,
+ * and then a new edge follows.
+ */
+static int client_rx_resume(struct gwp_wrk __unused *w,
+			    struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	struct gwp_conn *c = &gcp->client, *t = &gcp->target;
+	bool again = true;
+	ssize_t ret;
+
+	if (!c->tls || t->wr_shut)
+		return 0;
+
+	while (again && !client_rx_held(gcp) && c->len < c->cap &&
+	       gwp_ssl_rx_more(c->tls)) {
+		uint32_t from = c->len;
+
+		ret = tls_decrypt(c);
+		if (unlikely(ret < 0))
+			return (int)ret;
+
+		if (gwp_http_fwd_active(gcp)) {
+			int r = gwp_http_fwd_in(w, gcp, c, from);
+
+			if (unlikely(r))
+				return r;
+		}
+
+		/* Otherwise the engine has run out of what it can decrypt. */
+		again = c->len == c->cap || client_rx_held(gcp);
+
+		if (gcp->is_target_alive) {
+			ret = __do_send(c, t);
+			if (unlikely(ret < 0))
+				return (int)ret;
+		}
+		if (!c->wr_shut) {
+			ret = __do_send(t, c);
+			if (unlikely(ret < 0))
+				return (int)ret;
+		}
+	}
+#endif
+	return 0;
+}
+
+/*
  * After a forwarding splice, propagate half-closes and decide whether the
  * pair is done. Once a direction's source has reached EOF and everything it
  * sent has been flushed to the peer, shut the peer's write side so it sees the
@@ -1888,10 +1961,14 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			      struct gwp_conn *hup, bool force_target)
 {
 	bool shut_client = false, shut_target = false, done;
+	int r;
+
+	r = client_rx_resume(w, gcp);
+	if (unlikely(r))
+		return r;
 
 	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
-		int r = client_wr_flushed(gcp);
-
+		r = client_wr_flushed(gcp);
 		if (r < 0)
 			return r;
 		/*
@@ -1902,6 +1979,10 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (r) {
 			shut_client = true;
 			gcp->client.wr_shut = true;
+#ifdef CONFIG_HTTPS
+			if (gcp->client.tls)
+				gwp_ssl_tx_close(gcp->client.tls);
+#endif
 		}
 	}
 
@@ -2099,7 +2180,7 @@ static int handle_ev_client_upstream_hs(struct gwp_wrk *w,
 	if ((ev->events & EPOLLHUP) && gcp->client.rd_eof)
 		return -ECONNRESET;
 
-	if (!adj_epl_in(&gcp->client))
+	if (!adj_epl_in(&gcp->client, client_rx_held(gcp)))
 		return 0;
 
 	cev.events = gcp->client.ep_mask;
@@ -2825,8 +2906,17 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 	ret = __do_recv(&gcp->client);
 	if (unlikely(ret < 0))
 		return (int)ret;
-	if (!ret)
-		return gcp->client.rd_eof ? client_prot_eof(gcp) : 0;
+	if (!ret) {
+		if (gcp->client.rd_eof)
+			return client_prot_eof(gcp);
+		/* No plaintext, but the engine may have had something to say. */
+		if (client_reply_pending(gcp)) {
+			ret = __do_send(&gcp->target, &gcp->client);
+			if (ret < 0)
+				return (int)ret;
+		}
+		return arm_client_prot_out(w, gcp);
+	}
 
 	/*
 	 * More of a forwarding request's body (or what follows it) arriving
@@ -2865,7 +2955,7 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 	if (r == -EAGAIN)
 		r = 0;
 
-	if (gcp->target.len) {
+	if (client_reply_pending(gcp)) {
 		ret = __do_send(&gcp->target, &gcp->client);
 		if (ret < 0)
 			return (int)ret;
@@ -3096,7 +3186,7 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * __adjust_epl_mask() takes it back once the target is up and the
 	 * buffer drains.
 	 */
-	if (adj_epl_in(&gcp->client)) {
+	if (adj_epl_in(&gcp->client, client_rx_held(gcp))) {
 		struct epoll_event cev;
 
 		cev.events = gcp->client.ep_mask;
