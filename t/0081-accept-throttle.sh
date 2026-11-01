@@ -12,7 +12,7 @@
 # Here many SOCKS5 CONNECTs to a closed port first fail in normal operation.
 # Then idle clients fill the proxy's descriptor table until one is left
 # waiting in the listen backlog. Closing one idle client must not let that
-# one in; closing all of them must.
+# one in at once; closing all of them must.
 #
 # No client may be accepted and then dropped for want of a descriptor: the
 # proxy must stop accepting first and leave it in the backlog. Each client

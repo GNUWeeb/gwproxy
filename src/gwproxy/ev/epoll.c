@@ -188,6 +188,7 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 
 	memset(&w->tmrs, 0, sizeof(w->tmrs));
 	w->retry_at_ms = 0;
+	w->accept_resume_at_ms = 0;
 	w->accept_retry = false;
 	w->accept_paused = false;
 	w->tgt_wait = NULL;
@@ -312,25 +313,12 @@ void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 	w->udp_buf = NULL;
 }
 
-static int rearm_accept(struct gwp_wrk *w, int nr_fd_closed)
+/* Put a listener paused for want of descriptors back in the epoll set. */
+static int resume_accept(struct gwp_wrk *w)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct epoll_event ev;
 	int x, r;
-
-	/*
-	 * Each connection pair takes up to 3 file descriptors while it is
-	 * set up:
-	 *
-	 *   1. TCP socket for the client connection.
-	 *   2. TCP socket for the target connection.
-	 *   3. A DNS query socket or a second racing connect attempt.
-	 *
-	 * Before rearming the main TCP socket, wait until we have free
-	 * space for at least 3 connection pairs per worker thread.
-	 */
-	if (nr_fd_closed <= ((3 * ctx->cfg.nr_workers) * 3))
-		return 0;
 
 	ev.events = EPOLLIN;
 	ev.data.u64 = EV_BIT_ACCEPT;
@@ -350,12 +338,34 @@ static int rearm_accept(struct gwp_wrk *w, int nr_fd_closed)
 	return 0;
 }
 
+static int rearm_accept(struct gwp_wrk *w, int nr_fd_closed)
+{
+	struct gwp_ctx *ctx = w->ctx;
+
+	/*
+	 * Each connection pair takes up to 3 file descriptors while it is
+	 * set up:
+	 *
+	 *   1. TCP socket for the client connection.
+	 *   2. TCP socket for the target connection.
+	 *   3. A DNS query socket or a second racing connect attempt.
+	 *
+	 * With free space for at least 3 connection pairs per worker thread,
+	 * rearm the main TCP socket now rather than at its timed retry.
+	 */
+	if (nr_fd_closed <= ((3 * ctx->cfg.nr_workers) * 3))
+		return 0;
+
+	return resume_accept(w);
+}
+
 /*
- * Credit @n closed descriptors to the accept throttle, and rearm accept once
- * enough have been returned. Only while this worker's accept is stopped: the
- * shared counter is reset when the last stopped worker rearms, so credits
- * taken in normal operation would pile up without bound and let the next
- * EMFILE rearm at once, which is the churn the throttle exists to prevent.
+ * Credit @n closed descriptors to the accept throttle, and rearm accept ahead
+ * of its timed retry once enough have been returned. Only while this worker's
+ * accept is stopped: the shared counter is reset when the last stopped worker
+ * rearms, so credits taken in normal operation would pile up without bound and
+ * let the next EMFILE rearm at once, which is the churn the throttle exists to
+ * prevent.
  */
 static int credit_fd_closed(struct gwp_wrk *w, int n)
 {
@@ -731,11 +741,26 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 /* How long a timed pause lasts, in milliseconds; the io_uring loop's too. */
 #define RETRY_DELAY_MS	100
 
-/* Have fish_events() wake up for run_retries() RETRY_DELAY_MS from now. */
+/*
+ * The longest accept stays stopped for want of descriptors without enough of
+ * them being returned, in milliseconds. Long enough for the accept throttle to
+ * do its work, not bouncing between EMFILE and rearming on every close, yet it
+ * bounds the wait where the closes it counts will never add up: see
+ * handle_accept_error().
+ */
+#define ACCEPT_STOP_MAX_MS	5000
+
+/* Have fish_events() wake up for run_retries() at @at_ms, or earlier. */
+static void arm_retry_at(struct gwp_wrk *w, uint64_t at_ms)
+{
+	if (!w->retry_at_ms || at_ms < w->retry_at_ms)
+		w->retry_at_ms = at_ms;
+}
+
+/* Likewise, RETRY_DELAY_MS from now. */
 static void arm_retry(struct gwp_wrk *w)
 {
-	if (!w->retry_at_ms)
-		w->retry_at_ms = now_ms() + RETRY_DELAY_MS;
+	arm_retry_at(w, now_ms() + RETRY_DELAY_MS);
 }
 
 /*
@@ -763,9 +788,14 @@ static int wait_timeout(const struct gwp_wrk *w)
 static int run_retries(struct gwp_wrk *w)
 {
 	struct epoll_event ev;
+	uint64_t now;
 	int r;
 
-	if (likely(!w->retry_at_ms) || now_ms() < w->retry_at_ms)
+	if (likely(!w->retry_at_ms))
+		return 0;
+
+	now = now_ms();
+	if (now < w->retry_at_ms)
 		return 0;
 
 	w->retry_at_ms = 0;
@@ -776,6 +806,16 @@ static int run_retries(struct gwp_wrk *w)
 		if (unlikely(r))
 			return r;
 		w->accept_retry = false;
+	}
+
+	if (w->accept_is_stopped) {
+		if (now < w->accept_resume_at_ms) {
+			arm_retry_at(w, w->accept_resume_at_ms);
+		} else {
+			r = resume_accept(w);
+			if (unlikely(r))
+				return r;
+		}
 	}
 
 	if (w->nr_tgt_wait)
@@ -822,10 +862,12 @@ static int handle_accept_error(struct gwp_wrk *w, int e)
 		 *
 		 * Set the accept_is_stopped flag to true to let the
 		 * worker thread know that it should rearm the main
-		 * TCP socket with EPOLLIN again after it has at least
-		 * closed a file descriptor.
-		 *
-		 * See free_conn_pair() for more details.
+		 * TCP socket with EPOLLIN again once enough descriptors
+		 * have been closed (see credit_fd_closed()), or at the
+		 * latest after ACCEPT_STOP_MAX_MS. Those closes alone
+		 * would not do: only the stopped workers' count, they
+		 * may have too few pairs left to close, and the limit
+		 * may leave too few descriptors to ever add up.
 		 *
 		 * The pause is logged once, until a connection is accepted
 		 * again, in the same words as the io_uring loop uses.
@@ -842,6 +884,8 @@ static int handle_accept_error(struct gwp_wrk *w, int e)
 			return r;
 
 		atomic_fetch_add(&w->ctx->nr_accept_stopped, 1);
+		w->accept_resume_at_ms = now_ms() + ACCEPT_STOP_MAX_MS;
+		arm_retry_at(w, w->accept_resume_at_ms);
 		return -EAGAIN;
 	}
 

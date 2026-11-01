@@ -50,7 +50,10 @@ and drive I/O with either the
 (default) or
 .B io_uring
 event loop. It recovers gracefully from file\-descriptor exhaustion
-(EMFILE/ENFILE), caches DNS answers for hostname targets, tries and races the
+(EMFILE/ENFILE): a worker out of descriptors stops accepting and tries again
+after 100 ms on io_uring; on epoll, once several connections' worth have been
+closed, or after 5 seconds at the latest. It caches DNS answers for hostname
+targets, tries and races the
 addresses of a multi\-homed name on either loop (see
 .BR "TARGET ADDRESS SELECTION" ),
 and can mark its own outgoing connections with
