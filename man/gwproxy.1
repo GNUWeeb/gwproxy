@@ -1053,7 +1053,9 @@ upstream is reached with an HTTP CONNECT request, which likewise resolves the
 host at the proxy. Credentials embedded in the URL authenticate to the upstream.
 An
 .B https://
-upstream (TLS to the proxy) is not supported yet.
+upstream (TLS to the proxy) is not supported yet. In transparent mode the
+upstream, of any type, is asked for the connection's original destination
+address.
 .SH TARGET ADDRESS SELECTION
 A hostname target of a SOCKS5 or HTTP request usually resolves to several
 addresses, and gwproxy tries them as a list of candidates rather than

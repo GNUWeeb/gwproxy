@@ -3604,7 +3604,9 @@ int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->up_dst.ver != 0)
 		return 0;
 
-	if (ctx->upstream.remote_dns && !ctx->cfg.as_socks5 && !ctx->cfg.as_http)
+	/* Transparent mode has no --target: use the original destination. */
+	if (ctx->upstream.remote_dns && !ctx->cfg.as_socks5 &&
+	    !ctx->cfg.as_http && !ctx->cfg.as_transparent)
 		return upstream_dst_from_hostport(ctx->cfg.target, &gcp->up_dst);
 
 	return upstream_dst_from_sockaddr(&gcp->target_addr, &gcp->up_dst);
