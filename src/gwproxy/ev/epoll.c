@@ -689,7 +689,7 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (!cfg->as_http && !cfg->as_socks5 &&
 	    !gwp_ctx_acl_target_allowed(ctx, gcp)) {
 		pr_info(&ctx->lh, "ACL denied target %s for client %s",
-			ip_to_str(&gcp->target_addr),
+			gwp_upstream_dst_str(gcp),
 			ip_to_str(&gcp->client_addr));
 		return -EACCES;
 	}

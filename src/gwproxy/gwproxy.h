@@ -833,6 +833,11 @@ struct gwp_ctx {
 	struct log_handle		lh;
 	struct gwp_wrk			*workers;
 	struct gwp_sockaddr		target_addr;
+	/*
+	 * Plain --target naming a host that a remote-DNS upstream resolves
+	 * (target_addr stays unset then). Otherwise .ver is 0.
+	 */
+	struct gwp_socks5_addr		target_name;
 	struct gwp_socks5_ctx		*socks5;
 	struct gwp_auth			*auth;
 	struct gwp_ssl_ctx		*ssl_ctx;
@@ -1113,7 +1118,7 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
 int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				   int err, void *out, size_t *out_len);
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
-int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+int gwp_upstream_finalize_dst(struct gwp_conn_pair *gcp);
 int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 			   size_t cap);
 

@@ -1865,6 +1865,7 @@ static uint16_t sa_port_h(const struct gwp_sockaddr *s)
 
 static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 				      struct gwp_socks5_addr *out);
+static int upstream_target_init(struct gwp_ctx *ctx);
 
 /*
  * Fill the inputs of an OUTPUT request for @target (NULL when only a domain is
@@ -2135,6 +2136,16 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 	uint16_t dport = 0;
 	bool dnat = false;
 	enum gwp_acl_verdict v;
+
+	/*
+	 * Plain forwarding to a --target the upstream resolves: the request is
+	 * for that name. Set it each time, since a connect retried for want of
+	 * a descriptor must be judged afresh, not as an earlier DNAT left it.
+	 */
+	if (ctx->target_name.ver) {
+		gcp->up_dst = ctx->target_name;
+		gcp->req_domain = ctx->target_name.domain.str;
+	}
 
 	/*
 	 * Only a walk over several candidates evaluates the same domain and
@@ -2701,12 +2712,12 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 		const char *t = ctx->cfg.target;
 
 		/*
-		 * With socks5h:// the upstream proxy resolves the target, so
-		 * we must not resolve --target locally; keep it as a hostname
-		 * to hand to the proxy later.
+		 * With a remote-DNS upstream the proxy resolves the target, so
+		 * we must not resolve --target locally; keep a hostname to hand
+		 * to the proxy later.
 		 */
 		if (ctx->upstream.enabled && ctx->upstream.remote_dns)
-			r = 0;
+			r = upstream_target_init(ctx);
 		else
 			r = convert_str_to_ssaddr(t, &ctx->target_addr, 0);
 		if (r) {
@@ -3396,7 +3407,7 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
-		ip_to_str(&gcp->target_addr), ip_to_str(&gcp->client_addr),
+		gwp_upstream_dst_str(gcp), ip_to_str(&gcp->client_addr),
 		gcp->idx);
 
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
@@ -3519,13 +3530,6 @@ static int upstream_dst_from_hostport(const char *hostport,
 }
 
 /*
- * Finalize gcp->up_dst (the destination requested from the upstream proxy)
- * right before the client handshake. If a socks5h domain was already captured
- * during protocol parsing, keep it; otherwise derive it from the resolved
- * target IP (socks5://), or from the configured --target host for plain mode
- * with socks5h://.
- */
-/*
  * Whether a client-requested hostname is fit for the ACL, the resolver and an
  * upstream CONNECT request: an IPv6 literal, or letters, digits, '-' and '_'
  * in non-empty dot-separated labels (which covers IPv4 literals). Anything
@@ -3597,17 +3601,16 @@ int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 	return 0;
 }
 
-int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/*
+ * Finalize gcp->up_dst (the destination requested from the upstream proxy)
+ * right before the client handshake. A hostname for the upstream to resolve is
+ * already there, requested by the client or configured with --target; anything
+ * else goes by the target address, as the ACL may have rewritten it.
+ */
+int gwp_upstream_finalize_dst(struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
-
 	if (gcp->up_dst.ver != 0)
 		return 0;
-
-	/* Transparent mode has no --target: use the original destination. */
-	if (ctx->upstream.remote_dns && !ctx->cfg.as_socks5 &&
-	    !ctx->cfg.as_http && !ctx->cfg.as_transparent)
-		return upstream_dst_from_hostport(ctx->cfg.target, &gcp->up_dst);
 
 	return upstream_dst_from_sockaddr(&gcp->target_addr, &gcp->up_dst);
 }
@@ -3672,6 +3675,36 @@ static bool req_host_ip(const char *host, uint16_t port, struct gwp_sockaddr *sa
 		return true;
 	}
 	return false;
+}
+
+/*
+ * Take --target apart for a remote-DNS upstream, without resolving anything. It
+ * goes by the rules of a hostname a client requests (see
+ * prepare_target_addr_domain()), and the ACL needs it: an address is the
+ * target, for -d rules and DNAT, and a name is matched by -m domain.
+ */
+__cold
+static int upstream_target_init(struct gwp_ctx *ctx)
+{
+	struct gwp_socks5_addr *dst = &ctx->target_name;
+	uint16_t port;
+	int r;
+
+	r = upstream_dst_from_hostport(ctx->cfg.target, dst);
+	if (!r && !req_host_valid(dst->domain.str))
+		r = -EINVAL;
+	if (r) {
+		dst->ver = 0;
+		return r;
+	}
+
+	if (dst->domain.str[dst->domain.len - 1] == '.')
+		dst->domain.str[--dst->domain.len] = '\0';
+
+	port = ntohs(dst->port);
+	if (req_host_ip(dst->domain.str, port, &ctx->target_addr))
+		dst->ver = 0;
+	return 0;
 }
 
 static int prepare_target_addr_domain(struct gwp_wrk *w,
