@@ -3082,6 +3082,70 @@ static int setskopt_int(int fd, int level, int optname, int value)
 	return __sys_setsockopt(fd, level, optname, &value, sizeof(value));
 }
 
+/* Write the IPv4-mapped IPv6 form (::ffff:a.b.c.d) of a 4-byte address. */
+static void set_v4mapped(struct in6_addr *a6, const void *v4)
+{
+	memset(a6, 0, sizeof(*a6));
+	a6->s6_addr[10] = 0xff;
+	a6->s6_addr[11] = 0xff;
+	memcpy(&a6->s6_addr[12], v4, 4);
+}
+
+/* Canonicalise an address to (is_v4, pointer to its 4- or 16-byte IP). */
+static void sockaddr_canon_ip(const struct gwp_sockaddr *a, bool *is_v4,
+			      const uint8_t **ip)
+{
+	if (a->sa.sa_family == AF_INET) {
+		*is_v4 = true;
+		*ip = (const uint8_t *)&a->i4.sin_addr;
+		return;
+	}
+	if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr)) {
+		*is_v4 = true;
+		*ip = &a->i6.sin6_addr.s6_addr[12];
+		return;
+	}
+	*is_v4 = false;
+	*ip = a->i6.sin6_addr.s6_addr;
+}
+
+/*
+ * Write to @out the form of source @src that a socket about to dial @dst can
+ * bind. An IPv4-mapped address is IPv4 traffic on an AF_INET6 socket, so what
+ * has to match is the canonical family, and the spelling then follows the
+ * socket's: @dst decides, as the socket was created with its family. Returns
+ * false when @src is of the other family and cannot apply to @dst.
+ */
+static bool conn_bind_src(struct gwp_sockaddr *out,
+			  const struct gwp_sockaddr *src,
+			  const struct gwp_sockaddr *dst)
+{
+	const uint8_t *src_ip, *dst_ip;
+	bool src_v4, dst_v4;
+
+	sockaddr_canon_ip(src, &src_v4, &src_ip);
+	sockaddr_canon_ip(dst, &dst_v4, &dst_ip);
+	if (src_v4 != dst_v4)
+		return false;
+
+	if (src->sa.sa_family == dst->sa.sa_family) {
+		*out = *src;
+		return true;
+	}
+
+	memset(out, 0, sizeof(*out));
+	if (dst->sa.sa_family == AF_INET) {
+		out->i4.sin_family = AF_INET;
+		out->i4.sin_port = src->i6.sin6_port;
+		memcpy(&out->i4.sin_addr, src_ip, 4);
+	} else {
+		out->i6.sin6_family = AF_INET6;
+		out->i6.sin6_port = src->i4.sin_port;
+		set_v4mapped(&out->i6.sin6_addr, src_ip);
+	}
+	return true;
+}
+
 /*
  * Apply a bind spec to socket @fd before connect: pin the outgoing interface
  * (SO_BINDTODEVICE) and/or source address (bind()). Strict -- any failure is
@@ -3099,7 +3163,9 @@ static int setskopt_int(int fd, int level, int optname, int value)
  * refused, whereas the global default must not turn a dual-stack proxy into a
  * single-family one -- an IPv4 --bind-source simply does not apply to an IPv6
  * target, so the source is skipped and the connection proceeds. An interface
- * has no family, so --bind-iface still applies to every target.
+ * has no family, so --bind-iface still applies to every target. A v4-mapped
+ * address is IPv4 here, as it is to --outgoing-family and the ACL: were it to
+ * count as IPv6, a client could dodge an IPv4 source by spelling its target so.
  */
 static int apply_conn_bind(struct gwp_wrk *w, int fd,
 			   const struct gwp_sockaddr *dst,
@@ -3120,12 +3186,13 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 	}
 
 	if (b->have_src) {
-		const struct gwp_sockaddr *s = &b->src;
+		struct gwp_sockaddr src;
+		const struct gwp_sockaddr *s = &src;
 		socklen_t len;
 		in_port_t port;
 
 		/* The source family must match the socket/target family. */
-		if (s->sa.sa_family != dst->sa.sa_family) {
+		if (!conn_bind_src(&src, &b->src, dst)) {
 			if (global) {
 				pr_dbg(&w->ctx->lh,
 				       "bind default: --bind-source does not apply to target %s (other address family)",
@@ -3952,33 +4019,6 @@ static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->conn_state = CONN_STATE_SOCKS5_DATA;
 	gcp->prot_type = GWP_PROT_TYPE_SOCKS5;
 	return 0;
-}
-
-/* Write the IPv4-mapped IPv6 form (::ffff:a.b.c.d) of a 4-byte address. */
-static void set_v4mapped(struct in6_addr *a6, const void *v4)
-{
-	memset(a6, 0, sizeof(*a6));
-	a6->s6_addr[10] = 0xff;
-	a6->s6_addr[11] = 0xff;
-	memcpy(&a6->s6_addr[12], v4, 4);
-}
-
-/* Canonicalise an address to (is_v4, pointer to its 4- or 16-byte IP). */
-static void sockaddr_canon_ip(const struct gwp_sockaddr *a, bool *is_v4,
-			      const uint8_t **ip)
-{
-	if (a->sa.sa_family == AF_INET) {
-		*is_v4 = true;
-		*ip = (const uint8_t *)&a->i4.sin_addr;
-		return;
-	}
-	if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr)) {
-		*is_v4 = true;
-		*ip = &a->i6.sin6_addr.s6_addr[12];
-		return;
-	}
-	*is_v4 = false;
-	*ip = a->i6.sin6_addr.s6_addr;
 }
 
 /*

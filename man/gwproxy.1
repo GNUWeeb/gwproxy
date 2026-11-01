@@ -810,7 +810,9 @@ leaves an IPv6 target on its default source, so setting one does not quietly
 turn a dual\-stack proxy into a single\-family one. (An ACL
 .B \-\-to\-source
 that mismatches stays an error \(em an explicit rule naming the wrong family is
-a mistake, a default that cannot apply is not.) Default: unset.
+a mistake, a default that cannot apply is not.) An IPv4\-mapped address
+.RI ( ::ffff:a.b.c.d )
+is IPv4 for this comparison, as a target and as a source. Default: unset.
 .TP
 .BR \-I ", " \-\-bind\-iface=\fIname\fR
 Pin every outgoing connection to this network interface
