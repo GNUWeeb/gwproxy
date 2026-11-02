@@ -12,7 +12,9 @@
 #undef NDEBUG
 #endif
 #include <gwproxy/ssl.h>
+#include <openssl/bio.h>
 #include <assert.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -47,6 +49,18 @@ static const char TEST_KEY[] =
 "wTV6gRn6yqtpSjNe2b7OJQrnuiShRANCAAR6wF4KRXESxPLwqMguiJmwFPIZ8iVg\n"
 "TlIZaY/UgosFJXa/tUHwMIT3hEKlMIPb/+ERhbYMdNsheDzzVbSqfMiq\n"
 "-----END PRIVATE KEY-----\n";
+
+/* Linked with --wrap=BIO_meth_new, so that the call can be made to fail. */
+static bool bio_meth_new_fails;
+BIO_METHOD *__real_BIO_meth_new(int type, const char *name);
+BIO_METHOD *__wrap_BIO_meth_new(int type, const char *name);
+
+BIO_METHOD *__wrap_BIO_meth_new(int type, const char *name)
+{
+	if (bio_meth_new_fails)
+		return NULL;
+	return __real_BIO_meth_new(type, name);
+}
 
 static void write_file(const char *path, const char *data)
 {
@@ -293,10 +307,43 @@ static void test_alpn_negotiation(void)
 	PRTEST_OK();
 }
 
+/*
+ * Without the BIO method no connection can be set up. That must show when the
+ * context is created, at startup, not as clients being reset later on. Goes
+ * first: the method is only created once.
+ */
+static void test_bio_method_failure(void)
+{
+	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
+	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
+	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
+	int fd;
+
+	fd = mkstemp(cert); assert(fd >= 0); close(fd);
+	fd = mkstemp(key); assert(fd >= 0); close(fd);
+	write_file(cert, TEST_CERT);
+	write_file(key, TEST_KEY);
+
+	bio_meth_new_fails = true;
+	assert(gwp_ssl_ctx_server_create(&sctx, cert, key) < 0);
+	assert(gwp_ssl_ctx_client_create(&cctx) < 0);
+
+	bio_meth_new_fails = false;
+	assert(!gwp_ssl_ctx_server_create(&sctx, cert, key));
+	assert(!gwp_ssl_ctx_client_create(&cctx));
+	gwp_ssl_ctx_free(sctx);
+	gwp_ssl_ctx_free(cctx);
+
+	unlink(cert);
+	unlink(key);
+	PRTEST_OK();
+}
+
 int main(void)
 {
 	size_t i;
 
+	test_bio_method_failure();
 	for (i = 0; i < 200; i++) {
 		test_handshake_and_roundtrip();
 		test_zero_copy_queues();
