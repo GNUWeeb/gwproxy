@@ -217,20 +217,7 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 		goto out_close_ev_fd;
 	}
 
-	/*
-	 * Every event tears down at most one pair, except the accept event,
-	 * which handles up to 32 connections (see handle_ev_accept()). The
-	 * list never fills in practice; free_conn_pair() copes if it does.
-	 */
-	w->nr_dead = 0;
-	w->dead_cap = w->evsz + 32;
-	w->dead = calloc(w->dead_cap, sizeof(*w->dead));
-	if (!w->dead) {
-		r = -ENOMEM;
-		free(events);
-		goto out_close_ev_fd;
-	}
-
+	w->dead = NULL;
 	w->ev_fd = ev_fd;
 	w->ep_fd = ep_fd;
 	w->events = events;
@@ -274,8 +261,6 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 out_free_events:
 	free(events);
 	w->events = NULL;
-	free(w->dead);
-	w->dead = NULL;
 out_close_ev_fd:
 	__sys_close(ev_fd);
 out_close_ep_fd:
@@ -303,8 +288,6 @@ void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 
 	free(w->events);
 	w->events = NULL;
-	free(w->dead);
-	w->dead = NULL;
 	free(w->tgt_wait);
 	w->tgt_wait = NULL;
 	w->nr_tgt_wait = w->tgt_wait_cap = 0;
@@ -313,16 +296,52 @@ void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 	w->udp_buf = NULL;
 }
 
-/* Put a listener paused for want of descriptors back in the epoll set. */
-static int resume_accept(struct gwp_wrk *w)
+static void arm_retry(struct gwp_wrk *w);
+
+/*
+ * Put a paused listener back in the epoll set. This takes kernel memory and
+ * an epoll watch, and runs when the process is short of something already.
+ * Running out of those is no reason to cut every tunnel: returns -EAGAIN with
+ * a timed retry armed, the failure logged once until it passes.
+ */
+static int add_listener(struct gwp_wrk *w)
 {
-	struct gwp_ctx *ctx = w->ctx;
 	struct epoll_event ev;
-	int x, r;
+	int r;
 
 	ev.events = EPOLLIN;
 	ev.data.u64 = EV_BIT_ACCEPT;
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, w->tcp_fd, &ev);
+	if (likely(!r)) {
+		w->accept_add_failed = false;
+		return 0;
+	}
+
+	if (r != -ENOMEM && r != -ENOSPC)
+		return r;
+
+	if (!w->accept_add_failed) {
+		w->accept_add_failed = true;
+		pr_warn(&w->ctx->lh,
+			"Failed to put the listener back in the epoll set: %s, retrying (tidx=%u)",
+			strerror(-r), w->idx);
+	}
+	arm_retry(w);
+	return -EAGAIN;
+}
+
+/* Put a listener paused for want of descriptors back in the epoll set. */
+static int resume_accept(struct gwp_wrk *w)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	int x, r;
+
+	r = add_listener(w);
+	if (unlikely(r == -EAGAIN)) {
+		/* Due as soon as run_retries() comes round, whatever brought us. */
+		w->accept_resume_at_ms = 0;
+		return 0;
+	}
 	if (unlikely(r))
 		return r;
 
@@ -429,7 +448,8 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->udp_fd >= 0)
 		nr_fd_closed++;
 #ifdef CONFIG_NEW_DNS_RESOLVER
-	if (gcp->gdp && gcp->gdp->fd >= 0)
+	/* @gdp shares a union with @gde, the getaddrinfo() mode's lookup. */
+	if (ctx->cfg.use_raw_dns && gcp->gdp && gcp->gdp->fd >= 0)
 		nr_fd_closed++;	/* a raw DNS query's socket */
 #endif
 
@@ -484,11 +504,6 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		}
 	}
 
-	if (unlikely(w->nr_dead >= w->dead_cap)) {
-		w->ev_need_reload = true;
-		return __free_conn_pair(w, gcp);
-	}
-
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	/*
 	 * Close the query's socket now, so no reply for this pair is read
@@ -505,22 +520,23 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 #endif
 
 	gcp->flags |= GWP_CONN_FLAG_IS_DYING;
-	w->dead[w->nr_dead++] = gcp;
+	gcp->next_dead = w->dead;
+	w->dead = gcp;
 	return 0;
 }
 
 static int reap_dead_pairs(struct gwp_wrk *w)
 {
+	struct gwp_conn_pair *gcp;
 	int r, ret = 0;
-	uint16_t i;
 
-	for (i = 0; i < w->nr_dead; i++) {
-		r = __free_conn_pair(w, w->dead[i]);
+	while ((gcp = w->dead)) {
+		w->dead = gcp->next_dead;
+		r = __free_conn_pair(w, gcp);
 		if (unlikely(r) && !ret)
 			ret = r;
 	}
 
-	w->nr_dead = 0;
 	return ret;
 }
 
@@ -631,8 +647,6 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	return register_new_client(w, gcp, EV_BIT_CLIENT);
 }
-
-static void arm_retry(struct gwp_wrk *w);
 
 /*
  * The descriptor table is full, and an accepted client has no target socket
@@ -790,7 +804,6 @@ static int wait_timeout(const struct gwp_wrk *w)
 /* Do what a timed pause has been holding back, once it is due. */
 static int run_retries(struct gwp_wrk *w)
 {
-	struct epoll_event ev;
 	uint64_t now;
 	int r;
 
@@ -803,12 +816,11 @@ static int run_retries(struct gwp_wrk *w)
 
 	w->retry_at_ms = 0;
 	if (w->accept_retry) {
-		ev.events = EPOLLIN;
-		ev.data.u64 = EV_BIT_ACCEPT;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, w->tcp_fd, &ev);
-		if (unlikely(r))
+		r = add_listener(w);
+		if (likely(!r))
+			w->accept_retry = false;
+		else if (r != -EAGAIN)
 			return r;
-		w->accept_retry = false;
 	}
 
 	if (w->accept_is_stopped) {
@@ -2344,18 +2356,19 @@ static int handle_conn_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ip_to_str(&gcp->client_addr), ip_to_str(&gcp->target_addr));
 
 	/*
-	 * A target socket that never came up: tell the client the origin timed
-	 * out (SOCKS5 REP 0x06, HTTP 504) instead of just dropping it. Only
-	 * once the target socket exists -- the other user of this timer is the
-	 * protocol handshake, where the client has not asked for anything yet
-	 * and a CONNECT reply would answer a request that was never made.
+	 * A target socket that never came up, or a target name that did not
+	 * resolve in time: tell the client the origin timed out (SOCKS5 REP
+	 * 0x06, HTTP 504) instead of just dropping it. Only once the request is
+	 * complete -- the other user of this timer is the protocol handshake,
+	 * where the client has not asked for anything yet and a CONNECT reply
+	 * would answer a request that was never made.
 	 *
 	 * Send only what gwp_conn_fail_reply() added: plain forwarding has no
 	 * reply to give, and a stalled upstream handshake leaves its own bytes
 	 * in target.buf, which are dropped first.
 	 */
-	if ((gcp->target.fd >= 0 || has_inflight_attempt(gcp)) &&
-	    !gcp->is_target_alive) {
+	if ((gcp->target.fd >= 0 || has_inflight_attempt(gcp) ||
+	     gwp_in_dns_lookup(gcp)) && !gcp->is_target_alive) {
 		uint32_t len;
 
 		if (gwp_in_upstream_hs(gcp))
@@ -3374,9 +3387,6 @@ static int handle_events(struct gwp_wrk *w, int nr_events)
 		r = handle_event(w, &events[i]);
 		if (unlikely(r < 0))
 			break;
-
-		if (unlikely(w->ev_need_reload))
-			break;
 	}
 
 	if (r >= 0 && likely(!ctx->stop)) {
@@ -3402,7 +3412,6 @@ static int fish_events(struct gwp_wrk *w)
 {
 	int r;
 
-	w->ev_need_reload = false;
 	r = __sys_epoll_wait(w->ep_fd, w->events, w->evsz, wait_timeout(w));
 	w->now = gwp_now_sec();
 	if (unlikely(r < 0)) {

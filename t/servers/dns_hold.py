@@ -7,7 +7,8 @@ Usage: dns_hold.py <port> <names-file> <release-file>
 A name starting with "hold" gets no answer until <release-file> exists, so a
 lookup of one blocks for as long as the test wants, with no timing involved.
 Everything else is answered at once. A query for an A record gets 127.0.0.1,
-any other an empty answer.
+any other an empty answer. A name starting with "holdnx" is answered, when its
+time comes, with NXDOMAIN.
 
 <names-file> always holds the distinct held names received so far, one per
 line, so a test can tell which lookups really started.
@@ -41,6 +42,9 @@ def answer(q, qtype, peer):
     while q[qend]:
         qend += q[qend] + 1
     qend += 5
+    if parse(q)[0].startswith("holdnx"):
+        s.sendto(q[:2] + struct.pack("!HHHHH", 0x8183, 1, 0, 0, 0) + q[12:qend], peer)
+        return
     head = q[:2] + struct.pack("!HHHHH", 0x8180, 1, qtype == 1, 0, 0)
     rr = b""
     if qtype == 1:

@@ -511,6 +511,8 @@ struct gwp_conn_pair {
 	struct gwp_iou_udp	*udp_iou;
 	/* Targets a UDP association may hear from; NULL until it sends. */
 	struct gwp_udp_peers	*udp_peers;
+	/* The next pair on the epoll loop's list of pairs to free (@dead). */
+	struct gwp_conn_pair	*next_dead;
 
 	/*
 	 * The hostname the client asked for, when it used a domain target
@@ -747,9 +749,12 @@ struct gwp_wrk {
 			 * Pairs torn down while the current batch of events is
 			 * handled. They are only marked dying then, and freed
 			 * once the batch is done, because a later event in the
-			 * same batch may still point at them.
+			 * same batch may still point at them. A list through
+			 * the pairs, since one event can end any number of
+			 * them (see handle_ev_dns_cq()) and none may be left
+			 * out.
 			 */
-			struct gwp_conn_pair	**dead;
+			struct gwp_conn_pair	*dead;
 			/*
 			 * The timers of every pair of this worker (see
 			 * ev/tmr.h). They drive the epoll_wait() timeout, so
@@ -778,14 +783,6 @@ struct gwp_wrk {
 			uint32_t		nr_tgt_wait;
 			uint32_t		tgt_wait_cap;
 			uint16_t		evsz;
-			uint16_t		nr_dead;
-			uint16_t		dead_cap;
-			/*
-			 * If it's true, the worker MUST call epoll_wait() again
-			 * before continue iterating over the events. Only set
-			 * when @dead is full and a pair had to be freed at once.
-			 */
-			bool			ev_need_reload;
 			/*
 			 * accept() failed for a reason that closing
 			 * descriptors does not cure: the listener is out of
@@ -793,10 +790,12 @@ struct gwp_wrk {
 			 * Any accept pause, this one or the one for running
 			 * out of descriptors (accept_is_stopped), is logged
 			 * once, until a connection is accepted again
-			 * (accept_paused).
+			 * (accept_paused). A listener that could not be put
+			 * back is retried, and logged once (accept_add_failed).
 			 */
 			bool			accept_retry;
 			bool			accept_paused;
+			bool			accept_add_failed;
 		};
 #ifdef CONFIG_IO_URING
 		struct iou	*iou;
@@ -1086,6 +1085,18 @@ static inline bool gwp_in_upstream_hs(const struct gwp_conn_pair *gcp)
 
 	return cs >= CONN_STATE_UPSTREAM_S5_MIN &&
 	       cs <= CONN_STATE_UPSTREAM_HTTP_MAX;
+}
+
+/*
+ * Waiting for the target's name to resolve: the client's request is complete,
+ * so it is owed an answer however this ends.
+ */
+static inline bool gwp_in_dns_lookup(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs == CONN_STATE_SOCKS5_DNS_QUERY ||
+	       cs == CONN_STATE_HTTP_DNS_QUERY;
 }
 
 /* Move the data back to the start of the buffer, regaining the room in front. */
