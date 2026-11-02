@@ -604,6 +604,9 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_ctx *ctx = w->ctx;
 	int target_fd;
 
+	if (gwp_target_is_self(w, gcp, ca, false))
+		return -ELOOP;
+
 	/* With an upstream proxy, connect to the proxy instead. */
 	if (ctx->upstream.enabled)
 		ca = &ctx->upstream.addr;
@@ -1869,6 +1872,9 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 		pr_err(&ctx->lh, "getsockopt error: %s", strerror(-r));
 		err = -r;
 	}
+
+	if (!err && gwp_target_is_self(w, gcp, &gcp->attempt_addr[slot], true))
+		err = ELOOP;
 
 	if (unlikely(err)) {
 		pr_dbg(&ctx->lh, "Target attempt failed: %s (fd=%d, idx=%u, ta=%s)",

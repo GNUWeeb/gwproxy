@@ -734,6 +734,8 @@ struct gwp_tmr_heap {
 
 struct gwp_wrk {
 	int			tcp_fd;
+	/* Where tcp_fd listens, see gwp_target_is_self(). */
+	struct gwp_sockaddr	listen_addr;
 	struct gwp_conn_slot	conn_slot;
 
 	union {
@@ -1037,6 +1039,14 @@ bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *a);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
+
+/*
+ * Whether connecting to @dst, or to the upstream if there is one, would reach
+ * the listener of @w. @connected says the connection is already up. Logs a
+ * refusal; the caller drops the connection.
+ */
+bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
+			const struct gwp_sockaddr *dst, bool connected);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
 
 /* Monotonic seconds, at the coarse clock's resolution (a few ms). */

@@ -94,6 +94,36 @@ listening on anything but loopback without
 .B \-\-auth\-file
 is open to every client that can reach it; gwproxy logs a warning at startup
 when it is configured that way.
+.IP
+A target that is this listener is refused (SOCKS5 reply
+.BR 0x01 ,
+HTTP
+.BR 502 ,
+and a plain or transparent client is disconnected), since a client could
+otherwise chain the proxy through itself over and over on one connection. That
+covers a hostname, a
+.B \-j DNAT
+rewrite and an upstream proxy too, and an unspecified target as the address a
+connect to it reaches: loopback, or an IPv4 source forced by
+.B \-\-bind\-source
+or
+.BR "\-j BIND" .
+The other addresses of a hostname are still tried, so the client may get through
+to one of them, and when all fail the reply is that of the last to fail, which can
+be another error code.
+Under a wildcard address it means any address the host's routing table has as
+local, local routes included, in the family the wildcard covers, with this port;
+a service of the same port number on an address the listener does not cover is
+reached as usual. Asking the routing table takes a descriptor, so while the
+descriptor table is full a SOCKS5 or HTTP target on this port number is refused
+as if it were this listener, even if it is a remote service; plain and transparent
+clients wait for a descriptor, as they do for their target socket.
+With port 0, where each worker has a port of its own,
+only the worker's own port is recognised. A path back to the listener through NAT
+or another host is not recognised either; use
+.B \-\-max\-conns\-per\-ip
+to bound what one client can do that way, noting that such connections count
+against the proxy's own address.
 .TP
 .BR \-t ", " \-\-target=\fIaddr:port\fR
 For plain TCP forwarding, the fixed destination every accepted connection is
