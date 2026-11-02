@@ -10,6 +10,11 @@
 #   (b) every lookup still queued behind a busy resolver was run to the end
 #       for nobody, in front of the next client's.
 #
+# With the raw resolver compiled in, the epoll loop also took such a pair's
+# lookup for a raw DNS query's socket, which the pair does not have, and credited
+# a descriptor too many to the accept throttle: (c) accept stopped on EMFILE must
+# not resume early when these pairs time out.
+#
 # Run on both loops, which have to behave alike. The answers are held back
 # until the test has seen what it wants, so nothing here depends on how long a
 # lookup takes; the limits only have to be shorter than the resolver's own
@@ -196,5 +201,114 @@ PY
 	kill "$GWP_PID" "$dns_pid" 2>/dev/null
 	wait "$GWP_PID" "$dns_pid" 2>/dev/null
 done
+
+# (c) Only the raw resolver's build has the query's socket to count.
+if grep -q CONFIG_NEW_DNS_RESOLVER "$ROOT/config.h" 2>/dev/null; then
+	names="$WORK/names.credit"
+	release="$WORK/release.credit"
+	python3 "$SERVERS_DIR/dns_hold.py" 53 "$names" "$release" >"$WORK/dns.credit" 2>&1 &
+	dns_pid=$!
+	for i in $(seq 1 100); do
+		grep -q READY "$WORK/dns.credit" 2>/dev/null && break
+		sleep 0.05
+	done
+	grep -q READY "$WORK/dns.credit" || { echo "DNS server did not start"; exit 1; }
+
+	p="$(pick_port)"
+	gwp_start "127.0.0.1:$p" --as-socks5=1 --event-loop=epoll --nr-workers=1 \
+		--protocol-timeout=4
+
+	echo "[accept credit]"
+	timeout 60 python3 - "$p" "$GWP_PID" "$names" "$WORK/gwp.$p.log" <<'PY' || exit 1
+import os, resource, socket, struct, sys, time
+
+port, pid, names_file, log_file = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+# Accept resumes ahead of its timed retry (5 s, ACCEPT_STOP_MAX_MS) once more
+# than 9 descriptors came back. These pairs return one each, so 8 are too few;
+# counted double they are plenty.
+NR_PAIRS = 8
+RETRY = 5
+NAME = b"hold-credit.dns-cancel.invalid"
+
+
+def die(msg):
+    print(msg)
+    sys.exit(1)
+
+
+def hello():
+    c = socket.create_connection(("127.0.0.1", port), timeout=30)
+    c.settimeout(30)
+    c.sendall(b"\x05\x01\x00")
+    if c.recv(2) != b"\x05\x00":
+        die("no SOCKS5 method reply")
+    return c
+
+
+def request(c):
+    c.sendall(b"\x05\x01\x00\x03" + bytes([len(NAME)]) + NAME + struct.pack("!H", 80))
+
+
+# The first request opens what the lookup takes of the table, so what is free
+# after it stays free for the others, which share the lookup.
+pairs = [hello()]
+request(pairs[0])
+end = time.monotonic() + 3
+while time.monotonic() < end:
+    with open(names_file) as f:
+        if f.read().strip():
+            break
+    time.sleep(0.02)
+else:
+    print("the lookup did not start in time; inconclusive")
+    sys.exit(0)
+time.sleep(0.1)
+
+# The limit counts numbers, not descriptors, so find the one that leaves room
+# for just the others.
+used = {int(n) for n in os.listdir("/proc/%d/fd" % pid)}
+lim, free = 0, 0
+while free < NR_PAIRS - 1:
+    free += lim not in used
+    lim += 1
+resource.prlimit(pid, resource.RLIMIT_NOFILE, (lim, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
+
+# Accepting the last one fills the table, and the same round of accept then
+# stops on EMFILE, ahead of the answer to that client's hello. So it stopped no
+# earlier than t0 and, once the log says so, before the next client.
+for _ in range(NR_PAIRS - 1):
+    t0 = time.monotonic()
+    pairs.append(hello())
+    request(pairs[-1])
+
+# Stalled until the first pair timed out, there was still room and accept went
+# on, which says nothing.
+with open(log_file) as f:
+    if "pausing accept" not in f.read():
+        print("accept did not stop; inconclusive")
+        sys.exit(0)
+
+waiter = socket.create_connection(("127.0.0.1", port), timeout=30)
+waiter.sendall(b"\x05\x01\x00")
+waiter.settimeout(30)
+try:
+    got = waiter.recv(2)
+except OSError as e:
+    got = repr(e)
+spent = time.monotonic() - t0
+if got != b"\x05\x00":
+    die("the client after the pause got %r" % got)
+# Only a miscount brings accept back before this, however slow the machine.
+if spent < RETRY - 0.1:
+    die("accept resumed %.2f s after it stopped; %d pairs must not do that" % (spent, NR_PAIRS))
+print("resumed after %.2f s" % spent)
+PY
+	kill -0 "$GWP_PID" 2>/dev/null || { echo "[accept credit] proxy died"; exit 1; }
+	: >"$release"
+	kill "$GWP_PID" 2>/dev/null
+	wait "$GWP_PID" 2>/dev/null
+	kill "$dns_pid" 2>/dev/null
+	wait "$dns_pid" 2>/dev/null
+fi
 
 rc=0

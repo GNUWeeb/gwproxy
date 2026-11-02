@@ -465,7 +465,8 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->udp_fd >= 0)
 		nr_fd_closed++;
 #ifdef CONFIG_NEW_DNS_RESOLVER
-	if (gcp->gdp && gcp->gdp->fd >= 0)
+	/* @gdp shares a union with @gde, the getaddrinfo() mode's lookup. */
+	if (ctx->cfg.use_raw_dns && gcp->gdp && gcp->gdp->fd >= 0)
 		nr_fd_closed++;	/* a raw DNS query's socket */
 #endif
 
