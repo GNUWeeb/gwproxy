@@ -1148,7 +1148,9 @@ static void test_res_interim_run(void)
 
 /*
  * A field that may appear only once, sent twice, is answered with 400 rather
- * than a silent close; repeated list fields are still merged.
+ * than a silent close, however it is spelled and whatever the request is;
+ * repeated list fields are still merged and any other repeated field goes on
+ * as it came. What decides how the request is delimited stays out of that.
  */
 static void test_duplicate_field(void)
 {
@@ -1157,10 +1159,38 @@ static void test_duplicate_field(void)
 		"Host: example.com\r\nHost: evil.example\r\n\r\n",
 		"POST http://example.com/ HTTP/1.1\r\n"
 		"Content-Length: 1\r\nContent-Length: 2\r\n\r\n",
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"Content-Length: 1\r\ncontent-length: 1\r\n\r\n",
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"Transfer-Encoding: chunked\r\n\r\n",
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"Transfer-Encoding: identity\r\n\r\n",
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"Connection: x\r\nConnection: Content-Length\r\n"
+		"Content-Length: 1\r\n\r\n",
+		"GET http://example.com/ HTTP/1.1\r\n"
+		"User-Agent: a\r\nUSER-AGENT: b\r\n\r\n",
 		"CONNECT example.com:443 HTTP/1.1\r\n"
 		"Proxy-Authorization: Basic a\r\n"
 		"proxy-authorization: Basic b\r\n\r\n",
+		"CONNECT example.com:443 HTTP/1.1\r\n"
+		"Content-Length: 1\r\nContent-Length: 1\r\n\r\n",
 	};
+	static const char other[] =
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"X-Forwarded-For: 1\r\nX-Drop: a\r\nContent-Length: 0\r\n"
+		"Connection: x-drop\r\nKeep-Alive: 1\r\nKeep-Alive: 2\r\n"
+		"x-forwarded-for: 2\r\nX-DROP: b\r\nX-Forwarded-For: 3\r\n\r\n";
+	static const char other_want[] =
+		"POST / HTTP/1.1\r\nHost: example.com\r\n"
+		"X-Forwarded-For: 1\r\nContent-Length: 0\r\n"
+		"x-forwarded-for: 2\r\nX-Forwarded-For: 3\r\n"
+		"Connection: close\r\n\r\n";
+	static const char tunnel[] =
+		"CONNECT example.com:443 HTTP/1.1\r\n"
+		"X-A: 1\r\nX-A: 2\r\n\r\n";
 	static const char list[] =
 		"GET http://example.com/ HTTP/1.1\r\n"
 		"Accept: a\r\nAccept: b\r\n\r\n";
@@ -1183,6 +1213,20 @@ static void test_duplicate_field(void)
 	assert(run(hc, NULL, list, &host, &port, &req, &req_len) ==
 	       GWP_HTTP_FORWARD);
 	assert(memmem(req, req_len, "\r\nAccept: a, b\r\n", 16));
+	gwp_http_conn_free(hc);
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, other, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	assert(req_len == strlen(other_want) &&
+	       !memcmp(req, other_want, req_len));
+	gwp_http_conn_free(hc);
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, tunnel, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_CONNECT);
 	gwp_http_conn_free(hc);
 	PRTEST_OK();
 }

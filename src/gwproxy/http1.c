@@ -98,16 +98,17 @@ static inline int is_alpha(int c)
 
 /**
  * Check if the given HTTP header field key is one of the standard
- * headers that are allowed to appear multiple times in a message and
- * should be merged into a single comma-separated header value
- * according to the HTTP specification.
+ * list-based headers whose repeated lines are merged into a single
+ * comma-separated value according to the HTTP specification. The
+ * framing and connection-management fields the proxy reads have to be
+ * here: it must see all of a repeated one at once.
  *
  * @param key The header field name to check (case-insensitive).
  * @param n   The length of the header field name.
- * @return    true if the header is allowed to be provided multiple
- *            times and should be merged; false otherwise.
+ * @return    true if repeated lines of this field are merged; false
+ *            otherwise.
  */
-static bool is_field_allowed_to_be_duplicate(const char *key, size_t n)
+static bool is_field_merged_list(const char *key, size_t n)
 {
 #define LH(s)	{ s, sizeof(s) - 1 }
 	static const struct {
@@ -170,6 +171,57 @@ static bool is_field_allowed_to_be_duplicate(const char *key, size_t n)
 	return false;
 }
 
+/**
+ * Check if the given HTTP header field key may appear only once in a
+ * message: Host and Content-Length, because two of them are how a
+ * request gets routed or delimited one way here and another way
+ * further on; Proxy-Authorization, because it must be clear whose
+ * credentials were checked; and the other fields defined to hold one
+ * value, for which a second line is either a mistake or an attempt to
+ * have two recipients read different ones.
+ *
+ * @param key The header field name to check (case-insensitive).
+ * @param n   The length of the header field name.
+ * @return    true if a second line of this field refuses the message.
+ */
+static bool is_field_singular(const char *key, size_t n)
+{
+#define LH(s)	{ s, sizeof(s) - 1 }
+	static const struct {
+		const char	*name;
+		size_t		len;
+	} singular_headers[] = {
+		LH("Authorization"),
+		LH("Content-Length"),
+		LH("Content-Location"),
+		LH("Content-Range"),
+		LH("Content-Type"),
+		LH("Cookie"),
+		LH("Date"),
+		LH("Expect"),
+		LH("From"),
+		LH("Host"),
+		LH("If-Modified-Since"),
+		LH("If-Range"),
+		LH("If-Unmodified-Since"),
+		LH("Max-Forwards"),
+		LH("Origin"),
+		LH("Proxy-Authorization"),
+		LH("Referer"),
+		LH("User-Agent"),
+	};
+#undef LH
+	size_t i;
+
+	for (i = 0; i < sizeof(singular_headers) /
+			 sizeof(singular_headers[0]); i++) {
+		if (n == singular_headers[i].len &&
+		    !strncasecmp(key, singular_headers[i].name, n))
+			return true;
+	}
+
+	return false;
+}
 
 static int add_field(struct gwnet_http_hdr_fields *ff, uint32_t koff,
 		     uint32_t klen, uint32_t voff, uint32_t vlen);
@@ -1009,10 +1061,13 @@ static int mbuf_reserve(struct gwnet_http_hdr_fields *ff, size_t n)
 
 /*
  * Store the field whose name and value are at @koff/@voff in the header
- * (ff->base). A repeated list field has its value appended to the one stored,
- * after ", "; such a joined value is the only thing the store copies. Returns
- * 0, -EEXIST if the name is already present and may appear only once (the
- * stored value is left alone), or -ENOMEM.
+ * (ff->base). A repeated list field known to is_field_merged_list() has its
+ * value appended to the one stored, after ", "; such a joined value is the
+ * only thing the store copies. Any other repeated field keeps its own line, in
+ * order: its syntax is not known here, so a comma could change what it says,
+ * and nothing reads it but the recipient. Returns 0, -EEXIST if the name is
+ * already present and may appear only once (the stored value is left alone),
+ * or -ENOMEM.
  */
 static int add_field(struct gwnet_http_hdr_fields *ff, uint32_t koff,
 		     uint32_t klen, uint32_t voff, uint32_t vlen)
@@ -1022,7 +1077,14 @@ static int add_field(struct gwnet_http_hdr_fields *ff, uint32_t koff,
 	ssize_t idx = find_hdr_field_idx(ff, k, klen);
 	size_t need, cur;
 
-	if (idx < 0) {
+	/*
+	 * A field that may appear only once is not stored a second time: the
+	 * message is refused, so there is no point in touching the value.
+	 */
+	if (idx >= 0 && is_field_singular(k, klen))
+		return -EEXIST;
+
+	if (idx < 0 || !is_field_merged_list(k, klen)) {
 		if (ff->nr == ff->cap) {
 			size_t cap = ff->cap ? ff->cap * 2 : 16;
 
@@ -1041,13 +1103,6 @@ static int add_field(struct gwnet_http_hdr_fields *ff, uint32_t koff,
 		f->merged = false;
 		return 0;
 	}
-
-	/*
-	 * A field that may appear only once is not stored a second time: the
-	 * message is refused, so there is no point in touching the value.
-	 */
-	if (!is_field_allowed_to_be_duplicate(k, klen))
-		return -EEXIST;
 
 	f = &ff->ff[idx];
 	if (!vlen)
@@ -1943,8 +1998,8 @@ static void test_res_hdr_invalid_duplicate_fields(void)
 {
 	static const char buf[] =
 		"HTTP/1.1 200 OK\r\n"
-		"Server: gwhttpd\r\n"
-		"Server: gwhttpd2\r\n"
+		"Content-Length: 1\r\n"
+		"Content-Length: 2\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
 	struct gwnet_http_hdr_pctx ctx;
@@ -1959,6 +2014,49 @@ static void test_res_hdr_invalid_duplicate_fields(void)
 	assert(r == -EEXIST);
 	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
 	gwnet_http_res_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+/*
+ * Any other repeated field keeps its lines, in order, and a lookup finds the
+ * first; a list field in the table is still merged.
+ */
+static void test_req_hdr_duplicate_fields_kept(void)
+{
+	static const char buf[] =
+		"GET / HTTP/1.1\r\n"
+		"X-Forwarded-For: 1.1.1.1\r\n"
+		"Accept: a\r\n"
+		"x-forwarded-for: 2.2.2.2\r\n"
+		"Accept: b\r\n"
+		"X-Empty:\r\n"
+		"X-Forwarded-For: 3.3.3.3\r\n"
+		"X-Empty:\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	size_t vlen;
+	const char *v;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(hdr.fields.nr == 6);
+	ASSERT_HDRF(&hdr.fields, 0, "X-Forwarded-For", "1.1.1.1");
+	ASSERT_HDRF(&hdr.fields, 1, "Accept", "a, b");
+	ASSERT_HDRF(&hdr.fields, 2, "x-forwarded-for", "2.2.2.2");
+	ASSERT_HDRF(&hdr.fields, 3, "X-Empty", "");
+	ASSERT_HDRF(&hdr.fields, 4, "X-Forwarded-For", "3.3.3.3");
+	ASSERT_HDRF(&hdr.fields, 5, "X-Empty", "");
+	v = gwnet_http_hdr_fields_get(&hdr.fields, "X-FORWARDED-FOR", &vlen);
+	assert(v && vlen == 7 && !memcmp(v, "1.1.1.1", 7));
+	gwnet_http_req_hdr_free(&hdr);
 	gwnet_http_hdr_pctx_free(&ctx);
 	PRTEST_OK();
 }
@@ -2921,6 +3019,7 @@ void gwnet_http_run_tests(void)
 		test_req_hdr_field_value_bytes();
 		test_req_hdr_invalid_duplicate_fields();
 		test_res_hdr_invalid_duplicate_fields();
+		test_req_hdr_duplicate_fields_kept();
 		test_req_hdr_invalid_space_before_colon();
 		test_res_hdr_invalid_space_before_colon();
 		test_req_hdr_invalid_lone_cr();

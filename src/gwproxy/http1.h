@@ -53,11 +53,11 @@ enum {
 /*
  * One stored field: where its name and value are, as offsets into the header
  * the parser was given (struct gwnet_http_hdr_fields::base), so a field costs
- * no copy. The one exception is the value of a list field that was repeated:
- * its parts are joined with ", " in the store's own buffer (@merged set, @voff
- * then counts from gwnet_http_hdr_fields::mbuf). Neither name nor value is
- * NUL-terminated; use gwnet_http_hdr_field_key() and gwnet_http_hdr_field_val()
- * with the lengths.
+ * no copy. The one exception is the value of a known list field that was
+ * repeated: its parts are joined with ", " in the store's own buffer (@merged
+ * set, @voff then counts from gwnet_http_hdr_fields::mbuf). Neither name nor
+ * value is NUL-terminated; use gwnet_http_hdr_field_key() and
+ * gwnet_http_hdr_field_val() with the lengths.
  */
 struct gwnet_http_hdr_field {
 	uint32_t	koff;
@@ -380,7 +380,9 @@ void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff);
  * @param k    Null-terminated string containing the header key.
  * @param vlen Receives the length of the value.
  * @return     Pointer to the header value (not NUL-terminated), or NULL
- *             if not found.
+ *             if not found. Of a repeated field that is not merged (see
+ *             add_field()), this is the first line's value: a caller
+ *             that must see all of a field needs it merged or singular.
  */
 const char *gwnet_http_hdr_fields_get(const struct gwnet_http_hdr_fields *ff,
 				      const char *k, size_t *vlen);

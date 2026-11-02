@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Which request fields the proxy lets through, and what stays refused. A field
-# value may hold obs-text (bytes 0x80-0xff), passed on unchanged. None of that
-# may open the way to request smuggling: a framing field the proxy cannot read
-# exactly as a number or as "chunked" is refused, whatever bytes surround it,
-# and so is a byte that some peer could take for a line end or for part of a
-# field name. Whatever is accepted is compared byte for byte with what reaches
-# the origin, which sees that one request and nothing behind it.
+# value may hold obs-text (bytes 0x80-0xff), passed on unchanged, and a field
+# not defined to appear once may be repeated. None of that may open the way to
+# request smuggling: a framing field the proxy cannot read exactly as a number
+# or as "chunked" is refused, whatever bytes surround it, and so is a byte that
+# some peer could take for a line end or for part of a field name. Whatever is
+# accepted is compared byte for byte with what reaches the origin, which sees
+# that one request and nothing behind it.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -236,6 +237,80 @@ for v in (b'Basic \xc3\xa9', b'\xff', b'Basic dXNlcjpwYXNz\xa0',
           b'Basic \xa0dXNlcjpwYXNz'):
     no('credentials %r' % v, req([b'Proxy-Authorization: ' + v]),
        'HTTP/1.1 407 ', aport)
+
+# A repeated field that is neither singular nor a known list keeps its lines:
+# same spelling, same order, the fields around it where they were.
+for name in (b'X-Forwarded-For', b'Forwarded', b'Content-Language', b'X-A',
+             b'Set-Cookie', b'Via-Extension'):
+    lines = [name + b': 1', b'X-Other: y', name.lower() + b': 2',
+             name + b': \xc3\xa9, 3']
+    ok('repeated %r' % name, req(lines), out(lines))
+    connect_ok('CONNECT repeated %r' % name, lines)
+
+# That changes nothing about where the request ends.
+ok('repeated, Content-Length body',
+   req([b'X-A: 1', b'Content-Length: 4', b'X-A: 2'], b'body' + evil, b'POST'),
+   out([b'X-A: 1', b'Content-Length: 4', b'X-A: 2'], b'body', b'POST'))
+ok('repeated, chunked body',
+   req([b'X-A: 1', b'Transfer-Encoding: chunked', b'X-A: 2'],
+       b'0\r\n\r\n' + evil, b'POST'),
+   out([b'X-A: 1', b'Transfer-Encoding: chunked', b'X-A: 2'], b'0\r\n\r\n',
+       b'POST'))
+ok('no body, something behind the header',
+   req([b'X-A: 1', b'X-A: 2'], evil), out([b'X-A: 1', b'X-A: 2']))
+
+# Hop-by-hop and Connection-listed fields go, every line of them.
+ok('repeated hop-by-hop',
+   req([b'Keep-Alive: 1', b'X-A: 1', b'keep-alive: 2', b'Proxy-Connection: a',
+        b'Proxy-Connection: b']), out([b'X-A: 1']))
+ok('repeated, named by Connection',
+   req([b'X-Drop: 1', b'Connection: x-drop', b'x-drop: 2', b'X-A: 1',
+        b'X-DROP: 3']), out([b'X-A: 1']))
+ok('Transfer-Encoding with an empty line',
+   req([b'Transfer-Encoding:', b'Transfer-Encoding: chunked'],
+       b'0\r\n\r\n', b'POST'),
+   out([b'Transfer-Encoding: chunked'], b'0\r\n\r\n', b'POST'))
+
+# Two of a field that delimits or routes the request: never, whatever they say.
+CL = b'Content-Length'
+for a, b in ((b'4', b'4'), (b'4', b'0'), (b'0', b'4'), (b'', b'4'), (b'4', b'')):
+    for n2 in (CL, CL.lower(), CL.upper()):
+        no('two Content-Length %r %r' % (a, b),
+           req([CL + b': ' + a, n2 + b': ' + b], b'body' + evil, b'POST'), BAD)
+no('Content-Length apart', req([CL + b': 4', b'X-A: 1', b'X-A: 2', CL + b': 4'],
+                               b'body', b'POST'), BAD)
+TE = b'Transfer-Encoding'
+for a, b in ((b'chunked', b'chunked'), (b'chunked', b'identity'),
+             (b'identity', b'chunked'), (b'gzip', b'chunked'),
+             (b'', b'')):
+    no('two Transfer-Encoding %r %r' % (a, b),
+       req([TE + b': ' + a, TE.lower() + b': ' + b], b'0\r\n\r\n' + evil,
+           b'POST'), BAD)
+no('both framing fields',
+   req([TE + b': chunked', CL + b': 4', b'X-A: 1', b'X-A: 2'], b'body', b'POST'),
+   BAD)
+no('Connection lines adding up to a framing field',
+   req([b'Connection: x', b'Connection: Content-Length', CL + b': 4'],
+       b'body', b'POST'), BAD)
+no('two Host', req([b'Host: a', b'hOST: b']), BAD)
+
+# The rest of the fields defined to appear once stay refused as well, and on a
+# CONNECT too.
+for n in (b'Authorization', CL, b'Content-Location', b'Content-Range',
+          b'Content-Type', b'Cookie', b'Date', b'Expect', b'From', b'Host',
+          b'If-Modified-Since', b'If-Range', b'If-Unmodified-Since',
+          b'Max-Forwards', b'Origin', b'Proxy-Authorization', b'Referer',
+          b'User-Agent'):
+    no('two %r' % n, req([n + b': 1', n.lower() + b': 1']), BAD)
+    no('CONNECT two %r' % n,
+       b'CONNECT %s HTTP/1.1\r\n%s: 1\r\n%s: 1\r\n\r\n' %
+       (auth, n, n.lower()), BAD)
+
+# Which credentials count is never up for interpretation.
+good = b'Proxy-Authorization: Basic dXNlcjpwYXNz'
+no('credentials twice', req([good, good]), BAD, aport)
+no('good credentials after bad',
+   req([b'Proxy-Authorization: Basic eDp5', good]), BAD, aport)
 
 sys.exit(1 if errors else 0)
 EOF
