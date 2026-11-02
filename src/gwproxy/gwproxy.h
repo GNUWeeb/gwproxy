@@ -697,6 +697,13 @@ struct iou {
 	 * once per episode rather than on every retry.
 	 */
 	bool			submit_stalled;
+
+	/*
+	 * SQEs that found the SQ full while submitting failed, oldest first,
+	 * waiting for room (see get_sqe_nofail()).
+	 */
+	struct gwp_held_sqe	*held_first;
+	struct gwp_held_sqe	*held_last;
 };
 #endif
 

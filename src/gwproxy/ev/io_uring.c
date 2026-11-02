@@ -137,8 +137,38 @@ static int io_uring_submit_eintr(struct io_uring *ring, size_t nr_attemps)
 	return r;
 }
 
-/* How long get_sqe_nofail() keeps retrying a failing submit, in ms. */
+/* An SQE held back by get_sqe_nofail(), until the SQ has room for it. */
+struct gwp_held_sqe {
+	struct gwp_held_sqe	*next;
+	struct io_uring_sqe	sqe;
+};
+
+/* How long hold_sqe() waits for the memory to hold an SQE in, in ms. */
 #define GWP_SQE_RETRY_MS 1000
+
+static struct io_uring_sqe *hold_sqe(struct gwp_wrk *w)
+{
+	struct iou *iou = w->iou;
+	struct gwp_held_sqe *h;
+	unsigned int waited = 0;
+
+	while (!(h = calloc(1, sizeof(*h)))) {
+		if (waited++ >= GWP_SQE_RETRY_MS) {
+			pr_err(&w->ctx->lh,
+			       "Worker %u: no memory to hold an io_uring sqe in",
+			       w->idx);
+			abort();
+		}
+		usleep(1000);
+	}
+
+	if (iou->held_first)
+		iou->held_last->next = h;
+	else
+		iou->held_first = h;
+	iou->held_last = h;
+	return &h->sqe;
+}
 
 /*
  * Return a free SQE, submitting the queued ones to make room when the SQ is
@@ -147,44 +177,77 @@ static int io_uring_submit_eintr(struct io_uring *ring, size_t nr_attemps)
  *
  * A submit can fail for want of kernel memory (-EAGAIN, -ENOMEM), or, on
  * older kernels, while completions sit in the CQ overflow list (-EBUSY).
- * Those pass, so wait for them to: flush what overflowed into the CQ ring,
- * which handle_events() keeps clear of the completions it has handled
- * already, sleep a millisecond and submit again. Only an error that keeps
- * coming for GWP_SQE_RETRY_MS, or one that is not transient at all (a bad
- * ring fd, say), still aborts: the loop cannot go on without SQEs.
+ * Those pass, but maybe not soon, and on those kernels not before
+ * handle_events() has got on with the completions behind this one. So do not
+ * wait here: hand out an SQE of our own, to be copied to the SQ once there is
+ * room (submit_held_sqes()), and let the worker go back to fish_events(), which
+ * rides the failure out. While any is held the next ones are too, as requests
+ * have to reach the kernel in the order they were made: a timeout is removed
+ * before its successor is armed, say. They are bounded by what is in flight,
+ * as nothing new starts without a submit.
+ *
+ * An error that is not transient at all (a bad ring fd, say) still aborts: the
+ * loop cannot go on without SQEs.
  */
 static struct io_uring_sqe *get_sqe_nofail(struct gwp_wrk *w)
 {
 	struct io_uring *ring = &w->iou->ring;
 	struct io_uring_sqe *sqe;
-	unsigned int waited = 0;
-	int r = 0;
+	int r;
+
+	if (unlikely(w->iou->held_first))
+		return hold_sqe(w);
 
 	while (!(sqe = io_uring_get_sqe(ring))) {
 		r = io_uring_submit(ring);
 		if (likely(r > 0) || r == -EINTR)
 			continue;
 
-		if (r < 0 && r != -EAGAIN && r != -ENOMEM && r != -EBUSY)
-			break;
-		if (waited >= GWP_SQE_RETRY_MS)
-			break;
+		if (r < 0 && r != -EAGAIN && r != -ENOMEM && r != -EBUSY) {
+			pr_err(&w->ctx->lh,
+			       "Failed to get io_uring sqe for worker %u: %s",
+			       w->idx, strerror(-r));
+			abort();
+		}
 
-		if (!waited)
-			pr_warn(&w->ctx->lh,
-				"Worker %u: io_uring_submit(): %s; retrying",
-				w->idx, strerror(r < 0 ? -r : EAGAIN));
-		io_uring_get_events(ring);
-		usleep(1000);
-		waited++;
+		pr_warn(&w->ctx->lh,
+			"Worker %u: io_uring_submit(): %s; holding back what does not fit",
+			w->idx, strerror(r < 0 ? -r : EAGAIN));
+		return hold_sqe(w);
 	}
 
-	if (likely(sqe))
-		return sqe;
+	return sqe;
+}
 
-	pr_err(&w->ctx->lh, "Failed to get io_uring sqe for worker %u: %s",
-	       w->idx, strerror(r < 0 ? -r : EAGAIN));
-	abort();
+/*
+ * Move the held SQEs to the SQ, submitting whenever it fills. Returns 0 once
+ * none is left, or the error of a submit that failed, with the rest still held.
+ */
+static int submit_held_sqes(struct gwp_wrk *w)
+{
+	struct io_uring *ring = &w->iou->ring;
+	struct iou *iou = w->iou;
+	struct gwp_held_sqe *h;
+	struct io_uring_sqe *sqe;
+	int r;
+
+	while ((h = iou->held_first)) {
+		sqe = io_uring_get_sqe(ring);
+		if (sqe) {
+			*sqe = h->sqe;
+			iou->held_first = h->next;
+			free(h);
+			continue;
+		}
+
+		r = io_uring_submit(ring);
+		if (r == -EINTR)
+			continue;
+		if (r <= 0)
+			return r ? r : -EAGAIN;
+	}
+
+	return 0;
 }
 
 /*
@@ -251,8 +314,14 @@ out_err:
 __cold
 void gwp_ctx_free_thread_io_uring(struct gwp_wrk *w)
 {
+	struct gwp_held_sqe *h;
+
 	cancel_all_requests(w);
 	io_uring_queue_exit(&w->iou->ring);
+	while ((h = w->iou->held_first)) {
+		w->iou->held_first = h->next;
+		free(h);
+	}
 	__sys_close(w->iou->stop_efd);
 	pr_dbg(&w->ctx->lh, "Worker %u io_uring queue exited", w->idx);
 	free(w->iou);
@@ -2967,9 +3036,9 @@ static int handle_events(struct gwp_wrk *w)
 	/*
 	 * Release each CQE before handling it, so the slots of the ones
 	 * handled so far are free while a handler runs. A handler that
-	 * finds the SQ full submits from inside this loop, and on kernels
-	 * that refuse submission while completions are waiting in the CQ
-	 * overflow list, get_sqe_nofail() needs that room to flush them.
+	 * finds the SQ full submits from inside this loop, and kernels that
+	 * refuse submission while completions are waiting in the CQ overflow
+	 * list need that room to flush them.
 	 */
 	io_uring_for_each_cqe(&iou->ring, head, cqe) {
 		struct io_uring_cqe c = *cqe;
@@ -2992,14 +3061,16 @@ static int handle_events(struct gwp_wrk *w)
  * which would stop the proxy and drop every live connection: flush what
  * overflowed into the CQ ring for handle_events() to reap, back off for a
  * millisecond and go round again. The queued SQEs stay in the SQ ring and go
- * out with the next submit.
+ * out with the next submit, as do those that did not fit and are held.
  */
 static int fish_events(struct gwp_wrk *w)
 {
 	struct iou *iou = w->iou;
 	int r;
 
-	r = io_uring_submit_and_wait(&iou->ring, 1);
+	r = unlikely(iou->held_first) ? submit_held_sqes(w) : 0;
+	if (likely(!r))
+		r = io_uring_submit_and_wait(&iou->ring, 1);
 	w->now = gwp_now_sec();
 	if (likely(r >= 0)) {
 		iou->submit_stalled = false;
@@ -3029,6 +3100,10 @@ static int fish_events(struct gwp_wrk *w)
 static void submit_unconsumed_sqes(struct gwp_wrk *w)
 {
 	int r;
+
+	r = submit_held_sqes(w);
+	if (unlikely(r < 0))
+		log_submit_err(w, r);
 
 	if (io_uring_sq_ready(&w->iou->ring) > 0) {
 		r = io_uring_submit_eintr(&w->iou->ring, 8);
