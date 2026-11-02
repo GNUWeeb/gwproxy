@@ -252,6 +252,13 @@ enum {
 	EV_BIT_IOU_ATTEMPT_TIMER	= EV_BIT_ATTEMPT_TIMER,
 	EV_BIT_IOU_ATTEMPT_TIMER_DEL	= (49ull << 48ull),
 	EV_BIT_IOU_ATTEMPT_CANCEL	= (50ull << 48ull),
+
+	/*
+	 * The client watch during the connect and the upstream handshake, and
+	 * its removal, see prep_client_watch().
+	 */
+	EV_BIT_IOU_CLIENT_WATCH		= (25ull << 48ull),
+	EV_BIT_IOU_CLIENT_WATCH_DEL	= (27ull << 48ull),
 #endif
 };
 

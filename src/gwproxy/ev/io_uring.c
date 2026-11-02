@@ -334,6 +334,7 @@ static uint8_t *nr_ops_of(struct gwp_conn_pair *gcp, uint64_t ev_bit)
 	case EV_BIT_IOU_TLS_DETECT:
 	case EV_BIT_IOU_TLS_HS_RECV:
 	case EV_BIT_IOU_TLS_HS_SEND:
+	case EV_BIT_IOU_CLIENT_WATCH:
 		return &gcp->nr_ops_client;
 	case EV_BIT_IOU_TARGET_RECV:
 	case EV_BIT_IOU_TARGET_SEND:
@@ -651,6 +652,35 @@ static void prep_timer_del_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	pr_dbg(&w->ctx->lh,
 		"Prepared del timer for target fd=%d, ref_cnt=%d",
 		gcp->target.fd, gcp->ref_cnt);
+}
+
+/*
+ * Nothing else is armed on the client's socket during the connect and the
+ * upstream handshake, as what it sends stays in the socket until the target is
+ * up. Without a look at it, a client that resets would not be noticed before
+ * those end, which with --connect-timeout=0 may be never. Multishot, as a reset
+ * can follow a FIN, and a poll armed anew would fire on that FIN at once.
+ * Teardown cancels the poll along with the client's other I/O.
+ */
+static void prep_client_watch(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	io_uring_prep_poll_multishot(s, gcp->client.fd, POLLRDHUP);
+	io_uring_sqe_set_data(s, gcp);
+	s->user_data |= EV_BIT_IOU_CLIENT_WATCH;
+	get_gcp_io(gcp, s);
+}
+
+/* The target is up. A removal that finds the poll gone gets -ENOENT, ignored. */
+static void prep_client_watch_del(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	io_uring_prep_poll_remove(s, EV_BIT_IOU_CLIENT_WATCH | PTR_TO_U64(gcp));
+	io_uring_sqe_set_data(s, gcp);
+	s->user_data |= EV_BIT_IOU_CLIENT_WATCH_DEL;
+	get_gcp(gcp);
 }
 
 static void prep_attempt_timer_del(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -1287,9 +1317,17 @@ static int do_prep_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * Armed only after an attempt is actually running: on the failure path
 	 * the pair is torn down immediately and a live timeout would pin it
 	 * until it expired.
+	 *
+	 * The SOCKS5 and HTTP handshakes ran under the protocol timer, which
+	 * has served its purpose by now. Left armed, it would cut the connect
+	 * short and, the tunnel being up, stand in for the idle check until it
+	 * expired. Queued first: a removal matches by user_data alone.
 	 */
+	if (gcp->nr_timers_armed)
+		prep_timer_del_target(w, gcp);
 	if (ctx->cfg.connect_timeout > 0)
 		prep_timer_target(w, gcp, ctx->cfg.connect_timeout);
+	prep_client_watch(w, gcp);
 
 	return 0;
 }
@@ -1566,6 +1604,7 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	int r;
 
 	prep_timer_del_target(w, gcp);
+	prep_client_watch_del(w, gcp);
 	arm_idle_timer(w, gcp);
 	gcp->up_tx = false;
 	gcp->is_target_alive = true;
@@ -1744,6 +1783,7 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	prep_timer_del_target(w, gcp);
+	prep_client_watch_del(w, gcp);
 	arm_idle_timer(w, gcp);
 	gcp->is_target_alive = true;
 	pr_info(&w->ctx->lh,
@@ -1872,6 +1912,20 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 
 	adopt_winning_attempt(w, gcp, slot);
 	return finish_target_connect(w, gcp, res);
+}
+
+/*
+ * The client's socket during the connect or the upstream handshake. A reset ends
+ * the pair. A FIN alone may come from a client that only finished sending and
+ * waits for the answer, so like the epoll loop this holds on to it.
+ */
+static int handle_ev_client_watch(struct gwp_conn_pair *gcp, int res)
+{
+	/* Removed or refused, or the target came up as the poll fired. */
+	if (res <= 0 || gcp->is_target_alive)
+		return 0;
+
+	return (res & (POLLERR | POLLHUP)) ? -ECONNRESET : 0;
 }
 
 static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -2711,6 +2765,15 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	uint8_t *nr_ops;
 	int r;
 
+	/* The client watch stays armed, and keeps its reference. */
+	if (ev_bit == EV_BIT_IOU_CLIENT_WATCH && (cqe->flags & IORING_CQE_F_MORE)) {
+		gcp = udata;
+		if (!(gcp->flags & GWP_CONN_FLAG_IS_CANCEL) &&
+		    handle_ev_client_watch(gcp, cqe->res))
+			shutdown_gcp(w, gcp);
+		return 0;
+	}
+
 	/* I/O on one of the pair's sockets: it is no longer in flight. */
 	nr_ops = nr_ops_of(udata, ev_bit);
 	if (nr_ops) {
@@ -2830,6 +2893,14 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	case EV_BIT_IOU_UPSTREAM_S5:
 		pr_dbg(&ctx->lh, "Handling upstream SOCKS5 handshake event: %d", cqe->res);
 		r = handle_ev_upstream_s5(w, udata, cqe);
+		break;
+	case EV_BIT_IOU_CLIENT_WATCH:
+		pr_dbg(&ctx->lh, "Handling client watch event: %d", cqe->res);
+		r = handle_ev_client_watch(udata, cqe->res);
+		break;
+	case EV_BIT_IOU_CLIENT_WATCH_DEL:
+		pr_dbg(&ctx->lh, "Handling client watch removal: %d", cqe->res);
+		r = 0;
 		break;
 	case EV_BIT_IOU_TARGET_CANCEL:
 		gcp = udata;
