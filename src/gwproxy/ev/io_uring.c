@@ -1031,6 +1031,11 @@ static int tls_forward_resume(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * still being sent. Neither is a recv armed then, since the records the
  * engine may hold would not complete one. handle_ev_client_send() picks the
  * pump up again once the reply is out.
+ *
+ * The control connection of a UDP association has no more protocol to run: what
+ * the client sends over it is thrown away, as with a plaintext client. It still
+ * goes through the engine, which is how a close_notify or a bad record ends the
+ * association.
  */
 static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -1044,6 +1049,10 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		t->prot_resume = true;
 		return 0;
 	}
+
+again:
+	if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE)
+		c->len = from = 0;
 
 	while (c->len < c->cap) {
 		got = 0;
@@ -1062,6 +1071,9 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		}
 		c->len += (uint32_t)got;
 	}
+
+	if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE && c->len)
+		goto again;
 
 	if (c->len == from && c->len < c->cap) {
 		/* The client gave up on its handshake, as with a FIN. */
@@ -2558,7 +2570,13 @@ static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 	arm_idle_timer(w, gcp);
 
-	r = prep_recv_client_prot(w, gcp);
+#ifdef CONFIG_HTTPS
+	/* What the client sent behind its request may be in the engine by now. */
+	if (client_is_tls(gcp))
+		r = tls_prot_pump(w, gcp);
+	else
+#endif
+		r = prep_recv_client_prot(w, gcp);
 	if (r)
 		return r;
 	prep_udp_recv(w, gcp);
@@ -2636,6 +2654,14 @@ static int handle_ev_client_prot(struct gwp_wrk *w,
 	else if (!r)
 		return prep_recv_client_prot(w, gcp);
 
+#ifdef CONFIG_HTTPS
+	if (client_is_tls(gcp)) {
+		/* Decrypt the ciphertext chunk, then run the protocol on it. */
+		gwp_ssl_rx_commit(gcp->client.tls, (size_t)r);
+		return tls_prot_pump(w, gcp);
+	}
+#endif
+
 	/*
 	 * Once the UDP association is up the TCP control connection is idle and
 	 * only watched for close (r < 0, handled above). Discard any stray
@@ -2645,14 +2671,6 @@ static int handle_ev_client_prot(struct gwp_wrk *w,
 		gcp->client.len = 0;
 		return prep_recv_client_prot(w, gcp);
 	}
-
-#ifdef CONFIG_HTTPS
-	if (client_is_tls(gcp)) {
-		/* Decrypt the ciphertext chunk, then run the protocol on it. */
-		gwp_ssl_rx_commit(gcp->client.tls, (size_t)r);
-		return tls_prot_pump(w, gcp);
-	}
-#endif
 
 	gcp->client.len += (uint32_t)r;
 	return process_client_prot(w, gcp);

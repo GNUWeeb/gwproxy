@@ -7,7 +7,10 @@
 #
 # A tunnel through an upstream proxy is one such thing: a close_notify, or tunnel
 # bytes, sent along with the request must not wait for the client to send more.
-# Exercised on every event loop.
+#
+# The control connection of a SOCKS5 UDP association is another: a close_notify
+# or a bad record there has to end the association like a FIN, and not only when
+# the engine gets to see it. Exercised on every event loop.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -39,6 +42,14 @@ for loop in epoll io_uring; do
 			kill "$GWP_PID" 2>/dev/null
 		done
 	done
+
+	pp="$(pick_port)"
+	gwp_start "127.0.0.1:$pp" --as-socks5=1 --event-loop="$loop" \
+		--tls-cert="$WORK/cert.pem" --tls-key="$WORK/key.pem" \
+		--nr-workers=1
+	out="$(timeout 120 python3 "$HELPER" udp "$pp" 2>&1)"
+	[ "$out" = ok ] || fail "[$loop, udp] $out"
+	kill "$GWP_PID" 2>/dev/null
 done
 
 pass

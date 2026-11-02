@@ -6,6 +6,7 @@
 #
 # Usage: tls_held_records.py upstream <http|socks5> <close_notify|exact_fill>
 #                            <proxy_port> <upstream_port>
+#        tls_held_records.py udp <proxy_port>
 #
 #   close_notify
 #       Send a CONNECT and a close_notify in one go, and keep the connection
@@ -15,11 +16,17 @@
 #       Send a CONNECT that exactly fills a proxy's --client-buf-size=256 with
 #       more records behind it, and nothing after that. Those must come through
 #       the tunnel, which echoes them.
+#   udp
+#       Set up a SOCKS5 UDP association, and see what ends it. What the client
+#       sends over the control connection is thrown away, but a close_notify or
+#       a bad record is an end to it, as is a close_notify right behind the
+#       request. The proxy must then hang up and stop relaying.
 #
 # Prints "ok" on success, or what went wrong.
 
 import socket
 import ssl
+import struct
 import sys
 import threading
 
@@ -117,6 +124,21 @@ class Client:
         except ssl.SSLWantReadError:
             pass
 
+    def read_n(self, n):
+        """Read a reply of @n bytes: a record's worth, with nothing behind it."""
+        got = b""
+        while len(got) < n:
+            try:
+                got += self.o.read(n - len(got))
+            except ssl.SSLWantReadError:
+                d = self.s.recv(65536)
+                if not d:
+                    break
+                self.inb.write(d)
+            except ssl.SSLZeroReturnError:
+                break
+        return got
+
     def read_until(self, want):
         """Plaintext up to and including @want, or all there was by then."""
         got = b""
@@ -170,10 +192,121 @@ def upstream(kind, mode, port, up_port):
     return "ok"
 
 
+class Association:
+    def __init__(self, port, close_notify_behind=False):
+        self.c = Client(port)
+        self.c.o.write(b"\x05\x01\x00")
+        self.c.flush()
+        if self.c.read_n(2) != b"\x05\x00":
+            raise RuntimeError("SOCKS5 greeting refused")
+        self.c.o.write(b"\x05\x03\x00\x01\0\0\0\0\0\0")
+        if close_notify_behind:
+            self.c.close_notify()
+        self.c.flush()
+        rep = self.c.read_n(10)
+        if len(rep) != 10 or rep[1] != 0 or rep[3] != 1:
+            raise RuntimeError("UDP ASSOCIATE got %r" % rep)
+        self.relay = (socket.inet_ntoa(rep[4:8]),
+                      struct.unpack(">H", rep[8:10])[0])
+
+    def relayed(self, echo, tries=10):
+        """Whether a datagram gets through to @echo and back."""
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.settimeout(1)
+        pkt = (b"\0\0\0\x01" + socket.inet_aton("127.0.0.1")
+               + struct.pack(">H", echo.getsockname()[1]) + b"ping")
+        try:
+            for _ in range(tries):
+                u.sendto(pkt, self.relay)
+                try:
+                    echo.settimeout(1)
+                    d, a = echo.recvfrom(2048)
+                    echo.sendto(d, a)
+                    u.recv(2048)
+                    return True
+                except socket.timeout:
+                    pass
+            return False
+        finally:
+            u.close()
+
+    def wait_hangup(self):
+        """Whether the proxy hangs up the control connection."""
+        self.c.s.settimeout(TIMEOUT)
+        try:
+            while self.c.s.recv(4096):
+                pass
+        except socket.timeout:
+            return False
+        except ConnectionError:
+            pass
+        return True
+
+
+def udp_ends(port, echo):
+    def close_notify(a):
+        a.c.close_notify()
+        a.c.flush()
+
+    def bad_record(a):
+        a.c.s.sendall(b"\x17\x03\x03\x00\x40" + b"\xaa" * 64)
+
+    def fin(a):
+        a.c.s.shutdown(socket.SHUT_WR)
+
+    for f in (close_notify, bad_record, fin):
+        a = Association(port)
+        if not a.relayed(echo):
+            return "%s: nothing relayed to begin with" % f.__name__
+        f(a)
+        if not a.wait_hangup():
+            return "%s: the proxy did not hang up" % f.__name__
+        if a.relayed(echo, tries=2):
+            return "%s: still relaying after the hangup" % f.__name__
+        a.c.s.close()
+    return None
+
+
+def udp_stray(port, echo):
+    a = Association(port)
+    a.c.o.write(b"stray")
+    a.c.o.write(b"x" * 20000)
+    a.c.flush()
+    # Whether that went through the engine yet or not, this comes behind it.
+    if not a.relayed(echo):
+        return "stray bytes: association ended"
+    a.c.close_notify()
+    a.c.flush()
+    if not a.wait_hangup():
+        return "close_notify behind stray bytes: the proxy did not hang up"
+    a.c.s.close()
+    return None
+
+
+def udp_close_notify_behind(port):
+    a = Association(port, close_notify_behind=True)
+    if not a.wait_hangup():
+        return "close_notify behind the request: the proxy did not hang up"
+    a.c.s.close()
+    return None
+
+
+def udp(port):
+    echo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    echo.bind(("127.0.0.1", 0))
+    try:
+        return (udp_ends(port, echo) or udp_stray(port, echo)
+                or udp_close_notify_behind(port) or "ok")
+    finally:
+        echo.close()
+
+
 def main():
     if sys.argv[1] == "upstream":
         print(upstream(sys.argv[2], sys.argv[3], int(sys.argv[4]),
                        int(sys.argv[5])))
+    else:
+        print(udp(int(sys.argv[2])))
 
 
 if __name__ == "__main__":

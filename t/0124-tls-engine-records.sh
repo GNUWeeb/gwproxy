@@ -48,6 +48,9 @@ for loop in epoll io_uring; do
 		start_scenario "$loop" "$scenario" --target-buf-size=4096
 	done
 	start_scenario "$loop" strand --client-buf-size=256 --target-buf-size=256
+	# The epoll loop does not get its answers out on an association yet.
+	[ "$loop" = io_uring ] &&
+		start_scenario "$loop" udp --as-socks5=1 --target-buf-size=4096
 done
 
 failed=""
