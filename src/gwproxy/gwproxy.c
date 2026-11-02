@@ -3049,9 +3049,12 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 	r = init_conn(&gcp->target, cfg->target_buf_size);
 	if (r)
 		goto out_free_gcp;
-	r = init_conn(&gcp->client, cfg->client_buf_size);
+	/* Room behind the buffer for an HTTP request's rewrite to grow into. */
+	r = init_conn(&gcp->client,
+		      (uint32_t)cfg->client_buf_size + GWP_HTTP_REWRITE_SLACK);
 	if (r)
 		goto out_free_target_conn;
+	gcp->client.cap = (uint32_t)cfg->client_buf_size;
 
 	gcp->timer_fd = -1;
 	gcp->udp_fd = -1;
@@ -4860,16 +4863,20 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	/*
 	 * A forwarding request is rewritten in place, ready to go to the
-	 * origin; any other header is dropped once it has been dealt with.
+	 * origin, in the buffer and the room kept behind it, which from then
+	 * on is simply part of the buffer; any other header is dropped once
+	 * it has been dealt with.
 	 */
 	len = gcp->client.len;
 	r = gwp_http_conn_process(gcp->http_conn, ctx->auth, gcp->client.buf,
-				  &len, gcp->client.cap, &host, &port,
-				  &hdr_len);
-	if (r == GWP_HTTP_FORWARD)
+				  &len, gcp->client.cap + GWP_HTTP_REWRITE_SLACK,
+				  &host, &port, &hdr_len);
+	if (r == GWP_HTTP_FORWARD) {
 		gcp->client.len = (uint32_t)len;
-	else
+		gcp->client.cap += GWP_HTTP_REWRITE_SLACK;
+	} else {
 		gwp_conn_buf_advance(&gcp->client, hdr_len);
+	}
 
 	switch (r) {
 	case GWP_HTTP_NEED_MORE:

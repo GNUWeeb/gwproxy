@@ -960,6 +960,51 @@ static void test_errors(void)
 	PRTEST_OK();
 }
 
+/*
+ * The rewrite never adds more than GWP_HTTP_REWRITE_SLACK, so with that much
+ * room behind a full buffer no request is refused for what was read behind
+ * its header. The worst case takes it all.
+ */
+static void test_forward_rewrite_slack(void)
+{
+	static char buf[8192], rest[1024];
+	size_t n = (size_t)sprintf(buf, "GET http://e?q HTTP/1.1\n");
+	struct gwp_http_conn *hc;
+	size_t len, hl;
+	char *host, *port;
+	int i;
+
+	for (i = 0; i < 128; i++)
+		n += (size_t)sprintf(buf + n, "x%d:1\n", i);
+	buf[n++] = '\n';
+
+	/* What was read behind the header. */
+	memset(rest, 'r', sizeof(rest));
+	memcpy(buf + n, rest, sizeof(rest));
+	n += sizeof(rest);
+
+	/* One byte too few leaves the buffer as it was, so try that first. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	len = n;
+	assert(gwp_http_conn_process(hc, NULL, buf, &len,
+				     n + GWP_HTTP_REWRITE_SLACK - 1, &host,
+				     &port, &hl) == GWP_HTTP_TOO_LARGE);
+	gwp_http_conn_free(hc);
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	len = n;
+	assert(gwp_http_conn_process(hc, NULL, buf, &len,
+				     n + GWP_HTTP_REWRITE_SLACK, &host, &port,
+				     &hl) == GWP_HTTP_FORWARD);
+	assert(len == n + GWP_HTTP_REWRITE_SLACK);
+	assert(hl + sizeof(rest) == len);
+	assert(!memcmp(buf + hl, rest, sizeof(rest)));
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void cpu_limit_hit(int sig)
 {
 	static const char msg[] = "Too much CPU for a run of interim responses\n";
@@ -1525,6 +1570,7 @@ int main(void)
 		test_duplicate_field();
 		test_header_limits();
 	test_forward_in_place();
+		test_forward_rewrite_slack();
 		test_auth();
 		test_upstream_reply();
 		test_upstream_connect();

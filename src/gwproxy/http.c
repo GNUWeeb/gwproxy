@@ -85,6 +85,10 @@ struct gwp_http_conn {
 	size_t				res_scan;
 };
 
+_Static_assert(GWP_HTTP_REWRITE_SLACK == 1 + 1 + 1 + 20 +
+	       2 * GWNET_HTTP_HDR_MAX_FIELDS,
+	       "GWP_HTTP_REWRITE_SLACK must match the rewrite");
+
 /* Longest request header accepted, in bytes. */
 #define REQ_HDR_MAX		16384
 

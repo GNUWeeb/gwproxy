@@ -997,9 +997,8 @@ once rewritten (bare LF line ends become CRLF).
 .PP
 A request header may take at most 16384 bytes, and must fit in
 .B \-\-client\-buf\-size
-as a whole (a forwarding request also once rewritten); a larger one, or one
-with more than 128 field lines, is answered with "431 Request Header Fields
-Too Large".
+as a whole; a larger one, or one with more than 128 field lines, is answered
+with "431 Request Header Fields Too Large".
 .PP
 With
 .B \-\-auth\-file
