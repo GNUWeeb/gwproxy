@@ -49,7 +49,9 @@ ports="$(awk '{print $2}' "$qlog" | sort -u | wc -l)"
 # never get there with one lookup at a time.
 awk '$1 >= 1024 { big = 1 } END { exit !big }' "$qlog" \
 	|| fail "transaction IDs look sequential: $(cat "$qlog")"
-[ "$(awk '{print $1}' "$qlog" | sort -u | wc -l)" -eq "$n" ] \
+# 8 draws from 65536 repeat one by chance once in about 2300 runs, so a single
+# repeat is no finding. Two have odds of about 1 in 16 million.
+[ "$(awk '{print $1}' "$qlog" | sort -u | wc -l)" -ge $((n - 1)) ] \
 	|| fail "transaction IDs repeat: $(cat "$qlog")"
 
 pass
