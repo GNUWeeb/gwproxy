@@ -1278,8 +1278,11 @@ which requires
 .SH SIGNALS
 .TP
 .BR SIGINT ", " SIGTERM
-Begin a graceful shutdown: stop accepting new connections, let workers drain,
-and exit.
+Stop at once: workers leave their event loops and every connection is closed,
+with whatever is still in its buffers or on its way discarded. There is no
+drain. A client in the middle of a transfer sees a normal end of stream after
+only part of the data, so a protocol that does not mark its own end cannot tell
+this from a complete transfer.
 .TP
 .B SIGPIPE
 Ignored, so a peer closing a connection cannot terminate the process.
