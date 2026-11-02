@@ -266,6 +266,7 @@ struct gwp_acl {
  * in practice that stack, not the depth limit, is the recursion bound.
  */
 static pthread_once_t g_regex_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_regex_mctx_lock = PTHREAD_MUTEX_INITIALIZER;
 static pcre2_match_context *g_regex_mctx;
 
 /*
@@ -284,14 +285,34 @@ static void regex_md_free(void *md)
 	pcre2_match_data_free(md);
 }
 
-static void regex_ctx_init(void)
+static void regex_md_key_init(void)
 {
-	g_regex_mctx = pcre2_match_context_create(NULL);
-	if (g_regex_mctx) {
-		pcre2_set_match_limit(g_regex_mctx, 100000);
-		pcre2_set_depth_limit(g_regex_mctx, 1000);
-	}
 	g_regex_md_key_ok = !pthread_key_create(&g_regex_md_key, regex_md_free);
+}
+
+/*
+ * The shared match context, created on first use; NULL on OOM. A failure is
+ * not remembered: the next rule file gets another try, or one failed
+ * allocation would refuse every regexp rule until restart.
+ *
+ * regex_match() reads the pointer without the lock. It only runs on a pattern
+ * compiled after this returned non-NULL, in a ruleset published after that.
+ */
+static bool regex_mctx_ready(void)
+{
+	bool ok;
+
+	pthread_mutex_lock(&g_regex_mctx_lock);
+	if (!g_regex_mctx) {
+		g_regex_mctx = pcre2_match_context_create(NULL);
+		if (g_regex_mctx) {
+			pcre2_set_match_limit(g_regex_mctx, 100000);
+			pcre2_set_depth_limit(g_regex_mctx, 1000);
+		}
+	}
+	ok = g_regex_mctx != NULL;
+	pthread_mutex_unlock(&g_regex_mctx_lock);
+	return ok;
 }
 
 /*
@@ -306,8 +327,8 @@ static pcre2_code *regex_compile(const char *pat, bool caseless)
 	pcre2_code *re;
 	int errcode;
 
-	pthread_once(&g_regex_once, regex_ctx_init);
-	if (!g_regex_mctx)
+	pthread_once(&g_regex_once, regex_md_key_init);
+	if (!regex_mctx_ready())
 		return NULL;
 	re = pcre2_compile((PCRE2_SPTR)pat, PCRE2_ZERO_TERMINATED, opts,
 			   &errcode, &erroff, NULL);
