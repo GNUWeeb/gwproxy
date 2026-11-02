@@ -2425,6 +2425,14 @@ static int handle_ev_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (res != -ETIME)
 		return 0;
 
+	/*
+	 * It expired just as the pair started going away. The cancels are
+	 * queued already, so none would reach a connect started now, and its
+	 * reference would hold the pair for as long as the SYN is retried.
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
+		return 0;
+
 	if (gcp->next_cand >= gcp->nr_cand)
 		return 0;
 
