@@ -63,6 +63,10 @@ LIBGWDNS_TEST_OBJECTS = $(LIBGWDNS_TEST_CC_SOURCES:%.c=%.c.o)
 # is built straight from its source, like http1's self-test below.
 LIBGWDNS_CACHE_TEST_TARGET = $(GWPROXY_DIR)/tests/dns_cache.t
 
+# White-box test of how the DNS threads are shared between clients: it #includes
+# dns.c, to replace getaddrinfo() with one the test can hold up at will.
+LIBGWDNS_SCHED_TEST_TARGET = $(GWPROXY_DIR)/tests/dns_sched.t
+
 # http1's unit tests are embedded in http1.c, gated by the
 # GWNET_HTTP1_TESTS/GWNET_HTTP1_RUN_TESTS macros, so the self-test binary
 # is built straight from http1.c rather than a separate test source.
@@ -92,6 +96,7 @@ LIBGWIPLIM_TEST_OBJECTS = $(LIBGWIPLIM_TEST_CC_SOURCES:%.c=%.c.o)
 GWTMR_TEST_TARGET = $(GWPROXY_DIR)/tests/tmr.t
 
 ALL_TEST_TARGETS = $(LIBGWDNS_TEST_TARGET) $(LIBGWDNS_CACHE_TEST_TARGET) \
+		   $(LIBGWDNS_SCHED_TEST_TARGET) \
 		   $(LIBGWPSOCKS5_TEST_TARGET) \
 		   $(LIBGWHTTP1_TEST_TARGET) $(LIBGWHTTP_TEST_TARGET) \
 		   $(LIBGWACL_TEST_TARGET) $(LIBGWLOG_TEST_TARGET) \
@@ -215,6 +220,9 @@ $(GWPROXY_DIR)/tests/dns_parser.t: $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/dn
 
 $(LIBGWDNS_CACHE_TEST_TARGET): $(GWPROXY_DIR)/tests/dns_cache.c $(GWPROXY_DIR)/dns_cache.c $(GWPROXY_DIR)/dns_cache.h $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+
+$(LIBGWDNS_SCHED_TEST_TARGET): $(GWPROXY_DIR)/tests/dns_sched.c $(GWPROXY_DIR)/dns.c $(GWPROXY_DIR)/dns.h $(GWPROXY_DIR)/dns_cache.c $(GWPROXY_DIR)/dns_cache.h $(EXTRA_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(GWPROXY_DIR)/dns_cache.c $(LIBS)
 
 $(LIBGWHTTP1_TEST_TARGET): $(GWPROXY_DIR)/http1.c $(GWPROXY_DIR)/http1.h $(GWPROXY_DIR)/common.h $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) -DGWNET_HTTP1_TESTS -DGWNET_HTTP1_RUN_TESTS $(LDFLAGS) -o $@ $< $(LIBS)

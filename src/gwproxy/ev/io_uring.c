@@ -838,6 +838,20 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	gcp->flags |= GWP_CONN_FLAG_IS_CANCEL;
+
+	/*
+	 * Give up on a lookup still pending, or its reference would hold the
+	 * pair and its descriptors until the name resolves, past the protocol
+	 * timeout, and the resolver would run it for nobody. The resolver frees
+	 * the entry from here on. The caller holds a reference of its own, so
+	 * this put does not free the pair. On this loop @gde is always the live
+	 * member of the union: --raw-dns is refused here.
+	 */
+	if (gcp->gde) {
+		gwp_dns_entry_cancel(gcp->gde);
+		gcp->gde = NULL;
+		put_gcp(w, gcp);
+	}
 }
 
 static int prep_recv_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -2295,7 +2309,7 @@ static int handle_ev_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 /*
  * A lookup is pending; its result arrives on the worker's DNS completion
  * queue (handle_ev_dns_cq()). Hold a reference for it, as an SQE would, so
- * the pair outlives the wait.
+ * the pair outlives the wait. shutdown_gcp() drops it if the pair ends first.
  */
 static int prep_domain_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -2574,7 +2588,8 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 /*
  * Finished getaddrinfo() lookups of this worker; one wakeup may carry many.
  * Each pair holds a reference for its lookup (prep_domain_resolution()),
- * dropped here once the result is used, exactly as an SQE's completion does.
+ * dropped here once the result is used, exactly as an SQE's completion does,
+ * or by shutdown_gcp() when it cancels the lookup.
  */
 static int handle_ev_dns_cq(struct gwp_wrk *w)
 {
@@ -2586,7 +2601,7 @@ static int handle_ev_dns_cq(struct gwp_wrk *w)
 		struct gwp_conn_pair *gcp = e->udata;
 
 		next = e->next;
-		/* Defensive: the pair holds a reference until we put it. */
+		/* The pair gave up on it and may be gone: leave @gcp alone. */
 		if (unlikely(gwp_dns_entry_cancelled(e))) {
 			gwp_dns_entry_free(e);
 			continue;

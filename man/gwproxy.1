@@ -707,6 +707,28 @@ means unlimited. Default:
 .BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
 Number of DNS resolver worker threads, at most 1024. Default:
 .BR 4 .
+More are started on demand when lookups are waiting, up to 64 threads or
+.IR nr ,
+whichever is larger.
+.IP
+Each thread runs one blocking lookup, so the threads are shared out by client
+address, grouped as for
+.BR \-\-max\-conns\-per\-ip :
+an IPv4 address, or the /64 of an IPv6 one. A client runs at most half of the
+threads at a time, clients with lookups waiting take turns, and a quarter of the
+threads are kept for clients with no lookup running, who also go first, so slow
+names from a client or two do not hold up the others. It takes about 18 client
+addresses, at 64 threads, to use up the kept threads as well. A new client then
+waits for the next thread to come free, up to as long as one lookup takes, and
+longer with many more addresses than threads, as each of them gets a turn first.
+At most 1024 lookups wait per client and 16384 in all; a request over either
+limit is answered at once like a name
+that does not resolve (SOCKS5 REP 0x04, HTTP 502). A request for a name already
+being looked up shares that lookup, and no limit applies to it. When all clients
+arrive from one address, as behind another proxy, they count as one client; a
+larger
+.I nr
+raises its share.
 .TP
 .BR \-j ", " \-\-dns\-server=\fIaddr:port\fR
 Upstream DNS server for the built\-in raw resolver (see

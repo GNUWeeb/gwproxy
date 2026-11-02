@@ -34,10 +34,23 @@
  *
  * Each thread runs one blocking getaddrinfo() at a time and hands its result
  * to the waiting client as soon as it returns, so how many lookups are in
- * flight follows the load, and a slow name delays nobody but its own client.
+ * flight follows the load.
+ *
+ * A lookup can block for many seconds, and a client picks the names, so the
+ * threads are shared out by client address (see struct dns_client), or one
+ * client asking for names that never answer would stop name lookups for all
+ * the others: a client runs at most half of the threads at a time, and the
+ * clients with lookups waiting take turns. A quarter of the threads are kept
+ * for clients with nothing running, who also go first, so it takes more than
+ * a couple of client addresses to make a newcomer wait: lookups that started
+ * together end together, and without this the threads two clients hold would
+ * only come free to go straight back to them. Waiting is bounded too; a request
+ * over a limit fails at once, as a name that does not resolve would.
  */
-#define GWP_DNS_MAX_THREADS	64u
-#define GWP_DNS_IDLE_SECS	10
+#define GWP_DNS_MAX_THREADS		64u
+#define GWP_DNS_IDLE_SECS		10
+#define GWP_DNS_MAX_QUEUED_PER_CLIENT	1024u
+#define GWP_DNS_MAX_QUEUED		16384u
 
 enum {
 	GWP_DNS_THR_FREE	= 0,	/* slot unused */
@@ -74,15 +87,63 @@ struct gwp_dns_cq {
  */
 struct dns_lookup {
 	struct dns_lookup	*hnext;		/* in-flight table chain */
-	struct dns_lookup	*qnext;		/* run queue */
+	struct dns_lookup	*qnext;		/* @client's queue */
+	struct dns_lookup	*qprev;
+	struct dns_client	*client;	/* who it is counted against */
 	struct gwp_dns_entry	*waiters;	/* linked through ->next */
+	bool			running;	/* left the queue for a thread */
 	uint64_t		hash;
 	size_t			len;		/* of @key, without the NUL */
 	char			key[];		/* folded name */
 };
 
-/* Buckets of the in-flight table; a power of two. */
+/*
+ * The clients waiting for a thread, in the order they are served, one lookup
+ * per client each time:
+ *
+ * DNS_TURN_FIRST: those with a lookup queued and none running. They go first
+ * and may take any thread.
+ *
+ * DNS_TURN_ANY: those a thread may take a lookup from (dns_client.nr_ready),
+ * as long as it is not one of the threads kept for the list above.
+ *
+ * A client is on a list for exactly as long as that holds, so it can be on both,
+ * and whatever is at the head of a list can be served.
+ */
+enum {
+	DNS_TURN_FIRST,
+	DNS_TURN_ANY,
+	DNS_NR_TURNS,
+};
+
+struct dns_turns {
+	struct dns_client	*head;
+	struct dns_client	*tail;
+};
+
+/*
+ * A client address with lookups queued or running; it goes away with the last
+ * of them. @nr_ready is how many of its queued lookups a thread may take right
+ * now, within its share of the threads.
+ */
+struct dns_client {
+	struct dns_client	*hnext;		/* client table chain */
+	struct dns_client	*tnext[DNS_NR_TURNS];
+	struct dns_client	*tprev[DNS_NR_TURNS];
+	struct dns_lookup	*qhead;		/* queued lookups, oldest first */
+	struct dns_lookup	*qtail;
+	uint32_t		nr_queued;
+	uint32_t		nr_running;
+	uint32_t		nr_ready;
+	bool			on_turn[DNS_NR_TURNS];
+	bool			first;		/* queued, and none running */
+	uint64_t		hash;
+	struct gwp_iplim_key	key;
+};
+
+/* Buckets of the in-flight and client tables; powers of two. */
 #define GWP_DNS_INFLIGHT_BUCKETS	4096u
+#define GWP_DNS_CLIENT_BUCKETS		1024u
 
 struct gwp_dns_ctx {
 	bool			should_stop;
@@ -90,10 +151,15 @@ struct gwp_dns_ctx {
 	pthread_cond_t		cond;
 	uint32_t		nr_sleeping;
 	uint32_t		nr_entries;	/* queued lookups */
+	uint32_t		nr_ready;	/* sum of the clients' @nr_ready */
+	uint32_t		nr_first;	/* clients with @first set */
+	uint32_t		nr_running;	/* lookups with a thread */
 	uint32_t		nr_threads;	/* RUNNING slots */
 	uint32_t		max_threads;
-	struct dns_lookup	*head;
-	struct dns_lookup	*tail;
+	uint32_t		max_client_running;
+	uint32_t		max_any_running; /* with DNS_TURN_ANY's lookups */
+	struct dns_turns	turns[DNS_NR_TURNS];
+	struct dns_client	**clients;	/* GWP_DNS_CLIENT_BUCKETS */
 	struct dns_lookup	**inflight;	/* GWP_DNS_INFLIGHT_BUCKETS */
 	uint64_t		hash_key[2];
 	struct gwp_dns_thr	*threads;	/* @max_threads slots */
@@ -415,6 +481,17 @@ static void cond_scan_cache(struct gwp_dns_ctx *ctx)
 	ctx->last_scan = time(NULL);
 }
 
+/*
+ * Must be called with ctx->lock held. How many queued lookups a thread could
+ * take right now. A client's first lookup can take any thread; the others only
+ * those not kept for such a lookup.
+ */
+static uint32_t nr_takeable(const struct gwp_dns_ctx *ctx)
+{
+	return ctx->nr_running < ctx->max_any_running ? ctx->nr_ready
+						      : ctx->nr_first;
+}
+
 static bool is_persistent(const struct gwp_dns_thr *t)
 {
 	return t->id < t->ctx->cfg.nr_workers;
@@ -445,7 +522,7 @@ static bool wait_for_queue_entry(struct gwp_dns_thr *t)
 	}
 	ctx->nr_sleeping--;
 
-	if (r == ETIMEDOUT && !persistent && !ctx->head)
+	if (r == ETIMEDOUT && !persistent && !nr_takeable(ctx))
 		return false;
 
 	cond_scan_cache(ctx);
@@ -469,6 +546,144 @@ static void unhash_lookup(struct gwp_dns_ctx *ctx, struct dns_lookup *l)
 	while (*pp != l)
 		pp = &(*pp)->hnext;
 	*pp = l->hnext;
+}
+
+static void turn_add(struct gwp_dns_ctx *ctx, struct dns_client *c, int t)
+{
+	struct dns_turns *turns = &ctx->turns[t];
+
+	if (c->on_turn[t])
+		return;
+
+	c->on_turn[t] = true;
+	c->tnext[t] = NULL;
+	c->tprev[t] = turns->tail;
+	if (turns->tail)
+		turns->tail->tnext[t] = c;
+	else
+		turns->head = c;
+	turns->tail = c;
+}
+
+static void turn_del(struct gwp_dns_ctx *ctx, struct dns_client *c, int t)
+{
+	struct dns_turns *turns = &ctx->turns[t];
+
+	if (!c->on_turn[t])
+		return;
+
+	c->on_turn[t] = false;
+	if (c->tprev[t])
+		c->tprev[t]->tnext[t] = c->tnext[t];
+	else
+		turns->head = c->tnext[t];
+	if (c->tnext[t])
+		c->tnext[t]->tprev[t] = c->tprev[t];
+	else
+		turns->tail = c->tprev[t];
+}
+
+/*
+ * Must be called with ctx->lock held, after any change to @c's counts: bring
+ * its share of ctx->nr_ready and ctx->nr_first and its place on the lists up to
+ * date, and free it if nothing is left of it. @c must not be used afterwards
+ * unless it is known to still have a lookup.
+ */
+static void settle_client(struct gwp_dns_ctx *ctx, struct dns_client *c)
+{
+	uint32_t room = 0, ready;
+	struct dns_client **pp;
+	bool first;
+
+	if (c->nr_running < ctx->max_client_running)
+		room = ctx->max_client_running - c->nr_running;
+	ready = c->nr_queued < room ? c->nr_queued : room;
+	ctx->nr_ready += ready;
+	ctx->nr_ready -= c->nr_ready;
+	c->nr_ready = ready;
+
+	first = c->nr_queued && !c->nr_running;
+	ctx->nr_first += first;
+	ctx->nr_first -= c->first;
+	c->first = first;
+
+	if (ready)
+		turn_add(ctx, c, DNS_TURN_ANY);
+	else
+		turn_del(ctx, c, DNS_TURN_ANY);
+	if (first)
+		turn_add(ctx, c, DNS_TURN_FIRST);
+	else
+		turn_del(ctx, c, DNS_TURN_FIRST);
+
+	if (c->nr_queued || c->nr_running)
+		return;
+
+	pp = &ctx->clients[c->hash & (GWP_DNS_CLIENT_BUCKETS - 1)];
+	while (*pp != c)
+		pp = &(*pp)->hnext;
+	*pp = c->hnext;
+	free(c);
+}
+
+static void enqueue_lookup(struct dns_client *c, struct dns_lookup *l)
+{
+	l->client = c;
+	l->qnext = NULL;
+	l->qprev = c->qtail;
+	if (c->qtail)
+		c->qtail->qnext = l;
+	else
+		c->qhead = l;
+	c->qtail = l;
+	c->nr_queued++;
+}
+
+static void dequeue_lookup(struct dns_lookup *l)
+{
+	struct dns_client *c = l->client;
+
+	if (l->qprev)
+		l->qprev->qnext = l->qnext;
+	else
+		c->qhead = l->qnext;
+	if (l->qnext)
+		l->qnext->qprev = l->qprev;
+	else
+		c->qtail = l->qprev;
+	c->nr_queued--;
+}
+
+/*
+ * Must be called with ctx->lock held and nr_takeable() non-zero. Take the next
+ * lookup, from the client whose turn it is.
+ */
+static struct dns_lookup *take_lookup(struct gwp_dns_ctx *ctx)
+{
+	int t = ctx->nr_first ? DNS_TURN_FIRST : DNS_TURN_ANY;
+	struct dns_client *c = ctx->turns[t].head;
+	struct dns_lookup *l;
+
+	/* To the end of the list by settle_client(), if it has more to take. */
+	turn_del(ctx, c, t);
+
+	l = c->qhead;
+	dequeue_lookup(l);
+	l->running = true;
+	c->nr_running++;
+	ctx->nr_running++;
+	ctx->nr_entries--;
+	settle_client(ctx, c);
+	return l;
+}
+
+/* Must be called with ctx->lock held. A thread is done with @l. */
+static void finish_lookup(struct gwp_dns_ctx *ctx, struct dns_lookup *l)
+{
+	unhash_lookup(ctx, l);
+	l->client->nr_running--;
+	ctx->nr_running--;
+	settle_client(ctx, l->client);
 }
 
 /*
@@ -501,26 +716,19 @@ static void deliver_waiters(struct gwp_dns_entry *e, int res,
 static void process_queue_entry(struct gwp_dns_ctx *ctx)
 {
 	struct gwp_sockaddr addrs[GWP_DNS_MAX_ADDRS];
-	struct dns_lookup *l = ctx->head;
+	struct dns_lookup *l = take_lookup(ctx);
 	struct gwp_dns_entry *w;
 	struct addrinfo *res;
 	bool transient;
 	uint8_t nr;
 	int r;
 
-	ctx->head = l->qnext;
-	if (!ctx->head) {
-		ctx->tail = NULL;
-		assert(ctx->nr_entries == 1);
-	}
-	ctx->nr_entries--;
-
 	if (all_cancelled(l->waiters)) {
 		/*
 		 * Nobody cares about the result any more. Drop the lookup
 		 * without resolving the name.
 		 */
-		unhash_lookup(ctx, l);
+		finish_lookup(ctx, l);
 		pthread_mutex_unlock(&ctx->lock);
 		free_all_entries(l->waiters);
 		free(l);
@@ -554,7 +762,7 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 
 	pthread_mutex_lock(&ctx->lock);
 	w = l->waiters;
-	unhash_lookup(ctx, l);
+	finish_lookup(ctx, l);
 	pthread_mutex_unlock(&ctx->lock);
 	deliver_waiters(w, r, addrs, nr);
 	free(l);
@@ -569,7 +777,7 @@ static void *gwp_dns_thread_entry(void *arg)
 
 	pthread_mutex_lock(&ctx->lock);
 	while (!ctx->should_stop) {
-		if (ctx->head) {
+		if (nr_takeable(ctx)) {
 			process_queue_entry(ctx);
 			continue;
 		}
@@ -621,7 +829,7 @@ static void maybe_grow(struct gwp_dns_ctx *ctx)
 {
 	uint32_t i;
 
-	if (ctx->nr_entries <= ctx->nr_sleeping)
+	if (nr_takeable(ctx) <= ctx->nr_sleeping)
 		return;
 	if (ctx->nr_threads >= ctx->max_threads)
 		return;
@@ -674,6 +882,8 @@ static int init_threads(struct gwp_dns_ctx *ctx)
 	ctx->max_threads = ctx->cfg.nr_workers;
 	if (ctx->max_threads < GWP_DNS_MAX_THREADS)
 		ctx->max_threads = GWP_DNS_MAX_THREADS;
+	ctx->max_client_running = ctx->max_threads / 2;
+	ctx->max_any_running = ctx->max_threads - ctx->max_threads / 4;
 
 	ctx->threads = calloc(ctx->max_threads, sizeof(*ctx->threads));
 	if (!ctx->threads)
@@ -877,14 +1087,23 @@ static int init_cqs(struct gwp_dns_ctx *ctx)
 
 static void free_all_queued_entries(struct gwp_dns_ctx *ctx)
 {
+	struct dns_client *c, *cnext;
 	struct dns_lookup *l, *next;
+	uint32_t i;
 
-	for (l = ctx->head; l; l = next) {
-		next = l->qnext;
-		free_all_entries(l->waiters);
-		free(l);
+	for (i = 0; i < GWP_DNS_CLIENT_BUCKETS; i++) {
+		for (c = ctx->clients[i]; c; c = cnext) {
+			cnext = c->hnext;
+			for (l = c->qhead; l; l = next) {
+				next = l->qnext;
+				free_all_entries(l->waiters);
+				free(l);
+			}
+			free(c);
+		}
 	}
-	ctx->head = ctx->tail = NULL;
+	free(ctx->clients);
+	ctx->clients = NULL;
 	free(ctx->inflight);
 	ctx->inflight = NULL;
 }
@@ -935,7 +1154,8 @@ int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg)
 		goto out_destroy_cond;
 
 	ctx->inflight = calloc(GWP_DNS_INFLIGHT_BUCKETS, sizeof(*ctx->inflight));
-	if (!ctx->inflight) {
+	ctx->clients = calloc(GWP_DNS_CLIENT_BUCKETS, sizeof(*ctx->clients));
+	if (!ctx->inflight || !ctx->clients) {
 		r = -ENOMEM;
 		goto out_free_cqs;
 	}
@@ -949,8 +1169,6 @@ int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg)
 	ctx->nr_entries = 0;
 	ctx->nr_threads = 0;
 	ctx->threads = NULL;
-	ctx->head = NULL;
-	ctx->tail = NULL;
 	ctx->should_stop = false;
 	ctx->last_scan = time(NULL);
 	r = init_threads(ctx);
@@ -962,6 +1180,7 @@ int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg)
 out_free_cache:
 	free_cache(ctx->cache);
 out_free_cqs:
+	free(ctx->clients);
 	free(ctx->inflight);
 	free_cqs(ctx);
 out_destroy_cond:
@@ -1041,12 +1260,70 @@ struct gwp_dns_entry *gwp_dns_queue_result(struct gwp_dns_ctx *ctx,
 	return e;
 }
 
+/* Must be called with ctx->lock held. */
+static struct dns_client *get_client(struct gwp_dns_ctx *ctx,
+				     const struct gwp_iplim_key *key)
+{
+	uint64_t hash = gwp_siphash13(ctx->hash_key, key->b, sizeof(key->b));
+	struct dns_client **bucket, *c;
+
+	bucket = &ctx->clients[hash & (GWP_DNS_CLIENT_BUCKETS - 1)];
+	for (c = *bucket; c; c = c->hnext) {
+		if (c->hash == hash && !memcmp(&c->key, key, sizeof(*key)))
+			return c;
+	}
+
+	c = calloc(1, sizeof(*c));
+	if (!c)
+		return NULL;
+
+	c->hash = hash;
+	c->key = *key;
+	c->hnext = *bucket;
+	*bucket = c;
+	return c;
+}
+
+/*
+ * Must be called with ctx->lock held. @e joins @l, the lookup of the name it
+ * asks for. Client @c gets no new lookup out of this, so it is not limited.
+ *
+ * A lookup is queued with the client that asked first, but it now serves @c
+ * as well, and that client may have a long queue: left there, one client could
+ * make another wait behind its own slow names just by asking for a name the
+ * other is about to want. So a lookup still queued moves to the client with
+ * less outstanding, which also means that a client with a long queue cannot
+ * take one away from a client with a short one.
+ */
+static void attach_lookup(struct gwp_dns_ctx *ctx, struct dns_lookup *l,
+			  struct gwp_dns_entry *e, struct dns_client *c)
+{
+	struct dns_client *owner = l->client;
+
+	e->next = l->waiters;
+	l->waiters = e;
+
+	if (l->running || owner == c ||
+	    c->nr_queued + c->nr_running >= owner->nr_queued + owner->nr_running) {
+		settle_client(ctx, c);
+		return;
+	}
+
+	dequeue_lookup(l);
+	enqueue_lookup(c, l);
+	settle_client(ctx, owner);
+	settle_client(ctx, c);
+}
+
 struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx, uint32_t cq_idx,
 				    const char *name, uint16_t port,
+				    const struct gwp_iplim_key *client,
 				    void *udata)
 {
+	static const struct gwp_iplim_key no_client;
 	struct dns_lookup *l, *nl = NULL;
 	struct gwp_dns_entry *e;
+	struct dns_client *c;
 	char key[256];
 	uint64_t hash;
 	size_t len;
@@ -1069,40 +1346,58 @@ struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx, uint32_t cq_idx,
 	hash = gwp_siphash13(ctx->hash_key, key, len);
 
 	pthread_mutex_lock(&ctx->lock);
+	c = get_client(ctx, client ? client : &no_client);
+	if (!c)
+		goto out_nomem;
+
 	l = find_lookup(ctx, key, len, hash);
 	if (l) {
-		e->next = l->waiters;
-		l->waiters = e;
+		attach_lookup(ctx, l, e, c);
+		goto out_kick;
+	}
+
+	/*
+	 * Not cached as a failure: nothing is known about the name, and the
+	 * next client to ask for it may well get an answer.
+	 */
+	if (c->nr_queued >= GWP_DNS_MAX_QUEUED_PER_CLIENT ||
+	    ctx->nr_entries >= GWP_DNS_MAX_QUEUED) {
+		settle_client(ctx, c);
 		pthread_mutex_unlock(&ctx->lock);
+		e->res = -EHOSTUNREACH;
+		deliver_entry(e);
 		return e;
 	}
 
 	nl = malloc(sizeof(*nl) + len + 1);
 	if (!nl) {
-		pthread_mutex_unlock(&ctx->lock);
-		free(e);
-		return NULL;
+		settle_client(ctx, c);
+		goto out_nomem;
 	}
 
 	memcpy(nl->key, key, len + 1);
 	nl->len = len;
 	nl->hash = hash;
+	nl->running = false;
 	e->next = NULL;
 	nl->waiters = e;
 	nl->hnext = ctx->inflight[hash & (GWP_DNS_INFLIGHT_BUCKETS - 1)];
 	ctx->inflight[hash & (GWP_DNS_INFLIGHT_BUCKETS - 1)] = nl;
 
-	nl->qnext = NULL;
-	if (ctx->tail)
-		ctx->tail->qnext = nl;
-	else
-		ctx->head = nl;
-	ctx->tail = nl;
-
+	enqueue_lookup(c, nl);
 	ctx->nr_entries++;
-	if (ctx->nr_sleeping)
-		pthread_cond_signal(&ctx->cond);
-	maybe_grow(ctx);
+	settle_client(ctx, c);
+out_kick:
+	if (nr_takeable(ctx)) {
+		if (ctx->nr_sleeping)
+			pthread_cond_signal(&ctx->cond);
+		maybe_grow(ctx);
+	}
 	pthread_mutex_unlock(&ctx->lock);
 	return e;
+
+out_nomem:
+	pthread_mutex_unlock(&ctx->lock);
+	free(e);
+	return NULL;
 }
