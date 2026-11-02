@@ -158,6 +158,20 @@ static const struct gwp_cfg default_opts = {
 	.as_transparent		= false
 };
 
+/*
+ * The longest SOCKS5 message a client sends, an RFC 1929 request with a name
+ * and a password of 255 bytes each. A greeting takes up to 257 bytes and a
+ * CONNECT request up to 262.
+ */
+#define GWP_SOCKS5_MIN_CLIENT_BUF	513
+
+/*
+ * target.buf holds the handshake with an upstream proxy. The longest request
+ * is an HTTP CONNECT: twice an authority of up to 261 bytes, Basic credentials
+ * of 684 and the fixed text take 1264 bytes.
+ */
+#define GWP_UPSTREAM_MIN_TARGET_BUF	1280
+
 static int setskopt_int(int fd, int level, int optname, int val);
 static uint32_t cfg_dns_restyp(const struct gwp_cfg *cfg);
 
@@ -648,6 +662,22 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least 256 for SOCKS5 or HTTP.\n" ERR_WRAP);
 			goto einval;
 		}
+	}
+
+	/*
+	 * Each SOCKS5 message has to fit in client.buf as a whole, and the
+	 * proxy has no other way to read the rest of it.
+	 */
+	if (cfg->as_socks5 && cfg->client_buf_size < GWP_SOCKS5_MIN_CLIENT_BUF) {
+		fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be at least %d for SOCKS5.\n" ERR_WRAP,
+			GWP_SOCKS5_MIN_CLIENT_BUF);
+		goto einval;
+	}
+
+	if (cfg->upstream_proxy && cfg->target_buf_size < GWP_UPSTREAM_MIN_TARGET_BUF) {
+		fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least %d with --upstream-proxy.\n" ERR_WRAP,
+			GWP_UPSTREAM_MIN_TARGET_BUF);
+		goto einval;
 	}
 
 	return 0;

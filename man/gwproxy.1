@@ -887,10 +887,15 @@ replaces rather than merges with
 .BR \-T ", " \-\-target\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for target\(->client data. Default:
 .BR 65536 .
+At least 256 for SOCKS5 or HTTP, and at least 1280 with
+.BR \-\-upstream\-proxy ,
+whose handshake goes through this buffer.
 .TP
 .BR \-C ", " \-\-client\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for client\(->target data. Default:
 .BR 65536 .
+At least 256 for HTTP, and at least 513 for SOCKS5, the size of its longest
+request.
 .IP
 Each wakeup reads at most one buffer and writes it out, so the buffer size
 sets the syscalls per byte of a bulk transfer: 64 KiB takes about 40%

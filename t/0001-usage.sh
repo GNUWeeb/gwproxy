@@ -140,6 +140,24 @@ for bad in "$WORK/nodir/log" "$WORK/logdir" "$WORK/loglink"; do
 		fail "--log-file=$bad: exit $rc with no message"
 done
 
+# A buffer that cannot hold the longest message of the protocol would stall a
+# valid client, so it is not accepted. HTTP answers an oversized header itself.
+pp="$(pick_port)"
+expect_reject "SOCKS5 with a 512-byte client buffer" --as-socks5=1 \
+	--nr-workers=1 --bind="127.0.0.1:$pp" --client-buf-size=512
+expect_reject "SOCKS5 and HTTP with a 512-byte client buffer" --as-socks5=1 \
+	--as-http=1 --nr-workers=1 --bind="127.0.0.1:$pp" --client-buf-size=512
+expect_reject "upstream with a 1279-byte target buffer" --as-http=1 \
+	--nr-workers=1 --bind="127.0.0.1:$pp" --target-buf-size=1279 \
+	--upstream-proxy=http://127.0.0.1:1
+expect_reject "forwarding upstream with a 2-byte target buffer" \
+	--target=127.0.0.1:1 --nr-workers=1 --bind="127.0.0.1:$pp" \
+	--target-buf-size=2 --upstream-proxy=socks5://127.0.0.1:1
+rc=0
+timeout --foreground 2 "$GWPROXY" --as-http=1 --nr-workers=1 --bind=127.0.0.1:0 \
+	--client-buf-size=256 --target-buf-size=256 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 124 ] || fail "HTTP with 256-byte buffers was not accepted: exit $rc"
+
 # A malformed --upstream-proxy URL must be rejected at startup. Use URLs that
 # are structurally wrong (unsupported scheme, no scheme at all) rather than one
 # whose host merely fails to resolve: on a host with a wildcard search domain
