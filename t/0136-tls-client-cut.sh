@@ -4,12 +4,12 @@
 # A TLS client's stream that ended in anything but a clean end must not look
 # like one to the target, which may take the EOF for a complete upload: a record
 # that fails to verify, a fatal alert, a TCP reset or half a record have to reach
-# it as a reset, behind all that was properly received. An end the client meant,
-# with a close_notify, is an EOF, and so is a FIN at the end of a record, as too
-# many clients do just that. The proxy stopping in the middle of an upload is no
-# end either, and neither is any of this while the proxy is still connecting to
-# the target, or its giving up on that connect just as it went through. Exercised
-# on every event loop.
+# it as a reset, behind all that was properly received, even if that came in the
+# same segment. An end the client meant, with a close_notify, is an EOF, and so is
+# a FIN at the end of a record, as too many clients do just that. The proxy stopping
+# in the middle of an upload is no end either, and neither is any of this while the
+# proxy is still connecting to the target, or its giving up on that connect just as
+# it went through. Exercised on every event loop.
 
 . "$(dirname "$0")/lib.sh"
 require python3

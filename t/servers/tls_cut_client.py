@@ -191,6 +191,34 @@ def bad_record(c, o):
     return len(PAYLOAD), "reset"
 
 
+def records_then_bad_record(c, o):
+    # All in one send, for the proxy to read at once.
+    for _ in range(3):
+        c.o.write(b"A" * 1000)
+    c.s.sendall(c.outb.read() + b"\x17\x03\x03\x00\x40" + b"\xaa" * 64)
+    return 3000, "reset"
+
+
+def records_then_broken_record(c, o):
+    c.o.write(PAYLOAD)
+    d = bytearray(c.outb.read())
+    d[-1] ^= 1
+    c.s.sendall(bytes(d))
+    return FIRST_RECORD, "reset"
+
+
+def records_then_alert(c, o):
+    for _ in range(3):
+        c.o.write(b"A" * 1000)
+    c.inb.write(b"\x17\x03\x03\x00\x20" + b"\0" * 32)
+    try:
+        c.o.read(16)
+    except ssl.SSLError:
+        pass
+    c.flush()
+    return 3000, "reset"
+
+
 def fatal_alert(c, o):
     c.o.write(PAYLOAD)
     c.flush()
@@ -215,7 +243,9 @@ def tcp_reset(c, o):
 
 
 SCENARIOS = [clean, clean_fin, bare_fin, cut_header, cut_after_header,
-             cut_record, bad_record, fatal_alert, tcp_reset]
+             cut_record, bad_record,
+             records_then_bad_record, records_then_broken_record,
+             records_then_alert, fatal_alert, tcp_reset]
 
 
 def stop_proxy(port, pid):

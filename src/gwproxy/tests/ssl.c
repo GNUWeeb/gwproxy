@@ -363,6 +363,36 @@ static void test_rx_cut(void)
 
 	gwp_ssl_free(srv);
 	gwp_ssl_free(cli);
+
+	/* A record that fails to verify, which goes for all later reads too. */
+	srv = gwp_ssl_server_new(sctx);
+	cli = gwp_ssl_client_new(cctx);
+	assert(srv && cli);
+	do_handshake(cli, srv);
+	assert(gwp_ssl_write(cli, "abc", 3, &got) == GWP_SSL_OK && got == 3);
+	n = gwp_ssl_bio_read(cli, wire, sizeof(wire));
+	assert(n > 0);
+	wire[n - 1] ^= 1;
+	assert(gwp_ssl_bio_write(srv, wire, (size_t)n) == n);
+	assert(gwp_ssl_bio_write(srv, wire, (size_t)n) == n);
+	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_ERROR);
+	assert(!gwp_ssl_rx_more(srv));
+	assert(gwp_ssl_rx_cut(srv));
+	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_ERROR);
+	gwp_ssl_free(srv);
+	gwp_ssl_free(cli);
+
+	/* The socket failing under a stream that looked fine. */
+	srv = gwp_ssl_server_new(sctx);
+	cli = gwp_ssl_client_new(cctx);
+	assert(srv && cli);
+	do_handshake(cli, srv);
+	assert(!gwp_ssl_rx_cut(srv));
+	gwp_ssl_rx_fail(srv);
+	assert(gwp_ssl_rx_cut(srv));
+	gwp_ssl_free(srv);
+	gwp_ssl_free(cli);
+
 	gwp_ssl_ctx_free(sctx);
 	gwp_ssl_ctx_free(cctx);
 	unlink(cert);

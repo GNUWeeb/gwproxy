@@ -1180,6 +1180,11 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  * Decrypt as much of what the TLS engine holds as fits into src->buf, without
  * touching the socket. Returns the number of plaintext bytes produced, or <0
  * on error.
+ *
+ * What was decrypted ahead of a bad record or a fatal alert is as good as any,
+ * and the send that would take it is yet to come. With some of it in src->buf,
+ * the error is an end of the stream to be acted on once that has gone out, which
+ * __forward_progress() does, knowing it from gwp_ssl_rx_cut().
  */
 static ssize_t tls_decrypt(struct gwp_conn *src)
 {
@@ -1202,7 +1207,10 @@ static ssize_t tls_decrypt(struct gwp_conn *src)
 		}
 		if (sr == GWP_SSL_WANT_READ || sr == GWP_SSL_WANT_WRITE)
 			break;
-		return -EIO;
+		if (!src->len)
+			return -EIO;
+		src->rd_eof = true;
+		break;
 	}
 
 	return (ssize_t)got;
@@ -1244,7 +1252,12 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
 	} else if (n == 0) {
 		src->rd_eof = true;
 	} else if (n != -EAGAIN && n != -EINTR) {
-		return n;
+		if (!src->len)
+			return n;
+		/* As in tls_decrypt(), with what that has just decrypted. */
+		gwp_ssl_rx_fail(src->tls);
+		src->rd_eof = true;
+		return got;
 	}
 
 	n = tls_decrypt(src);
