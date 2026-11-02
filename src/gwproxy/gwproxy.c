@@ -28,6 +28,7 @@
 #include <time.h>
 #include <inttypes.h>
 #include <stdatomic.h>
+#include <sched.h>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -4776,7 +4777,8 @@ static int gwp_ctx_run(struct gwp_ctx *ctx)
 	return (int)(intptr_t)gwp_ctx_thread_entry(&ctx->workers[0]);
 }
 
-static struct gwp_ctx *g_ctx = NULL;
+static struct gwp_ctx *_Atomic g_ctx = NULL;
+static atomic_int g_nr_sig_handlers = 0;
 
 /*
  * Runs on whichever thread the signal lands on, possibly in the middle of a
@@ -4787,12 +4789,39 @@ __cold
 static void sig_handler(int sig)
 {
 	int saved_errno = errno;
+	struct gwp_ctx *ctx;
 
-	if (g_ctx)
-		gwp_ctx_stop(g_ctx);
+	atomic_fetch_add(&g_nr_sig_handlers, 1);
+	ctx = atomic_load(&g_ctx);
+	if (ctx)
+		gwp_ctx_stop(ctx);
+	atomic_fetch_sub(&g_nr_sig_handlers, 1);
 
 	errno = saved_errno;
 	(void)sig;
+}
+
+/*
+ * The context is about to go, and main()'s frame with it, but a signal can
+ * still arrive: timeout(1) sends its SIGTERM twice, and exit() may take a while
+ * yet. Have the handler leave it alone, and wait out one running on another
+ * thread. This thread is the last one left once the context is freed, so keep
+ * the signals pending on it from here on: there is nothing left for them to
+ * stop, and one landing in exit() can upset what runs there, such as the
+ * leak check of a sanitizer build, which stops the process with ptrace.
+ */
+__cold
+static void sig_handler_detach_ctx(void)
+{
+	sigset_t set;
+
+	sigemptyset(&set);
+	sigaddset(&set, SIGINT);
+	sigaddset(&set, SIGTERM);
+	pthread_sigmask(SIG_BLOCK, &set, NULL);
+	atomic_store(&g_ctx, NULL);
+	while (atomic_load(&g_nr_sig_handlers))
+		sched_yield();
 }
 
 static void prepare_rlimit(void)
@@ -4830,7 +4859,7 @@ int main(int argc, char *argv[])
 	if (r < 0)
 		goto out;
 
-	g_ctx = &ctx;
+	atomic_store(&g_ctx, &ctx);
 	r |= sigaction(SIGINT, &sa, NULL);
 	r |= sigaction(SIGTERM, &sa, NULL);
 	sa.sa_handler = SIG_IGN;
@@ -4843,6 +4872,7 @@ int main(int argc, char *argv[])
 
 	r = gwp_ctx_run(&ctx);
 out_free:
+	sig_handler_detach_ctx();
 	gwp_ctx_free(&ctx);
 out:
 	return -r;
