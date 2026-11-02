@@ -23,6 +23,26 @@
  * issues the actual send/recv with its own primitive.
  */
 
+/*
+ * The longest reply a client can be owed once the tunnel is up: SOCKS5 with an
+ * IPv6 bound address. An HTTP client's is 19 bytes.
+ */
+#define UPSTREAM_CLIENT_REPLY_MAX	22
+
+/*
+ * While the reply to a CONNECT is awaited, target.cap leaves this much of the
+ * buffer unused. gwp_upstream_splice_reply() puts the client's reply where the
+ * upstream's was, and it can be the longer of the two: with no room held back,
+ * a first read that fills the buffer with the upstream's reply and the
+ * destination's early data would leave it nowhere to go. Plain forwarding owes
+ * no reply, so it holds nothing back.
+ */
+static uint32_t client_reply_room(const struct gwp_conn_pair *gcp)
+{
+	return gcp->prot_type == GWP_PROT_TYPE_NONE ? 0 :
+						      UPSTREAM_CLIENT_REPLY_MAX;
+}
+
 const char *gwp_upstream_dst_str(struct gwp_conn_pair *gcp)
 {
 	static __thread char buf[300];
@@ -42,6 +62,8 @@ int gwp_upstream_splice_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	uint8_t rbuf[512];
 	size_t rlen = 0;
 	int r;
+
+	gcp->target.cap += client_reply_room(gcp);
 
 	/* Build the downstream reply for the client (before any early data). */
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
@@ -102,6 +124,7 @@ static int build_connect(struct gwp_conn_pair *gcp)
 		return r;
 
 	gcp->target.len = (uint32_t)len;
+	gcp->target.cap -= client_reply_room(gcp);
 	gcp->up_tx = true;
 	gcp->conn_state = CONN_STATE_UPSTREAM_S5_CONNECT;
 	return 0;
@@ -293,6 +316,7 @@ static int http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return r;
 
 	gcp->target.len = (uint32_t)len;
+	gcp->target.cap -= client_reply_room(gcp);
 	gcp->up_tx = true;
 	gcp->up_scan = 0;
 	gcp->conn_state = CONN_STATE_UPSTREAM_HTTP_CONNECT;
