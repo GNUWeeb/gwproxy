@@ -20,6 +20,8 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/time.h>
 
 #define PRTEST_OK()					\
 do {							\
@@ -959,8 +961,196 @@ static void test_errors(void)
 }
 
 /*
+ * The rewrite never adds more than GWP_HTTP_REWRITE_SLACK, so with that much
+ * room behind a full buffer no request is refused for what was read behind
+ * its header. The worst case takes it all.
+ */
+static void test_forward_rewrite_slack(void)
+{
+	static char buf[8192], rest[1024];
+	size_t n = (size_t)sprintf(buf, "GET http://e?q HTTP/1.1\n");
+	struct gwp_http_conn *hc;
+	size_t len, hl;
+	char *host, *port;
+	int i;
+
+	for (i = 0; i < 128; i++)
+		n += (size_t)sprintf(buf + n, "x%d:1\n", i);
+	buf[n++] = '\n';
+
+	/* What was read behind the header. */
+	memset(rest, 'r', sizeof(rest));
+	memcpy(buf + n, rest, sizeof(rest));
+	n += sizeof(rest);
+
+	/* One byte too few leaves the buffer as it was, so try that first. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	len = n;
+	assert(gwp_http_conn_process(hc, NULL, buf, &len,
+				     n + GWP_HTTP_REWRITE_SLACK - 1, &host,
+				     &port, &hl) == GWP_HTTP_TOO_LARGE);
+	gwp_http_conn_free(hc);
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	len = n;
+	assert(gwp_http_conn_process(hc, NULL, buf, &len,
+				     n + GWP_HTTP_REWRITE_SLACK, &host, &port,
+				     &hl) == GWP_HTTP_FORWARD);
+	assert(len == n + GWP_HTTP_REWRITE_SLACK);
+	assert(hl + sizeof(rest) == len);
+	assert(!memcmp(buf + hl, rest, sizeof(rest)));
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+/*
+ * obs-text in a field value goes on unchanged, but is nothing the framing
+ * fields or the credentials could hold.
+ */
+static void test_field_obs_text(void)
+{
+	static const char *const bad[] = {
+		"POST http://e/ HTTP/1.1\r\nContent-Length: 4\xa0\r\n\r\n",
+		"POST http://e/ HTTP/1.1\r\nContent-Length: \xa0" "4\r\n\r\n",
+		"POST http://e/ HTTP/1.1\r\nTransfer-Encoding: chunked\x85\r\n\r\n",
+		"POST http://e/ HTTP/1.1\r\nTransfer-Encoding: \xc2\xa0"
+		"chunked\r\n\r\n",
+	};
+	static const char good[] =
+		"GET http://e/ HTTP/1.1\r\nX-N: caf\xc3\xa9 \xff\r\n\r\n";
+	static const char want[] =
+		"GET / HTTP/1.1\r\nHost: e\r\nX-N: caf\xc3\xa9 \xff\r\n"
+		"Connection: close\r\n\r\n";
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0, i;
+
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		assert(proc(hc, NULL, bad[i], &host, &port, &req, &req_len,
+			    NULL) == GWP_HTTP_BAD_REQUEST);
+		gwp_http_conn_free(hc);
+	}
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, good, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	assert(req_len == strlen(want) && !memcmp(req, want, req_len));
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+static void cpu_limit_hit(int sig)
+{
+	static const char msg[] = "Too much CPU for a run of interim responses\n";
+
+	(void)sig;
+	if (write(2, msg, sizeof(msg) - 1) < 0)
+		_exit(2);
+	_exit(1);
+}
+
+/*
+ * A read full of interim responses takes time in proportion to its length.
+ * Moving the bytes that follow each header down the buffer took the square of
+ * it: 8 MiB of headers meant terabytes of memmove(), minutes of CPU rather
+ * than a fraction of a second, so the limit on CPU time here leaves plenty of
+ * room for a sanitizer or a slow machine, and a loaded one does not count.
+ */
+static void test_res_interim_run(void)
+{
+	static const char one[] = "HTTP/1.1 100\r\n\r\n";
+	static const char fin[] = "HTTP/1.1 200 OK\r\n\r\nbody";
+	static const char fin_out[] = "HTTP/1.1 200 OK\r\n"
+				      "Connection: close\r\n"
+				      "Proxy-Connection: close\r\n"
+				      "\r\nbody";
+	const size_t n = 512 * 1024, l = sizeof(one) - 1;
+	const size_t in_len = n * l, cap = in_len + 4096;
+	struct itimerval limit = { .it_value = { .tv_sec = 30 } };
+	struct itimerval off = { { 0, 0 }, { 0, 0 } };
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char *in = malloc(cap), *out = malloc(cap);
+	size_t i, out_len, part = 0;
+
+	assert(hc && in && out);
+	for (i = 0; i < n; i++)
+		memcpy(in + i * l, one, l);
+
+	signal(SIGPROF, cpu_limit_hit);
+	assert(!setitimer(ITIMER_PROF, &limit, NULL));
+	assert(!gwp_http_fwd_res_init(hc, cap));
+	assert(!gwp_http_fwd_res_input(hc, in, in_len, false, out, cap,
+				       &out_len));
+	assert(!setitimer(ITIMER_PROF, &off, NULL));
+	signal(SIGPROF, SIG_DFL);
+
+	assert(out_len == in_len && !memcmp(out, in, in_len));
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_HDR);
+	assert(!gwp_http_fwd_res_pending(hc));
+
+	/*
+	 * Whatever follows the headers dealt with is kept, at the start of the
+	 * buffer, wherever a read happens to cut the next header: in the
+	 * middle of a line, or inside the blank line that ends it.
+	 */
+	for (part = 1; part < sizeof(one) - 1; part++) {
+		size_t tot = 3 * l + part;
+
+		assert(!gwp_http_fwd_res_init(hc, cap));
+		memcpy(in, one, l);
+		memcpy(in + l, one, l);
+		memcpy(in + 2 * l, one, l);
+		memcpy(in + 3 * l, one, part);
+		assert(!gwp_http_fwd_res_input(hc, in, tot, false, out, cap,
+					       &out_len));
+		assert(out_len == 3 * l && !memcmp(out, in, out_len));
+		assert(gwp_http_fwd_res_pending(hc) == part);
+
+		memcpy(in, one + part, l - part);
+		assert(!gwp_http_fwd_res_input(hc, in, l - part, false, out,
+					       cap, &out_len));
+		assert(out_len == l && !memcmp(out, one, l));
+		assert(!gwp_http_fwd_res_pending(hc));
+	}
+
+	/* Then the final response and the body behind it, in the same read. */
+	assert(!gwp_http_fwd_res_init(hc, cap));
+	memcpy(in, one, l);
+	memcpy(in + l, one, l);
+	memcpy(in + 2 * l, fin, sizeof(fin) - 1);
+	assert(!gwp_http_fwd_res_input(hc, in, 2 * l + sizeof(fin) - 1, false,
+				       out, cap, &out_len));
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
+	assert(out_len == 2 * l + sizeof(fin_out) - 1);
+	assert(!memcmp(out, one, l) && !memcmp(out + l, one, l));
+	assert(!memcmp(out + 2 * l, fin_out, sizeof(fin_out) - 1));
+
+	/* The hold-back limit counts what is left, not what has been read. */
+	assert(!gwp_http_fwd_res_init(hc, 2 * l));
+	assert(!gwp_http_fwd_res_input(hc, one, l, false, out, cap, &out_len));
+	assert(out_len == l);
+	memcpy(in, one, l - 1);
+	assert(!gwp_http_fwd_res_input(hc, in, l - 1, false, out, cap,
+				       &out_len));
+	assert(!out_len && gwp_http_fwd_res_pending(hc) == l - 1);
+
+	gwp_http_conn_free(hc);
+	free(in);
+	free(out);
+	PRTEST_OK();
+}
+
+/*
  * A field that may appear only once, sent twice, is answered with 400 rather
- * than a silent close; repeated list fields are still merged.
+ * than a silent close, however it is spelled and whatever the request is;
+ * repeated list fields are still merged and any other repeated field goes on
+ * as it came. What decides how the request is delimited stays out of that.
  */
 static void test_duplicate_field(void)
 {
@@ -969,10 +1159,38 @@ static void test_duplicate_field(void)
 		"Host: example.com\r\nHost: evil.example\r\n\r\n",
 		"POST http://example.com/ HTTP/1.1\r\n"
 		"Content-Length: 1\r\nContent-Length: 2\r\n\r\n",
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"Content-Length: 1\r\ncontent-length: 1\r\n\r\n",
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"Transfer-Encoding: chunked\r\n\r\n",
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"Transfer-Encoding: identity\r\n\r\n",
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"Connection: x\r\nConnection: Content-Length\r\n"
+		"Content-Length: 1\r\n\r\n",
+		"GET http://example.com/ HTTP/1.1\r\n"
+		"User-Agent: a\r\nUSER-AGENT: b\r\n\r\n",
 		"CONNECT example.com:443 HTTP/1.1\r\n"
 		"Proxy-Authorization: Basic a\r\n"
 		"proxy-authorization: Basic b\r\n\r\n",
+		"CONNECT example.com:443 HTTP/1.1\r\n"
+		"Content-Length: 1\r\nContent-Length: 1\r\n\r\n",
 	};
+	static const char other[] =
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"X-Forwarded-For: 1\r\nX-Drop: a\r\nContent-Length: 0\r\n"
+		"Connection: x-drop\r\nKeep-Alive: 1\r\nKeep-Alive: 2\r\n"
+		"x-forwarded-for: 2\r\nX-DROP: b\r\nX-Forwarded-For: 3\r\n\r\n";
+	static const char other_want[] =
+		"POST / HTTP/1.1\r\nHost: example.com\r\n"
+		"X-Forwarded-For: 1\r\nContent-Length: 0\r\n"
+		"x-forwarded-for: 2\r\nX-Forwarded-For: 3\r\n"
+		"Connection: close\r\n\r\n";
+	static const char tunnel[] =
+		"CONNECT example.com:443 HTTP/1.1\r\n"
+		"X-A: 1\r\nX-A: 2\r\n\r\n";
 	static const char list[] =
 		"GET http://example.com/ HTTP/1.1\r\n"
 		"Accept: a\r\nAccept: b\r\n\r\n";
@@ -995,6 +1213,20 @@ static void test_duplicate_field(void)
 	assert(run(hc, NULL, list, &host, &port, &req, &req_len) ==
 	       GWP_HTTP_FORWARD);
 	assert(memmem(req, req_len, "\r\nAccept: a, b\r\n", 16));
+	gwp_http_conn_free(hc);
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, other, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	assert(req_len == strlen(other_want) &&
+	       !memcmp(req, other_want, req_len));
+	gwp_http_conn_free(hc);
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, tunnel, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_CONNECT);
 	gwp_http_conn_free(hc);
 	PRTEST_OK();
 }
@@ -1419,9 +1651,11 @@ int main(void)
 		test_res_direct();
 		test_need_more();
 		test_errors();
+		test_field_obs_text();
 		test_duplicate_field();
 		test_header_limits();
 	test_forward_in_place();
+		test_forward_rewrite_slack();
 		test_auth();
 		test_upstream_reply();
 		test_upstream_connect();
@@ -1429,6 +1663,7 @@ int main(void)
 
 	/* Byte-by-byte feeding of 17 KiB headers: once is enough. */
 	test_incremental();
+	test_res_interim_run();
 	test_auth_store();
 	test_auth_basic_token();
 
