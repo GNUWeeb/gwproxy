@@ -35,6 +35,13 @@ expect_reject()
 out="$("$GWPROXY" --help 2>&1)" || fail "--help exited non-zero"
 printf '%s\n' "$out" | grep -q '^Usage:' || fail "--help did not print a Usage line"
 
+# --help must name the DNS server --raw-dns really uses by default: it said
+# "system resolver", while every target name went to a public resolver.
+if printf '%s\n' "$out" | grep -q -- --dns-server; then
+	printf '%s\n' "$out" | grep -- --dns-server | grep -q '1\.1\.1\.1' || \
+		fail "--help does not name the default --dns-server"
+fi
+
 # An unknown option must be rejected. The remaining arguments form a valid,
 # runnable configuration so the unknown option is the only reason to fail --
 # otherwise this check would also pass on the missing-target guard below and

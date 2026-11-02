@@ -222,7 +222,7 @@ static void show_help(const char *app)
 	printf("  -Y, --tls-key=file              PEM private key matching --tls-cert\n");
 #endif
 #ifdef CONFIG_NEW_DNS_RESOLVER
-	printf("  -j, --dns-server=addr:port      DNS server address (default: system resolver)\n");
+	printf("  -j, --dns-server=addr:port      DNS server address for --raw-dns (default: %s)\n", default_opts.dns_servers);
 	printf("  -r, --raw-dns=0|1               Use raw DNS for SOCKS5 (default: %d)\n", default_opts.use_raw_dns);
 #endif
 	printf("\n");
