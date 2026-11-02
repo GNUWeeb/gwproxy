@@ -429,9 +429,21 @@ takes a PCRE instead (case\-sensitive, raw/unanchored, needs
 .BR \-\-use\-pcre ).
 It is
 .B OUTPUT
-\-only and matches nothing when the connection is unauthenticated, so it only
-has effect together with
-.BR \-\-auth\-file .
+\-only. A connection with no authenticated user has no name to match, so
+.B \-\-user
+does not match it, and the negated
+.B ! \-\-user
+.I does
+match it, the same way
+.B ! \-\-domain
+matches a target with no hostname. So
+.B "\-m user ! \-\-user alice \-j ACCEPT"
+admits anonymous clients too, unless every client has to authenticate. That
+holds for SOCKS5 and HTTP with
+.B \-\-auth\-file
+only: no connection in plain or transparent mode has a user, even with
+.BR \-\-auth\-file ,
+and the same goes for SOCKS5 and HTTP without it.
 The
 .BR \-\-user\-regexp
 option, like

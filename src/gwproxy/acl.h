@@ -111,7 +111,8 @@ static inline void gwp_acl_memo_reset(struct gwp_acl_memo *m)
  *            known (e.g. socks5h remote-DNS upstream).
  *   @domain  client-requested destination hostname for -m domain, or NULL.
  *   @user    authenticated username for -m user (OUTPUT), or NULL when the
- *            connection is unauthenticated (no -m user rule then matches).
+ *            connection is unauthenticated. No user is not any name: --user
+ *            and --user-regexp do not match, and so their negations do.
  *   @sport   client source port, host byte order (both chains).
  *   @dport   destination port, host byte order (OUTPUT).
  *   @proto   GWP_ACL_PROTO_TCP / _UDP.

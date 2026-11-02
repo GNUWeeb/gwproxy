@@ -2118,7 +2118,8 @@ static bool domain_match(const struct gwp_acl_rule *r, const char *dom)
 /*
  * True if rule @r's -m user criterion matches the authenticated username @user
  * (exact, case-sensitive; or PCRE when --user-regexp was used). Returns false
- * for a NULL @user so an unauthenticated connection never matches a user rule.
+ * for a NULL @user, so an unauthenticated connection does not match --user, and
+ * does match its negation "! --user", as an absent hostname does "! --domain".
  */
 static bool user_match(const struct gwp_acl_rule *r, const char *user)
 {
