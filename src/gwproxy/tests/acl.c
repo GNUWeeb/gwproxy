@@ -254,6 +254,14 @@ static noinline void test_domain(void)
 	assert(out(a, NULL, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 
+	/* One trailing dot in a rule is the same name without it. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m domain --domain Example.Com. -j REJECT\n"));
+	assert(out(a, NULL, "example.com", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, NULL, "other.com", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+
 	/*
 	 * A rule WITHOUT a domain match, evaluated against a query that DOES
 	 * carry a domain, must not deref the rule's NULL domain (regression:
@@ -670,6 +678,8 @@ static noinline void test_parse_errors(void)
 		"-A INPUT --dports 80 -j ACCEPT\n",	    /* --dports in INPUT */
 		"-A OUTPUT -d 1.2.3.4 -m domain --domain x -j ACCEPT\n", /* d+domain */
 		"-A OUTPUT -m domain -j REJECT\n",	    /* -m domain w/o --domain */
+		"-A OUTPUT -m domain --domain . -j REJECT\n",	    /* no name */
+		"-A OUTPUT -m domain --domain x.. -j REJECT\n",   /* never matches */
 		"-A OUTPUT -m user -j REJECT\n",	    /* -m user w/o --user */
 		"-A OUTPUT -j BOGUS\n",			    /* bad target */
 		"-A OUTPUT -x -j ACCEPT\n",		    /* unknown option */

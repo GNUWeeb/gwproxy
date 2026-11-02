@@ -918,6 +918,7 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 	bool have_src = false, have_iface = false;
 	bool have_accept = false;	/* --accept: MARK/BIND become terminal */
 	const char *v;
+	size_t l;
 	int i, ret = -EINVAL;
 
 	if (n < 2)
@@ -974,7 +975,18 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			if (chain != GWP_ACL_OUTPUT || !m_domain || !v ||
 			    r->has_domain || r->has_dst)
 				goto out;
-			r->domain.str = strdup(v);
+			/*
+			 * "name." is "name" to the resolver, and a request has
+			 * its dot removed before the ACL sees it, so a rule
+			 * must lose it too or it can never match. Nothing can
+			 * match what still ends in a dot after that.
+			 */
+			l = strlen(v);
+			if (l > 1 && v[l - 1] == '.')
+				l--;
+			if (v[l - 1] == '.')
+				goto out;
+			r->domain.str = strndup(v, l);
 			if (!r->domain.str) {
 				ret = -ENOMEM;
 				goto out;

@@ -162,6 +162,8 @@ for loop in epoll io_uring; do
 			"-P OUTPUT ACCEPT\n-A OUTPUT -m domain --domain $NAME -j REJECT" denied
 		run_case "-m domain, trailing dot" "$NAME.:80" \
 			"-P OUTPUT ACCEPT\n-A OUTPUT -m domain --domain $NAME -j REJECT" denied
+		run_case "-m domain, rule with a trailing dot" "$NAME:80" \
+			"-P OUTPUT ACCEPT\n-A OUTPUT -m domain --domain $NAME. -j REJECT" denied
 		run_case "-d, no address to match" "$NAME:80" \
 			"-P OUTPUT ACCEPT\n-A OUTPUT -d 0.0.0.0/0 -j REJECT" "up $NAME 80"
 		run_case "-d, literal" "$LIT:80" \

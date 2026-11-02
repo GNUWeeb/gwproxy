@@ -399,6 +399,12 @@ match can deny some of a name's addresses while the connection still succeeds
 on another (see
 .BR "TARGET ADDRESS SELECTION" ).
 .IP
+One trailing dot does not count, in a
+.B \-\-domain
+value or in the requested name: "example.com." and "example.com" are the same
+name. A value that still ends in a dot without it, or is nothing but one, is a
+parse error. A regexp sees the requested name with its dot already removed.
+.IP
 .B \-\-domain\-regexp
 .I pattern
 (an alternative to
