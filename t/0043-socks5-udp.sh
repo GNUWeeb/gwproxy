@@ -10,7 +10,8 @@
 # control connection, and plain SOCKS5 CONNECT still works on the same port. The
 # relay is exercised on both event loops (epoll and, when built, io_uring).
 # The datagrams the relay must REFUSE are asserted too: a wrong source address
-# (RFC 1928), a fragmented datagram, and a domain-name target.
+# (RFC 1928), a fragmented datagram, and a domain-name target. BND.ADDR must be
+# in the client's own address family.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -43,7 +44,7 @@ gwp_start "127.0.0.1:$up" --as-socks5=1 --event-loop=epoll --nr-workers=2
 
 # Run the full relay matrix on one event loop.
 run_loop() {
-	local loop="$1" pp tp
+	local loop="$1" pp tp r
 
 	# (1) IPv4 client -> IPv4 target: datagrams of assorted sizes echo back.
 	pp="$(pick_port)"
@@ -159,6 +160,20 @@ run_loop() {
 		|| fail "$loop relay accepted a domain-name target"
 
 	kill "$GWP_PID" 2>/dev/null
+
+	# (10) On a dual-stack socket an IPv4 client's address is v4-mapped, but
+	#      BND.ADDR must still be IPv4: a client's AF_INET socket cannot
+	#      send to an IPv6 address. Binding the mapped loopback address gives
+	#      such a socket without listening on the wildcard.
+	if [ "$have_v6" = 1 ]; then
+		sp="$(pick_port)"
+		gwp_start "[::ffff:127.0.0.1]:$sp" --as-socks5=1 \
+			--event-loop="$loop" --nr-workers=2
+		r="$(probe --bnd-atyp 1 "$sp" "$ep")"
+		[ "$r" = RELAYED ] \
+			|| fail "$loop IPv4 client of a dual-stack listener: $r"
+		kill "$GWP_PID" 2>/dev/null
+	fi
 }
 
 run_loop epoll

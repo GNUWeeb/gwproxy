@@ -4454,7 +4454,6 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		goto reply;
 	}
 
-	/* BND.ADDR from the control connection, BND.PORT from the relay socket. */
 	slen = sizeof(relay);
 	r = __sys_getsockname(fd, &relay.sa, &slen);
 	if (r < 0) {
@@ -4465,13 +4464,12 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		rep = GWP_SOCKS5_REP_FAILURE;
 		goto reply;
 	}
-	if (local.sa.sa_family == AF_INET) {
-		bnd.ver = GWP_SOCKS5_ATYP_IPV4;
-		memcpy(bnd.ip4, &local.i4.sin_addr, 4);
-	} else {
-		bnd.ver = GWP_SOCKS5_ATYP_IPV6;
-		memcpy(bnd.ip6, &local.i6.sin6_addr, 16);
-	}
+	/*
+	 * BND.ADDR from the control connection, BND.PORT from the relay socket.
+	 * An IPv4 client of a dual-stack listener is told an IPv4 address, not
+	 * the v4-mapped form of it that getsockname() reports.
+	 */
+	gwp_socks5_reply_addr_from_sockaddr(&local, &bnd);
 	bnd.port = relay.i6.sin6_port;
 
 	gcp->udp_fd = fd;
