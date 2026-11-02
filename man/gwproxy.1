@@ -704,8 +704,9 @@ seconds.
 .BR \-\-dns\-cache\-max\-entries=\fInr\fR
 Bound the DNS cache to at most
 .I nr
-entries; once full, new hostnames are resolved but not cached (existing entries
-are still served and refreshed) so memory cannot grow without limit.
+entries; once full, expired entries are reclaimed to make room, and with none
+to reclaim new hostnames are resolved but not cached (existing entries are still
+served and refreshed) so memory cannot grow without limit.
 .B 0
 means unlimited. Default:
 .BR 65536 .

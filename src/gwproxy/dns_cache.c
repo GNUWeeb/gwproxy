@@ -55,6 +55,7 @@ struct dns_hash_map {
 	size_t			nr_buckets;
 	size_t			nr_entries;
 	size_t			max_entries;	/* 0 = unlimited */
+	size_t			reclaim_pos;	/* next bucket to reclaim from */
 	uint64_t		key[2];		/* per-cache random SipHash key */
 };
 
@@ -69,6 +70,13 @@ struct gwp_dns_cache {
  * table never stalls them for the whole pass.
  */
 #define GWP_DNS_HOUSEKEEP_CHUNK	1024
+
+/*
+ * Buckets an insert into a full table sweeps for expired entries. A table full
+ * of live entries pays this on every insert, under the write lock, so it is a
+ * small step: the next refused insert carries on from where this one stopped.
+ */
+#define GWP_DNS_RECLAIM_BUCKETS	64
 
 static uint64_t hash_key(const uint64_t key[2], const char *name, size_t len)
 {
@@ -85,6 +93,7 @@ static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
 	map->nr_buckets = nr_buckets;
 	map->nr_entries = 0;
 	map->max_entries = max_entries;
+	map->reclaim_pos = 0;
 	gwp_dns_gen_hash_key(map->key);
 	return 0;
 }
@@ -204,6 +213,54 @@ static int alloc_dns_entry(struct dns_cache_entry **ep, const char *key,
 	return 0;
 }
 
+/*
+ * Unlink and free the expired entries of buckets [@start, @start + @nr), and
+ * return the bucket after the last one swept. Chains with nothing expired are
+ * only read.
+ */
+static size_t dns_map_remove_expired(struct dns_hash_map *map, size_t start,
+				     size_t nr, time_t now)
+{
+	size_t i, end = start + nr;
+
+	if (end > map->nr_buckets)
+		end = map->nr_buckets;
+
+	for (i = start; i < end; i++) {
+		struct dns_cache_entry **pp = &map->table[i], *cur;
+
+		while ((cur = *pp)) {
+			if (cur->expired_at > now) {
+				pp = &cur->next;
+				continue;
+			}
+			*pp = cur->next;
+			map->nr_entries--;
+			put_dns_entry(cur);
+		}
+	}
+
+	return end;
+}
+
+/*
+ * Whether the table can take one more entry. A full table may be holding
+ * entries that have expired, which until the next housekeeping pass, up to the
+ * cache lifetime away, would keep out names that could be cached.
+ */
+static bool dns_map_has_room(struct dns_hash_map *map, time_t now)
+{
+	if (!map->max_entries || map->nr_entries < map->max_entries)
+		return true;
+
+	map->reclaim_pos = dns_map_remove_expired(map, map->reclaim_pos,
+						  GWP_DNS_RECLAIM_BUCKETS, now);
+	if (map->reclaim_pos >= map->nr_buckets)
+		map->reclaim_pos = 0;
+
+	return map->nr_entries < map->max_entries;
+}
+
 static int dns_map_insert(struct dns_hash_map *map, const char *key,
 			  const struct addrinfo *ai, time_t expired_at)
 {
@@ -233,7 +290,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 		/*
 		 * Case 1. Best case, no collision!
 		 */
-		if (map->max_entries && map->nr_entries >= map->max_entries) {
+		if (!dns_map_has_room(map, now)) {
 			free(de);	/* fresh, not linked anywhere yet */
 			return -ENOSPC;
 		}
@@ -328,11 +385,12 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	 * Collision with a different key or an expired entry.
 	 *
 	 * The collision walk above already reclaimed any expired entries in this
-	 * bucket, so the count reflects live + not-yet-swept entries. Bound the
-	 * cache: once at capacity, refuse new keys (resolution still works, it is
+	 * bucket, so the count reflects live + not-yet-swept entries, and @prev
+	 * is live: a sweep leaves it alone. Bound the cache: once at capacity
+	 * with nothing to reclaim, refuse new keys (resolution still works, it is
 	 * just not cached) rather than growing without limit.
 	 */
-	if (map->max_entries && map->nr_entries >= map->max_entries) {
+	if (!dns_map_has_room(map, now)) {
 		free(de);	/* fresh, not linked anywhere yet */
 		return -ENOSPC;
 	}
@@ -453,36 +511,6 @@ int gwp_dns_cache_lookup_addrs(struct gwp_dns_cache *cache, const char *key,
 	r = dns_map_lookup(&cache->map, key, out);
 	pthread_rwlock_unlock(&cache->lock);
 	return r;
-}
-
-/*
- * Unlink and free the expired entries of buckets [@start, @start + @nr), and
- * return the bucket after the last one swept. Chains with nothing expired are
- * only read.
- */
-static size_t dns_map_remove_expired(struct dns_hash_map *map, size_t start,
-				     size_t nr, time_t now)
-{
-	size_t i, end = start + nr;
-
-	if (end > map->nr_buckets)
-		end = map->nr_buckets;
-
-	for (i = start; i < end; i++) {
-		struct dns_cache_entry **pp = &map->table[i], *cur;
-
-		while ((cur = *pp)) {
-			if (cur->expired_at > now) {
-				pp = &cur->next;
-				continue;
-			}
-			*pp = cur->next;
-			map->nr_entries--;
-			put_dns_entry(cur);
-		}
-	}
-
-	return end;
 }
 
 void gwp_dns_cache_housekeep(struct gwp_dns_cache *cache)

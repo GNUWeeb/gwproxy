@@ -147,10 +147,86 @@ static void test_lookup_does_not_sweep(void)
 	gwp_dns_cache_free(cache);
 }
 
+/*
+ * Expired entries must not keep new names out of a full table until the next
+ * housekeeping pass, which may be the whole cache lifetime away, while entries
+ * that are still live keep their place.
+ */
+static void test_full_table_reclaims_expired(void)
+{
+	enum { CAP = 100, BUCKETS = 1024, NEW = 100 };
+	struct gwp_dns_cache *cache = NULL;
+	struct gwp_dns_cache_addrs ca;
+	struct sockaddr_in sa;
+	struct addrinfo ai;
+	int i, r, refused = 0;
+	char name[32];
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	memset(&ai, 0, sizeof(ai));
+	ai.ai_family = AF_INET;
+	ai.ai_addr = (struct sockaddr *)&sa;
+	ai.ai_addrlen = sizeof(sa);
+
+	r = gwp_dns_cache_init(&cache, BUCKETS, CAP);
+	assert(!r && cache);
+
+	/* Inserted live and expired afterwards, as in the test above. */
+	for (i = 0; i < CAP; i++) {
+		snprintf(name, sizeof(name), "dead%d.example", i);
+		r = gwp_dns_cache_insert(cache, name, &ai, time(NULL) + 100);
+		assert(!r);
+	}
+	assert(cache->map.nr_entries == CAP);
+	for (i = 0; i < BUCKETS; i++) {
+		struct dns_cache_entry *e;
+
+		for (e = cache->map.table[i]; e; e = e->next)
+			e->expired_at = time(NULL) - 1;
+	}
+
+	/*
+	 * Each refused insert moves the sweep on, so one pass over the table
+	 * reclaims all of them, and no more than that many can be refused.
+	 */
+	for (i = 0; i < NEW; i++) {
+		snprintf(name, sizeof(name), "new%d.example", i);
+		r = gwp_dns_cache_insert(cache, name, &ai, time(NULL) + 100);
+		assert(!r || r == -ENOSPC);
+		refused += !!r;
+	}
+	printf("dns_cache: %d of %d new names refused, table full of dead ones\n",
+	       refused, NEW);
+	assert(refused <= BUCKETS / GWP_DNS_RECLAIM_BUCKETS);
+	assert(cache->map.nr_entries <= CAP);
+
+	/* Now fill it with live names: the cap holds and they stay. */
+	for (i = 0; i < CAP * 2; i++) {
+		snprintf(name, sizeof(name), "live%d.example", i);
+		r = gwp_dns_cache_insert(cache, name, &ai, time(NULL) + 100);
+		assert(!r || r == -ENOSPC);
+		assert(cache->map.nr_entries <= CAP);
+	}
+	assert(cache->map.nr_entries == CAP);
+	r = gwp_dns_cache_insert(cache, "refused.example", &ai, time(NULL) + 100);
+	assert(r == -ENOSPC);
+	assert(gwp_dns_cache_lookup_addrs(cache, "refused.example", &ca) == -ENOENT);
+	for (i = 0, r = 0; i < CAP; i++) {
+		snprintf(name, sizeof(name), "new%d.example", i);
+		if (!gwp_dns_cache_lookup_addrs(cache, name, &ca))
+			r++;
+	}
+	assert(r >= NEW - refused);
+
+	gwp_dns_cache_free(cache);
+}
+
 int main(void)
 {
 	test_hash_flood();
 	test_lookup_does_not_sweep();
+	test_full_table_reclaims_expired();
 	printf("All tests passed.\n");
 	return 0;
 }
