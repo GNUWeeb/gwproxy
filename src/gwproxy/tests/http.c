@@ -20,6 +20,8 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/time.h>
 
 #define PRTEST_OK()					\
 do {							\
@@ -958,6 +960,107 @@ static void test_errors(void)
 	PRTEST_OK();
 }
 
+static void cpu_limit_hit(int sig)
+{
+	static const char msg[] = "Too much CPU for a run of interim responses\n";
+
+	(void)sig;
+	if (write(2, msg, sizeof(msg) - 1) < 0)
+		_exit(2);
+	_exit(1);
+}
+
+/*
+ * A read full of interim responses takes time in proportion to its length.
+ * Moving the bytes that follow each header down the buffer took the square of
+ * it: 8 MiB of headers meant terabytes of memmove(), minutes of CPU rather
+ * than a fraction of a second, so the limit on CPU time here leaves plenty of
+ * room for a sanitizer or a slow machine, and a loaded one does not count.
+ */
+static void test_res_interim_run(void)
+{
+	static const char one[] = "HTTP/1.1 100\r\n\r\n";
+	static const char fin[] = "HTTP/1.1 200 OK\r\n\r\nbody";
+	static const char fin_out[] = "HTTP/1.1 200 OK\r\n"
+				      "Connection: close\r\n"
+				      "Proxy-Connection: close\r\n"
+				      "\r\nbody";
+	const size_t n = 512 * 1024, l = sizeof(one) - 1;
+	const size_t in_len = n * l, cap = in_len + 4096;
+	struct itimerval limit = { .it_value = { .tv_sec = 30 } };
+	struct itimerval off = { { 0, 0 }, { 0, 0 } };
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char *in = malloc(cap), *out = malloc(cap);
+	size_t i, out_len, part = 0;
+
+	assert(hc && in && out);
+	for (i = 0; i < n; i++)
+		memcpy(in + i * l, one, l);
+
+	signal(SIGPROF, cpu_limit_hit);
+	assert(!setitimer(ITIMER_PROF, &limit, NULL));
+	assert(!gwp_http_fwd_res_init(hc, cap));
+	assert(!gwp_http_fwd_res_input(hc, in, in_len, false, out, cap,
+				       &out_len));
+	assert(!setitimer(ITIMER_PROF, &off, NULL));
+	signal(SIGPROF, SIG_DFL);
+
+	assert(out_len == in_len && !memcmp(out, in, in_len));
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_HDR);
+	assert(!gwp_http_fwd_res_pending(hc));
+
+	/*
+	 * Whatever follows the headers dealt with is kept, at the start of the
+	 * buffer, wherever a read happens to cut the next header: in the
+	 * middle of a line, or inside the blank line that ends it.
+	 */
+	for (part = 1; part < sizeof(one) - 1; part++) {
+		size_t tot = 3 * l + part;
+
+		assert(!gwp_http_fwd_res_init(hc, cap));
+		memcpy(in, one, l);
+		memcpy(in + l, one, l);
+		memcpy(in + 2 * l, one, l);
+		memcpy(in + 3 * l, one, part);
+		assert(!gwp_http_fwd_res_input(hc, in, tot, false, out, cap,
+					       &out_len));
+		assert(out_len == 3 * l && !memcmp(out, in, out_len));
+		assert(gwp_http_fwd_res_pending(hc) == part);
+
+		memcpy(in, one + part, l - part);
+		assert(!gwp_http_fwd_res_input(hc, in, l - part, false, out,
+					       cap, &out_len));
+		assert(out_len == l && !memcmp(out, one, l));
+		assert(!gwp_http_fwd_res_pending(hc));
+	}
+
+	/* Then the final response and the body behind it, in the same read. */
+	assert(!gwp_http_fwd_res_init(hc, cap));
+	memcpy(in, one, l);
+	memcpy(in + l, one, l);
+	memcpy(in + 2 * l, fin, sizeof(fin) - 1);
+	assert(!gwp_http_fwd_res_input(hc, in, 2 * l + sizeof(fin) - 1, false,
+				       out, cap, &out_len));
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
+	assert(out_len == 2 * l + sizeof(fin_out) - 1);
+	assert(!memcmp(out, one, l) && !memcmp(out + l, one, l));
+	assert(!memcmp(out + 2 * l, fin_out, sizeof(fin_out) - 1));
+
+	/* The hold-back limit counts what is left, not what has been read. */
+	assert(!gwp_http_fwd_res_init(hc, 2 * l));
+	assert(!gwp_http_fwd_res_input(hc, one, l, false, out, cap, &out_len));
+	assert(out_len == l);
+	memcpy(in, one, l - 1);
+	assert(!gwp_http_fwd_res_input(hc, in, l - 1, false, out, cap,
+				       &out_len));
+	assert(!out_len && gwp_http_fwd_res_pending(hc) == l - 1);
+
+	gwp_http_conn_free(hc);
+	free(in);
+	free(out);
+	PRTEST_OK();
+}
+
 /*
  * A field that may appear only once, sent twice, is answered with 400 rather
  * than a silent close; repeated list fields are still merged.
@@ -1429,6 +1532,7 @@ int main(void)
 
 	/* Byte-by-byte feeding of 17 KiB headers: once is enough. */
 	test_incremental();
+	test_res_interim_run();
 	test_auth_store();
 	test_auth_basic_token();
 
