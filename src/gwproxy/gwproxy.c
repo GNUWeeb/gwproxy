@@ -2007,6 +2007,7 @@ static uint16_t sa_port_h(const struct gwp_sockaddr *s)
 static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 				      struct gwp_socks5_addr *out);
 static int upstream_target_init(struct gwp_ctx *ctx);
+static int parse_port(const char *s, uint16_t *port);
 
 /*
  * Fill the inputs of an OUTPUT request for @target (NULL when only a domain is
@@ -3733,7 +3734,7 @@ static int upstream_dst_from_hostport(const char *hostport,
 {
 	char buf[300], *colon, *host;
 	size_t hl, n = strlen(hostport);
-	int port;
+	uint16_t port;
 
 	if (n == 0 || n >= sizeof(buf))
 		return -EINVAL;
@@ -3743,8 +3744,7 @@ static int upstream_dst_from_hostport(const char *hostport,
 	if (!colon)
 		return -EINVAL;
 	*colon = '\0';
-	port = atoi(colon + 1);
-	if (port <= 0 || port > 65535)
+	if (parse_port(colon + 1, &port) || !port)
 		return -EINVAL;
 
 	host = buf;
@@ -3754,7 +3754,7 @@ static int upstream_dst_from_hostport(const char *hostport,
 		host++;
 	}
 
-	return upstream_dst_from_domain(host, (uint16_t)port, out);
+	return upstream_dst_from_domain(host, port, out);
 }
 
 /*

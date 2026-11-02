@@ -87,6 +87,8 @@ Default:
 .BR \-b ", " \-\-bind=\fIaddr:port\fR
 Address and port to listen on. IPv6 literals are written in brackets, e.g.
 .BR [::1]:1080 " or " 0.0.0.0:8080 .
+A port outside 0 to 65535, or one with anything behind its digits, is refused
+at startup, here and in every other address option.
 The default,
 .BR [::]:1080 ,
 listens on the dual\-stack IPv4/IPv6 wildcard. A SOCKS5 or HTTP proxy
