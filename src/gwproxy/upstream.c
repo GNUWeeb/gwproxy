@@ -107,7 +107,7 @@ static int build_connect(struct gwp_conn_pair *gcp)
 	return 0;
 }
 
-static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify)
+static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	const uint8_t *buf = (const uint8_t *)gcp->target.buf;
@@ -134,7 +134,6 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify)
 
 		pr_err(&ctx->lh, "Upstream SOCKS5 proxy selected no acceptable auth method (0x%02x)",
 			method);
-		*notify = true;
 		return -EACCES;
 	}
 	case CONN_STATE_UPSTREAM_S5_AUTH: {
@@ -148,7 +147,6 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify)
 		if (status != 0x00) {
 			pr_err(&ctx->lh, "Upstream SOCKS5 authentication failed (idx=%u)",
 				gcp->idx);
-			*notify = true;
 			return -EACCES;
 		}
 		r = build_connect(gcp);
@@ -165,7 +163,6 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify)
 		if (rep != GWP_SOCKS5_REP_SUCCESS) {
 			pr_err(&ctx->lh, "Upstream SOCKS5 CONNECT failed (rep=0x%02x, idx=%u, dst=%s)",
 				rep, gcp->idx, gwp_upstream_dst_str(gcp));
-			*notify = true;
 			return -ECONNREFUSED;
 		}
 		r = gwp_upstream_splice_reply(w, gcp, consumed);
@@ -176,7 +173,7 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify)
 	}
 }
 
-static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify)
+static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	size_t consumed, scan = gcp->up_scan;
 	int status, r;
@@ -192,7 +189,6 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify
 	if (r == -EAGAIN && gcp->target.len >= gcp->target.cap) {
 		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT reply header too large (idx=%u, dst=%s)",
 			gcp->idx, gwp_upstream_dst_str(gcp));
-		*notify = true;
 		return -EMSGSIZE;
 	}
 	if (r)
@@ -201,7 +197,6 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify
 	if (status < 200 || status >= 300) {
 		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT failed (status=%d, idx=%u, dst=%s)",
 			status, gcp->idx, gwp_upstream_dst_str(gcp));
-		*notify = true;
 		return -ECONNREFUSED;
 	}
 	r = gwp_upstream_splice_reply(w, gcp, consumed);
@@ -219,8 +214,9 @@ int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	/*
 	 * Only a refused CONNECT says something about the destination. An
 	 * upstream that turned down our credentials, or answered something
-	 * we cannot use, is a failure of the proxy chain: REP 0x01, not the
-	 * 0x02 "not allowed by ruleset" that -EACCES would map to.
+	 * we cannot use, or hung up, is a failure of the proxy chain: REP
+	 * 0x01, not the 0x02 "not allowed by ruleset" that -EACCES would map
+	 * to.
 	 */
 	if (err != -ECONNREFUSED)
 		err = -EPROTO;
@@ -229,20 +225,19 @@ int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return r ? r : (int)gcp->target.len;
 }
 
-int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			     bool *notify)
+int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	bool n = false;
 	int r;
 
 	if (gcp->conn_state >= CONN_STATE_UPSTREAM_HTTP_MIN &&
 	    gcp->conn_state <= CONN_STATE_UPSTREAM_HTTP_MAX)
-		r = http_parse(w, gcp, &n);
+		r = http_parse(w, gcp);
 	else
-		r = s5_parse(w, gcp, &n);
+		r = s5_parse(w, gcp);
 
-	if (notify)
-		*notify = n;
+	if (r == -EINVAL)
+		pr_err(&w->ctx->lh, "Upstream proxy sent a malformed reply (idx=%u, dst=%s)",
+			gcp->idx, gwp_upstream_dst_str(gcp));
 	return r;
 }
 

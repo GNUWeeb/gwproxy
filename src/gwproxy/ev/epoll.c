@@ -1645,8 +1645,8 @@ static int upstream_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	int r = gwp_upstream_hs_start(w, gcp);
 
 	if (r == GWP_UPSTREAM_IO_SEND)
-		return upstream_send(w, gcp);
-	return r;	/* negative errno */
+		r = upstream_send(w, gcp);
+	return r < 0 ? upstream_fail(w, gcp, r) : r;
 }
 
 /*
@@ -1698,13 +1698,10 @@ static int upstream_hold(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
 }
 
-__hot
-static int handle_ev_upstream(struct gwp_wrk *w,
-			      struct gwp_conn_pair *gcp,
-			      struct epoll_event *ev)
+static int upstream_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		       struct epoll_event *ev)
 {
 	ssize_t sr;
-	bool notify;
 	int r;
 
 	/* Transmit phase: flush the pending request to the proxy. */
@@ -1736,7 +1733,7 @@ static int handle_ev_upstream(struct gwp_wrk *w,
 			return -ECONNRESET;
 	}
 
-	r = gwp_upstream_hs_on_reply(w, gcp, &notify);
+	r = gwp_upstream_hs_on_reply(w, gcp);
 	switch (r) {
 	case GWP_UPSTREAM_IO_SEND:
 		return upstream_send(w, gcp);
@@ -1747,8 +1744,21 @@ static int handle_ev_upstream(struct gwp_wrk *w,
 	case GWP_UPSTREAM_IO_DONE:
 		return upstream_finish(w, gcp);
 	default:			/* negative errno */
-		return notify ? upstream_fail(w, gcp, r) : r;
+		return r;
 	}
+}
+
+__hot
+static int handle_ev_upstream(struct gwp_wrk *w,
+			      struct gwp_conn_pair *gcp,
+			      struct epoll_event *ev)
+{
+	int r = upstream_io(w, gcp, ev);
+
+	/* Past the handshake, the client has had its reply. */
+	if (unlikely(r < 0) && gwp_in_upstream_hs(gcp))
+		return upstream_fail(w, gcp, r);
+	return r;
 }
 
 /*
@@ -2128,11 +2138,10 @@ static int handle_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * through attempts, whose failures handle_ev_target_attempt() answers.
  *
  * The connect failed, or the upstream proxy dropped us mid-handshake, so
- * collect the reason and tear the pair down. Neither case has a reply to
- * give, and the socket must not be treated as connected: EPOLLERR is
- * level-triggered and stays raised, so going on with the upstream
- * handshake on it would come straight back here until the connect timer
- * fired.
+ * collect the reason for the pair's teardown. The socket must not be treated
+ * as connected: EPOLLERR is level-triggered and stays raised, so going on with
+ * the upstream handshake on it would come straight back here until the connect
+ * timer fired.
  */
 static int handle_ev_target_conn_err(struct gwp_wrk *w,
 				     struct gwp_conn_pair *gcp)
@@ -2166,8 +2175,12 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return -ECONNRESET;
 
 	if (unlikely(ev->events & EPOLLERR)) {
-		if (!gcp->is_target_alive)
-			return handle_ev_target_conn_err(w, gcp);
+		if (!gcp->is_target_alive) {
+			r = handle_ev_target_conn_err(w, gcp);
+			if (gwp_in_upstream_hs(gcp))
+				return upstream_fail(w, gcp, r);
+			return r;
+		}
 
 		pr_err(&w->ctx->lh, "EPOLLERR on target connection event");
 		return -ECONNRESET;
