@@ -1607,10 +1607,19 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * request in client.buf, which the origin must receive. The send
 	 * completion arms the next client recv.
 	 */
-	if (!gcp->client.len)
-		return prep_recv_client(w, gcp);
-	prep_send_target(w, gcp);
-	return 0;
+	if (gcp->client.len) {
+		prep_send_target(w, gcp);
+		return 0;
+	}
+#ifdef CONFIG_HTTPS
+	/*
+	 * The engine may hold more of it, or a close_notify, all off the socket
+	 * already: no recv would complete for those.
+	 */
+	if (client_is_tls(gcp))
+		return tls_forward_pump(w, gcp);
+#endif
+	return prep_recv_client(w, gcp);
 }
 
 /* Begin the upstream-proxy handshake and queue the first request send. */
