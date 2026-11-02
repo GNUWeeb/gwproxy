@@ -111,6 +111,21 @@ timeout --foreground 2 "$GWPROXY" --nr-workers=1 --bind=127.0.0.1:0 \
 rc=$?
 [ "$rc" = 124 ] || fail "--bind=:0 --target=:65535 was not accepted: exit $rc"
 
+# A --log-file that cannot be opened stops the proxy, and that must be said on
+# stderr: the log it would have gone to is the file that failed.
+mkdir "$WORK/logdir"
+ln -s "$WORK/logdir/target" "$WORK/loglink"
+for bad in "$WORK/nodir/log" "$WORK/logdir" "$WORK/loglink"; do
+	rc=0
+	timeout --foreground 5 "$GWPROXY" --as-socks5=1 --nr-workers=1 --bind=127.0.0.1:0 \
+		--log-file="$bad" >/dev/null 2>"$WORK/logfile.err" || rc=$?
+	case "$rc" in
+	0|124) fail "--log-file=$bad was accepted: exit $rc" ;;
+	esac
+	grep -qF "Failed to open log file '$bad'" "$WORK/logfile.err" || \
+		fail "--log-file=$bad: exit $rc with no message"
+done
+
 # A malformed --upstream-proxy URL must be rejected at startup. Use URLs that
 # are structurally wrong (unsupported scheme, no scheme at all) rather than one
 # whose host merely fails to resolve: on a host with a wildcard search domain

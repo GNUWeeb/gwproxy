@@ -826,7 +826,8 @@ static int gwp_ctx_init_log(struct gwp_ctx *ctx)
 			r = -errno;
 			if (fd >= 0)
 				close(fd);
-			pr_err(&ctx->lh, "Failed to open log file '%s': %s",
+			/* There is no log to report this to, so not pr_err(). */
+			fprintf(stderr, "Failed to open log file '%s': %s\n",
 				cfg->log_file, strerror(-r));
 		}
 	}
