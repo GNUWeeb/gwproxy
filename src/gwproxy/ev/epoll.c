@@ -1939,7 +1939,11 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (done)
 		return -ECONNRESET;
 
-	if (hup && hup->ep_mask) {
+	/*
+	 * @hup's event came from the kernel, so it is registered whatever its
+	 * mask says: the mask is empty if it had nothing left to wait for.
+	 */
+	if (hup) {
 		__sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, hup->fd, NULL);
 		hup->ep_mask = 0;
 	}
