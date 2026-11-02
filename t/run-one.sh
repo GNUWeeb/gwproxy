@@ -33,6 +33,8 @@ TIMEOUT="${GWP_TEST_TIMEOUT:-180}"
 export GWPROXY="${GWPROXY:-$ROOT/gwproxy}"
 
 log="${res%.res}.log"
+stuck="${res%.res}.stuck"
+rm -f "$stuck"
 mkdir -p "$(dirname "$res")"
 
 start=$SECONDS
@@ -53,12 +55,29 @@ pgid=$!
 # for the rest of the timeout, holding every descriptor it inherited -- make's
 # jobserver pipe among them, which keeps `make -jN test` blocked long after the
 # last test has finished.
+#
+# Before that it records what the test is stuck on: a test that hangs usually
+# prints nothing, and it is gone by the time anyone can look. From /proc alone,
+# as ps differs between the systems the tests run on.
 setsid bash -c '
 	sleep "$1"
+	for d in /proc/[0-9]*; do
+		st="$(sed "s/.*) //" "$d/stat" 2>/dev/null)" || continue
+		read -r _ _ _ sid _ <<<"$st"
+		[ "$sid" = "$2" ] || continue
+		echo "pid ${d#/proc/}: $(tr "\\0" " " <"$d/cmdline")"
+		grep -E "^(SigBlk|SigIgn|SigCgt):" "$d/status"
+		for t in "$d"/task/*; do
+			echo "  task ${t##*/} $(cat "$t/comm")" \
+				"state=$(sed "s/.*) //;s/ .*//" "$t/stat")" \
+				"wchan=$(cat "$t/wchan" 2>/dev/null)" \
+				"syscall=$(cat "$t/syscall" 2>/dev/null)"
+		done
+	done >"$3" 2>&1
 	kill -TERM -"$2" 2>/dev/null
 	sleep 5
 	kill -KILL -"$2" 2>/dev/null
-' watchdog "$TIMEOUT" "$pgid" </dev/null >/dev/null 2>&1 &
+' watchdog "$TIMEOUT" "$pgid" "$stuck" </dev/null >/dev/null 2>&1 &
 watchdog=$!
 
 rc=0
@@ -87,7 +106,8 @@ case "$status" in
 PASS)	printf 'ok    %-32s (%ss)\n' "$name" "$elapsed" ;;
 SKIP)	printf 'skip  %-32s %s\n' "$name" \
 		"$(sed -n 's/^SKIP: //p' "$log" | head -1)" ;;
-FAIL)	printf 'FAIL  %-32s (rc=%s)\n' "$name" "$rc" ;;
+FAIL)	printf 'FAIL  %-32s (rc=%s)\n' "$name" "$rc"
+	[ ! -s "$stuck" ] || sed "s/^/# $name: /" "$stuck" ;;
 esac
 
 exit 0
