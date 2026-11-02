@@ -158,6 +158,20 @@ static const struct gwp_cfg default_opts = {
 	.as_transparent		= false
 };
 
+/*
+ * The longest SOCKS5 message a client sends, an RFC 1929 request with a name
+ * and a password of 255 bytes each. A greeting takes up to 257 bytes and a
+ * CONNECT request up to 262.
+ */
+#define GWP_SOCKS5_MIN_CLIENT_BUF	513
+
+/*
+ * target.buf holds the handshake with an upstream proxy. The longest request
+ * is an HTTP CONNECT: twice an authority of up to 261 bytes, Basic credentials
+ * of 684 and the fixed text take 1264 bytes.
+ */
+#define GWP_UPSTREAM_MIN_TARGET_BUF	1280
+
 static int setskopt_int(int fd, int level, int optname, int val);
 static uint32_t cfg_dns_restyp(const struct gwp_cfg *cfg);
 
@@ -218,11 +232,11 @@ static void show_help(const char *app)
 	printf("                                  them wholesale for the connections it matches\n");
 	printf("  -R, --as-transparent=0|1        Transparent proxy: take the target from SO_ORIGINAL_DST (iptables REDIRECT) (default: %d)\n", default_opts.as_transparent);
 #ifdef CONFIG_HTTPS
-	printf("  -E, --tls-cert=file             PEM certificate chain; enables TLS termination on the listener (auto-detected per connection)\n");
+	printf("  -E, --tls-cert=file             PEM certificate chain; enables TLS termination on a SOCKS5 or HTTP listener (auto-detected per connection)\n");
 	printf("  -Y, --tls-key=file              PEM private key matching --tls-cert\n");
 #endif
 #ifdef CONFIG_NEW_DNS_RESOLVER
-	printf("  -j, --dns-server=addr:port      DNS server address (default: system resolver)\n");
+	printf("  -j, --dns-server=addr:port      DNS server address for --raw-dns (default: %s)\n", default_opts.dns_servers);
 	printf("  -r, --raw-dns=0|1               Use raw DNS for SOCKS5 (default: %d)\n", default_opts.use_raw_dns);
 #endif
 	printf("\n");
@@ -581,6 +595,16 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		fprintf(stderr, ERR_WRAP "Error: --tls-cert and --tls-key must be provided together\n" ERR_WRAP);
 		goto einval;
 	}
+
+	/*
+	 * The TLS listener detects a ClientHello in the SOCKS5 and HTTP paths
+	 * only. Elsewhere the certificate would do nothing but log that TLS is
+	 * on while the listener speaks cleartext.
+	 */
+	if (cfg->tls_cert && !cfg->as_socks5 && !cfg->as_http) {
+		fprintf(stderr, ERR_WRAP "Error: --tls-cert needs --as-socks5=1 or --as-http=1\n" ERR_WRAP);
+		goto einval;
+	}
 #endif
 
 	if (cfg->as_transparent && (cfg->as_socks5 || cfg->as_http)) {
@@ -638,6 +662,22 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least 256 for SOCKS5 or HTTP.\n" ERR_WRAP);
 			goto einval;
 		}
+	}
+
+	/*
+	 * Each SOCKS5 message has to fit in client.buf as a whole, and the
+	 * proxy has no other way to read the rest of it.
+	 */
+	if (cfg->as_socks5 && cfg->client_buf_size < GWP_SOCKS5_MIN_CLIENT_BUF) {
+		fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be at least %d for SOCKS5.\n" ERR_WRAP,
+			GWP_SOCKS5_MIN_CLIENT_BUF);
+		goto einval;
+	}
+
+	if (cfg->upstream_proxy && cfg->target_buf_size < GWP_UPSTREAM_MIN_TARGET_BUF) {
+		fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least %d with --upstream-proxy.\n" ERR_WRAP,
+			GWP_UPSTREAM_MIN_TARGET_BUF);
+		goto einval;
 	}
 
 	return 0;
@@ -826,7 +866,8 @@ static int gwp_ctx_init_log(struct gwp_ctx *ctx)
 			r = -errno;
 			if (fd >= 0)
 				close(fd);
-			pr_err(&ctx->lh, "Failed to open log file '%s': %s",
+			/* There is no log to report this to, so not pr_err(). */
+			fprintf(stderr, "Failed to open log file '%s': %s\n",
 				cfg->log_file, strerror(-r));
 		}
 	}
@@ -1282,6 +1323,7 @@ __cold
 static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 {
 	struct gwp_wrk *w, *workers = ctx->workers;
+	void *ret;
 	int i;
 
 	if (!workers)
@@ -1295,8 +1337,10 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 			continue;
 
 		pr_dbg(&ctx->lh, "Joining worker thread %d", i);
-		pthread_join(w->thread, NULL);
+		pthread_join(w->thread, &ret);
 		w->need_join = false;
+		if ((intptr_t)ret < 0 && !ctx->worker_err)
+			ctx->worker_err = (int)(intptr_t)ret;
 	}
 
 	for (i = 0; i < ctx->cfg.nr_workers; i++)
@@ -2007,6 +2051,7 @@ static uint16_t sa_port_h(const struct gwp_sockaddr *s)
 static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 				      struct gwp_socks5_addr *out);
 static int upstream_target_init(struct gwp_ctx *ctx);
+static int parse_port(const char *s, uint16_t *port);
 
 /*
  * Fill the inputs of an OUTPUT request for @target (NULL when only a domain is
@@ -3733,7 +3778,7 @@ static int upstream_dst_from_hostport(const char *hostport,
 {
 	char buf[300], *colon, *host;
 	size_t hl, n = strlen(hostport);
-	int port;
+	uint16_t port;
 
 	if (n == 0 || n >= sizeof(buf))
 		return -EINVAL;
@@ -3743,8 +3788,7 @@ static int upstream_dst_from_hostport(const char *hostport,
 	if (!colon)
 		return -EINVAL;
 	*colon = '\0';
-	port = atoi(colon + 1);
-	if (port <= 0 || port > 65535)
+	if (parse_port(colon + 1, &port) || !port)
 		return -EINVAL;
 
 	host = buf;
@@ -3754,7 +3798,7 @@ static int upstream_dst_from_hostport(const char *hostport,
 		host++;
 	}
 
-	return upstream_dst_from_domain(host, (uint16_t)port, out);
+	return upstream_dst_from_domain(host, port, out);
 }
 
 /*
@@ -5079,13 +5123,47 @@ static void prepare_rlimit(void)
 	}
 }
 
+/*
+ * Give any of fds 0-2 that was closed to /dev/null. The default log target is
+ * fd 1 whatever it has become: left closed, the next descriptor we open takes
+ * its number, and the log lines go to the PID file or a client's socket.
+ */
+__cold
+static int open_std_fds(void)
+{
+	int fd;
+
+	for (fd = 0; fd <= 2; fd++) {
+		if (fcntl(fd, F_GETFD) >= 0 || errno != EBADF)
+			continue;
+		/* The lowest free number, so this one: the lower ones are open. */
+		if (open("/dev/null", O_RDWR) < 0)
+			return -errno;
+	}
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
-	struct sigaction sa = { .sa_handler = &sig_handler };
+	struct sigaction sa = { .sa_handler = SIG_IGN };
 	struct gwp_ctx ctx;
 	int r;
 
 	memset(&ctx, 0, sizeof(ctx));
+	r = open_std_fds();
+	if (r < 0) {
+		fprintf(stderr, "Failed to open /dev/null: %s\n", strerror(-r));
+		goto out;
+	}
+
+	/* Before the first log line: its target may be a pipe nobody reads. */
+	r = sigaction(SIGPIPE, &sa, NULL);
+	if (r < 0) {
+		r = -errno;
+		fprintf(stderr, "Failed to set signal handlers: %s\n", strerror(-r));
+		goto out;
+	}
+
 	r = parse_options(argc, argv, &ctx.cfg);
 	if (r < 0)
 		goto out;
@@ -5096,10 +5174,9 @@ int main(int argc, char *argv[])
 		goto out;
 
 	atomic_store(&g_ctx, &ctx);
+	sa.sa_handler = &sig_handler;
 	r |= sigaction(SIGINT, &sa, NULL);
 	r |= sigaction(SIGTERM, &sa, NULL);
-	sa.sa_handler = SIG_IGN;
-	r |= sigaction(SIGPIPE, &sa, NULL);
 	if (r < 0) {
 		r = -errno;
 		fprintf(stderr, "Failed to set signal handlers: %s\n", strerror(-r));
@@ -5110,6 +5187,9 @@ int main(int argc, char *argv[])
 out_free:
 	sig_handler_detach_ctx();
 	gwp_ctx_free(&ctx);
+	/* Worker 0 leaves cleanly when another worker's error stopped it. */
+	if (!r)
+		r = ctx.worker_err;
 out:
 	return -r;
 }

@@ -293,6 +293,21 @@ wait_listen()
 	return 1
 }
 
+# wait_sigterm_handled <pid>: wait until <pid> has its SIGTERM handler in place.
+# The listeners come up before the handler does, so a signal sent right after
+# wait_listen() can still kill the proxy, which is no clean exit.
+wait_sigterm_handled()
+{
+	local pid="$1" i v
+
+	for i in $(seq 1 300); do
+		v="$(sed -n 's/^SigCgt:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)"
+		[ -n "$v" ] && [ $(( 0x$v & 0x4000 )) != 0 ] && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
 # gwp_start <bind> [args...]: start gwproxy bound to <bind> (e.g. "[::1]:1080"
 # or "127.0.0.1:1080") and wait until it is listening. Sets GWP_PID. The log
 # is captured under $WORK and dumped on failure.

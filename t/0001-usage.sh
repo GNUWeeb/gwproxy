@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Basic CLI behaviour: --help, unknown options, and required-argument checks.
+# Basic CLI behaviour: --help, unknown options, and required-argument checks,
+# and the flags configure takes from the environment.
 
 . "$(dirname "$0")/lib.sh"
 
@@ -33,6 +34,13 @@ expect_reject()
 # --help succeeds and prints a usage line.
 out="$("$GWPROXY" --help 2>&1)" || fail "--help exited non-zero"
 printf '%s\n' "$out" | grep -q '^Usage:' || fail "--help did not print a Usage line"
+
+# --help must name the DNS server --raw-dns really uses by default: it said
+# "system resolver", while every target name went to a public resolver.
+if printf '%s\n' "$out" | grep -q -- --dns-server; then
+	printf '%s\n' "$out" | grep -- --dns-server | grep -q '1\.1\.1\.1' || \
+		fail "--help does not name the default --dns-server"
+fi
 
 # An unknown option must be rejected. The remaining arguments form a valid,
 # runnable configuration so the unknown option is the only reason to fail --
@@ -67,6 +75,89 @@ if [ "$(id -u)" != 0 ]; then
 		fail "--mark error does not show 4294967295: $out"
 fi
 
+# A port that does not fit must be refused, not cut to its first five
+# characters or wrapped modulo 65536 into some other port. Only IP literals
+# here, so nothing goes to a resolver.
+for bad in 65536 123456 16722xyz -1 ""; do
+	what="port '$bad'"
+	expect_reject "--bind with $what" --as-socks5=1 --nr-workers=1 \
+		--bind="127.0.0.1:$bad"
+	expect_reject "--bind in brackets with $what" --as-socks5=1 \
+		--nr-workers=1 --bind="[::1]:$bad"
+done
+pp="$(pick_port)"
+for bad in 65536 16722xyz; do
+	what="port '$bad'"
+	expect_reject "--target with $what" --nr-workers=1 \
+		--bind="127.0.0.1:$pp" --target="127.0.0.1:$bad"
+	expect_reject "--upstream-proxy with $what" --as-socks5=1 \
+		--nr-workers=1 --bind="127.0.0.1:$pp" \
+		--upstream-proxy="socks5://127.0.0.1:$bad"
+	# A remote-DNS upstream takes --target without resolving it.
+	expect_reject "--target for a socks5h upstream with $what" \
+		--nr-workers=1 --bind="127.0.0.1:$pp" \
+		--upstream-proxy="socks5h://127.0.0.1:1" \
+		--target="host.invalid:$bad"
+	if "$GWPROXY" --help 2>&1 | grep -q -- --dns-server; then
+		expect_reject "--dns-server with $what" --as-socks5=1 \
+			--nr-workers=1 --bind="127.0.0.1:$pp" \
+			--raw-dns=1 --dns-server="127.0.0.1:$bad"
+	fi
+done
+
+# The edges of the range still work: port 0 asks for an ephemeral port.
+timeout --foreground 2 "$GWPROXY" --nr-workers=1 --bind=127.0.0.1:0 \
+	--target=127.0.0.1:65535 >/dev/null 2>&1
+rc=$?
+[ "$rc" = 124 ] || fail "--bind=:0 --target=:65535 was not accepted: exit $rc"
+
+# TLS is terminated in the SOCKS5 and HTTP paths only. Elsewhere a certificate
+# used to be accepted, and the log said TLS was on over a cleartext listener.
+if "$GWPROXY" --help 2>&1 | grep -q -- --tls-cert; then
+	for mode in --target=127.0.0.1:1 --as-transparent=1; do
+		rc=0
+		timeout --foreground 5 "$GWPROXY" --nr-workers=1 --bind=127.0.0.1:0 "$mode" \
+			--tls-cert=/nonexistent/c --tls-key=/nonexistent/k \
+			>"$WORK/tlsmode.out" 2>&1 || rc=$?
+		[ "$rc" = "$EINVAL" ] || fail "--tls-cert with $mode: exit $rc"
+		grep -q -- 'Error: --tls-cert needs' "$WORK/tlsmode.out" || \
+			fail "--tls-cert with $mode: no error message"
+	done
+fi
+
+# A --log-file that cannot be opened stops the proxy, and that must be said on
+# stderr: the log it would have gone to is the file that failed.
+mkdir "$WORK/logdir"
+ln -s "$WORK/logdir/target" "$WORK/loglink"
+for bad in "$WORK/nodir/log" "$WORK/logdir" "$WORK/loglink"; do
+	rc=0
+	timeout --foreground 5 "$GWPROXY" --as-socks5=1 --nr-workers=1 --bind=127.0.0.1:0 \
+		--log-file="$bad" >/dev/null 2>"$WORK/logfile.err" || rc=$?
+	case "$rc" in
+	0|124) fail "--log-file=$bad was accepted: exit $rc" ;;
+	esac
+	grep -qF "Failed to open log file '$bad'" "$WORK/logfile.err" || \
+		fail "--log-file=$bad: exit $rc with no message"
+done
+
+# A buffer that cannot hold the longest message of the protocol would stall a
+# valid client, so it is not accepted. HTTP answers an oversized header itself.
+pp="$(pick_port)"
+expect_reject "SOCKS5 with a 512-byte client buffer" --as-socks5=1 \
+	--nr-workers=1 --bind="127.0.0.1:$pp" --client-buf-size=512
+expect_reject "SOCKS5 and HTTP with a 512-byte client buffer" --as-socks5=1 \
+	--as-http=1 --nr-workers=1 --bind="127.0.0.1:$pp" --client-buf-size=512
+expect_reject "upstream with a 1279-byte target buffer" --as-http=1 \
+	--nr-workers=1 --bind="127.0.0.1:$pp" --target-buf-size=1279 \
+	--upstream-proxy=http://127.0.0.1:1
+expect_reject "forwarding upstream with a 2-byte target buffer" \
+	--target=127.0.0.1:1 --nr-workers=1 --bind="127.0.0.1:$pp" \
+	--target-buf-size=2 --upstream-proxy=socks5://127.0.0.1:1
+rc=0
+timeout --foreground 2 "$GWPROXY" --as-http=1 --nr-workers=1 --bind=127.0.0.1:0 \
+	--client-buf-size=256 --target-buf-size=256 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 124 ] || fail "HTTP with 256-byte buffers was not accepted: exit $rc"
+
 # A malformed --upstream-proxy URL must be rejected at startup. Use URLs that
 # are structurally wrong (unsupported scheme, no scheme at all) rather than one
 # whose host merely fails to resolve: on a host with a wildcard search domain
@@ -79,5 +170,27 @@ if "$GWPROXY" --help 2>&1 | grep -q -- "--upstream-proxy"; then
 		--as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
 		--upstream-proxy="not-a-url"
 fi
+
+# configure must keep LDFLAGS from the environment, as packagers set them, and
+# keep LIB_LDFLAGS for the end of the link line, where libraries belong. It
+# leaves a config.make symlink in its working directory: not in the tree.
+mkdir "$WORK/cfg"
+cc="$(sed -n 's/^CC=//p' "$ROOT/config.make")"
+(cd "$WORK/cfg" && LDFLAGS=-Wl,--mymark LIB_LDFLAGS=-lmylib \
+	sh "$ROOT/configure" --cc="${cc:-gcc}" --build-dir="$WORK/cfg/b") \
+	>/dev/null 2>&1 || fail "configure failed"
+ld="$(sed -n 's/^LDFLAGS=//p' "$WORK/cfg/b/config.make")"
+lib="$(sed -n 's/^LIB_LDFLAGS=//p' "$WORK/cfg/b/config.make")"
+case "$ld" in
+*-Wl,--mymark*) ;;
+*) fail "configure dropped LDFLAGS from the environment: LDFLAGS=$ld" ;;
+esac
+case "$ld" in
+*-lmylib*) fail "configure put LIB_LDFLAGS in LDFLAGS: LDFLAGS=$ld" ;;
+esac
+case "$lib" in
+*-lmylib*) ;;
+*) fail "configure dropped LIB_LDFLAGS: LIB_LDFLAGS=$lib" ;;
+esac
 
 pass

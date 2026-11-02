@@ -865,6 +865,8 @@ struct gwp_ctx {
 	 * is also safe to store from a signal handler.
 	 */
 	_Atomic(bool)			stop;
+	/* First error of the workers joined by gwp_ctx_free_threads(). */
+	int				worker_err;
 	uint8_t				ev_used;
 	struct log_handle		lh;
 	struct gwp_wrk			*workers;

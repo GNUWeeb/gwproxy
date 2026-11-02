@@ -87,6 +87,8 @@ Default:
 .BR \-b ", " \-\-bind=\fIaddr:port\fR
 Address and port to listen on. IPv6 literals are written in brackets, e.g.
 .BR [::1]:1080 " or " 0.0.0.0:8080 .
+A port outside 0 to 65535, or one with anything behind its digits, is refused
+at startup, here and in every other address option.
 The default,
 .BR [::]:1080 ,
 listens on the dual\-stack IPv4/IPv6 wildcard. A SOCKS5 or HTTP proxy
@@ -574,7 +576,13 @@ These options require a build with OpenSSL support (see
 .BR \-E ", " \-\-tls\-cert=\fIfile\fR
 PEM certificate chain presented to TLS clients. Providing it (together with
 .BR \-\-tls\-key )
-enables TLS termination on the listener.
+enables TLS termination on the listener. It needs
+.B \-\-as\-socks5=1
+or
+.BR \-\-as\-http=1 :
+with plain forwarding or
+.B \-\-as\-transparent=1
+the proxy refuses to start, as they do not terminate TLS.
 .TP
 .BR \-Y ", " \-\-tls\-key=\fIfile\fR
 PEM private key matching
@@ -879,10 +887,15 @@ replaces rather than merges with
 .BR \-T ", " \-\-target\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for target\(->client data. Default:
 .BR 65536 .
+At least 256 for SOCKS5 or HTTP, and at least 1280 with
+.BR \-\-upstream\-proxy ,
+whose handshake goes through this buffer.
 .TP
 .BR \-C ", " \-\-client\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for client\(->target data. Default:
 .BR 65536 .
+At least 256 for HTTP, and at least 513 for SOCKS5, the size of its longest
+request.
 .IP
 Each wakeup reads at most one buffer and writes it out, so the buffer size
 sets the syscalls per byte of a bulk transfer: 64 KiB takes about 40%
@@ -1265,8 +1278,11 @@ which requires
 .SH SIGNALS
 .TP
 .BR SIGINT ", " SIGTERM
-Begin a graceful shutdown: stop accepting new connections, let workers drain,
-and exit.
+Stop at once: workers leave their event loops and every connection is closed,
+with whatever is still in its buffers or on its way discarded. There is no
+drain. A client in the middle of a transfer sees a normal end of stream after
+only part of the data, so a protocol that does not mark its own end cannot tell
+this from a complete transfer.
 .TP
 .B SIGPIPE
 Ignored, so a peer closing a connection cannot terminate the process.
