@@ -2252,8 +2252,8 @@ static uint16_t sa_port(const struct gwp_sockaddr *sa)
  * @req->dnat. The address and port are taken from the rule where set, otherwise
  * carried over from the matched target (@req->target); a port-only rewrite thus
  * keeps the original address. If neither the rule nor the request supplies an
- * address, @req->dnat is left with family 0 (no usable rewrite -- the caller,
- * which only DNATs concrete targets, ignores it).
+ * address, @req->dnat is left with family 0, and @req->dnat_port is all there
+ * is to apply: the caller changes the port of the hostname it was asked for.
  */
 static void apply_dnat(struct gwp_acl_req *req, const struct gwp_acl_dnat *d)
 {
@@ -2286,6 +2286,7 @@ static void apply_dnat(struct gwp_acl_req *req, const struct gwp_acl_dnat *d)
 	}
 
 	req->dnat = out;
+	req->dnat_port = d->set_port ? d->port : 0;
 	req->dnat_applied = true;
 }
 

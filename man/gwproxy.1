@@ -298,7 +298,9 @@ iptables, is terminal \(em it accepts the connection and stops matching (DNAT
 applies to SOCKS5, HTTP, plain and transparent forwarding and, when chaining, to
 the destination handed to an upstream proxy \(em including replacing a
 .B socks5h://
-hostname with the rewritten IP \(em but not the UDP relay), or
+hostname with the rewritten IP, or for a port\-only
+.B \-\-to :\fIport\fR
+keeping the hostname and changing its port \(em but not the UDP relay), or
 .B MARK
 .RB ( OUTPUT "-only) with " \-\-set\-mark " " \fInum\fR "."
 .IP

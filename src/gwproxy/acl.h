@@ -156,6 +156,8 @@ struct gwp_acl_req {
 	/* Small scalars: inputs, then output flags, grouped to pack tightly. */
 	uint16_t			sport;
 	uint16_t			dport;
+	/* The rule's port, or 0; set only with @dnat_applied. */
+	uint16_t			dnat_port;
 	uint8_t				proto;	/* enum gwp_acl_proto */
 	bool				dnat_applied;
 	bool				mark_set;
