@@ -2338,18 +2338,19 @@ static int handle_conn_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ip_to_str(&gcp->client_addr), ip_to_str(&gcp->target_addr));
 
 	/*
-	 * A target socket that never came up: tell the client the origin timed
-	 * out (SOCKS5 REP 0x06, HTTP 504) instead of just dropping it. Only
-	 * once the target socket exists -- the other user of this timer is the
-	 * protocol handshake, where the client has not asked for anything yet
-	 * and a CONNECT reply would answer a request that was never made.
+	 * A target socket that never came up, or a target name that did not
+	 * resolve in time: tell the client the origin timed out (SOCKS5 REP
+	 * 0x06, HTTP 504) instead of just dropping it. Only once the request is
+	 * complete -- the other user of this timer is the protocol handshake,
+	 * where the client has not asked for anything yet and a CONNECT reply
+	 * would answer a request that was never made.
 	 *
 	 * Send only what gwp_conn_fail_reply() added: plain forwarding has no
 	 * reply to give, and a stalled upstream handshake leaves its own bytes
 	 * in target.buf, which are dropped first.
 	 */
-	if ((gcp->target.fd >= 0 || has_inflight_attempt(gcp)) &&
-	    !gcp->is_target_alive) {
+	if ((gcp->target.fd >= 0 || has_inflight_attempt(gcp) ||
+	     gwp_in_dns_lookup(gcp)) && !gcp->is_target_alive) {
 		uint32_t len;
 
 		if (gwp_in_upstream_hs(gcp))

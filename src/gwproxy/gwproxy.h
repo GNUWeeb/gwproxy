@@ -1076,6 +1076,18 @@ static inline bool gwp_in_upstream_hs(const struct gwp_conn_pair *gcp)
 	       cs <= CONN_STATE_UPSTREAM_HTTP_MAX;
 }
 
+/*
+ * Waiting for the target's name to resolve: the client's request is complete,
+ * so it is owed an answer however this ends.
+ */
+static inline bool gwp_in_dns_lookup(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs == CONN_STATE_SOCKS5_DNS_QUERY ||
+	       cs == CONN_STATE_HTTP_DNS_QUERY;
+}
+
 /* Move the data back to the start of the buffer, regaining the room in front. */
 static inline void gwp_conn_buf_compact(struct gwp_conn *conn)
 {

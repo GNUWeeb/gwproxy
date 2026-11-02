@@ -1917,17 +1917,19 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 		/*
 		 * Tell the client the origin timed out (SOCKS5 REP 0x06, HTTP
-		 * 504) rather than hanging up silently. Only once a target
-		 * socket exists -- the other user of this timer is the protocol
-		 * handshake, where nothing has been requested yet. During a
-		 * race there is no target fd yet, so the in-flight attempts
-		 * count as one.
+		 * 504) rather than hanging up silently. Only once the request
+		 * is complete -- the other user of this timer is the protocol
+		 * handshake, where nothing has been requested yet. That is
+		 * while a target socket exists, while the target's name is
+		 * being looked up, and during a race, where there is no target
+		 * fd yet, so the in-flight attempts count as one.
 		 *
 		 * Send only what gwp_conn_fail_reply() added: plain forwarding
 		 * has no reply to give, and a stalled upstream handshake leaves
 		 * its own bytes in target.buf, which are dropped first.
 		 */
-		if (gcp->target.fd >= 0 || has_inflight_attempt(gcp)) {
+		if (gcp->target.fd >= 0 || has_inflight_attempt(gcp) ||
+		    gwp_in_dns_lookup(gcp)) {
 			uint32_t len;
 
 			if (gwp_in_upstream_hs(gcp)) {

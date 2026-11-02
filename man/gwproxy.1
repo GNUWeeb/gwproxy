@@ -108,7 +108,9 @@ listener, from 1 to 1024. Default:
 .TP
 .BR \-o ", " \-\-protocol\-timeout=\fIsec\fR
 Seconds allowed for a client to complete the SOCKS5/HTTP (and, if enabled, TLS)
-handshake before the connection is dropped. Default:
+handshake before the connection is dropped. This includes the lookup of the
+target's name; a client whose request is waiting for one when the time runs out
+gets a SOCKS5 reply 0x06 or an HTTP 504 first. Default:
 .BR 10 .
 .TP
 .BR \-c ", " \-\-connect\-timeout=\fIsec\fR
