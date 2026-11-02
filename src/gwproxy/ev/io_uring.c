@@ -2372,9 +2372,12 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * Chaining: every attempt dials the same upstream proxy, so
 		 * walking the target's addresses would just repeat the same
 		 * failure. The candidates still matter for the ACL above and
-		 * for the destination named to the upstream.
+		 * for the destination named to the upstream. Not so for a
+		 * -j MARK or -j BIND, which is this candidate's alone: the
+		 * next one may well carry another, or none.
 		 */
-		if (w->ctx->upstream.enabled)
+		if (w->ctx->upstream.enabled && !gcp->acl_sockopt.mark_set &&
+		    !gcp->acl_sockopt.bind.set)
 			break;
 	}
 
