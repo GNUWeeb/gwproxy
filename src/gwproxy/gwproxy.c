@@ -50,6 +50,8 @@
 #include <sys/inotify.h>
 #include <poll.h>
 #include <sys/file.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 /* Long-only options (no short letter): values >= 128 are skipped by the
  * short-option string builder below. */
@@ -1017,6 +1019,14 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 		goto out_close;
 	}
 
+	slen = sizeof(w->listen_addr);
+	r = __sys_getsockname(fd, &w->listen_addr.sa, &slen);
+	if (r < 0) {
+		pr_err(&w->ctx->lh, "Failed to get the listening address: %s",
+		       strerror(-r));
+		goto out_close;
+	}
+
 	w->tcp_fd = fd;
 	pr_info(&w->ctx->lh, "Worker %u is listening on %s (fd=%d)", w->idx,
 		cfg->bind, fd);
@@ -1860,8 +1870,15 @@ static void gwp_ctx_free_auth(struct gwp_ctx *ctx)
  * "localhost" resolves to both families, so leaving any of these out lets a
  * client reach loopback-only services anyway. 169.254/16 holds the cloud
  * metadata endpoint. The IPv6 transition prefixes (IPv4-compatible ::/96,
- * NAT64, 6to4) can embed any of the IPv4 ranges above. ::ffff:a.b.c.d needs no
- * rule of its own: the matcher folds it into IPv4 before comparing.
+ * NAT64, 6to4, Teredo, SIIT's ::ffff:0:a.b.c.d) can embed any of the IPv4
+ * ranges above. ::ffff:a.b.c.d needs no rule of its own: the matcher folds it
+ * into IPv4 before comparing, which also keeps ::/8 from covering it.
+ *
+ * The rest is what the IANA special-purpose registries do not call globally
+ * reachable (documentation, benchmarking, ORCHID, the old 6to4 relay anycast),
+ * and all of IPv6 outside 2000::/3, the only part allocated for global unicast.
+ * That takes in the discard prefixes 100::/64 and 100:0:0:1::/64 under 100::/8,
+ * SRv6 5f00::/16 under 4000::/3, and SIIT under ::/8.
  *
  * ::/128 and ::1/128 are listed even though ::/96 covers them, so that each
  * of them is rejected by a rule of its own.
@@ -1876,8 +1893,12 @@ static const char gwp_acl_default_rules[] =
 	"-A OUTPUT -d 169.254.0.0/16 -j REJECT\n"
 	"-A OUTPUT -d 172.16.0.0/12 -j REJECT\n"
 	"-A OUTPUT -d 192.0.0.0/24 -j REJECT\n"
+	"-A OUTPUT -d 192.0.2.0/24 -j REJECT\n"
+	"-A OUTPUT -d 192.88.99.0/24 -j REJECT\n"
 	"-A OUTPUT -d 192.168.0.0/16 -j REJECT\n"
 	"-A OUTPUT -d 198.18.0.0/15 -j REJECT\n"
+	"-A OUTPUT -d 198.51.100.0/24 -j REJECT\n"
+	"-A OUTPUT -d 203.0.113.0/24 -j REJECT\n"
 	"-A OUTPUT -d 224.0.0.0/4 -j REJECT\n"
 	"-A OUTPUT -d 240.0.0.0/4 -j REJECT\n"
 	/* IPv6 */
@@ -1886,8 +1907,28 @@ static const char gwp_acl_default_rules[] =
 	"-A OUTPUT -d ::/96 -j REJECT\n"
 	"-A OUTPUT -d 64:ff9b::/96 -j REJECT\n"
 	"-A OUTPUT -d 64:ff9b:1::/48 -j REJECT\n"
+	"-A OUTPUT -d ::/8 -j REJECT\n"
+	"-A OUTPUT -d 100::/8 -j REJECT\n"
+	"-A OUTPUT -d 200::/7 -j REJECT\n"
+	"-A OUTPUT -d 400::/6 -j REJECT\n"
+	"-A OUTPUT -d 800::/5 -j REJECT\n"
+	"-A OUTPUT -d 1000::/4 -j REJECT\n"
+	"-A OUTPUT -d 2001::/32 -j REJECT\n"
+	"-A OUTPUT -d 2001:2::/48 -j REJECT\n"
+	"-A OUTPUT -d 2001:10::/28 -j REJECT\n"
+	"-A OUTPUT -d 2001:db8::/32 -j REJECT\n"
 	"-A OUTPUT -d 2002::/16 -j REJECT\n"
+	"-A OUTPUT -d 3fff::/20 -j REJECT\n"
+	"-A OUTPUT -d 4000::/3 -j REJECT\n"
+	"-A OUTPUT -d 6000::/3 -j REJECT\n"
+	"-A OUTPUT -d 8000::/3 -j REJECT\n"
+	"-A OUTPUT -d a000::/3 -j REJECT\n"
+	"-A OUTPUT -d c000::/3 -j REJECT\n"
+	"-A OUTPUT -d e000::/4 -j REJECT\n"
+	"-A OUTPUT -d f000::/5 -j REJECT\n"
+	"-A OUTPUT -d f800::/6 -j REJECT\n"
 	"-A OUTPUT -d fc00::/7 -j REJECT\n"
+	"-A OUTPUT -d fe00::/9 -j REJECT\n"
 	"-A OUTPUT -d fe80::/10 -j REJECT\n"
 	"-A OUTPUT -d fec0::/10 -j REJECT\n"
 	"-A OUTPUT -d ff00::/8 -j REJECT\n"
@@ -4294,6 +4335,202 @@ bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr 
 	if (av4 != bv4)
 		return false;
 	return !memcmp(ai, bi, av4 ? 4 : 16);
+}
+
+/*
+ * Ask the routing table whether connections to @a stay on this host, secondary
+ * addresses and local routes of either family included. The reply is written
+ * while the request is sent, so nothing here waits. An error reply is a route
+ * that does not exist or leads nowhere. Returns 1 or 0, or a negative errno when
+ * the kernel could not be asked.
+ */
+static int route_is_local(const struct gwp_sockaddr *a)
+{
+	struct {
+		struct nlmsghdr	nh;
+		struct rtmsg	rt;
+		struct rtattr	dst;
+		uint8_t		ip[16];
+	} req;
+	union {
+		struct nlmsghdr	nh;
+		char		buf[1024];
+	} rsp;
+	const struct rtmsg *rt = NLMSG_DATA(&rsp.nh);
+	const uint8_t *ip;
+	uint32_t ip_len;
+	ssize_t n;
+	bool v4;
+	int fd;
+
+	sockaddr_canon_ip(a, &v4, &ip);
+	ip_len = v4 ? 4 : 16;
+
+	memset(&req, 0, sizeof(req));
+	req.nh.nlmsg_len = (uint32_t)(NLMSG_LENGTH(sizeof(req.rt)) + RTA_LENGTH(ip_len));
+	req.nh.nlmsg_type = RTM_GETROUTE;
+	req.nh.nlmsg_flags = NLM_F_REQUEST;
+	req.rt.rtm_family = v4 ? AF_INET : AF_INET6;
+	req.rt.rtm_dst_len = (uint8_t)(ip_len * 8);
+	req.dst.rta_type = RTA_DST;
+	req.dst.rta_len = (uint16_t)RTA_LENGTH(ip_len);
+	memcpy(req.ip, ip, ip_len);
+
+	fd = __sys_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
+			  NETLINK_ROUTE);
+	if (fd < 0)
+		return fd;
+	n = __sys_send(fd, &req, req.nh.nlmsg_len, 0);
+	if (n >= 0)
+		n = __sys_recv(fd, &rsp, sizeof(rsp), 0);
+	__sys_close(fd);
+
+	if (n < 0)
+		return (int)n;
+	if (n < (ssize_t)NLMSG_HDRLEN)
+		return -EIO;
+	if (rsp.nh.nlmsg_type == NLMSG_ERROR)
+		return 0;
+	if (rsp.nh.nlmsg_type != RTM_NEWROUTE ||
+	    n < (ssize_t)NLMSG_LENGTH(sizeof(*rt)))
+		return -EIO;
+	return rt->rtm_type == RTN_LOCAL;
+}
+
+/*
+ * Whether @a is an address of this host. Where netlink is shut off, bind() is the
+ * next best: it has no word on IPv6 local routes and says yes to anything under
+ * ip_nonlocal_bind, though EADDRINUSE is the ephemeral ports running out, for an
+ * address that is local. Returns 1 or 0, or a negative errno with no descriptor to
+ * ask with.
+ */
+static int ip_is_local(const struct gwp_sockaddr *a)
+{
+	struct gwp_sockaddr s = *a;
+	socklen_t len;
+	int fd, r;
+
+	r = route_is_local(a);
+	if (r >= 0)
+		return r;
+
+	if (a->sa.sa_family == AF_INET) {
+		s.i4.sin_port = 0;
+		len = sizeof(s.i4);
+	} else {
+		s.i6.sin6_port = 0;
+		len = sizeof(s.i6);
+	}
+
+	fd = __sys_socket(a->sa.sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return fd;
+	r = __sys_bind(fd, &s.sa, len);
+	__sys_close(fd);
+	return !r || r == -EADDRINUSE;
+}
+
+/*
+ * Write to @out the address connect() actually goes to for @dst. The unspecified
+ * address means loopback on IPv6. On IPv4 it means the source of the socket when
+ * one is forced (see gwp_create_sock_target() for which one applies), and
+ * 127.0.0.1 otherwise.
+ */
+static void target_connect_addr(const struct gwp_wrk *w,
+				const struct gwp_conn_pair *gcp,
+				const struct gwp_sockaddr *dst,
+				struct gwp_sockaddr *out)
+{
+	static const uint8_t any[sizeof(struct in6_addr)];
+	static const uint8_t lo4[4] = { 127, 0, 0, 1 };
+	const struct gwp_acl_bind *b = gcp->acl_sockopt.bind.set ?
+				       &gcp->acl_sockopt.bind : &w->ctx->bind_def;
+	const uint8_t *ip;
+	bool v4;
+
+	*out = *dst;
+	sockaddr_canon_ip(dst, &v4, &ip);
+	if (memcmp(ip, any, v4 ? 4 : 16))
+		return;
+
+	if (!v4) {
+		out->i6.sin6_addr = in6addr_loopback;
+		return;
+	}
+
+	if (b->set && b->have_src && conn_bind_src(out, &b->src, dst)) {
+		sockaddr_canon_ip(out, &v4, &ip);
+		if (memcmp(ip, any, 4))
+			return;
+	}
+
+	*out = *dst;
+	if (dst->sa.sa_family == AF_INET)
+		memcpy(&out->i4.sin_addr, lo4, 4);
+	else
+		set_v4mapped(&out->i6.sin6_addr, lo4);
+}
+
+/*
+ * A client must not get to connect the proxy to itself: the bytes it pipelines
+ * behind the request are passed on once the target is up, so they make the next
+ * request, and one connection and a few KB nest the proxy in itself thousands
+ * of times, each hop one more pair of descriptors. A proxy request is asked about
+ * when its attempt has connected: no client bytes have moved yet, so the chain
+ * ends at the first hop, and the failure takes the way of a refused connect, reply
+ * included.
+ *
+ * Plain forwarding needs no client bytes: each hop dials the next by itself, and
+ * by the time a connection is seen to be up the next hop is on its way, and it
+ * goes on after the client has left. So plain forwarding is asked about before
+ * the connect, and the connection is never made.
+ *
+ * Only the port is looked at for every connection. The rest is for the few that
+ * match, so it costs ordinary traffic nothing. A path back through NAT or another
+ * host cannot be told from here.
+ *
+ * A full descriptor table leaves nothing to ask the kernel with. Before a connect
+ * the answer is then no: the caller's own socket will not be had either, it waits
+ * for a descriptor and comes back here with one. With @connected there is no
+ * coming back and the answer is yes, as a no would let the hop through, and so on
+ * for each two descriptors freed: the chain would soak up all of them and keep the
+ * table full. The price is that a remote service on the listener's port number is
+ * refused for as long as the table is full.
+ */
+bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
+			const struct gwp_sockaddr *dst, bool connected)
+{
+	static const uint8_t any[sizeof(struct in6_addr)];
+	const struct gwp_sockaddr *lst = &w->listen_addr;
+	struct gwp_sockaddr to;
+	const uint8_t *lip, *dip;
+	bool lv4, dv4, self, unsure = false;
+
+	if (w->ctx->upstream.enabled)
+		dst = &w->ctx->upstream.addr;
+	if (sa_port_h(dst) != sa_port_h(lst))
+		return false;
+
+	sockaddr_canon_ip(lst, &lv4, &lip);
+	target_connect_addr(w, gcp, dst, &to);
+	sockaddr_canon_ip(&to, &dv4, &dip);
+	if (memcmp(lip, any, lv4 ? 4 : 16)) {
+		self = gwp_sockaddr_ip_eq(&to, lst);
+	} else if (lv4 ? !dv4 : (dv4 && w->ctx->cfg.bind_ipv6_only)) {
+		self = false;		/* a family the wildcard leaves out */
+	} else {
+		int r = ip_is_local(&to);
+
+		unsure = r < 0;
+		self = unsure ? connected : r;
+	}
+
+	if (self)
+		pr_info(&w->ctx->lh,
+			"Refused a target that %s this proxy: %s (idx=%u, ca=%s)",
+			unsure ? "may be" : "is",
+			ip_to_str(dst), gcp->idx, ip_to_str(&gcp->client_addr));
+	return self;
 }
 
 bool gwp_sockaddr_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr *b)

@@ -429,6 +429,11 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	socklen_t addr_len;
 	int fd;
 
+	/* Plain forwarding, see gwp_target_is_self(). */
+	if (gcp->prot_type == GWP_PROT_TYPE_NONE &&
+	    gwp_target_is_self(w, gcp, &gcp->target_addr, false))
+		return -ELOOP;
+
 	ca = ctx->upstream.enabled ? &ctx->upstream.addr : &gcp->target_addr;
 
 	fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, NULL, false);
@@ -1840,6 +1845,12 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 	fd = gcp->attempt_fd[slot];
 	if (unlikely(fd < 0))
 		return 0;		/* already retired */
+
+	/* Plain forwarding was asked before the connect. */
+	if (!res && gcp->target.fd < 0 && !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL) &&
+	    gcp->prot_type != GWP_PROT_TYPE_NONE &&
+	    gwp_target_is_self(w, gcp, &gcp->attempt_addr[slot], true))
+		res = -ELOOP;
 
 	/*
 	 * A winner was already adopted, or the pair is being torn down: this is

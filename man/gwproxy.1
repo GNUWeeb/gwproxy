@@ -96,6 +96,36 @@ listening on anything but loopback without
 .B \-\-auth\-file
 is open to every client that can reach it; gwproxy logs a warning at startup
 when it is configured that way.
+.IP
+A target that is this listener is refused (SOCKS5 reply
+.BR 0x01 ,
+HTTP
+.BR 502 ,
+and a plain or transparent client is disconnected), since a client could
+otherwise chain the proxy through itself over and over on one connection. That
+covers a hostname, a
+.B \-j DNAT
+rewrite and an upstream proxy too, and an unspecified target as the address a
+connect to it reaches: loopback, or an IPv4 source forced by
+.B \-\-bind\-source
+or
+.BR "\-j BIND" .
+The other addresses of a hostname are still tried, so the client may get through
+to one of them, and when all fail the reply is that of the last to fail, which can
+be another error code.
+Under a wildcard address it means any address the host's routing table has as
+local, local routes included, in the family the wildcard covers, with this port;
+a service of the same port number on an address the listener does not cover is
+reached as usual. Asking the routing table takes a descriptor, so while the
+descriptor table is full a SOCKS5 or HTTP target on this port number is refused
+as if it were this listener, even if it is a remote service; plain and transparent
+clients wait for a descriptor, as they do for their target socket.
+With port 0, where each worker has a port of its own,
+only the worker's own port is recognised. A path back to the listener through NAT
+or another host is not recognised either; use
+.B \-\-max\-conns\-per\-ip
+to bound what one client can do that way, noting that such connections count
+against the proxy's own address.
 .TP
 .BR \-t ", " \-\-target=\fIaddr:port\fR
 For plain TCP forwarding, the fixed destination every accepted connection is
@@ -401,6 +431,12 @@ match can deny some of a name's addresses while the connection still succeeds
 on another (see
 .BR "TARGET ADDRESS SELECTION" ).
 .IP
+One trailing dot does not count, in a
+.B \-\-domain
+value or in the requested name: "example.com." and "example.com" are the same
+name. A value that still ends in a dot without it, or is nothing but one, is a
+parse error. A regexp sees the requested name with its dot already removed.
+.IP
 .B \-\-domain\-regexp
 .I pattern
 (an alternative to
@@ -425,9 +461,21 @@ takes a PCRE instead (case\-sensitive, raw/unanchored, needs
 .BR \-\-use\-pcre ).
 It is
 .B OUTPUT
-\-only and matches nothing when the connection is unauthenticated, so it only
-has effect together with
-.BR \-\-auth\-file .
+\-only. A connection with no authenticated user has no name to match, so
+.B \-\-user
+does not match it, and the negated
+.B ! \-\-user
+.I does
+match it, the same way
+.B ! \-\-domain
+matches a target with no hostname. So
+.B "\-m user ! \-\-user alice \-j ACCEPT"
+admits anonymous clients too, unless every client has to authenticate. That
+holds for SOCKS5 and HTTP with
+.B \-\-auth\-file
+only: no connection in plain or transparent mode has a user, even with
+.BR \-\-auth\-file ,
+and the same goes for SOCKS5 and HTTP without it.
 The
 .BR \-\-user\-regexp
 option, like
@@ -515,13 +563,16 @@ accepts all clients but rejects outgoing connections to anything other than
 public unicast addresses: the unspecified addresses (on Linux a connection to
 0.0.0.0 or :: reaches the local host), loopback, private and shared (CGNAT)
 space, link\-local (including the cloud metadata service at 169.254.169.254),
-benchmarking, multicast, reserved and broadcast addresses, and the IPv6
-prefixes that embed an IPv4 address (IPv4\-compatible, NAT64, 6to4). An
-IPv4\-mapped target (::ffff:a.b.c.d) is matched as the IPv4 address it
-carries, so the IPv4 rules cover it too. A hostname is checked per resolved
-address, so a name such as
+benchmarking, documentation, multicast, reserved and broadcast addresses, the
+old 6to4 relay anycast, the IPv6 prefixes that embed an IPv4 address
+(IPv4\-compatible, SIIT, NAT64, 6to4, Teredo), ORCHID, and all of IPv6 outside
+2000::/3, the only part allocated for global unicast. An IPv4\-mapped target
+(::ffff:a.b.c.d) is matched as the IPv4 address it carries, so the IPv4 rules
+cover it too. A hostname is checked per resolved address, so a name such as
 .B localhost
-is refused for both its 127.0.0.1 and its ::1 address:
+is refused for both its 127.0.0.1 and its ::1 address. With a remote\-DNS
+upstream no address is known here, so the name itself is refused; the regexp
+rule is only there in a PCRE2 build:
 .RS
 .nf
 \-P INPUT ACCEPT
@@ -532,8 +583,12 @@ is refused for both its 127.0.0.1 and its ::1 address:
 \-A OUTPUT \-d 169.254.0.0/16 \-j REJECT
 \-A OUTPUT \-d 172.16.0.0/12 \-j REJECT
 \-A OUTPUT \-d 192.0.0.0/24 \-j REJECT
+\-A OUTPUT \-d 192.0.2.0/24 \-j REJECT
+\-A OUTPUT \-d 192.88.99.0/24 \-j REJECT
 \-A OUTPUT \-d 192.168.0.0/16 \-j REJECT
 \-A OUTPUT \-d 198.18.0.0/15 \-j REJECT
+\-A OUTPUT \-d 198.51.100.0/24 \-j REJECT
+\-A OUTPUT \-d 203.0.113.0/24 \-j REJECT
 \-A OUTPUT \-d 224.0.0.0/4 \-j REJECT
 \-A OUTPUT \-d 240.0.0.0/4 \-j REJECT
 \-A OUTPUT \-d ::/128 \-j REJECT
@@ -541,11 +596,33 @@ is refused for both its 127.0.0.1 and its ::1 address:
 \-A OUTPUT \-d ::/96 \-j REJECT
 \-A OUTPUT \-d 64:ff9b::/96 \-j REJECT
 \-A OUTPUT \-d 64:ff9b:1::/48 \-j REJECT
+\-A OUTPUT \-d ::/8 \-j REJECT
+\-A OUTPUT \-d 100::/8 \-j REJECT
+\-A OUTPUT \-d 200::/7 \-j REJECT
+\-A OUTPUT \-d 400::/6 \-j REJECT
+\-A OUTPUT \-d 800::/5 \-j REJECT
+\-A OUTPUT \-d 1000::/4 \-j REJECT
+\-A OUTPUT \-d 2001::/32 \-j REJECT
+\-A OUTPUT \-d 2001:2::/48 \-j REJECT
+\-A OUTPUT \-d 2001:10::/28 \-j REJECT
+\-A OUTPUT \-d 2001:db8::/32 \-j REJECT
 \-A OUTPUT \-d 2002::/16 \-j REJECT
+\-A OUTPUT \-d 3fff::/20 \-j REJECT
+\-A OUTPUT \-d 4000::/3 \-j REJECT
+\-A OUTPUT \-d 6000::/3 \-j REJECT
+\-A OUTPUT \-d 8000::/3 \-j REJECT
+\-A OUTPUT \-d a000::/3 \-j REJECT
+\-A OUTPUT \-d c000::/3 \-j REJECT
+\-A OUTPUT \-d e000::/4 \-j REJECT
+\-A OUTPUT \-d f000::/5 \-j REJECT
+\-A OUTPUT \-d f800::/6 \-j REJECT
 \-A OUTPUT \-d fc00::/7 \-j REJECT
+\-A OUTPUT \-d fe00::/9 \-j REJECT
 \-A OUTPUT \-d fe80::/10 \-j REJECT
 \-A OUTPUT \-d fec0::/10 \-j REJECT
 \-A OUTPUT \-d ff00::/8 \-j REJECT
+\-A OUTPUT \-m domain \-\-domain localhost \-j REJECT
+\-A OUTPUT \-m domain \-\-domain\-regexp \e.localhost$ \-j REJECT
 \-P OUTPUT ACCEPT
 .fi
 .RE
