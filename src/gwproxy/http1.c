@@ -80,6 +80,17 @@ static inline int is_vchar(int c)
 	return 0;
 }
 
+/*
+ * A byte of a field value: HTAB, SP, VCHAR and obs-text (RFC 9110 Section
+ * 5.5). A value is never read as text, only compared with the few names and
+ * tokens the proxy knows, so obs-text simply fails to match those. A bare CR,
+ * NUL or any other control byte is refused: it could end the line for a peer.
+ */
+static inline bool is_field_char(unsigned char c)
+{
+	return c == '\t' || (c >= 0x20 && c != 0x7f);
+}
+
 static inline int is_alpha(int c)
 {
 	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
@@ -683,7 +694,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 		 *
 		 * After the colon, there may be a space, but it is
 		 * optional. If it exists, it must be followed by
-		 * a vchar or space characters.
+		 * field value bytes, see is_field_char().
 		 *
 		 * The value may contain trailing space characters,
 		 * they must be trimmed.
@@ -734,7 +745,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 			if (c == '\r' || c == '\n')
 				break;
 
-			if (!is_vchar(c) && !is_space(c))
+			if (!is_field_char((unsigned char)c))
 				return -EINVAL;
 
 			vl++;
@@ -1844,6 +1855,63 @@ static void test_res_hdr_trim_whitespaces(void)
 	PRTEST_OK();
 }
 
+/* A field value may hold obs-text, and no control byte beside it. */
+static void test_req_hdr_field_value_bytes(void)
+{
+	static const char good[] =
+		"GET / HTTP/1.1\r\n"
+		"Host: \xc3\xa9\r\n"
+		"X-A: \x80\t\xff x\r\n"
+		"X-B: \xa0 \t\r\n"
+		"\r\n";
+	static const char *const bad[] = {
+		"GET / HTTP/1.1\r\nX-A: \xc3\x01\r\n\r\n",
+		"GET / HTTP/1.1\r\nX-A: \xc3\x7f\r\n\r\n",
+		"GET / HTTP/1.1\r\nX-A: \xc3\rX-B: 1\r\n\r\n",
+		"GET / HTTP/1.1\r\nX-\xc3\xa9: 1\r\n\r\n",
+		"GET / HTTP/1.1\r\nX-A\xa0: 1\r\n\r\n",
+	};
+	static const char nul[] = "GET / HTTP/1.1\r\nX-A: \xc3\0\r\n\r\n";
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	size_t i;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = good;
+	ctx.len = sizeof(good) - 1;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	ASSERT_HDRF(&hdr.fields, 0, "Host", "\xc3\xa9");
+	ASSERT_HDRF(&hdr.fields, 1, "X-A", "\x80\t\xff x");
+	ASSERT_HDRF(&hdr.fields, 2, "X-B", "\xa0");
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		r = gwnet_http_hdr_pctx_init(&ctx);
+		assert(!r);
+		ctx.buf = bad[i];
+		ctx.len = strlen(bad[i]);
+		r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+		assert(r == -EINVAL);
+		gwnet_http_req_hdr_free(&hdr);
+		gwnet_http_hdr_pctx_free(&ctx);
+	}
+
+	/* A NUL does not end a value either; strlen() would not reach it. */
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = nul;
+	ctx.len = sizeof(nul) - 1;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
 static void test_req_hdr_invalid_duplicate_fields(void)
 {
 	static const char buf[] =
@@ -2850,6 +2918,7 @@ void gwnet_http_run_tests(void)
 		test_res_hdr_invalid_version();
 		test_req_hdr_trim_whitespaces();
 		test_res_hdr_trim_whitespaces();
+		test_req_hdr_field_value_bytes();
 		test_req_hdr_invalid_duplicate_fields();
 		test_res_hdr_invalid_duplicate_fields();
 		test_req_hdr_invalid_space_before_colon();

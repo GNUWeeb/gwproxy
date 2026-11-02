@@ -1005,6 +1005,46 @@ static void test_forward_rewrite_slack(void)
 	PRTEST_OK();
 }
 
+/*
+ * obs-text in a field value goes on unchanged, but is nothing the framing
+ * fields or the credentials could hold.
+ */
+static void test_field_obs_text(void)
+{
+	static const char *const bad[] = {
+		"POST http://e/ HTTP/1.1\r\nContent-Length: 4\xa0\r\n\r\n",
+		"POST http://e/ HTTP/1.1\r\nContent-Length: \xa0" "4\r\n\r\n",
+		"POST http://e/ HTTP/1.1\r\nTransfer-Encoding: chunked\x85\r\n\r\n",
+		"POST http://e/ HTTP/1.1\r\nTransfer-Encoding: \xc2\xa0"
+		"chunked\r\n\r\n",
+	};
+	static const char good[] =
+		"GET http://e/ HTTP/1.1\r\nX-N: caf\xc3\xa9 \xff\r\n\r\n";
+	static const char want[] =
+		"GET / HTTP/1.1\r\nHost: e\r\nX-N: caf\xc3\xa9 \xff\r\n"
+		"Connection: close\r\n\r\n";
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0, i;
+
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		assert(proc(hc, NULL, bad[i], &host, &port, &req, &req_len,
+			    NULL) == GWP_HTTP_BAD_REQUEST);
+		gwp_http_conn_free(hc);
+	}
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, good, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	assert(req_len == strlen(want) && !memcmp(req, want, req_len));
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void cpu_limit_hit(int sig)
 {
 	static const char msg[] = "Too much CPU for a run of interim responses\n";
@@ -1567,6 +1607,7 @@ int main(void)
 		test_res_direct();
 		test_need_more();
 		test_errors();
+		test_field_obs_text();
 		test_duplicate_field();
 		test_header_limits();
 	test_forward_in_place();
