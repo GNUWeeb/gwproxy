@@ -111,6 +111,20 @@ timeout --foreground 2 "$GWPROXY" --nr-workers=1 --bind=127.0.0.1:0 \
 rc=$?
 [ "$rc" = 124 ] || fail "--bind=:0 --target=:65535 was not accepted: exit $rc"
 
+# TLS is terminated in the SOCKS5 and HTTP paths only. Elsewhere a certificate
+# used to be accepted, and the log said TLS was on over a cleartext listener.
+if "$GWPROXY" --help 2>&1 | grep -q -- --tls-cert; then
+	for mode in --target=127.0.0.1:1 --as-transparent=1; do
+		rc=0
+		timeout --foreground 5 "$GWPROXY" --nr-workers=1 --bind=127.0.0.1:0 "$mode" \
+			--tls-cert=/nonexistent/c --tls-key=/nonexistent/k \
+			>"$WORK/tlsmode.out" 2>&1 || rc=$?
+		[ "$rc" = "$EINVAL" ] || fail "--tls-cert with $mode: exit $rc"
+		grep -q -- 'Error: --tls-cert needs' "$WORK/tlsmode.out" || \
+			fail "--tls-cert with $mode: no error message"
+	done
+fi
+
 # A --log-file that cannot be opened stops the proxy, and that must be said on
 # stderr: the log it would have gone to is the file that failed.
 mkdir "$WORK/logdir"

@@ -576,7 +576,13 @@ These options require a build with OpenSSL support (see
 .BR \-E ", " \-\-tls\-cert=\fIfile\fR
 PEM certificate chain presented to TLS clients. Providing it (together with
 .BR \-\-tls\-key )
-enables TLS termination on the listener.
+enables TLS termination on the listener. It needs
+.B \-\-as\-socks5=1
+or
+.BR \-\-as\-http=1 :
+with plain forwarding or
+.B \-\-as\-transparent=1
+the proxy refuses to start, as they do not terminate TLS.
 .TP
 .BR \-Y ", " \-\-tls\-key=\fIfile\fR
 PEM private key matching

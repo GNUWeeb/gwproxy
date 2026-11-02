@@ -218,7 +218,7 @@ static void show_help(const char *app)
 	printf("                                  them wholesale for the connections it matches\n");
 	printf("  -R, --as-transparent=0|1        Transparent proxy: take the target from SO_ORIGINAL_DST (iptables REDIRECT) (default: %d)\n", default_opts.as_transparent);
 #ifdef CONFIG_HTTPS
-	printf("  -E, --tls-cert=file             PEM certificate chain; enables TLS termination on the listener (auto-detected per connection)\n");
+	printf("  -E, --tls-cert=file             PEM certificate chain; enables TLS termination on a SOCKS5 or HTTP listener (auto-detected per connection)\n");
 	printf("  -Y, --tls-key=file              PEM private key matching --tls-cert\n");
 #endif
 #ifdef CONFIG_NEW_DNS_RESOLVER
@@ -579,6 +579,16 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 #ifdef CONFIG_HTTPS
 	if ((cfg->tls_cert != NULL) != (cfg->tls_key != NULL)) {
 		fprintf(stderr, ERR_WRAP "Error: --tls-cert and --tls-key must be provided together\n" ERR_WRAP);
+		goto einval;
+	}
+
+	/*
+	 * The TLS listener detects a ClientHello in the SOCKS5 and HTTP paths
+	 * only. Elsewhere the certificate would do nothing but log that TLS is
+	 * on while the listener speaks cleartext.
+	 */
+	if (cfg->tls_cert && !cfg->as_socks5 && !cfg->as_http) {
+		fprintf(stderr, ERR_WRAP "Error: --tls-cert needs --as-socks5=1 or --as-http=1\n" ERR_WRAP);
 		goto einval;
 	}
 #endif
