@@ -209,6 +209,13 @@ the proxy rejects it with reply
 .B CONNECT
 unaffected; only meaningful with
 .BR \-\-as\-socks5 .
+Datagrams are taken only from the IP address of the control connection. When
+the request declares that address and a port, only that port is the client;
+when it declares any other address, or no port, the first valid datagram from
+that IP address decides the port, so another party on the same IP address can
+get there first. A client behind a NAT cannot know its outside port and is
+served by the latter rule. A client that declares the control connection's
+address with a port the NAT rewrites gets no service.
 Default:
 .BR 1 .
 .TP
@@ -774,7 +781,10 @@ sysctl. It has no effect when
 .B \-\-bind
 names an IPv4 address. It applies to the listener only: the SOCKS5 UDP relay
 socket stays dual\-stack on purpose, because a single\-family bind cannot
-egress the other family, so UDP ASSOCIATE to IPv4 targets keeps working.
+egress the other family, so UDP ASSOCIATE to IPv4 targets keeps working. On a
+kernel without IPv6 (booted with
+.BR ipv6.disable=1 )
+the relay socket is IPv4 only and datagrams to IPv6 targets are dropped.
 .TP
 .BR \-L ", " \-\-dns\-cache\-secs=\fIsec\fR
 Cache proxy DNS answers for this many seconds.

@@ -2277,8 +2277,11 @@ static void udp_peer_canon(struct gwp_sockaddr *a)
 	static const uint8_t v4_any[4];
 	uint8_t *b = a->i6.sin6_addr.s6_addr;
 
-	if (a->sa.sa_family != AF_INET6)
+	if (a->sa.sa_family == AF_INET) {
+		if (a->i4.sin_addr.s_addr == htonl(INADDR_ANY))
+			a->i4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 		return;
+	}
 	if (IN6_IS_ADDR_UNSPECIFIED(&a->i6.sin6_addr))
 		a->i6.sin6_addr = in6addr_loopback;
 	else if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr) &&
@@ -4303,7 +4306,7 @@ static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * True when @a may be dialled under --outgoing-family.
  *
  * The comparison must be v4-mapped aware: the SOCKS5 UDP relay hands targets
- * over as ::ffff:a.b.c.d on its dual-stack socket, so a bare
+ * over as ::ffff:a.b.c.d on a dual-stack socket, so a bare
  * sa_family == AF_INET6 test would refuse ordinary IPv4 traffic.
  */
 bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
@@ -4324,8 +4327,8 @@ bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
 
 /*
  * Compare two addresses by IP only (not port), treating an IPv4 address and its
- * IPv4-mapped IPv6 form as equal. The UDP relay socket is dual-stack, so a
- * datagram's source is always AF_INET6 (v4-mapped for an IPv4 peer) while the
+ * IPv4-mapped IPv6 form as equal. The UDP relay socket is normally dual-stack,
+ * so a datagram's source is AF_INET6 (v4-mapped for an IPv4 peer) while the
  * pinned client address may be either family; this bridges them.
  */
 bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr *b)
@@ -4562,14 +4565,12 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 	} else {
 		/*
 		 * Until the client is pinned nothing can be relayed back, so
-		 * accept only its first datagram, and only from the same IP as
-		 * its TCP control connection (RFC 1928); this keeps an off-path
-		 * source from hijacking the association.
+		 * accept only its first valid datagram, and only from the same
+		 * IP as its TCP control connection (RFC 1928); this keeps an
+		 * off-path source from hijacking the association.
 		 */
 		if (!gwp_sockaddr_ip_eq(src, &gcp->client_addr))
 			return GWP_UDP_DROP;
-		gcp->udp_peer = *src;
-		gcp->udp_pinned = true;
 		client_dgram = true;
 	}
 
@@ -4582,14 +4583,25 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 
 		if (gwp_socks5_udp_parse_hdr(base, n, &dst, &hdr_len))
 			return GWP_UDP_DROP;
-		if (gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen))
-			return GWP_UDP_DROP;	/* domain target: unsupported */
+		/* A source has the relay socket's family: see addr_to_sockaddr. */
+		if (gwp_socks5_addr_to_sockaddr(&dst, src->sa.sa_family, &tsa,
+						&tslen))
+			return GWP_UDP_DROP;	/* no way to reach this target */
 		/*
-		 * --outgoing-family. tsa is v4-mapped for an IPv4 target on this
+		 * --outgoing-family. tsa is v4-mapped for an IPv4 target on a
 		 * dual-stack relay socket, which the predicate accounts for.
 		 */
 		if (!gwp_ctx_outgoing_family_ok(w->ctx, &tsa))
 			return GWP_UDP_DROP;	/* wrong family for this proxy */
+		/*
+		 * Pin only now: a datagram that cannot be relayed whatever the
+		 * rules say must not lock the real client out. The ACL below
+		 * judges the pinned address, so this comes before it.
+		 */
+		if (!gcp->udp_pinned) {
+			gcp->udp_peer = *src;
+			gcp->udp_pinned = true;
+		}
 		if (!udp_target_allowed(w->ctx, gcp, &tsa))
 			return GWP_UDP_DROP;	/* ACL denied this datagram */
 		/* Only a target the client has sent to may answer it. */
@@ -4613,32 +4625,48 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 						     : 3 + 1 + 16 + 2;
 		if (gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen))
 			return GWP_UDP_DROP;
-		/* The relay is dual-stack, so udp_peer is always AF_INET6. */
 		out->buf = base - h;
 		out->len = h + n;
 		out->dst = gcp->udp_peer;
-		out->dstlen = sizeof(gcp->udp_peer.i6);
+		out->dstlen = gcp->udp_peer.sa.sa_family == AF_INET ?
+			      sizeof(gcp->udp_peer.i4) : sizeof(gcp->udp_peer.i6);
 		return GWP_UDP_TO_CLIENT;
 	}
 }
 
-int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
+int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a, int family,
 				struct gwp_sockaddr *sa, socklen_t *slen)
 {
-	/*
-	 * The relay socket is dual-stack AF_INET6, so every target is expressed
-	 * as an IPv6 sockaddr: an IPv4 target becomes its IPv4-mapped form so
-	 * one socket can reach both families.
-	 */
 	memset(sa, 0, sizeof(*sa));
 	switch (a->ver) {
 	case GWP_SOCKS5_ATYP_IPV4:
+		if (family == AF_INET) {
+			sa->i4.sin_family = AF_INET;
+			memcpy(&sa->i4.sin_addr, a->ip4, 4);
+			sa->i4.sin_port = a->port;
+			*slen = sizeof(sa->i4);
+			return 0;
+		}
+		/*
+		 * A dual-stack AF_INET6 relay socket expresses every target as
+		 * an IPv6 sockaddr: an IPv4 target becomes its IPv4-mapped form
+		 * so one socket can reach both families.
+		 */
 		sa->i6.sin6_family = AF_INET6;
 		set_v4mapped(&sa->i6.sin6_addr, a->ip4);
 		sa->i6.sin6_port = a->port;
 		*slen = sizeof(sa->i6);
 		return 0;
 	case GWP_SOCKS5_ATYP_IPV6:
+		if (family == AF_INET) {
+			if (!IN6_IS_ADDR_V4MAPPED((const struct in6_addr *)a->ip6))
+				return -EAFNOSUPPORT;
+			sa->i4.sin_family = AF_INET;
+			memcpy(&sa->i4.sin_addr, a->ip6 + 12, 4);
+			sa->i4.sin_port = a->port;
+			*slen = sizeof(sa->i4);
+			return 0;
+		}
 		sa->i6.sin6_family = AF_INET6;
 		memcpy(&sa->i6.sin6_addr, a->ip6, 16);
 		sa->i6.sin6_port = a->port;
@@ -4651,9 +4679,9 @@ int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
 }
 
 /*
- * Fill a SOCKS5 header address from a UDP reply's source. The relay is
- * dual-stack so the source is AF_INET6; a v4-mapped source is unmapped back to
- * an IPv4 ATYP so the client sees the target it actually addressed.
+ * Fill a SOCKS5 header address from a UDP reply's source. A dual-stack relay
+ * sees a source as AF_INET6; a v4-mapped source is unmapped back to an IPv4 ATYP
+ * so the client sees the target it actually addressed.
  */
 void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 					 struct gwp_socks5_addr *a)
@@ -4675,6 +4703,32 @@ void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 	a->port = src->i6.sin6_port;
 }
 
+/*
+ * Pin the UDP client up front when its request says where it will send from
+ * (RFC 1928: the server MAY use DST.ADDR and DST.PORT to limit access), so that
+ * another port on its IP cannot take the association by sending first. Only a
+ * declared port together with the control connection's own IP counts: a client
+ * that declares another address, or none, may be behind a NAT and have its port
+ * rewritten too, and it would be cut off. Such a client is pinned from its first
+ * valid datagram instead.
+ */
+static void udp_pin_declared(struct gwp_conn_pair *gcp, int family)
+{
+	const struct gwp_socks5_addr *d = &gcp->s5_conn->dst_addr;
+	struct gwp_sockaddr sa;
+	socklen_t slen;
+
+	if (!d->port || gwp_socks5_addr_to_sockaddr(d, family, &sa, &slen))
+		return;
+	if (!gwp_sockaddr_ip_eq(&sa, &gcp->client_addr))
+		return;
+	/* The bytes carry no scope, which a link-local peer needs to be sent to. */
+	if (family == AF_INET6 && gcp->client_addr.sa.sa_family == AF_INET6)
+		sa.i6.sin6_scope_id = gcp->client_addr.i6.sin6_scope_id;
+	gcp->udp_peer = sa;
+	gcp->udp_pinned = true;
+}
+
 int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
@@ -4682,6 +4736,7 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_socks5_addr bnd;
 	struct gwp_sockaddr local, relay;
 	socklen_t slen = sizeof(local);
+	socklen_t relay_len;
 	int fd = -1, r, rep = GWP_SOCKS5_REP_SUCCESS;
 	size_t out_len;
 
@@ -4717,6 +4772,9 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * (getsockname() on the control fd), paired with the relay's ephemeral
 	 * port. Widening the bind to the wildcard does not change the threat
 	 * model: the port is ephemeral and the client is IP-pinned.
+	 *
+	 * A kernel without IPv6 (ipv6.disable=1) has no such socket, and no
+	 * IPv6 targets either: use an IPv4 wildcard socket there.
 	 */
 	r = __sys_getsockname(gcp->client.fd, &local.sa, &slen);
 	if (r < 0) {
@@ -4726,22 +4784,28 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		goto reply;
 	}
 
+	memset(&relay, 0, sizeof(relay));
 	fd = __sys_socket(AF_INET6, type, 0);
+	if (fd == -EAFNOSUPPORT) {
+		fd = __sys_socket(AF_INET, type, 0);
+		relay.i4.sin_family = AF_INET;
+		relay_len = sizeof(relay.i4);
+	} else {
+		relay.i6.sin6_family = AF_INET6;
+		relay_len = sizeof(relay.i6);
+	}
 	if (fd < 0) {
 		pr_err(&ctx->lh, "UDP associate: socket() failed: %s", strerror(-fd));
 		rep = GWP_SOCKS5_REP_FAILURE;
 		goto reply;
 	}
 
-	setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
+	if (relay.sa.sa_family == AF_INET6)
+		setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
 	if (ctx->cfg.mark)
 		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)ctx->cfg.mark);
 
-	memset(&relay, 0, sizeof(relay));
-	relay.i6.sin6_family = AF_INET6;
-	relay.i6.sin6_addr = in6addr_any;
-	relay.i6.sin6_port = 0;
-	r = __sys_bind(fd, &relay.sa, sizeof(relay.i6));
+	r = __sys_bind(fd, &relay.sa, relay_len);
 	if (r < 0) {
 		pr_err(&ctx->lh, "UDP associate: bind() failed: %s", strerror(-r));
 		__sys_close(fd);
@@ -4750,7 +4814,6 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		goto reply;
 	}
 
-	/* BND.ADDR from the control connection, BND.PORT from the relay socket. */
 	slen = sizeof(relay);
 	r = __sys_getsockname(fd, &relay.sa, &slen);
 	if (r < 0) {
@@ -4761,15 +4824,16 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		rep = GWP_SOCKS5_REP_FAILURE;
 		goto reply;
 	}
-	if (local.sa.sa_family == AF_INET) {
-		bnd.ver = GWP_SOCKS5_ATYP_IPV4;
-		memcpy(bnd.ip4, &local.i4.sin_addr, 4);
-	} else {
-		bnd.ver = GWP_SOCKS5_ATYP_IPV6;
-		memcpy(bnd.ip6, &local.i6.sin6_addr, 16);
-	}
-	bnd.port = relay.i6.sin6_port;
+	/*
+	 * BND.ADDR from the control connection, BND.PORT from the relay socket.
+	 * An IPv4 client of a dual-stack listener is told an IPv4 address, not
+	 * the v4-mapped form of it that getsockname() reports.
+	 */
+	gwp_socks5_reply_addr_from_sockaddr(&local, &bnd);
+	bnd.port = relay.sa.sa_family == AF_INET ? relay.i4.sin_port :
+						   relay.i6.sin6_port;
 
+	udp_pin_declared(gcp, relay.sa.sa_family);
 	gcp->udp_fd = fd;
 	pr_info(&ctx->lh,
 		"SOCKS5 UDP ASSOCIATE relay bound (idx=%u, cfd=%d, ufd=%d)",

@@ -552,9 +552,10 @@ struct gwp_conn_pair {
 	int			attempt_fd[GWP_MAX_CONN_CAND];
 
 	/*
-	 * @udp_peer is the UDP client's source address, pinned from its first
-	 * datagram (@udp_pinned); datagrams from other sources are replies,
-	 * relayed only from a target in @udp_peers.
+	 * @udp_peer is the UDP client's source address, pinned (@udp_pinned)
+	 * from its request when that names its IP and port, else from its first
+	 * valid datagram; datagrams from other sources are replies, relayed only
+	 * from a target in @udp_peers.
 	 */
 	struct gwp_sockaddr	udp_peer;
 	/* Last client->target datagram's ACL verdict; see udp_target_allowed(). */
@@ -948,10 +949,12 @@ void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd);
 int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /*
- * Convert a SOCKS5 IPv4/IPv6 target to a sockaddr for the dual-stack UDP relay
- * (always AF_INET6; IPv4 is returned v4-mapped). Domain -> -EAFNOSUPPORT.
+ * Convert a SOCKS5 IPv4/IPv6 target to a sockaddr for a UDP relay socket of
+ * @family: on the dual-stack AF_INET6 socket IPv4 is returned v4-mapped, on the
+ * AF_INET one of a kernel without IPv6 a v4-mapped IPv6 target is returned as
+ * IPv4. Domain, or a true IPv6 target on AF_INET -> -EAFNOSUPPORT.
  */
-int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
+int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a, int family,
 				struct gwp_sockaddr *sa, socklen_t *slen);
 
 /* Fill a SOCKS5 UDP reply-header address from a datagram source (unmaps v4). */
