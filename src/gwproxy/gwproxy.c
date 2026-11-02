@@ -4266,14 +4266,12 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 	} else {
 		/*
 		 * Until the client is pinned nothing can be relayed back, so
-		 * accept only its first datagram, and only from the same IP as
-		 * its TCP control connection (RFC 1928); this keeps an off-path
-		 * source from hijacking the association.
+		 * accept only its first valid datagram, and only from the same
+		 * IP as its TCP control connection (RFC 1928); this keeps an
+		 * off-path source from hijacking the association.
 		 */
 		if (!gwp_sockaddr_ip_eq(src, &gcp->client_addr))
 			return GWP_UDP_DROP;
-		gcp->udp_peer = *src;
-		gcp->udp_pinned = true;
 		client_dgram = true;
 	}
 
@@ -4294,6 +4292,15 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 		 */
 		if (!gwp_ctx_outgoing_family_ok(w->ctx, &tsa))
 			return GWP_UDP_DROP;	/* wrong family for this proxy */
+		/*
+		 * Pin only now: a datagram that cannot be relayed whatever the
+		 * rules say must not lock the real client out. The ACL below
+		 * judges the pinned address, so this comes before it.
+		 */
+		if (!gcp->udp_pinned) {
+			gcp->udp_peer = *src;
+			gcp->udp_pinned = true;
+		}
 		if (!udp_target_allowed(w->ctx, gcp, &tsa))
 			return GWP_UDP_DROP;	/* ACL denied this datagram */
 		/* Only a target the client has sent to may answer it. */
