@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Basic CLI behaviour: --help, unknown options, and required-argument checks.
+# Basic CLI behaviour: --help, unknown options, and required-argument checks,
+# and the flags configure takes from the environment.
 
 . "$(dirname "$0")/lib.sh"
 
@@ -115,5 +116,27 @@ if "$GWPROXY" --help 2>&1 | grep -q -- "--upstream-proxy"; then
 		--as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
 		--upstream-proxy="not-a-url"
 fi
+
+# configure must keep LDFLAGS from the environment, as packagers set them, and
+# keep LIB_LDFLAGS for the end of the link line, where libraries belong. It
+# leaves a config.make symlink in its working directory: not in the tree.
+mkdir "$WORK/cfg"
+cc="$(sed -n 's/^CC=//p' "$ROOT/config.make")"
+(cd "$WORK/cfg" && LDFLAGS=-Wl,--mymark LIB_LDFLAGS=-lmylib \
+	sh "$ROOT/configure" --cc="${cc:-gcc}" --build-dir="$WORK/cfg/b") \
+	>/dev/null 2>&1 || fail "configure failed"
+ld="$(sed -n 's/^LDFLAGS=//p' "$WORK/cfg/b/config.make")"
+lib="$(sed -n 's/^LIB_LDFLAGS=//p' "$WORK/cfg/b/config.make")"
+case "$ld" in
+*-Wl,--mymark*) ;;
+*) fail "configure dropped LDFLAGS from the environment: LDFLAGS=$ld" ;;
+esac
+case "$ld" in
+*-lmylib*) fail "configure put LIB_LDFLAGS in LDFLAGS: LDFLAGS=$ld" ;;
+esac
+case "$lib" in
+*-lmylib*) ;;
+*) fail "configure dropped LIB_LDFLAGS: LIB_LDFLAGS=$lib" ;;
+esac
 
 pass
