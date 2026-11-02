@@ -1283,6 +1283,7 @@ __cold
 static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 {
 	struct gwp_wrk *w, *workers = ctx->workers;
+	void *ret;
 	int i;
 
 	if (!workers)
@@ -1296,8 +1297,10 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 			continue;
 
 		pr_dbg(&ctx->lh, "Joining worker thread %d", i);
-		pthread_join(w->thread, NULL);
+		pthread_join(w->thread, &ret);
 		w->need_join = false;
+		if ((intptr_t)ret < 0 && !ctx->worker_err)
+			ctx->worker_err = (int)(intptr_t)ret;
 	}
 
 	for (i = 0; i < ctx->cfg.nr_workers; i++)
@@ -5144,6 +5147,9 @@ int main(int argc, char *argv[])
 out_free:
 	sig_handler_detach_ctx();
 	gwp_ctx_free(&ctx);
+	/* Worker 0 leaves cleanly when another worker's error stopped it. */
+	if (!r)
+		r = ctx.worker_err;
 out:
 	return -r;
 }
