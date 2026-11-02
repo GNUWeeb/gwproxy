@@ -342,12 +342,18 @@ Neither pinning needs a capability of its own:
 .B SO_BINDTODEVICE
 has been unprivileged since Linux 5.7, and binding a source address that is
 configured locally never required one.
+With no source
+.I port
+(the default) the kernel picks one at
+.BR connect (2)
+.RB ( IP_BIND_ADDRESS_NO_PORT ),
+so each destination has the whole local port range to itself.
 Binding a fixed source
 .I port
-limits concurrency to one connection per identical destination (a 4\-tuple
-clash), and defeats multi\-address racing and fallback, since two attempts of
-one connection cannot share a source port; omit the port (the default) for an
-ephemeral source port.
+limits that source to one connection at a time, whatever the destination, and
+for as long as the closed one lingers in TIME_WAIT; it also defeats
+multi\-address racing and fallback, since two attempts of one connection cannot
+share a source port.
 .RE
 .IP
 .B \-\-accept
@@ -815,9 +821,11 @@ address, a bare IPv6 address, or a bracketed
 .RI [ v6 ]
 when a
 .I port
-follows. Omit the port (the default) for an ephemeral source port; pinning a
-fixed one limits concurrency to a single connection per destination and defeats
-multi\-address racing, as described under
+follows. Omit the port (the default) for an ephemeral source port, chosen per
+destination at
+.BR connect (2);
+pinning a fixed one limits that source to a single connection at a time and
+defeats multi\-address racing, as described under
 .BR \-\-acl\-file .
 A source whose address family differs from the address being dialled is
 .I skipped
@@ -827,7 +835,9 @@ leaves an IPv6 target on its default source, so setting one does not quietly
 turn a dual\-stack proxy into a single\-family one. (An ACL
 .B \-\-to\-source
 that mismatches stays an error \(em an explicit rule naming the wrong family is
-a mistake, a default that cannot apply is not.) Default: unset.
+a mistake, a default that cannot apply is not.) An IPv4\-mapped address
+.RI ( ::ffff:a.b.c.d )
+is IPv4 for this comparison, as a target and as a source. Default: unset.
 .TP
 .BR \-I ", " \-\-bind\-iface=\fIname\fR
 Pin every outgoing connection to this network interface
