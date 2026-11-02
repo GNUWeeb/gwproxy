@@ -760,6 +760,12 @@ struct gwp_wrk {
 			 */
 			uint64_t		retry_at_ms;
 			/*
+			 * When accept stopped for want of descriptors
+			 * (accept_is_stopped) resumes, if the descriptors
+			 * returned have not resumed it by then.
+			 */
+			uint64_t		accept_resume_at_ms;
+			/*
 			 * Plain and transparent forwarding clients whose
 			 * target socket could not be created for want of
 			 * descriptors, retried by run_retries().
