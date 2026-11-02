@@ -1122,6 +1122,18 @@ static int tls_hs_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	hs = gwp_ssl_handshake(ssl);
 	if (hs == GWP_SSL_ERROR) {
 		pr_dbg(&w->ctx->lh, "TLS handshake failed: %s", gwp_ssl_errstr());
+		/*
+		 * The engine's alert tells the client why: the send goes out
+		 * ahead of the teardown's cancels, and its completion is not
+		 * looked at. Nothing else uses the scratch at this point, since
+		 * a handshake step only runs once the last flight has gone out.
+		 */
+		n = gwp_ssl_bio_read(ssl, t->tx, sizeof(t->tx));
+		if (n > 0) {
+			t->tx_len = (uint32_t)n;
+			t->tx_sent = 0;
+			prep_send_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_SEND);
+		}
 		return -ECONNRESET;
 	}
 

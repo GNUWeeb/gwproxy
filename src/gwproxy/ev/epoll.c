@@ -3141,6 +3141,8 @@ static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	hs = gwp_ssl_handshake(c->tls);
 	if (hs == GWP_SSL_ERROR) {
 		pr_dbg(&w->ctx->lh, "TLS handshake failed: %s", gwp_ssl_errstr());
+		/* The engine's alert tells the client why, if it can be sent. */
+		tls_flush_hs(c);
 		return -ECONNRESET;
 	}
 
