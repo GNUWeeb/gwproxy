@@ -313,16 +313,52 @@ void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 	w->udp_buf = NULL;
 }
 
-/* Put a listener paused for want of descriptors back in the epoll set. */
-static int resume_accept(struct gwp_wrk *w)
+static void arm_retry(struct gwp_wrk *w);
+
+/*
+ * Put a paused listener back in the epoll set. This takes kernel memory and
+ * an epoll watch, and runs when the process is short of something already.
+ * Running out of those is no reason to cut every tunnel: returns -EAGAIN with
+ * a timed retry armed, the failure logged once until it passes.
+ */
+static int add_listener(struct gwp_wrk *w)
 {
-	struct gwp_ctx *ctx = w->ctx;
 	struct epoll_event ev;
-	int x, r;
+	int r;
 
 	ev.events = EPOLLIN;
 	ev.data.u64 = EV_BIT_ACCEPT;
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, w->tcp_fd, &ev);
+	if (likely(!r)) {
+		w->accept_add_failed = false;
+		return 0;
+	}
+
+	if (r != -ENOMEM && r != -ENOSPC)
+		return r;
+
+	if (!w->accept_add_failed) {
+		w->accept_add_failed = true;
+		pr_warn(&w->ctx->lh,
+			"Failed to put the listener back in the epoll set: %s, retrying (tidx=%u)",
+			strerror(-r), w->idx);
+	}
+	arm_retry(w);
+	return -EAGAIN;
+}
+
+/* Put a listener paused for want of descriptors back in the epoll set. */
+static int resume_accept(struct gwp_wrk *w)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	int x, r;
+
+	r = add_listener(w);
+	if (unlikely(r == -EAGAIN)) {
+		/* Due as soon as run_retries() comes round, whatever brought us. */
+		w->accept_resume_at_ms = 0;
+		return 0;
+	}
 	if (unlikely(r))
 		return r;
 
@@ -629,8 +665,6 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return register_new_client(w, gcp, EV_BIT_CLIENT);
 }
 
-static void arm_retry(struct gwp_wrk *w);
-
 /*
  * The descriptor table is full, and an accepted client has no target socket
  * yet. Closing the client would turn a passing shortage into a reset seen by
@@ -787,7 +821,6 @@ static int wait_timeout(const struct gwp_wrk *w)
 /* Do what a timed pause has been holding back, once it is due. */
 static int run_retries(struct gwp_wrk *w)
 {
-	struct epoll_event ev;
 	uint64_t now;
 	int r;
 
@@ -800,12 +833,11 @@ static int run_retries(struct gwp_wrk *w)
 
 	w->retry_at_ms = 0;
 	if (w->accept_retry) {
-		ev.events = EPOLLIN;
-		ev.data.u64 = EV_BIT_ACCEPT;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, w->tcp_fd, &ev);
-		if (unlikely(r))
+		r = add_listener(w);
+		if (likely(!r))
+			w->accept_retry = false;
+		else if (r != -EAGAIN)
 			return r;
-		w->accept_retry = false;
 	}
 
 	if (w->accept_is_stopped) {

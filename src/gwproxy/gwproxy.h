@@ -791,10 +791,12 @@ struct gwp_wrk {
 			 * Any accept pause, this one or the one for running
 			 * out of descriptors (accept_is_stopped), is logged
 			 * once, until a connection is accepted again
-			 * (accept_paused).
+			 * (accept_paused). A listener that could not be put
+			 * back is retried, and logged once (accept_add_failed).
 			 */
 			bool			accept_retry;
 			bool			accept_paused;
+			bool			accept_add_failed;
 		};
 #ifdef CONFIG_IO_URING
 		struct iou	*iou;
