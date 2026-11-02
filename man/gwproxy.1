@@ -175,6 +175,13 @@ the proxy rejects it with reply
 .B CONNECT
 unaffected; only meaningful with
 .BR \-\-as\-socks5 .
+Datagrams are taken only from the IP address of the control connection. When
+the request declares that address and a port, only that port is the client;
+when it declares any other address, or no port, the first valid datagram from
+that IP address decides the port, so another party on the same IP address can
+get there first. A client behind a NAT cannot know its outside port and is
+served by the latter rule. A client that declares the control connection's
+address with a port the NAT rewrites gets no service.
 Default:
 .BR 1 .
 .TP

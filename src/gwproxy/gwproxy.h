@@ -550,9 +550,10 @@ struct gwp_conn_pair {
 	int			attempt_fd[GWP_MAX_CONN_CAND];
 
 	/*
-	 * @udp_peer is the UDP client's source address, pinned from its first
-	 * valid datagram (@udp_pinned); datagrams from other sources are
-	 * replies, relayed only from a target in @udp_peers.
+	 * @udp_peer is the UDP client's source address, pinned (@udp_pinned)
+	 * from its request when that names its IP and port, else from its first
+	 * valid datagram; datagrams from other sources are replies, relayed only
+	 * from a target in @udp_peers.
 	 */
 	struct gwp_sockaddr	udp_peer;
 	/* Last client->target datagram's ACL verdict; see udp_target_allowed(). */

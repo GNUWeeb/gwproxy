@@ -4386,6 +4386,32 @@ void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 	a->port = src->i6.sin6_port;
 }
 
+/*
+ * Pin the UDP client up front when its request says where it will send from
+ * (RFC 1928: the server MAY use DST.ADDR and DST.PORT to limit access), so that
+ * another port on its IP cannot take the association by sending first. Only a
+ * declared port together with the control connection's own IP counts: a client
+ * that declares another address, or none, may be behind a NAT and have its port
+ * rewritten too, and it would be cut off. Such a client is pinned from its first
+ * valid datagram instead.
+ */
+static void udp_pin_declared(struct gwp_conn_pair *gcp)
+{
+	const struct gwp_socks5_addr *d = &gcp->s5_conn->dst_addr;
+	struct gwp_sockaddr sa;
+	socklen_t slen;
+
+	if (!d->port || gwp_socks5_addr_to_sockaddr(d, &sa, &slen))
+		return;
+	if (!gwp_sockaddr_ip_eq(&sa, &gcp->client_addr))
+		return;
+	/* The bytes carry no scope, which a link-local peer needs to be sent to. */
+	if (gcp->client_addr.sa.sa_family == AF_INET6)
+		sa.i6.sin6_scope_id = gcp->client_addr.i6.sin6_scope_id;
+	gcp->udp_peer = sa;
+	gcp->udp_pinned = true;
+}
+
 int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
@@ -4479,6 +4505,7 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gwp_socks5_reply_addr_from_sockaddr(&local, &bnd);
 	bnd.port = relay.i6.sin6_port;
 
+	udp_pin_declared(gcp);
 	gcp->udp_fd = fd;
 	pr_info(&ctx->lh,
 		"SOCKS5 UDP ASSOCIATE relay bound (idx=%u, cfd=%d, ufd=%d)",
