@@ -252,6 +252,13 @@ enum {
 	EV_BIT_IOU_ATTEMPT_TIMER	= EV_BIT_ATTEMPT_TIMER,
 	EV_BIT_IOU_ATTEMPT_TIMER_DEL	= (49ull << 48ull),
 	EV_BIT_IOU_ATTEMPT_CANCEL	= (50ull << 48ull),
+
+	/*
+	 * The client watch during the connect and the upstream handshake, and
+	 * its removal, see prep_client_watch().
+	 */
+	EV_BIT_IOU_CLIENT_WATCH		= (25ull << 48ull),
+	EV_BIT_IOU_CLIENT_WATCH_DEL	= (27ull << 48ull),
 #endif
 };
 
@@ -693,6 +700,13 @@ struct iou {
 	 * once per episode rather than on every retry.
 	 */
 	bool			submit_stalled;
+
+	/*
+	 * SQEs that found the SQ full while submitting failed, oldest first,
+	 * waiting for room (see get_sqe_nofail()).
+	 */
+	struct gwp_held_sqe	*held_first;
+	struct gwp_held_sqe	*held_last;
 };
 #endif
 

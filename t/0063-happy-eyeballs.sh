@@ -195,6 +195,71 @@ for loop in epoll io_uring; do
 	else
 		echo "[$loop] refused-then-denied: skipped (resolver put the live address first)"
 	fi
+
+	# (d) With an upstream every attempt dials the same proxy, but a strict
+	#     -j BIND or -j MARK is still per candidate: one that fails on the
+	#     first address must only skip that address. Nothing leaves by the
+	#     wrong path, and the upstream is asked for the second address. With
+	#     the rule on both there is nothing left, and nothing reaches the
+	#     upstream. SO_MARK needs a capability that the namespace's root
+	#     has, so that case gives it up first.
+	if [ "$(order_of he-refused | cut -d' ' -f1)" = "127.0.0.7" ]; then
+		up=39714
+		: >"$WORK/up.rec"
+		python3 "$SERVERS_DIR/recording_proxy.py" socks5 127.0.0.1 "$up" \
+			"$WORK/up.rec" >/dev/null 2>&1 &
+		up_pid=$!
+		wait_listen "$up" "$up_pid" || { echo "upstream did not listen"; exit 1; }
+		for rule in bind mark; do
+			case "$rule" in
+			bind)
+				action='-j BIND --to-iface missing0'
+				wrap=""
+				;;
+			mark)
+				command -v setpriv >/dev/null 2>&1 || continue
+				action='-j MARK --set-mark 7'
+				wrap="setpriv --bounding-set=-net_admin,-net_raw"
+				;;
+			esac
+			pp=39715
+			printf -- '%s\n' "-A OUTPUT -d 127.0.0.7 $action" \
+				'-P OUTPUT ACCEPT' >"$WORK/first.acl"
+			printf -- '%s\n' "-A OUTPUT -d 127.0.0.7 $action" \
+				"-A OUTPUT -d 127.0.0.9 $action" \
+				'-P OUTPUT ACCEPT' >"$WORK/both.acl"
+			for acl in first both; do
+				: >"$WORK/up.rec"
+				$wrap "$GWPROXY" --bind=127.0.0.1:$pp --as-socks5=1 \
+					--nr-workers=1 --acl-file="$WORK/$acl.acl" \
+					--event-loop="$loop" --connect-timeout=10 \
+					--upstream-proxy=socks5://127.0.0.1:$up \
+					>"$WORK/up.$rule.$acl.log" 2>&1 &
+				gwp_pid=$!
+				wait_listen "$pp" "$gwp_pid" || { echo "[$loop] gwproxy did not listen on $pp"; exit 1; }
+				rep=$(python3 "$ROOT/t/servers/socks5_probe.py" \
+					--atyp domain --dst he-refused "$pp" "$op")
+				rec="$(cat "$WORK/up.rec")"
+				echo "[$loop] upstream $rule on $acl: $rep; upstream saw: $rec"
+				kill "$gwp_pid" 2>/dev/null
+				wait "$gwp_pid" 2>/dev/null
+				if [ "$acl" = first ]; then
+					[ "$rep" = "REP=0x00" ] || exit 1
+					case "$rec" in
+					*"addr=127.0.0.9 "*) ;;
+					*) exit 1 ;;
+					esac
+				else
+					[ "$rep" != "REP=0x00" ] || exit 1
+					[ -z "$rec" ] || exit 1
+				fi
+			done
+		done
+		kill "$up_pid" 2>/dev/null
+		wait "$up_pid" 2>/dev/null
+	else
+		echo "[$loop] upstream-socket-option: skipped (resolver put the live address first)"
+	fi
 done
 
 rc=0
