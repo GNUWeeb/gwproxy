@@ -252,7 +252,7 @@ static int s5_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	size_t len = gcp->target.cap;
 	int r;
 
-	r = gwp_upstream_finalize_dst(w, gcp);
+	r = gwp_upstream_finalize_dst(gcp);
 	if (unlikely(r)) {
 		pr_err(&ctx->lh, "Failed to prepare upstream destination (idx=%u): %s",
 			gcp->idx, strerror(-r));
@@ -279,7 +279,7 @@ static int http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	size_t len = 0;
 	int r;
 
-	r = gwp_upstream_finalize_dst(w, gcp);
+	r = gwp_upstream_finalize_dst(gcp);
 	if (unlikely(r)) {
 		pr_err(&w->ctx->lh, "Failed to prepare upstream destination (idx=%u): %s",
 			gcp->idx, strerror(-r));
