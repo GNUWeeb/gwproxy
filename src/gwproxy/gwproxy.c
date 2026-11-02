@@ -187,8 +187,8 @@ static void show_help(const char *app)
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
 	printf("      --dns-cache-max-entries=nr  Max DNS cache entries; 0 = unlimited (default: %d)\n", default_opts.dns_cache_max_entries);
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
-	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads for SOCKS5 (default: %d)\n", default_opts.nr_dns_workers);
-	printf("                                  More are started while lookups queue up, up to 64.\n");
+	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads kept running (default: %d)\n", default_opts.nr_dns_workers);
+	printf("                                  More are started while lookups queue up, up to 64 or nr if larger.\n");
 	printf("  -c, --connect-timeout=sec       Connection to target timeout in seconds (default: %d)\n", default_opts.connect_timeout);
 	printf("      --idle-timeout=sec          Close a tunnel or UDP association idle this long; 0 = never (default: %d)\n", default_opts.idle_timeout);
 	printf("      --max-conns-per-ip=nr       Most client connections at once per IPv4 address or IPv6 /64; 0 = no cap (default: %d)\n", default_opts.max_conns_per_ip);
@@ -223,7 +223,7 @@ static void show_help(const char *app)
 #endif
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	printf("  -j, --dns-server=addr:port      DNS server address (default: system resolver)\n");
-	printf("  -r, --raw-dns=0|1               Use raw DNS for SOCKS5 (default: %d)\n", default_opts.use_raw_dns);
+	printf("  -r, --raw-dns=0|1               Use raw DNS for hostname targets (default: %d)\n", default_opts.use_raw_dns);
 #endif
 	printf("\n");
 }

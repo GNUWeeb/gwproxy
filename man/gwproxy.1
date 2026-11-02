@@ -712,11 +712,12 @@ means unlimited. Default:
 .BR 65536 .
 .TP
 .BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
-Number of DNS resolver worker threads, at most 1024. Default:
-.BR 4 .
-More are started on demand when lookups are waiting, up to 64 threads or
+Number of DNS resolver worker threads kept running, at most 1024. This does not
+cap how many lookups run at once: more threads are started on demand when lookups
+are waiting, up to 64 threads or
 .IR nr ,
-whichever is larger.
+whichever is larger, and those exit again after 10 seconds idle. Default:
+.BR 4 .
 .IP
 Each thread runs one blocking lookup, so the threads are shared out by client
 address, grouped as for
