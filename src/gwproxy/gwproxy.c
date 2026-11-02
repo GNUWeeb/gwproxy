@@ -5080,13 +5080,47 @@ static void prepare_rlimit(void)
 	}
 }
 
+/*
+ * Give any of fds 0-2 that was closed to /dev/null. The default log target is
+ * fd 1 whatever it has become: left closed, the next descriptor we open takes
+ * its number, and the log lines go to the PID file or a client's socket.
+ */
+__cold
+static int open_std_fds(void)
+{
+	int fd;
+
+	for (fd = 0; fd <= 2; fd++) {
+		if (fcntl(fd, F_GETFD) >= 0 || errno != EBADF)
+			continue;
+		/* The lowest free number, so this one: the lower ones are open. */
+		if (open("/dev/null", O_RDWR) < 0)
+			return -errno;
+	}
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
-	struct sigaction sa = { .sa_handler = &sig_handler };
+	struct sigaction sa = { .sa_handler = SIG_IGN };
 	struct gwp_ctx ctx;
 	int r;
 
 	memset(&ctx, 0, sizeof(ctx));
+	r = open_std_fds();
+	if (r < 0) {
+		fprintf(stderr, "Failed to open /dev/null: %s\n", strerror(-r));
+		goto out;
+	}
+
+	/* Before the first log line: its target may be a pipe nobody reads. */
+	r = sigaction(SIGPIPE, &sa, NULL);
+	if (r < 0) {
+		r = -errno;
+		fprintf(stderr, "Failed to set signal handlers: %s\n", strerror(-r));
+		goto out;
+	}
+
 	r = parse_options(argc, argv, &ctx.cfg);
 	if (r < 0)
 		goto out;
@@ -5097,10 +5131,9 @@ int main(int argc, char *argv[])
 		goto out;
 
 	atomic_store(&g_ctx, &ctx);
+	sa.sa_handler = &sig_handler;
 	r |= sigaction(SIGINT, &sa, NULL);
 	r |= sigaction(SIGTERM, &sa, NULL);
-	sa.sa_handler = SIG_IGN;
-	r |= sigaction(SIGPIPE, &sa, NULL);
 	if (r < 0) {
 		r = -errno;
 		fprintf(stderr, "Failed to set signal handlers: %s\n", strerror(-r));
