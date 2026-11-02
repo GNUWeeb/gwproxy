@@ -511,6 +511,8 @@ struct gwp_conn_pair {
 	struct gwp_iou_udp	*udp_iou;
 	/* Targets a UDP association may hear from; NULL until it sends. */
 	struct gwp_udp_peers	*udp_peers;
+	/* The next pair on the epoll loop's list of pairs to free (@dead). */
+	struct gwp_conn_pair	*next_dead;
 
 	/*
 	 * The hostname the client asked for, when it used a domain target
@@ -745,9 +747,12 @@ struct gwp_wrk {
 			 * Pairs torn down while the current batch of events is
 			 * handled. They are only marked dying then, and freed
 			 * once the batch is done, because a later event in the
-			 * same batch may still point at them.
+			 * same batch may still point at them. A list through
+			 * the pairs, since one event can end any number of
+			 * them (see handle_ev_dns_cq()) and none may be left
+			 * out.
 			 */
-			struct gwp_conn_pair	**dead;
+			struct gwp_conn_pair	*dead;
 			/*
 			 * The timers of every pair of this worker (see
 			 * ev/tmr.h). They drive the epoll_wait() timeout, so
@@ -776,14 +781,6 @@ struct gwp_wrk {
 			uint32_t		nr_tgt_wait;
 			uint32_t		tgt_wait_cap;
 			uint16_t		evsz;
-			uint16_t		nr_dead;
-			uint16_t		dead_cap;
-			/*
-			 * If it's true, the worker MUST call epoll_wait() again
-			 * before continue iterating over the events. Only set
-			 * when @dead is full and a pair had to be freed at once.
-			 */
-			bool			ev_need_reload;
 			/*
 			 * accept() failed for a reason that closing
 			 * descriptors does not cure: the listener is out of

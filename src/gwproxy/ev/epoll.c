@@ -217,20 +217,7 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 		goto out_close_ev_fd;
 	}
 
-	/*
-	 * Every event tears down at most one pair, except the accept event,
-	 * which handles up to 32 connections (see handle_ev_accept()). The
-	 * list never fills in practice; free_conn_pair() copes if it does.
-	 */
-	w->nr_dead = 0;
-	w->dead_cap = w->evsz + 32;
-	w->dead = calloc(w->dead_cap, sizeof(*w->dead));
-	if (!w->dead) {
-		r = -ENOMEM;
-		free(events);
-		goto out_close_ev_fd;
-	}
-
+	w->dead = NULL;
 	w->ev_fd = ev_fd;
 	w->ep_fd = ep_fd;
 	w->events = events;
@@ -274,8 +261,6 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 out_free_events:
 	free(events);
 	w->events = NULL;
-	free(w->dead);
-	w->dead = NULL;
 out_close_ev_fd:
 	__sys_close(ev_fd);
 out_close_ep_fd:
@@ -303,8 +288,6 @@ void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 
 	free(w->events);
 	w->events = NULL;
-	free(w->dead);
-	w->dead = NULL;
 	free(w->tgt_wait);
 	w->tgt_wait = NULL;
 	w->nr_tgt_wait = w->tgt_wait_cap = 0;
@@ -521,11 +504,6 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		}
 	}
 
-	if (unlikely(w->nr_dead >= w->dead_cap)) {
-		w->ev_need_reload = true;
-		return __free_conn_pair(w, gcp);
-	}
-
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	/*
 	 * Close the query's socket now, so no reply for this pair is read
@@ -542,22 +520,23 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 #endif
 
 	gcp->flags |= GWP_CONN_FLAG_IS_DYING;
-	w->dead[w->nr_dead++] = gcp;
+	gcp->next_dead = w->dead;
+	w->dead = gcp;
 	return 0;
 }
 
 static int reap_dead_pairs(struct gwp_wrk *w)
 {
+	struct gwp_conn_pair *gcp;
 	int r, ret = 0;
-	uint16_t i;
 
-	for (i = 0; i < w->nr_dead; i++) {
-		r = __free_conn_pair(w, w->dead[i]);
+	while ((gcp = w->dead)) {
+		w->dead = gcp->next_dead;
+		r = __free_conn_pair(w, gcp);
 		if (unlikely(r) && !ret)
 			ret = r;
 	}
 
-	w->nr_dead = 0;
 	return ret;
 }
 
@@ -3402,9 +3381,6 @@ static int handle_events(struct gwp_wrk *w, int nr_events)
 		r = handle_event(w, &events[i]);
 		if (unlikely(r < 0))
 			break;
-
-		if (unlikely(w->ev_need_reload))
-			break;
 	}
 
 	if (r >= 0 && likely(!ctx->stop)) {
@@ -3430,7 +3406,6 @@ static int fish_events(struct gwp_wrk *w)
 {
 	int r;
 
-	w->ev_need_reload = false;
 	r = __sys_epoll_wait(w->ep_fd, w->events, w->evsz, wait_timeout(w));
 	w->now = gwp_now_sec();
 	if (unlikely(r < 0)) {
