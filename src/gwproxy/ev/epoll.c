@@ -2031,6 +2031,11 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
+#ifdef CONFIG_HTTPS
+		/* Not an end to pass on; see gwp_free_conn_pair(). */
+		if (gcp->client.tls && gwp_ssl_rx_cut(gcp->client.tls))
+			return -ECONNRESET;
+#endif
 		/*
 		 * The client may finish before the target is even connected.
 		 * There is no target socket yet, or only one still in

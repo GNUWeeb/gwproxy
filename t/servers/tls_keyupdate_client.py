@@ -189,11 +189,15 @@ class Sink:
         c, _ = self.ls.accept()
         if self.shut:
             c.shutdown(socket.SHUT_WR)
-        while True:
-            d = c.recv(65536)
-            if not d:
-                break
-            self.count += len(d)
+        try:
+            while True:
+                d = c.recv(65536)
+                if not d:
+                    break
+                self.count += len(d)
+        except ConnectionResetError:
+            # The client went without a close_notify: the proxy says so.
+            pass
 
 
 class Talker(Sink):

@@ -1023,6 +1023,7 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
  * closed, which the epoll loop credits to its accept-rearm accounting.
  */
 int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
+void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair *gcp);
 
 /* True if the ACL INPUT chain permits an incoming client for @proto (allow-all
  * with no ACL). */

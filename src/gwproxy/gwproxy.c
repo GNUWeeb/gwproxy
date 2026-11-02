@@ -1106,6 +1106,50 @@ static void gwp_conn_pair_drop_dns(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gwp_dns_entry_cancel(gcp->gde);
 }
 
+/*
+ * TLS tells the end of a client's stream from it being cut: a forged or broken
+ * record, a fatal alert, a reset, half a record. A pair that goes down with the
+ * target's write side not shut has not seen that end, so a plain close() would
+ * hand the target the very EOF that a protocol framed by it takes for a complete
+ * stream. Make the close reset the connection. A plaintext client has no such
+ * end to tell apart, and is left as it is.
+ *
+ * A connect attempt counts as well: the target may have accepted long before the
+ * proxy gets to see the result, and would read an empty stream as a complete one.
+ */
+#ifdef CONFIG_HTTPS
+static void gwp_set_reset_on_close(int fd)
+{
+	static const struct linger l = { .l_onoff = 1, .l_linger = 0 };
+
+	__sys_setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
+}
+#endif
+
+void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	uint8_t i;
+
+	if (!gcp->client.tls)
+		return;
+
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
+		if (gcp->attempt_fd[i] >= 0)
+			gwp_set_reset_on_close(gcp->attempt_fd[i]);
+	}
+#endif
+}
+
+static void gwp_conn_pair_abort_target(const struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	if (gcp->client.tls && gcp->target.fd >= 0 && !gcp->target.wr_shut)
+		gwp_set_reset_on_close(gcp->target.fd);
+	gwp_conn_pair_abort_attempts(gcp);
+#endif
+}
+
 __cold
 static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 {
@@ -1121,6 +1165,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 			continue;
 
 		log_conn_pair_close(w, gcp);
+		gwp_conn_pair_abort_target(gcp);
 		if (gcp->flags & GWP_CONN_FLAG_IPLIM)
 			gwp_ctx_iplim_put(w->ctx, &gcp->client_addr);
 		free_conn(&gcp->target);
@@ -3114,6 +3159,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return -EINVAL;
 
 	log_conn_pair_close(w, gcp);
+	gwp_conn_pair_abort_target(gcp);
 
 	/*
 	 * Every way a client goes away ends here (or, at shutdown, in

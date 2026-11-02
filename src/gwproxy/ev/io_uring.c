@@ -788,7 +788,11 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * reference each, so the pair cannot be freed until they are reaped.
 	 * The attempt timeout is dropped for the same reason -- unlike the
 	 * connect timer it is not otherwise waited on.
+	 *
+	 * Their sockets are closed as those completions come in, ahead of
+	 * gwp_free_conn_pair(), so a cut stream has to be seen to here.
 	 */
+	gwp_conn_pair_abort_attempts(gcp);
 	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
 		if (gcp->attempt_fd[i] >= 0)
 			cancel_attempt(w, gcp, i);
@@ -2024,6 +2028,11 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
+#ifdef CONFIG_HTTPS
+		/* Not an end to pass on; see gwp_free_conn_pair(). */
+		if (client_is_tls(gcp) && gwp_ssl_rx_cut(gcp->client.tls))
+			return -ECONNRESET;
+#endif
 		shut_target = true;
 		gcp->target.wr_shut = true;
 	}

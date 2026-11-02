@@ -57,6 +57,8 @@ struct gwp_ssl {
 	 * nothing has been received since: reading again cannot make progress.
 	 */
 	bool		rx_starved;
+	/* The peer's close_notify has been read. */
+	bool		rx_closed;
 };
 
 _Static_assert(GWP_SSL_RECORD_MAX >= SSL3_RT_HEADER_LENGTH +
@@ -427,6 +429,19 @@ bool gwp_ssl_rx_more(struct gwp_ssl *s)
 	return q_len(&s->rq) > 0 && !s->rx_starved;
 }
 
+bool gwp_ssl_rx_cut(struct gwp_ssl *s)
+{
+	if (s->rx_closed)
+		return false;
+	if (q_len(&s->rq) > 0 || SSL_has_pending(s->ssl))
+		return true;
+	/*
+	 * The engine holds nothing unprocessed right after a record's header,
+	 * yet it is waiting for the body. Only this says so.
+	 */
+	return !strcmp(SSL_rstate_string(s->ssl), "RB");
+}
+
 int gwp_ssl_bio_read(struct gwp_ssl *s, void *buf, size_t len)
 {
 	size_t n = q_len(&s->wq);
@@ -523,6 +538,7 @@ int gwp_ssl_read(struct gwp_ssl *s, void *buf, size_t len, size_t *out_len)
 	 */
 	if (SSL_get_error(s->ssl, r) == SSL_ERROR_ZERO_RETURN) {
 		s->rx_starved = true;
+		s->rx_closed = true;
 		return GWP_SSL_OK;
 	}
 	r = map_err(s, r);

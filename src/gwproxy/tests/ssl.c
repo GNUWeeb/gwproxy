@@ -307,6 +307,69 @@ static void test_alpn_negotiation(void)
 	PRTEST_OK();
 }
 
+/* How the end of a peer's stream looks, for all that the engine has read. */
+static void test_rx_cut(void)
+{
+	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
+	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
+	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
+	static unsigned char wire[4096];
+	struct gwp_ssl *srv, *cli;
+	char out[64];
+	size_t got;
+	int fd, n;
+
+	fd = mkstemp(cert); assert(fd >= 0); close(fd);
+	fd = mkstemp(key); assert(fd >= 0); close(fd);
+	write_file(cert, TEST_CERT);
+	write_file(key, TEST_KEY);
+	assert(!gwp_ssl_ctx_server_create(&sctx, cert, key));
+	assert(!gwp_ssl_ctx_client_create(&cctx));
+	srv = gwp_ssl_server_new(sctx);
+	cli = gwp_ssl_client_new(cctx);
+	assert(srv && cli);
+	do_handshake(cli, srv);
+
+	/* Nothing but whole records so far. */
+	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_WANT_READ);
+	assert(!gwp_ssl_rx_cut(srv));
+
+	/* A part of a record, in the queue or with the engine, then the rest. */
+	assert(gwp_ssl_write(cli, "abc", 3, &got) == GWP_SSL_OK && got == 3);
+	n = gwp_ssl_bio_read(cli, wire, sizeof(wire));
+	assert(n > 8);
+	assert(gwp_ssl_bio_write(srv, wire, 3) == 3);
+	assert(gwp_ssl_rx_cut(srv));
+	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_WANT_READ);
+	assert(gwp_ssl_rx_cut(srv));
+	/* The header and not a byte more: the engine has it all, and waits. */
+	assert(gwp_ssl_bio_write(srv, wire + 3, 2) == 2);
+	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_WANT_READ);
+	assert(gwp_ssl_rx_cut(srv));
+	assert(gwp_ssl_bio_write(srv, wire + 5, 3) == 3);
+	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_WANT_READ);
+	assert(gwp_ssl_rx_cut(srv));
+	assert(gwp_ssl_bio_write(srv, wire + 8, (size_t)n - 8) == n - 8);
+	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_OK && got == 3);
+	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_WANT_READ);
+	assert(!gwp_ssl_rx_cut(srv));
+
+	/* A close_notify is an end, whatever follows it. */
+	assert(gwp_ssl_shutdown(cli) == GWP_SSL_OK);
+	shuttle(cli, srv);
+	assert(gwp_ssl_bio_write(srv, "junk", 4) == 4);
+	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_OK && !got);
+	assert(!gwp_ssl_rx_cut(srv));
+
+	gwp_ssl_free(srv);
+	gwp_ssl_free(cli);
+	gwp_ssl_ctx_free(sctx);
+	gwp_ssl_ctx_free(cctx);
+	unlink(cert);
+	unlink(key);
+	PRTEST_OK();
+}
+
 /*
  * Without the BIO method no connection can be set up. That must show when the
  * context is created, at startup, not as clients being reset later on. Goes
@@ -349,6 +412,7 @@ int main(void)
 		test_zero_copy_queues();
 		test_bad_cert_rejected();
 		test_alpn_negotiation();
+		test_rx_cut();
 	}
 
 	printf("All tests passed!\n");

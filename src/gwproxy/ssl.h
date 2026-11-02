@@ -83,6 +83,13 @@ void gwp_ssl_rx_commit(struct gwp_ssl *s, size_t len);
  */
 bool gwp_ssl_rx_more(struct gwp_ssl *s);
 /*
+ * The peer's side of the socket has ended, and what gwp_ssl_read() could make of
+ * the ciphertext has been read: whether the stream was visibly cut. No close_notify
+ * came, and a record was left incomplete. A peer that stops at the end of a record
+ * without a close_notify is not reported, as plenty of clients simply do that.
+ */
+bool gwp_ssl_rx_cut(struct gwp_ssl *s);
+/*
  * Pull ciphertext the engine wants to send (SSL -> network) into @buf. Returns
  * the number of bytes read, 0 if none is pending, or <0 on error.
  */
