@@ -1816,8 +1816,15 @@ static void gwp_ctx_free_auth(struct gwp_ctx *ctx)
  * "localhost" resolves to both families, so leaving any of these out lets a
  * client reach loopback-only services anyway. 169.254/16 holds the cloud
  * metadata endpoint. The IPv6 transition prefixes (IPv4-compatible ::/96,
- * NAT64, 6to4) can embed any of the IPv4 ranges above. ::ffff:a.b.c.d needs no
- * rule of its own: the matcher folds it into IPv4 before comparing.
+ * NAT64, 6to4, Teredo, SIIT's ::ffff:0:a.b.c.d) can embed any of the IPv4
+ * ranges above. ::ffff:a.b.c.d needs no rule of its own: the matcher folds it
+ * into IPv4 before comparing, which also keeps ::/8 from covering it.
+ *
+ * The rest is what the IANA special-purpose registries do not call globally
+ * reachable (documentation, benchmarking, ORCHID, the old 6to4 relay anycast),
+ * and all of IPv6 outside 2000::/3, the only part allocated for global unicast.
+ * That takes in the discard prefixes 100::/64 and 100:0:0:1::/64 under 100::/8,
+ * SRv6 5f00::/16 under 4000::/3, and SIIT under ::/8.
  *
  * ::/128 and ::1/128 are listed even though ::/96 covers them, so that each
  * of them is rejected by a rule of its own.
@@ -1832,8 +1839,12 @@ static const char gwp_acl_default_rules[] =
 	"-A OUTPUT -d 169.254.0.0/16 -j REJECT\n"
 	"-A OUTPUT -d 172.16.0.0/12 -j REJECT\n"
 	"-A OUTPUT -d 192.0.0.0/24 -j REJECT\n"
+	"-A OUTPUT -d 192.0.2.0/24 -j REJECT\n"
+	"-A OUTPUT -d 192.88.99.0/24 -j REJECT\n"
 	"-A OUTPUT -d 192.168.0.0/16 -j REJECT\n"
 	"-A OUTPUT -d 198.18.0.0/15 -j REJECT\n"
+	"-A OUTPUT -d 198.51.100.0/24 -j REJECT\n"
+	"-A OUTPUT -d 203.0.113.0/24 -j REJECT\n"
 	"-A OUTPUT -d 224.0.0.0/4 -j REJECT\n"
 	"-A OUTPUT -d 240.0.0.0/4 -j REJECT\n"
 	/* IPv6 */
@@ -1842,8 +1853,28 @@ static const char gwp_acl_default_rules[] =
 	"-A OUTPUT -d ::/96 -j REJECT\n"
 	"-A OUTPUT -d 64:ff9b::/96 -j REJECT\n"
 	"-A OUTPUT -d 64:ff9b:1::/48 -j REJECT\n"
+	"-A OUTPUT -d ::/8 -j REJECT\n"
+	"-A OUTPUT -d 100::/8 -j REJECT\n"
+	"-A OUTPUT -d 200::/7 -j REJECT\n"
+	"-A OUTPUT -d 400::/6 -j REJECT\n"
+	"-A OUTPUT -d 800::/5 -j REJECT\n"
+	"-A OUTPUT -d 1000::/4 -j REJECT\n"
+	"-A OUTPUT -d 2001::/32 -j REJECT\n"
+	"-A OUTPUT -d 2001:2::/48 -j REJECT\n"
+	"-A OUTPUT -d 2001:10::/28 -j REJECT\n"
+	"-A OUTPUT -d 2001:db8::/32 -j REJECT\n"
 	"-A OUTPUT -d 2002::/16 -j REJECT\n"
+	"-A OUTPUT -d 3fff::/20 -j REJECT\n"
+	"-A OUTPUT -d 4000::/3 -j REJECT\n"
+	"-A OUTPUT -d 6000::/3 -j REJECT\n"
+	"-A OUTPUT -d 8000::/3 -j REJECT\n"
+	"-A OUTPUT -d a000::/3 -j REJECT\n"
+	"-A OUTPUT -d c000::/3 -j REJECT\n"
+	"-A OUTPUT -d e000::/4 -j REJECT\n"
+	"-A OUTPUT -d f000::/5 -j REJECT\n"
+	"-A OUTPUT -d f800::/6 -j REJECT\n"
 	"-A OUTPUT -d fc00::/7 -j REJECT\n"
+	"-A OUTPUT -d fe00::/9 -j REJECT\n"
 	"-A OUTPUT -d fe80::/10 -j REJECT\n"
 	"-A OUTPUT -d fec0::/10 -j REJECT\n"
 	"-A OUTPUT -d ff00::/8 -j REJECT\n"

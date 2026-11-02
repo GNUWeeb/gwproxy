@@ -531,13 +531,16 @@ accepts all clients but rejects outgoing connections to anything other than
 public unicast addresses: the unspecified addresses (on Linux a connection to
 0.0.0.0 or :: reaches the local host), loopback, private and shared (CGNAT)
 space, link\-local (including the cloud metadata service at 169.254.169.254),
-benchmarking, multicast, reserved and broadcast addresses, and the IPv6
-prefixes that embed an IPv4 address (IPv4\-compatible, NAT64, 6to4). An
-IPv4\-mapped target (::ffff:a.b.c.d) is matched as the IPv4 address it
-carries, so the IPv4 rules cover it too. A hostname is checked per resolved
-address, so a name such as
+benchmarking, documentation, multicast, reserved and broadcast addresses, the
+old 6to4 relay anycast, the IPv6 prefixes that embed an IPv4 address
+(IPv4\-compatible, SIIT, NAT64, 6to4, Teredo), ORCHID, and all of IPv6 outside
+2000::/3, the only part allocated for global unicast. An IPv4\-mapped target
+(::ffff:a.b.c.d) is matched as the IPv4 address it carries, so the IPv4 rules
+cover it too. A hostname is checked per resolved address, so a name such as
 .B localhost
-is refused for both its 127.0.0.1 and its ::1 address:
+is refused for both its 127.0.0.1 and its ::1 address. With a remote\-DNS
+upstream no address is known here, so the name itself is refused; the regexp
+rule is only there in a PCRE2 build:
 .RS
 .nf
 \-P INPUT ACCEPT
@@ -548,8 +551,12 @@ is refused for both its 127.0.0.1 and its ::1 address:
 \-A OUTPUT \-d 169.254.0.0/16 \-j REJECT
 \-A OUTPUT \-d 172.16.0.0/12 \-j REJECT
 \-A OUTPUT \-d 192.0.0.0/24 \-j REJECT
+\-A OUTPUT \-d 192.0.2.0/24 \-j REJECT
+\-A OUTPUT \-d 192.88.99.0/24 \-j REJECT
 \-A OUTPUT \-d 192.168.0.0/16 \-j REJECT
 \-A OUTPUT \-d 198.18.0.0/15 \-j REJECT
+\-A OUTPUT \-d 198.51.100.0/24 \-j REJECT
+\-A OUTPUT \-d 203.0.113.0/24 \-j REJECT
 \-A OUTPUT \-d 224.0.0.0/4 \-j REJECT
 \-A OUTPUT \-d 240.0.0.0/4 \-j REJECT
 \-A OUTPUT \-d ::/128 \-j REJECT
@@ -557,11 +564,33 @@ is refused for both its 127.0.0.1 and its ::1 address:
 \-A OUTPUT \-d ::/96 \-j REJECT
 \-A OUTPUT \-d 64:ff9b::/96 \-j REJECT
 \-A OUTPUT \-d 64:ff9b:1::/48 \-j REJECT
+\-A OUTPUT \-d ::/8 \-j REJECT
+\-A OUTPUT \-d 100::/8 \-j REJECT
+\-A OUTPUT \-d 200::/7 \-j REJECT
+\-A OUTPUT \-d 400::/6 \-j REJECT
+\-A OUTPUT \-d 800::/5 \-j REJECT
+\-A OUTPUT \-d 1000::/4 \-j REJECT
+\-A OUTPUT \-d 2001::/32 \-j REJECT
+\-A OUTPUT \-d 2001:2::/48 \-j REJECT
+\-A OUTPUT \-d 2001:10::/28 \-j REJECT
+\-A OUTPUT \-d 2001:db8::/32 \-j REJECT
 \-A OUTPUT \-d 2002::/16 \-j REJECT
+\-A OUTPUT \-d 3fff::/20 \-j REJECT
+\-A OUTPUT \-d 4000::/3 \-j REJECT
+\-A OUTPUT \-d 6000::/3 \-j REJECT
+\-A OUTPUT \-d 8000::/3 \-j REJECT
+\-A OUTPUT \-d a000::/3 \-j REJECT
+\-A OUTPUT \-d c000::/3 \-j REJECT
+\-A OUTPUT \-d e000::/4 \-j REJECT
+\-A OUTPUT \-d f000::/5 \-j REJECT
+\-A OUTPUT \-d f800::/6 \-j REJECT
 \-A OUTPUT \-d fc00::/7 \-j REJECT
+\-A OUTPUT \-d fe00::/9 \-j REJECT
 \-A OUTPUT \-d fe80::/10 \-j REJECT
 \-A OUTPUT \-d fec0::/10 \-j REJECT
 \-A OUTPUT \-d ff00::/8 \-j REJECT
+\-A OUTPUT \-m domain \-\-domain localhost \-j REJECT
+\-A OUTPUT \-m domain \-\-domain\-regexp \e.localhost$ \-j REJECT
 \-P OUTPUT ACCEPT
 .fi
 .RE
