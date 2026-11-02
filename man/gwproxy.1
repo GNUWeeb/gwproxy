@@ -1163,6 +1163,18 @@ HTTP/2\-preferring client. The OpenSSL engine is driven entirely through memory
 BIOs and never touches the socket directly. TLS termination works on both the
 epoll and io_uring event loops.
 .PP
+The end of a TLS client's stream reaches the target as a normal end of stream
+only if it is one. If a record fails to verify, the client sends a fatal alert,
+its connection is reset, its TCP stream stops in the middle of a record, or
+gwproxy itself gives up on the connection or shuts down before the client
+finished sending, the target's connection is reset (TCP RST) rather than closed,
+so that a protocol delimited by the connection closing does not take the stream
+for complete. A reset drops what the target's socket had not sent yet, which is
+no loss to a stream that was cut anyway. A TCP FIN after a whole record with no
+.B close_notify
+is still passed on as a normal end of stream: many clients close that way, and
+gwproxy cannot tell them from an attacker who injects the FIN at that point.
+.PP
 This is distinct from an HTTP
 .B CONNECT
 tunnel to an

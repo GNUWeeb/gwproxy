@@ -241,7 +241,7 @@ $(GWTMR_TEST_TARGET): $(GWPROXY_DIR)/tests/tmr.c $(GWPROXY_DIR)/ev/tmr.h $(GWPRO
 
 ifeq ($(CONFIG_HTTPS),y)
 $(SSL_TEST_TARGET): $(GWPROXY_DIR)/ssl.c.o $(SSL_TEST_OBJECTS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+	$(CC) $(LDFLAGS) -Wl,--wrap=BIO_meth_new -o $@ $^ $(LIBS)
 endif
 
 %.c.o: %.c $(EXTRA_DEPS)

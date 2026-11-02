@@ -894,7 +894,11 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * reference each, so the pair cannot be freed until they are reaped.
 	 * The attempt timeout is dropped for the same reason -- unlike the
 	 * connect timer it is not otherwise waited on.
+	 *
+	 * Their sockets are closed as those completions come in, ahead of
+	 * gwp_free_conn_pair(), so a cut stream has to be seen to here.
 	 */
+	gwp_conn_pair_abort_attempts(gcp);
 	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
 		if (gcp->attempt_fd[i] >= 0)
 			cancel_attempt(w, gcp, i);
@@ -1133,6 +1137,11 @@ static int tls_forward_resume(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * still being sent. Neither is a recv armed then, since the records the
  * engine may hold would not complete one. handle_ev_client_send() picks the
  * pump up again once the reply is out.
+ *
+ * The control connection of a UDP association has no more protocol to run: what
+ * the client sends over it is thrown away, as with a plaintext client. It still
+ * goes through the engine, which is how a close_notify or a bad record ends the
+ * association.
  */
 static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -1146,6 +1155,10 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		t->prot_resume = true;
 		return 0;
 	}
+
+again:
+	if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE)
+		c->len = from = 0;
 
 	while (c->len < c->cap) {
 		got = 0;
@@ -1164,6 +1177,9 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		}
 		c->len += (uint32_t)got;
 	}
+
+	if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE && c->len)
+		goto again;
 
 	if (c->len == from && c->len < c->cap) {
 		/* The client gave up on its handshake, as with a FIN. */
@@ -1224,6 +1240,18 @@ static int tls_hs_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	hs = gwp_ssl_handshake(ssl);
 	if (hs == GWP_SSL_ERROR) {
 		pr_dbg(&w->ctx->lh, "TLS handshake failed: %s", gwp_ssl_errstr());
+		/*
+		 * The engine's alert tells the client why: the send goes out
+		 * ahead of the teardown's cancels, and its completion is not
+		 * looked at. Nothing else uses the scratch at this point, since
+		 * a handshake step only runs once the last flight has gone out.
+		 */
+		n = gwp_ssl_bio_read(ssl, t->tx, sizeof(t->tx));
+		if (n > 0) {
+			t->tx_len = (uint32_t)n;
+			t->tx_sent = 0;
+			prep_send_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_SEND);
+		}
 		return -ECONNRESET;
 	}
 
@@ -1706,10 +1734,19 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * request in client.buf, which the origin must receive. The send
 	 * completion arms the next client recv.
 	 */
-	if (!gcp->client.len)
-		return prep_recv_client(w, gcp);
-	prep_send_target(w, gcp);
-	return 0;
+	if (gcp->client.len) {
+		prep_send_target(w, gcp);
+		return 0;
+	}
+#ifdef CONFIG_HTTPS
+	/*
+	 * The engine may hold more of it, or a close_notify, all off the socket
+	 * already: no recv would complete for those.
+	 */
+	if (client_is_tls(gcp))
+		return tls_forward_pump(w, gcp);
+#endif
+	return prep_recv_client(w, gcp);
 }
 
 /*
@@ -2168,6 +2205,11 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
+#ifdef CONFIG_HTTPS
+		/* Not an end to pass on; see gwp_free_conn_pair(). */
+		if (client_is_tls(gcp) && gwp_ssl_rx_cut(gcp->client.tls))
+			return -ECONNRESET;
+#endif
 		shut_target = true;
 		gcp->target.wr_shut = true;
 	}
@@ -2683,7 +2725,13 @@ static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 	arm_idle_timer(w, gcp);
 
-	r = prep_recv_client_prot(w, gcp);
+#ifdef CONFIG_HTTPS
+	/* What the client sent behind its request may be in the engine by now. */
+	if (client_is_tls(gcp))
+		r = tls_prot_pump(w, gcp);
+	else
+#endif
+		r = prep_recv_client_prot(w, gcp);
 	if (r)
 		return r;
 	prep_udp_recv(w, gcp);
@@ -2761,6 +2809,14 @@ static int handle_ev_client_prot(struct gwp_wrk *w,
 	else if (!r)
 		return prep_recv_client_prot(w, gcp);
 
+#ifdef CONFIG_HTTPS
+	if (client_is_tls(gcp)) {
+		/* Decrypt the ciphertext chunk, then run the protocol on it. */
+		gwp_ssl_rx_commit(gcp->client.tls, (size_t)r);
+		return tls_prot_pump(w, gcp);
+	}
+#endif
+
 	/*
 	 * Once the UDP association is up the TCP control connection is idle and
 	 * only watched for close (r < 0, handled above). Discard any stray
@@ -2770,14 +2826,6 @@ static int handle_ev_client_prot(struct gwp_wrk *w,
 		gcp->client.len = 0;
 		return prep_recv_client_prot(w, gcp);
 	}
-
-#ifdef CONFIG_HTTPS
-	if (client_is_tls(gcp)) {
-		/* Decrypt the ciphertext chunk, then run the protocol on it. */
-		gwp_ssl_rx_commit(gcp->client.tls, (size_t)r);
-		return tls_prot_pump(w, gcp);
-	}
-#endif
 
 	gcp->client.len += (uint32_t)r;
 	return process_client_prot(w, gcp);

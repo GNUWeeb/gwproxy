@@ -1196,6 +1196,11 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  * Decrypt as much of what the TLS engine holds as fits into src->buf, without
  * touching the socket. Returns the number of plaintext bytes produced, or <0
  * on error.
+ *
+ * What was decrypted ahead of a bad record or a fatal alert is as good as any,
+ * and the send that would take it is yet to come. With some of it in src->buf,
+ * the error is an end of the stream to be acted on once that has gone out, which
+ * __forward_progress() does, knowing it from gwp_ssl_rx_cut().
  */
 static ssize_t tls_decrypt(struct gwp_conn *src)
 {
@@ -1218,7 +1223,10 @@ static ssize_t tls_decrypt(struct gwp_conn *src)
 		}
 		if (sr == GWP_SSL_WANT_READ || sr == GWP_SSL_WANT_WRITE)
 			break;
-		return -EIO;
+		if (!src->len)
+			return -EIO;
+		src->rd_eof = true;
+		break;
 	}
 
 	return (ssize_t)got;
@@ -1260,7 +1268,12 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
 	} else if (n == 0) {
 		src->rd_eof = true;
 	} else if (n != -EAGAIN && n != -EINTR) {
-		return n;
+		if (!src->len)
+			return n;
+		/* As in tls_decrypt(), with what that has just decrypted. */
+		gwp_ssl_rx_fail(src->tls);
+		src->rd_eof = true;
+		return got;
 	}
 
 	n = tls_decrypt(src);
@@ -2060,6 +2073,11 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
+#ifdef CONFIG_HTTPS
+		/* Not an end to pass on; see gwp_free_conn_pair(). */
+		if (gcp->client.tls && gwp_ssl_rx_cut(gcp->client.tls))
+			return -ECONNRESET;
+#endif
 		/*
 		 * The client may finish before the target is even connected.
 		 * There is no target socket yet, or only one still in
@@ -3159,6 +3177,8 @@ static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	hs = gwp_ssl_handshake(c->tls);
 	if (hs == GWP_SSL_ERROR) {
 		pr_dbg(&w->ctx->lh, "TLS handshake failed: %s", gwp_ssl_errstr());
+		/* The engine's alert tells the client why, if it can be sent. */
+		tls_flush_hs(c);
 		return -ECONNRESET;
 	}
 

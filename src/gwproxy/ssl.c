@@ -18,7 +18,6 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
-#include <openssl/crypto.h>
 
 #include "ssl.h"
 
@@ -58,6 +57,10 @@ struct gwp_ssl {
 	 * nothing has been received since: reading again cannot make progress.
 	 */
 	bool		rx_starved;
+	/* The peer's close_notify has been read. */
+	bool		rx_closed;
+	/* Reading failed for good; the engine is not to be asked again. */
+	bool		rx_failed;
 };
 
 _Static_assert(GWP_SSL_RECORD_MAX >= SSL3_RT_HEADER_LENGTH +
@@ -179,34 +182,40 @@ static int q_bio_create(BIO *b)
 }
 
 static BIO_METHOD *q_bio_meth;
-static CRYPTO_ONCE q_bio_once = CRYPTO_ONCE_STATIC_INIT;
 
-static void q_bio_meth_init(void)
+/*
+ * Create the method the queues' BIOs share. This belongs to creating a context:
+ * that happens at startup, before any worker runs, and a failure there stops
+ * the proxy with an error. Left to the first connection, it would fail there
+ * for good, with plaintext clients still served and nothing to show for it
+ * but TLS clients being reset.
+ */
+static int q_bio_meth_init(void)
 {
 	BIO_METHOD *m;
+
+	if (q_bio_meth)
+		return 0;
 
 	m = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK,
 			 "gwproxy queue");
 	if (!m)
-		return;
+		return -ENOMEM;
 	if (!BIO_meth_set_write(m, q_bio_write) ||
 	    !BIO_meth_set_read(m, q_bio_read) ||
 	    !BIO_meth_set_ctrl(m, q_bio_ctrl) ||
 	    !BIO_meth_set_create(m, q_bio_create)) {
 		BIO_meth_free(m);
-		return;
+		return -ENOMEM;
 	}
 	q_bio_meth = m;
+	return 0;
 }
 
 static BIO *q_bio_new(struct gwp_ssl_q *q)
 {
-	BIO *b;
+	BIO *b = BIO_new(q_bio_meth);
 
-	if (!CRYPTO_THREAD_run_once(&q_bio_once, q_bio_meth_init) ||
-	    !q_bio_meth)
-		return NULL;
-	b = BIO_new(q_bio_meth);
 	if (b)
 		BIO_set_data(b, q);
 	return b;
@@ -236,8 +245,12 @@ static int alpn_select_cb(SSL *ssl, const unsigned char **out,
 int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
 			      const char *key_file)
 {
-	struct gwp_ssl_ctx *c = calloc(1, sizeof(*c));
+	struct gwp_ssl_ctx *c;
 
+	if (q_bio_meth_init())
+		return -ENOMEM;
+
+	c = calloc(1, sizeof(*c));
 	if (!c)
 		return -ENOMEM;
 
@@ -266,8 +279,12 @@ err:
 
 int gwp_ssl_ctx_client_create(struct gwp_ssl_ctx **out)
 {
-	struct gwp_ssl_ctx *c = calloc(1, sizeof(*c));
+	struct gwp_ssl_ctx *c;
 
+	if (q_bio_meth_init())
+		return -ENOMEM;
+
+	c = calloc(1, sizeof(*c));
 	if (!c)
 		return -ENOMEM;
 
@@ -409,9 +426,29 @@ void gwp_ssl_rx_commit(struct gwp_ssl *s, size_t len)
 
 bool gwp_ssl_rx_more(struct gwp_ssl *s)
 {
+	if (s->rx_failed)
+		return false;
 	if (SSL_pending(s->ssl) > 0)
 		return true;
 	return q_len(&s->rq) > 0 && !s->rx_starved;
+}
+
+bool gwp_ssl_rx_cut(struct gwp_ssl *s)
+{
+	if (s->rx_closed)
+		return false;
+	if (s->rx_failed || q_len(&s->rq) > 0 || SSL_has_pending(s->ssl))
+		return true;
+	/*
+	 * The engine holds nothing unprocessed right after a record's header,
+	 * yet it is waiting for the body. Only this says so.
+	 */
+	return !strcmp(SSL_rstate_string(s->ssl), "RB");
+}
+
+void gwp_ssl_rx_fail(struct gwp_ssl *s)
+{
+	s->rx_failed = true;
 }
 
 int gwp_ssl_bio_read(struct gwp_ssl *s, void *buf, size_t len)
@@ -496,6 +533,8 @@ int gwp_ssl_read(struct gwp_ssl *s, void *buf, size_t len, size_t *out_len)
 	*out_len = 0;
 	if (!len)
 		return GWP_SSL_OK;
+	if (s->rx_failed)
+		return GWP_SSL_ERROR;
 
 	ERR_clear_error();
 	r = SSL_read(s->ssl, buf, cap_int(len));
@@ -510,11 +549,14 @@ int gwp_ssl_read(struct gwp_ssl *s, void *buf, size_t len, size_t *out_len)
 	 */
 	if (SSL_get_error(s->ssl, r) == SSL_ERROR_ZERO_RETURN) {
 		s->rx_starved = true;
+		s->rx_closed = true;
 		return GWP_SSL_OK;
 	}
 	r = map_err(s, r);
 	if (r == GWP_SSL_WANT_READ)
 		s->rx_starved = true;
+	else if (r == GWP_SSL_ERROR)
+		s->rx_failed = true;
 	return r;
 }
 

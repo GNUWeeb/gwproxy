@@ -31,6 +31,10 @@
 #       client's reading going again, and then stop sending and only read. The
 #       origin must get every byte with nothing more from the client to bring
 #       the last of them along. Run on a proxy started with small buffers.
+#   udp
+#       On the control connection of a SOCKS5 UDP association: what the proxy's
+#       engine has to say there must also come through, and must not pile up
+#       when the client asks for it without reading.
 #   shut
 #       The origin finishes sending, which ends the proxy's sending to the
 #       client, and goes on reading. Keep asking and sending a byte each time:
@@ -189,11 +193,15 @@ class Sink:
         c, _ = self.ls.accept()
         if self.shut:
             c.shutdown(socket.SHUT_WR)
-        while True:
-            d = c.recv(65536)
-            if not d:
-                break
-            self.count += len(d)
+        try:
+            while True:
+                d = c.recv(65536)
+                if not d:
+                    break
+                self.count += len(d)
+        except ConnectionResetError:
+            # The client went without a close_notify: the proxy says so.
+            pass
 
 
 class Talker(Sink):
@@ -265,10 +273,9 @@ def answer(port, pid):
     return expect_answer(c, "on a tunnel")
 
 
-def noread(port, pid):
-    sink = Sink()
-    c = Client(port, rcvbuf=4096)
-    connect_tunnel(c, sink)
+def flood_unread(c, pid):
+    """Ask and send until the proxy stops reading. Returns the bytes sent and
+    the result of the SSL_write() left unfinished."""
     c.s.setblocking(False)
     time.sleep(0.2)
     before = vm_hwm(pid)
@@ -287,10 +294,18 @@ def noread(port, pid):
         elif LIB.SSL_get_error(c.ssl, n) == SSL_ERROR_WANT_WRITE:
             select.select([], [c.s], [], 0.1)
         else:
-            return "SSL_write failed"
+            raise RuntimeError("SSL_write failed")
         if sent % 4096 == 0:
             check_growth(pid, before, MAX_GROWTH, sent, "KeyUpdates")
     check_growth(pid, before, MAX_GROWTH, sent, "KeyUpdates")
+    return sent, n
+
+
+def noread(port, pid):
+    sink = Sink()
+    c = Client(port, rcvbuf=4096)
+    connect_tunnel(c, sink)
+    sent, n = flood_unread(c, pid)
 
     # Read again, and all must get going. This has no use for what it reads,
     # and SSL_read() would not get to the socket with a KeyUpdate of ours
@@ -309,6 +324,38 @@ def noread(port, pid):
             n = LIB.SSL_write(c.ssl, b"x", 1)
             if n != 1 and LIB.SSL_get_error(c.ssl, n) != SSL_ERROR_WANT_WRITE:
                 return "SSL_write failed"
+    return None
+
+
+def udp(port, pid):
+    # Much less and the answers to read below crawl through the tiny window.
+    c = Client(port, rcvbuf=STRAND_RCVBUF)
+    c.write(b"\x05\x01\x00")
+    if c.read_some() != b"\x05\x00":
+        return "SOCKS5 greeting refused"
+    c.write(b"\x05\x03\x00\x01\0\0\0\0\0\0")
+    rep = c.read_some()
+    if len(rep) != 10 or rep[1] != 0:
+        return "UDP ASSOCIATE got %r" % rep
+    err = expect_answer(c, "on a UDP association")
+    if err:
+        return err
+    c.drain(1)
+    n = flood_unread(c, pid)[1]
+
+    # Read again, and the proxy must take what the client still has to send.
+    deadline = time.monotonic() + 90
+    while n != 1:
+        if time.monotonic() > deadline:
+            return "association did not resume"
+        try:
+            if not c.s.recv(65536):
+                return "proxy hung up"
+        except BlockingIOError:
+            select.select([c.s], [], [], 0.1)
+        n = LIB.SSL_write(c.ssl, b"x", 1)
+        if n != 1 and LIB.SSL_get_error(c.ssl, n) != SSL_ERROR_WANT_WRITE:
+            return "SSL_write failed"
     return None
 
 
@@ -479,7 +526,7 @@ def main():
     scenario, port, pid = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
     try:
         err = {"answer": answer, "noread": noread, "burst": burst,
-               "strand": strand, "shut": shut}[scenario](port, pid)
+               "strand": strand, "shut": shut, "udp": udp}[scenario](port, pid)
     except (RuntimeError, OSError) as e:
         err = repr(e)
     print(err or "ok")
