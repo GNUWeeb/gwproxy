@@ -1041,6 +1041,14 @@ bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
  */
 bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *a);
+
+/*
+ * The address to create and connect @gcp's next outgoing socket to: the
+ * upstream proxy when chaining, else its target. Returns 0, or -EAFNOSUPPORT
+ * when --outgoing-family forbids the destination named to the upstream.
+ */
+int gwp_conn_dial_addr(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+		       struct gwp_sockaddr **addr);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 
@@ -1225,19 +1233,18 @@ int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
  * handshake state and either build the next request (GWP_UPSTREAM_IO_SEND), ask
  * for more (GWP_UPSTREAM_IO_RECV), or on final success splice the downstream
  * reply and report GWP_UPSTREAM_IO_DONE. On failure returns a negative errno
- * (logging its own pr_err) and, when @notify is non-NULL, sets *@notify true if
- * the failure is a protocol-level rejection whose downstream client should be
- * told; the caller owns that notification and all timer / forwarding state.
+ * (logging its own pr_err); the caller owns telling the client, through
+ * gwp_upstream_fail_reply(), and all timer / forwarding state.
  */
-int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			     bool *notify);
+int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /*
- * The upstream handshake failed with @err and the client is to be told: put
- * its failure reply in target.buf in place of whatever the upstream sent --
- * SOCKS5 REP 0x05 for a refused CONNECT and 0x01 for anything else, an HTTP
- * client a 502. Returns the number of bytes to send to the client (0 for
- * plain forwarding, which has no reply to give), or a negative errno.
+ * The upstream handshake failed with @err, whatever the way: a refusal, a reply
+ * that makes no sense, a hangup. The client still waits for an answer to its
+ * request, so put its failure reply in target.buf in place of whatever the
+ * upstream sent -- SOCKS5 REP 0x05 for a refused CONNECT and 0x01 for anything
+ * else, an HTTP client a 502. Returns the number of bytes to send to the client
+ * (0 for plain forwarding, which has no reply to give), or a negative errno.
  */
 int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    int err);

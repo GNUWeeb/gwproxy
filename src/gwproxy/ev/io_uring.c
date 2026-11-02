@@ -434,7 +434,9 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	    gwp_target_is_self(w, gcp, &gcp->target_addr, false))
 		return -ELOOP;
 
-	ca = ctx->upstream.enabled ? &ctx->upstream.addr : &gcp->target_addr;
+	fd = gwp_conn_dial_addr(ctx, gcp, &ca);
+	if (unlikely(fd))
+		return fd;
 
 	fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, NULL, false);
 	if (unlikely(fd < 0))
@@ -1602,6 +1604,19 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
+/*
+ * A handshake with the upstream proxy failed. Tell the downstream client in
+ * whatever protocol it speaks and return @err so the caller tears the pair
+ * down; the reply's send goes out ahead of the teardown's cancels.
+ */
+static int upstream_iou_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			     int err)
+{
+	if (gwp_upstream_fail_reply(w, gcp, err) > 0)
+		prep_send_client(w, gcp);
+	return err;
+}
+
 /* Begin the upstream-proxy handshake and queue the first request send. */
 static int upstream_iou_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -1611,7 +1626,7 @@ static int upstream_iou_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		prep_upstream_send(w, gcp);
 		return 0;
 	}
-	return r;	/* negative errno */
+	return upstream_iou_fail(w, gcp, r);
 }
 
 /*
@@ -1644,10 +1659,9 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
 	int r = handle_sock_ret(cqe->res);
-	bool notify;
 
 	if (r < 0)
-		return r;
+		return upstream_iou_fail(w, gcp, r);
 
 	if (gcp->up_tx) {
 		/* A request send completed. */
@@ -1668,7 +1682,7 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (r > 0)
 		gcp->target.len += (uint32_t)r;
 
-	r = gwp_upstream_hs_on_reply(w, gcp, &notify);
+	r = gwp_upstream_hs_on_reply(w, gcp);
 	switch (r) {
 	case GWP_UPSTREAM_IO_SEND:
 		prep_upstream_send(w, gcp);
@@ -1680,13 +1694,7 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return upstream_iou_finish(w, gcp);
 	}
 
-	/*
-	 * Negative errno. Tell the client when the upstream turned us down;
-	 * the reply's send goes out ahead of the teardown's cancels.
-	 */
-	if (notify && gwp_upstream_fail_reply(w, gcp, r) > 0)
-		prep_send_client(w, gcp);
-	return r;
+	return upstream_iou_fail(w, gcp, r);	/* negative errno */
 }
 
 /*
