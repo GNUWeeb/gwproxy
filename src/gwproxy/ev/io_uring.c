@@ -434,7 +434,9 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	    gwp_target_is_self(w, gcp, &gcp->target_addr, false))
 		return -ELOOP;
 
-	ca = ctx->upstream.enabled ? &ctx->upstream.addr : &gcp->target_addr;
+	fd = gwp_conn_dial_addr(ctx, gcp, &ca);
+	if (unlikely(fd))
+		return fd;
 
 	fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, NULL, false);
 	if (unlikely(fd < 0))

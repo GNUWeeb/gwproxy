@@ -1039,6 +1039,14 @@ bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
  */
 bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *a);
+
+/*
+ * The address to create and connect @gcp's next outgoing socket to: the
+ * upstream proxy when chaining, else its target. Returns 0, or -EAFNOSUPPORT
+ * when --outgoing-family forbids the destination named to the upstream.
+ */
+int gwp_conn_dial_addr(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+		       struct gwp_sockaddr **addr);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 

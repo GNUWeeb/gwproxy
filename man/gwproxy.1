@@ -709,7 +709,11 @@ rule that rewrites a destination into the forbidden family is caught as well.
 It also covers the hop to an
 .BR \-\-upstream\-proxy ,
 so an upstream whose own address is of the forbidden family is rejected at
-startup rather than failing on every connection. Likewise
+startup rather than failing on every connection, and to the destination named
+to the upstream: an address of the forbidden family, requested by the client
+or made by a
+.B \-j DNAT
+rule, is refused the same way, before the upstream is contacted. Likewise
 .B \-\-prefer\-ipv6=1
 with
 .BR \-\-outgoing\-family=ipv4 ,
@@ -728,8 +732,8 @@ With
 or
 .BR http:// ,
 the hostname is handed to the upstream and that proxy resolves it. gwproxy
-never sees the address, so the upstream may well connect over IPv6. Only the
-hop to the upstream itself is restricted. With
+never sees the address, so the upstream may well connect over IPv6. For a
+hostname, only the hop to the upstream itself is restricted. With
 .B socks5://
 the name is resolved locally, so the restriction does apply.
 .IP \(bu 2

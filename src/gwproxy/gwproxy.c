@@ -4330,6 +4330,35 @@ bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
 	return !is_v4;
 }
 
+int gwp_conn_dial_addr(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+		       struct gwp_sockaddr **addr)
+{
+	int fam = gcp->target_addr.sa.sa_family;
+
+	if (!ctx->upstream.enabled) {
+		*addr = &gcp->target_addr;
+		return 0;
+	}
+
+	/*
+	 * --outgoing-family also binds an address the upstream will be asked
+	 * for, requested by the client or made by a -j DNAT: it is not this
+	 * proxy that dials it, but it is this proxy that sends it there. Only a
+	 * hostname for the upstream to resolve is out of reach. A DNAT that
+	 * replaced such a hostname has updated target_addr too.
+	 */
+	if (gcp->up_dst.ver != GWP_SOCKS5_ATYP_DOMAIN &&
+	    (fam == AF_INET || fam == AF_INET6) &&
+	    !gwp_ctx_outgoing_family_ok(ctx, &gcp->target_addr)) {
+		pr_info(&ctx->lh, "--outgoing-family refuses target %s",
+			ip_to_str(&gcp->target_addr));
+		return -EAFNOSUPPORT;
+	}
+
+	*addr = &ctx->upstream.addr;
+	return 0;
+}
+
 
 /*
  * Compare two addresses by IP only (not port), treating an IPv4 address and its

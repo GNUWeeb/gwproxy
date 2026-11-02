@@ -10,6 +10,9 @@
 #   * a hostname resolves to the allowed family only, so a name with both A and
 #     AAAA still connects rather than being refused.
 #
+# Through an upstream proxy, what counts is the destination named to it as well
+# as the hop to it; a hostname the upstream resolves is the one exception.
+#
 # Every case here pins the family explicitly and asserts against a *pair* of
 # runs where that is the only difference, because "the connection worked" on a
 # dual-stack loopback proves nothing on its own.
@@ -110,6 +113,120 @@ sys.exit(0 if socket.getaddrinfo("localhost", None, socket.AF_INET) else 1)' 2>/
 		[ "$code" = 502 ] \
 			|| fail "[$loop] HTTP ipv6 target under ipv4 got $code (want 502)"
 	fi
+done
+
+# Chaining: the destination named to an upstream is an outgoing target too. An
+# address of the wrong family is refused before anything is dialled, whether a
+# client asked for it or a DNAT made it, and only a hostname the upstream is to
+# resolve is beyond the restriction. The stub upstream never connects anywhere,
+# so none of this needs IPv6 on the host.
+chain_acl="$WORK/chain.acl"
+cat >"$chain_acl" <<-'ACL'
+-P OUTPUT ACCEPT
+-A OUTPUT -d 192.0.2.41/32 -j DNAT --to [2001:db8::1]:80
+-A OUTPUT -m domain --domain dnat6.example -j DNAT --to [2001:db8::1]:80
+-A OUTPUT -m domain --domain dnat4.example -j DNAT --to 192.0.2.9:80
+ACL
+
+# chain_cases <label> <proxy_port> <log> <case>...: run the cases in turn, each
+# "<socks5|http>,<host>,<reply>,<requests>": the SOCKS5 REP or HTTP status for a
+# CONNECT to <host> port 80, and how many requests the upstream must have seen
+# by then. Exits non-zero at the first that is wrong.
+chain_cases() {
+	python3 - "$@" <<-'PY'
+	import socket, sys
+	label, pp, rlog = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+	def ask(front, host):
+	    t = socket.create_connection(('127.0.0.1', pp)); t.settimeout(60)
+	    if front == "http":
+	        h = "[%s]" % host if ":" in host else host
+	        t.sendall(b"CONNECT %s:80 HTTP/1.1\r\nHost: x\r\n\r\n" % h.encode())
+	        r = t.recv(100)
+	        return r.split()[1].decode() if r else "CLOSED"
+	    t.sendall(b'\x05\x01\x00'); assert t.recv(2) == b'\x05\x00'
+	    if ":" in host:
+	        a = b'\x04' + socket.inet_pton(socket.AF_INET6, host)
+	    else:
+	        try:
+	            a = b'\x01' + socket.inet_aton(host)
+	        except OSError:
+	            a = b'\x03' + bytes([len(host)]) + host.encode()
+	    t.sendall(b'\x05\x01\x00' + a + b'\x00\x50')
+	    r = t.recv(4)
+	    return "0x%02x" % r[1] if len(r) > 1 else "CLOSED"
+	for case in sys.argv[4:]:
+	    front, host, want, nreq = case.split(",")
+	    open(rlog, "w").close()
+	    got = ask(front, host)
+	    seen = len(open(rlog).readlines())
+	    print("# %s, %s %s: reply %s, %d upstream requests" % (label, front, host, got, seen), file=sys.stderr)
+	    if got != want or seen != int(nreq):
+	        print("FAIL: %s, %s %s: reply %s (want %s), %d upstream requests (want %s)" % (label, front, host, got, want, seen, nreq))
+	        sys.exit(1)
+	PY
+}
+
+for loop in epoll io_uring; do
+	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+
+	for scheme in socks5 socks5h http; do
+		kind=socks5
+		[ "$scheme" = http ] && kind=http
+		rlog="$WORK/chain.$loop.$scheme.log"
+		: >"$rlog"
+		up="$(pick_port)"
+		python3 "$SERVERS_DIR/stub_upstream.py" "$kind" "$up" "$rlog" \
+			>"$WORK/chain.err" 2>&1 &
+		up_pid=$!
+		_PIDS+=("$up_pid")
+		wait_listen "$up" "$up_pid" || fail "stub upstream did not listen"
+
+		p="$(pick_port)"
+		gwp_start "127.0.0.1:$p" --as-socks5=1 --as-http=1 --nr-workers=1 \
+			--event-loop="$loop" --outgoing-family=ipv4 \
+			--acl-file="$chain_acl" \
+			--upstream-proxy="$scheme://127.0.0.1:$up"
+
+		cases=(socks5,2001:db8::1,0x08,0 http,2001:db8::1,502,0
+		       socks5,192.0.2.41,0x08,0 http,192.0.2.41,502,0
+		       socks5,192.0.2.9,0x00,1 socks5,::ffff:192.0.2.9,0x00,1)
+		# A name is resolved locally for socks5://, and tests resolve none.
+		[ "$scheme" = socks5 ] || \
+			cases+=(socks5,plain.example,0x00,1
+				socks5,dnat6.example,0x08,0
+				socks5,dnat4.example,0x00,1)
+		chain_cases "[$loop] $scheme upstream" "$p" "$rlog" "${cases[@]}" \
+			|| fail "[$loop] $scheme upstream: a destination was not judged right"
+		kill "$GWP_PID" 2>/dev/null
+		wait "$GWP_PID" 2>/dev/null
+
+		# Plain forwarding has no reply to give: the client is closed, and
+		# the upstream is not bothered.
+		if [ "$scheme" = socks5h ]; then
+			p="$(pick_port)"
+			gwp_start "127.0.0.1:$p" --target='[2001:db8::1]:80' --nr-workers=1 \
+				--event-loop="$loop" --outgoing-family=ipv4 --acl-allow-all \
+				--upstream-proxy="$scheme://127.0.0.1:$up"
+			: >"$rlog"
+			got="$(python3 - "$p" <<-'PY'
+			import socket, sys
+			c = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+			c.settimeout(60)
+			try:
+			    print(c.recv(64).hex() or "-")
+			except ConnectionResetError:
+			    print("-")
+			PY
+			)"
+			[ "$got" = - ] || fail "[$loop] plain ipv6 target: client got $got"
+			[ ! -s "$rlog" ] || fail "[$loop] plain ipv6 target: reached the upstream"
+			kill "$GWP_PID" 2>/dev/null
+			wait "$GWP_PID" 2>/dev/null
+		fi
+
+		kill "$up_pid" 2>/dev/null
+		wait "$up_pid" 2>/dev/null
+	done
 done
 
 # Contradictory configurations are refused at startup rather than failing on

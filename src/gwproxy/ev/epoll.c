@@ -600,16 +600,17 @@ static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  */
 static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_sockaddr *ca = &gcp->target_addr;
 	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_sockaddr *ca;
 	int target_fd;
 
-	if (gwp_target_is_self(w, gcp, ca, false))
+	if (gwp_target_is_self(w, gcp, &gcp->target_addr, false))
 		return -ELOOP;
 
 	/* With an upstream proxy, connect to the proxy instead. */
-	if (ctx->upstream.enabled)
-		ca = &ctx->upstream.addr;
+	target_fd = gwp_conn_dial_addr(ctx, gcp, &ca);
+	if (unlikely(target_fd))
+		return target_fd;
 
 	target_fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt,
 					   &gcp->is_target_alive, true);
@@ -2438,18 +2439,17 @@ static bool has_inflight_attempt(const struct gwp_conn_pair *gcp)
 static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 uint8_t slot)
 {
+	struct gwp_sockaddr *ca;
 	struct epoll_event ev;
 	bool alive = false;
 	int tfd, r;
 
-	if (w->ctx->upstream.enabled) {
-		/* Connect to the upstream proxy, not the real destination. */
-		tfd = gwp_create_sock_target(w, &w->ctx->upstream.addr,
-					     &gcp->acl_sockopt, &alive, true);
-	} else {
-		tfd = gwp_create_sock_target(w, &gcp->target_addr,
-					     &gcp->acl_sockopt, &alive, true);
-	}
+	/* With an upstream proxy, connect to the proxy instead. */
+	tfd = gwp_conn_dial_addr(w->ctx, gcp, &ca);
+	if (unlikely(tfd))
+		return tfd;
+
+	tfd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, &alive, true);
 	if (unlikely(tfd < 0))
 		return tfd;
 
