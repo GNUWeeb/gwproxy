@@ -654,6 +654,8 @@ struct gwp_conn_pair {
 	 * was appended in the meantime.
 	 */
 	bool			client_tx;
+	/* A recv of the target's data is in flight. */
+	bool			target_rx;
 #endif
 };
 
