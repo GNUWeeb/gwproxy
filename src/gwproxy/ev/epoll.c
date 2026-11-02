@@ -2748,9 +2748,10 @@ static bool is_ev_bit_conn_pair(uint64_t ev_bit)
  * lossy, so individual datagram errors are dropped rather than failing the
  * association; only the TCP control connection's close tears it down.
  *
- * The relay socket is dual-stack, so IPv4 and IPv6 targets both work; an IPv4
- * target's address is carried v4-mapped internally and unmapped again for the
- * reply header (see gwp_socks5_addr_to_sockaddr / reply_addr_from_sockaddr).
+ * The relay socket is dual-stack (IPv4 only on a kernel without IPv6), so IPv4
+ * and IPv6 targets both work; an IPv4 target's address is carried v4-mapped
+ * internally and unmapped again for the reply header (see
+ * gwp_socks5_addr_to_sockaddr / reply_addr_from_sockaddr).
  *
  * Known limitations, each a follow-up:
  *   - Domain-name (ATYP=0x03) encapsulated targets need DNS in the datagram

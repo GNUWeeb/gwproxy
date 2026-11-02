@@ -694,7 +694,10 @@ sysctl. It has no effect when
 .B \-\-bind
 names an IPv4 address. It applies to the listener only: the SOCKS5 UDP relay
 socket stays dual\-stack on purpose, because a single\-family bind cannot
-egress the other family, so UDP ASSOCIATE to IPv4 targets keeps working.
+egress the other family, so UDP ASSOCIATE to IPv4 targets keeps working. On a
+kernel without IPv6 (booted with
+.BR ipv6.disable=1 )
+the relay socket is IPv4 only and datagrams to IPv6 targets are dropped.
 .TP
 .BR \-L ", " \-\-dns\-cache\-secs=\fIsec\fR
 Cache proxy DNS answers for this many seconds.
