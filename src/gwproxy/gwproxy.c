@@ -3986,6 +3986,18 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	}
 
 	if (cfg->use_raw_dns) {
+		struct gwp_sockaddr sa;
+
+		/*
+		 * An address is the target, not a name to ask the server about:
+		 * the query would tell the server where the client is going, and
+		 * its answer would choose where the tunnel goes. The system
+		 * resolver parses these itself.
+		 */
+		if (req_host_ip(host, port, &sa)) {
+			gwp_conn_set_single_candidate(gcp, &sa);
+			return 0;
+		}
 		return gwp_raw_dns_resolve(w, gcp, host, port);
 	} else {
 		struct gwp_sockaddr addrs[GWP_MAX_CONN_CAND];

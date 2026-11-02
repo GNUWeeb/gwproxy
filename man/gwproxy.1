@@ -744,7 +744,8 @@ Requires a build with the new DNS resolver. Default:
 .TP
 .BR \-r ", " \-\-raw\-dns=\fI0|1\fR
 Use the built\-in raw DNS resolver for SOCKS5/HTTP hostname targets instead of
-the system resolver. Requires a build with the new DNS resolver and the
+the system resolver. An IP literal target is connected to as it is and never
+sent to the DNS server. Requires a build with the new DNS resolver and the
 .B epoll
 event loop; combining it with
 .B \-\-event\-loop=io_uring
