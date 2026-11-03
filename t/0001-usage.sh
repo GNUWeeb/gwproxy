@@ -18,7 +18,7 @@ expect_reject()
 	local what="$1"; shift
 	local rc=0
 
-	timeout 5 "$GWPROXY" "$@" >/dev/null 2>&1 || rc=$?
+	timeout --foreground 5 "$GWPROXY" "$@" >/dev/null 2>&1 || rc=$?
 	case "$rc" in
 	"$EINVAL")
 		return 0 ;;
@@ -60,7 +60,7 @@ done
 # Without CAP_NET_ADMIN the --mark probe fails at startup, and the error must
 # name the mark as given: one above INT_MAX used to be printed as negative.
 if [ "$(id -u)" != 0 ]; then
-	out="$(timeout 5 "$GWPROXY" --as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
+	out="$(timeout --foreground 5 "$GWPROXY" --as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
 		--nr-workers=1 --mark=0xffffffff 2>&1)" && \
 		fail "--mark without CAP_NET_ADMIN: gwproxy exited successfully"
 	printf '%s\n' "$out" | grep -q -- '--mark=4294967295 ' || \

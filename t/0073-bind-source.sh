@@ -175,7 +175,7 @@ reject()
 	local desc="$1" p rc=0
 	shift
 	p="$(pick_port)"
-	timeout 10 "$GWPROXY" --bind="127.0.0.1:$p" --target=127.0.0.1:9 \
+	timeout --foreground 10 "$GWPROXY" --bind="127.0.0.1:$p" --target=127.0.0.1:9 \
 		--acl-allow-all --nr-workers=1 "$@" >"$WORK/reject.log" 2>&1 || rc=$?
 	case "$rc" in
 	0)	fail "gwproxy exited 0 with $desc" ;;

@@ -33,7 +33,7 @@ grep -qi 'ACL' "$WORK/bad.log" || fail "malformed ACL startup lacked an error"
 # running; the timeout turns that into a failure instead of a hang.
 : >"$WORK/empty.acl"
 ec=0
-timeout 10 "$GWPROXY" --bind="127.0.0.1:$(pick_port)" --as-socks5=1 \
+timeout --foreground 10 "$GWPROXY" --bind="127.0.0.1:$(pick_port)" --as-socks5=1 \
 	--acl-file="$WORK/empty.acl" >"$WORK/empty.log" 2>&1 || ec=$?
 { [ "$ec" -ne 0 ] && [ "$ec" -ne 124 ]; } || \
 	fail "gwproxy accepted an empty ACL file (exit $ec)"
