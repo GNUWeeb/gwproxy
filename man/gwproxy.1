@@ -289,6 +289,28 @@ is part of that word. The directives are:
 \(em set a chain's default policy
 .RB ( ACCEPT " or " REJECT ).
 .IP \(bu 3
+.BI "include " path ;
+\(em read the rules of another file in place of this line, so first\-match
+order is the order of the lines as read top to bottom through every file. A
+relative
+.I path
+is taken from the directory of the file that holds the line, an absolute one as
+given; it is one word (no quoting, no globs), and the
+.B ;
+is required (it may also stand apart as the last word). An included file may
+include others, up to 8 levels below the
+.B \-\-acl\-file
+(a chain of 9 files), one load reads at most 64 files (the
+.B \-\-acl\-file
+and every include counted, a file included twice twice), and none may include
+itself, directly or through others. Every file of the set, the
+.B \-\-acl\-file
+included, must be a regular file (a FIFO or a device is refused rather than
+waited on) and is held to the same checks (not empty, no NUL byte, not changed
+while read, no malformed line), and
+the set loads whole or not at all: any failure refuses it at startup, or keeps
+the previous rules on reload.
+.IP \(bu 3
 .BI "\-A " "chain [matches] " "\fB\-j\fR " target
 \(em append a rule. Matches, each negatable with a leading
 .BR ! :

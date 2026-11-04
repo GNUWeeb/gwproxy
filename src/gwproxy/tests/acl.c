@@ -22,6 +22,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <limits.h>
 
 static struct gwp_sockaddr sa4(const char *ip, uint16_t port)
 {
@@ -1828,6 +1829,357 @@ static void test_file_fifo(void)
 	free(path);
 }
 
+/*
+ * ------------------------------------------------------------------------
+ * include
+ * ------------------------------------------------------------------------
+ */
+
+/* A new empty directory for one include test; malloc'd path. */
+static char *inc_dir(void)
+{
+	const char *tmp = getenv("TMPDIR");
+	char *dir;
+
+	if (!tmp || !*tmp)
+		tmp = "/tmp";
+	assert(asprintf(&dir, "%s/gwp-acl-inc.XXXXXX", tmp) > 0);
+	assert(mkdtemp(dir));
+	return dir;
+}
+
+/* Write @text to @dir/@name (truncating it); returns the malloc'd path. */
+static char *inc_write(const char *dir, const char *name, const char *text)
+{
+	size_t len = strlen(text);
+	char *path;
+	int fd;
+
+	assert(asprintf(&path, "%s/%s", dir, name) > 0);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	assert(fd >= 0);
+	assert(write(fd, text, len) == (ssize_t)len);
+	close(fd);
+	return path;
+}
+
+static void inc_put(const char *dir, const char *name, const char *text)
+{
+	free(inc_write(dir, name, text));
+}
+
+/* Remove @dir and everything in it (one level of subdirectories). */
+static void inc_rmdir(char *dir)
+{
+	char *cmd;
+
+	assert(asprintf(&cmd, "rm -rf -- '%s'", dir) > 0);
+	assert(!system(cmd));
+	free(cmd);
+	free(dir);
+}
+
+/* @acl's watched files are @dir/<each of @names>, in that order. */
+static void inc_files(struct gwp_acl *acl, const char *dir,
+		      const char *const *names, size_t nr)
+{
+	char path[PATH_MAX];
+	size_t i;
+
+	for (i = 0; i < nr; i++) {
+		snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+		assert(gwp_acl_file(acl, i));
+		assert(!strcmp(gwp_acl_file(acl, i), path));
+	}
+	assert(!gwp_acl_file(acl, nr));
+}
+
+static enum gwp_acl_verdict inc_out(struct gwp_acl *a, const char *ip)
+{
+	struct gwp_sockaddr t = sa4(ip, 80);
+
+	return out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP);
+}
+
+/*
+ * The rules of an included file go in at the include line, so first-match
+ * order is the order read top to bottom across the files. A relative path
+ * is taken from the including file's directory, at every level; an absolute
+ * one as given. A file included twice, but not inside itself, is no cycle.
+ */
+static noinline void test_include_order(void)
+{
+	static const char *const names[] = {
+		"main.acl", "sub/a.acl", "sub/b.acl", "sub/c.acl", "abs.acl",
+	};
+	char *dir = inc_dir(), *sub, *main_path, *abs_path, *text;
+	char cwd[PATH_MAX];
+	struct gwp_acl *a;
+
+	assert(asprintf(&sub, "%s/sub", dir) > 0);
+	assert(!mkdir(sub, 0700));
+	abs_path = inc_write(dir, "abs.acl",
+			     "-A OUTPUT -d 203.0.113.1 -j REJECT\n");
+	assert(asprintf(&text,
+		"-A OUTPUT -d 192.0.2.1 -j ACCEPT\n"
+		"include sub/a.acl;\n"
+		"-A OUTPUT -d 192.0.2.0/24 -j ACCEPT\n"
+		"include %s ; # an absolute path\n"
+		"-A OUTPUT -d 198.51.100.0/24 -j REJECT\n"
+		"#include sub/missing.acl;\n"
+		"-P OUTPUT ACCEPT\n", abs_path) > 0);
+	main_path = inc_write(dir, "main.acl", text);
+	free(text);
+	inc_put(sub, "a.acl",
+		"-A OUTPUT -d 192.0.2.0/25 -j REJECT\n"
+		"include b.acl;\n"
+		"include c.acl;\n");
+	inc_put(sub, "b.acl",
+		"-A OUTPUT -d 192.0.2.128/25 -j REJECT\n"
+		"include c.acl;\n");
+	inc_put(sub, "c.acl", "-A OUTPUT -d 203.0.113.2 -j REJECT\n");
+
+	assert(!gwp_acl_create(&a, main_path));
+	/* Before the include, from it, from its include, after it. */
+	assert(inc_out(a, "192.0.2.1") == GWP_ACL_ACCEPT);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.200") == GWP_ACL_REJECT);
+	assert(inc_out(a, "198.51.100.7") == GWP_ACL_REJECT);
+	assert(inc_out(a, "203.0.113.1") == GWP_ACL_REJECT);
+	assert(inc_out(a, "203.0.113.2") == GWP_ACL_REJECT);
+	assert(inc_out(a, "203.0.113.3") == GWP_ACL_ACCEPT);
+	/* abs.acl is listed by the path it was included by. */
+	inc_files(a, dir, names, 5);
+	gwp_acl_destroy(a);
+
+	/* A top file named without a directory includes from the cwd. */
+	assert(getcwd(cwd, sizeof(cwd)));
+	assert(!chdir(dir));
+	assert(!gwp_acl_create(&a, "main.acl"));
+	assert(!strcmp(gwp_acl_file(a, 0), "main.acl"));
+	assert(!strcmp(gwp_acl_file(a, 1), "sub/a.acl"));
+	assert(!strcmp(gwp_acl_file(a, 2), "sub/b.acl"));
+	assert(inc_out(a, "192.0.2.200") == GWP_ACL_REJECT);
+	assert(!chdir(cwd));
+	gwp_acl_destroy(a);
+
+	free(abs_path);
+	free(main_path);
+	free(sub);
+	inc_rmdir(dir);
+}
+
+/* @text as main.acl in @dir must fail to load with @err. */
+static void inc_refused(const char *dir, const char *text, int err)
+{
+	struct gwp_acl *a = NULL;
+	char *path = inc_write(dir, "main.acl", text);
+
+	assert(gwp_acl_create(&a, path) == err);
+	assert(!a);
+	free(path);
+}
+
+/*
+ * Every way an include can go wrong refuses the whole load: a bad include
+ * line, a missing or unreadable file, an empty one or one with a NUL byte, a
+ * bad rule in an included file, a cycle (by any name), or nesting too deep.
+ */
+static noinline void test_include_errors(void)
+{
+	static const char nul[] = "-P OUTPUT REJECT\n\0\n";
+	char *dir = inc_dir(), *path, name[32], text[64];
+	struct gwp_acl *a = NULL;
+	int fd, i;
+
+	inc_put(dir, "ok.acl", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
+
+	/* The syntax: one path, then a ';', which may stand alone. */
+	inc_refused(dir, "include ok.acl\n", -EINVAL);
+	inc_refused(dir, "include\n", -EINVAL);
+	inc_refused(dir, "include ;\n", -EINVAL);
+	inc_refused(dir, "include ;;\n", -EINVAL);
+	inc_refused(dir, "include ok.acl;;\n", -EINVAL);
+	inc_refused(dir, "include ok.acl; ;\n", -EINVAL);
+	inc_refused(dir, "include ok.acl other.acl;\n", -EINVAL);
+	inc_refused(dir, "include ok.acl ok.acl ;\n", -EINVAL);
+	inc_refused(dir, "include ok.acl # no ;\n", -EINVAL);
+	inc_refused(dir, "-A OUTPUT -j ACCEPT include ok.acl;\n", -EINVAL);
+	path = inc_write(dir, "main.acl", "include ok.acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	gwp_acl_destroy(a);
+	free(path);
+
+	/* No directory to take a path from: refused in text. */
+	assert(gwp_acl_parse_str(&a, "include /dev/null;\n") == -EINVAL);
+
+	inc_refused(dir, "include missing.acl;\n", -ENOENT);
+	inc_refused(dir, "include .;\n", -EINVAL);
+	inc_refused(dir, "include /dev/null;\n", -EINVAL);
+
+	/*
+	 * A FIFO, included or as the top file, is refused at once: opening it
+	 * for reading would otherwise wait for a writer that never comes.
+	 */
+	assert(asprintf(&path, "%s/pipe.acl", dir) > 0);
+	assert(!mkfifo(path, 0600));
+	inc_refused(dir, "include pipe.acl;\n", -EINVAL);
+	assert(gwp_acl_create(&a, path) == -EINVAL);
+	free(path);
+
+	inc_put(dir, "empty.acl", "");
+	inc_refused(dir, "include empty.acl;\n", -ENODATA);
+	path = inc_write(dir, "nul.acl", "");
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, nul, sizeof(nul) - 1) == (ssize_t)sizeof(nul) - 1);
+	close(fd);
+	free(path);
+	inc_refused(dir, "include nul.acl;\n", -EINVAL);
+
+	inc_put(dir, "bad.acl", "-A OUTPUT -j BOGUS\n");
+	inc_refused(dir, "-P OUTPUT REJECT\ninclude bad.acl;\n", -EINVAL);
+
+	/* Cycles: directly, through another file, through another name. */
+	inc_refused(dir, "include main.acl;\n", -ELOOP);
+	inc_refused(dir, "include ./main.acl;\n", -ELOOP);
+	inc_put(dir, "back.acl", "include main.acl;\n");
+	inc_refused(dir, "include back.acl;\n", -ELOOP);
+	inc_put(dir, "self.acl", "include link.acl;\n");
+	assert(asprintf(&path, "%s/link.acl", dir) > 0);
+	assert(!symlink("self.acl", path));
+	free(path);
+	inc_refused(dir, "include self.acl;\n", -ELOOP);
+
+	/*
+	 * Depth: dN.acl includes d(N+1).acl and d7.acl includes leaf.acl. From
+	 * main.acl (level 0) through d1.acl, leaf.acl is at level 8 and loads;
+	 * through d0.acl it is at level 9, one too deep.
+	 */
+	for (i = 0; i < 7; i++) {
+		snprintf(name, sizeof(name), "d%d.acl", i);
+		snprintf(text, sizeof(text), "include d%d.acl;\n", i + 1);
+		inc_put(dir, name, text);
+	}
+	inc_put(dir, "d7.acl", "include leaf.acl;\n");
+	inc_put(dir, "leaf.acl", "-A OUTPUT -d 192.0.2.8 -j REJECT\n");
+	path = inc_write(dir, "main.acl", "include d0.acl;\n");
+	assert(gwp_acl_create(&a, path) == -ELOOP);
+	free(path);
+	path = inc_write(dir, "main.acl", "include d1.acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(inc_out(a, "192.0.2.8") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	free(path);
+
+	/*
+	 * At most 64 reads of a file per load, the top file and each repeat
+	 * counted: 63 includes load, 64 do not. And a diamond that would
+	 * read 2^8 files is stopped by the same cap, not by the depth one.
+	 */
+	{
+		char big[64 * 16 + 1];
+		char *p = big;
+
+		for (i = 0; i < 63; i++)
+			p += sprintf(p, "include ok.acl;\n");
+		path = inc_write(dir, "main.acl", big);
+		assert(!gwp_acl_create(&a, path));
+		assert(inc_out(a, "192.0.2.1") == GWP_ACL_REJECT);
+		gwp_acl_destroy(a);
+		free(path);
+		p += sprintf(p, "include ok.acl;\n");
+		inc_refused(dir, big, -E2BIG);
+	}
+	for (i = 0; i < 8; i++) {
+		snprintf(name, sizeof(name), "w%d.acl", i);
+		snprintf(text, sizeof(text), "include w%d.acl;\ninclude w%d.acl;\n",
+			 i + 1, i + 1);
+		inc_put(dir, name, text);
+	}
+	inc_put(dir, "w8.acl", "-A OUTPUT -d 192.0.2.8 -j REJECT\n");
+	inc_refused(dir, "include w1.acl;\n", -E2BIG);
+
+	inc_rmdir(dir);
+}
+
+/*
+ * A change to an included file is picked up by a reload of the whole set,
+ * a broken one keeps the old rules, and the files to watch follow the
+ * includes: every file the last attempt met, even one that was missing.
+ */
+static noinline void test_include_reload(void)
+{
+	static const char *const two[] = { "main.acl", "a.acl" };
+	static const char *const three[] = { "main.acl", "a.acl", "new.acl" };
+	static const char *const one[] = { "main.acl" };
+	char *dir = inc_dir(), *main_path, *a_path;
+	struct stat st, st_main, st_a;
+	struct gwp_acl *a;
+
+	main_path = inc_write(dir, "main.acl",
+			      "include a.acl;\n-P OUTPUT ACCEPT\n");
+	inc_put(dir, "a.acl", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
+	assert(!stat(main_path, &st_main));
+	assert(asprintf(&a_path, "%s/a.acl", dir) > 0);
+	assert(!stat(a_path, &st_a));
+	assert(!gwp_acl_create(&a, main_path));
+	assert(inc_out(a, "192.0.2.1") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_ACCEPT);
+	inc_files(a, dir, two, 2);
+
+	/*
+	 * Each file's identity is the one it had when it was read, and stays
+	 * so after it changes: the reload watch compares against it, so a
+	 * change made right after the read is still seen as one.
+	 */
+	assert(!gwp_acl_file_stat(a, 0, &st));
+	assert(st.st_ino == st_main.st_ino && st.st_size == st_main.st_size);
+	assert(!gwp_acl_file_stat(a, 1, &st));
+	assert(st.st_ino == st_a.st_ino && st.st_size == st_a.st_size);
+	inc_put(dir, "a.acl", "-A OUTPUT -d 192.0.2.1 -j REJECT # longer\n");
+	assert(!gwp_acl_file_stat(a, 1, &st));
+	assert(st.st_size == st_a.st_size);
+	assert(gwp_acl_file_stat(a, 2, &st) == -ENOENT);
+
+	inc_put(dir, "a.acl", "-A OUTPUT -d 192.0.2.2 -j REJECT\n");
+	assert(!gwp_acl_reload(a));
+	assert(inc_out(a, "192.0.2.1") == GWP_ACL_ACCEPT);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+
+	/* A broken included file: the old rules stay. */
+	inc_put(dir, "a.acl", "-A OUTPUT -j BOGUS\n");
+	assert(gwp_acl_reload(a) == -EINVAL);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+	inc_files(a, dir, two, 2);
+	inc_put(dir, "a.acl", "-A OUTPUT -d 192.0.2.3 -j REJECT\n");
+
+	/* An include of a file not there yet: it is watched all the same. */
+	inc_put(dir, "main.acl",
+		"include a.acl;\ninclude new.acl;\n-P OUTPUT ACCEPT\n");
+	assert(gwp_acl_reload(a) == -ENOENT);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+	inc_files(a, dir, three, 3);
+	assert(gwp_acl_file_stat(a, 2, &st) == -ENOENT);
+	inc_put(dir, "new.acl", "-A OUTPUT -d 192.0.2.4 -j REJECT\n");
+	assert(!gwp_acl_reload(a));
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_ACCEPT);
+	assert(inc_out(a, "192.0.2.3") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.4") == GWP_ACL_REJECT);
+	inc_files(a, dir, three, 3);
+
+	/* Includes dropped: so are their files. */
+	inc_put(dir, "main.acl", "-P OUTPUT REJECT\n");
+	assert(!gwp_acl_reload(a));
+	assert(inc_out(a, "192.0.2.5") == GWP_ACL_REJECT);
+	inc_files(a, dir, one, 1);
+
+	gwp_acl_destroy(a);
+	free(a_path);
+	free(main_path);
+	inc_rmdir(dir);
+}
+
 #ifdef CONFIG_PCRE
 /* Linked with --wrap, so a test can fail the context's allocation. */
 void *__real_pcre2_match_context_create_8(void *gcontext);
@@ -1885,6 +2237,9 @@ static void run_tests(void)
 	test_empty_chain_policy();
 	test_file_nul();
 	test_file_fifo();
+	test_include_order();
+	test_include_errors();
+	test_include_reload();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();
