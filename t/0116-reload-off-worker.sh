@@ -2,12 +2,16 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Reloading --auth-file or --acl-file must not hold up a worker. A single
-# worker proxies while a reload is stuck: the file is replaced by a FIFO, so
-# the reload blocks opening and reading it until the test writes the new
+# worker proxies while an auth reload is stuck: the file is replaced by a FIFO,
+# so the reload blocks opening and reading it until the test writes the new
 # contents. In the meantime the worker must keep serving with the current
-# credentials and rules; once the contents arrive the reload completes (or,
-# for the ACL, which cannot be read from a FIFO, fails and keeps the current
-# rules). Exercised on every available event loop.
+# credentials; once the contents arrive the reload completes. The ACL loader
+# reads regular files only and does not wait on a FIFO in place of the ACL
+# file: that reload fails at once and the current rules stay, the worker keeps
+# serving throughout, and the proxy still stops on SIGTERM. So the ACL half no
+# longer holds a reload stuck; that the reload thread is off the worker is
+# shown by the auth half, whose reloads run on the same thread. Exercised on
+# every available event loop.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -140,29 +144,51 @@ for loop in epoll io_uring; do
 		&& fail "[$loop] credentials removed by the reload still work"
 	settle_replace "$WORK/auth" $'bob:pw-b\n'
 
-	# ACL reload stuck: the worker still serves under the current rules.
-	# The ACL loader needs a seekable file, so this reload fails once it
-	# gets past the open: the current rules must stay in force, and a
-	# valid file put in place afterwards must still be applied.
+	# A FIFO in place of the ACL file: the reload refuses it without
+	# opening it for good, so nothing is stuck. The current rules must
+	# stay in force, and a valid file put in place afterwards must still
+	# be applied.
 	acl="-A OUTPUT -d 127.0.0.1 --dports $hp -j REJECT"$'\n-P INPUT ACCEPT\n-P OUTPUT ACCEPT\n'
-	stuck_replace "$WORK/acl" "$acl" \
-		|| fail "[$loop] the ACL reload never opened the new file"
+	rm -f "$WORK/acl.fifo"
+	mkfifo "$WORK/acl.fifo"
+	mv -f "$WORK/acl.fifo" "$WORK/acl"
 	fetch "$pp" bob pw-b \
 		|| fail "[$loop] the worker stopped serving during an ACL reload"
-	finish_replace
 	for i in $(seq 1 50); do
 		grep -q "Failed to reload ACL file" "$WORK/gwp.$pp.log" && break
 		sleep 0.1
 	done
 	grep -q "Failed to reload ACL file" "$WORK/gwp.$pp.log" \
 		|| fail "[$loop] the failed ACL reload was not reported"
+	grep -q "acl: $WORK/acl: not a regular file" "$WORK/gwp.$pp.log" \
+		|| fail "[$loop] the FIFO in place of the ACL file was not reported"
 	fetch "$pp" bob pw-b \
 		|| fail "[$loop] a failed ACL reload dropped the current rules"
-	settle_replace "$WORK/acl" "$acl"
+	printf '%s' "$acl" >"$WORK/settle"
+	mv -f "$WORK/settle" "$WORK/acl"
 	wait_fetch 0 "$pp" bob pw-b \
 		|| fail "[$loop] the ACL file put in place was not applied"
 
+	# With a FIFO in place again, SIGTERM still stops the proxy: no
+	# reload is left stuck on it.
+	mkfifo "$WORK/acl.fifo"
+	mv -f "$WORK/acl.fifo" "$WORK/acl"
+	for i in $(seq 1 50); do
+		[ "$(grep -c "Failed to reload ACL file" "$WORK/gwp.$pp.log")" -ge 2 ] \
+			&& break
+		sleep 0.1
+	done
+	[ "$(grep -c "Failed to reload ACL file" "$WORK/gwp.$pp.log")" -ge 2 ] \
+		|| fail "[$loop] the second FIFO was not refused"
 	kill "$GWP_PID" 2>/dev/null
+	for i in $(seq 1 300); do
+		kill -0 "$GWP_PID" 2>/dev/null || break
+		sleep 0.1
+	done
+	kill -0 "$GWP_PID" 2>/dev/null \
+		&& fail "[$loop] the proxy did not exit on SIGTERM"
+	# The next loop writes the ACL file anew, which would block on a FIFO.
+	rm -f "$WORK/acl"
 done
 
 pass

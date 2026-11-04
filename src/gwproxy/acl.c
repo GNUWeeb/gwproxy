@@ -17,6 +17,9 @@
 #include <sched.h>
 #include <time.h>
 #include <sys/random.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
@@ -1691,16 +1694,39 @@ static int parse_text(struct gwp_acl_ruleset *rs, const char *text)
 	return r;
 }
 
+/*
+ * Only a regular file is read. The open does not block, so a FIFO (or a
+ * device) put in place of the rule file is refused instead of stopping the
+ * reload, and every later one, until a writer comes along.
+ */
 static int read_file(const char *path, char **out)
 {
+	struct stat st;
 	long sz;
 	char *buf;
 	size_t rd;
 	FILE *fp;
+	int fd, r;
 
-	fp = fopen(path, "rb");
-	if (!fp)
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
 		return -errno;
+	if (fstat(fd, &st)) {
+		r = -errno;
+		close(fd);
+		return r;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "acl: %s: not a regular file\n", path);
+		close(fd);
+		return -EINVAL;
+	}
+	fp = fdopen(fd, "rb");
+	if (!fp) {
+		r = -errno;
+		close(fd);
+		return r;
+	}
 
 	if (fseek(fp, 0, SEEK_END) || (sz = ftell(fp)) < 0 ||
 	    fseek(fp, 0, SEEK_SET)) {

@@ -266,7 +266,8 @@ and outgoing targets
 .RB ( OUTPUT " chain)."
 The file is watched and hot\-reloaded on change, and a malformed file is
 rejected (at startup, or by keeping the previous rules on reload); so is an
-empty file, one with a NUL byte, and one that changes while it is read. A file
+empty file, one with a NUL byte, one that changes while it is read, and
+anything that is not a regular file (a FIFO is refused, not waited on). A file
 that is rewritten in place can still be reloaded half written; replace it
 atomically instead: write the new rules to a temporary file in the same
 directory and rename it over the old one. When

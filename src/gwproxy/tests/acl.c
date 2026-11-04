@@ -7,6 +7,8 @@
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
+/* Before common.h: musl's struct stat has a field named __unused. */
+#include <sys/stat.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/common.h>
 #include <arpa/inet.h>
@@ -1799,6 +1801,33 @@ static void test_file_nul(void)
 	free(path);
 }
 
+/*
+ * A FIFO in place of the rule file, at creation or on reload, is refused at
+ * once: opening it for reading would otherwise wait for a writer that may
+ * never come, and hold up every later reload and shutdown with it.
+ */
+static void test_file_fifo(void)
+{
+	struct gwp_sockaddr t = sa4("93.184.216.34", 80);
+	char *path, *fifo;
+	struct gwp_acl *a;
+
+	path = write_tmp_rules("-P OUTPUT REJECT\n");
+	assert(asprintf(&fifo, "%s.fifo", path) > 0);
+	assert(!mkfifo(fifo, 0600));
+	assert(gwp_acl_create(&a, fifo) == -EINVAL);
+
+	assert(!gwp_acl_create(&a, path));
+	assert(!rename(fifo, path));
+	assert(gwp_acl_reload(a) == -EINVAL);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(fifo);
+	free(path);
+}
+
 #ifdef CONFIG_PCRE
 /* Linked with --wrap, so a test can fail the context's allocation. */
 void *__real_pcre2_match_context_create_8(void *gcontext);
@@ -1855,6 +1884,7 @@ static void run_tests(void)
 	test_generation();
 	test_empty_chain_policy();
 	test_file_nul();
+	test_file_fifo();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();
