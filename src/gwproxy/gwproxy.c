@@ -2393,6 +2393,8 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 		req.dport = dport;
 	req.memo = memo;
 	v = gwp_acl_eval_output(ctx->acl, &req);
+	/* The -j UPSTREAM choice is not used yet; give its pool back. */
+	gwp_acl_req_release(&req);
 	if (v != GWP_ACL_ACCEPT)
 		return v;
 
@@ -2475,6 +2477,8 @@ static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	acl_out_req(&req, &gcp->udp_peer, target, NULL, gcp_req_user(gcp),
 		    GWP_ACL_PROTO_UDP);
 	ok = gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
+	/* UDP is relayed direct: -j UPSTREAM does not apply to it. */
+	gwp_acl_req_release(&req);
 
 	c->valid = req.cacheable;
 	c->gen = req.gen;
