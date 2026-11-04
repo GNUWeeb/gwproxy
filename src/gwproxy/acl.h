@@ -34,6 +34,73 @@ enum gwp_acl_proto {
 struct gwp_acl;
 
 /*
+ * An upstream pool, defined in the rule file by a block:
+ *
+ *	upstream NAME {
+ *		server URL;
+ *		least_conn;
+ *	}
+ *
+ * and chosen by an OUTPUT rule's "-j UPSTREAM --to NAME". A pool belongs to
+ * the ruleset that defined it, and is read-only once loaded. It is reference
+ * counted, so it can outlive that ruleset after a reload: an evaluation that
+ * names a pool hands the caller a reference (see struct gwp_acl_req).
+ */
+struct gwp_acl_pool;
+
+/* How a pool spreads connections over its servers. */
+enum gwp_acl_pool_method {
+	GWP_ACL_POOL_ROUND_ROBIN	= 0,	/* the default */
+	GWP_ACL_POOL_LEAST_CONN		= 1,	/* "least_conn;" */
+};
+
+/* What the OUTPUT chain chose as the upstream of a connection. */
+enum gwp_acl_upstream {
+	GWP_ACL_UPSTREAM_NONE	= 0,	/* no -j UPSTREAM rule matched */
+	GWP_ACL_UPSTREAM_DIRECT	= 1,	/* "--to DIRECT": no upstream at all */
+	GWP_ACL_UPSTREAM_POOL	= 2,	/* a pool: gwp_acl_req.upstream_pool */
+};
+
+/* The pool's name, as written after "upstream". */
+const char *gwp_acl_pool_name(const struct gwp_acl_pool *p);
+
+enum gwp_acl_pool_method gwp_acl_pool_method(const struct gwp_acl_pool *p);
+
+/*
+ * True when the pool's servers resolve the target's name (socks5h://,
+ * http://, https://), false when gwproxy resolves it (socks5://). Every
+ * server of a pool has the same mode.
+ */
+bool gwp_acl_pool_remote_dns(const struct gwp_acl_pool *p);
+
+/* How many servers the pool has: at least 1, at most 64. */
+uint32_t gwp_acl_pool_nr_servers(const struct gwp_acl_pool *p);
+
+/*
+ * The URL of the pool's @i-th server (from 0, in file order), exactly as
+ * written, credentials included: never log it, log gwp_acl_url_redact()'s
+ * form instead. NULL when @i is out of range.
+ */
+const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i);
+
+/* Take another reference to @p. */
+void gwp_acl_pool_get(struct gwp_acl_pool *p);
+
+/* Drop a reference to @p, freeing it on the last one (NULL is a no-op). */
+void gwp_acl_pool_put(struct gwp_acl_pool *p);
+
+/*
+ * Copy the upstream URL @url to @buf (of @size bytes, NUL-terminated) with
+ * its "user:pass@" part, if any, left out, so it can be logged. When @url
+ * has an '@', everything up to and including the last one is dropped, but
+ * for a leading "SCHEME://" made of scheme characters only; so a malformed
+ * URL is cut too, whatever its shape. Returns 0, or -ENAMETOOLONG when the
+ * result did not fit (@buf then holds as much as fits, still without
+ * credentials).
+ */
+int gwp_acl_url_redact(const char *url, char *buf, size_t size);
+
+/*
  * A -j BIND request: pin the outgoing connection to a source address (and/or
  * port) and/or a network interface. At least one of @have_src / a non-empty
  * @iface is present. @set marks that a BIND rule matched. The 16-byte @iface is
@@ -70,6 +137,11 @@ int gwp_acl_parse_bind_source(const char *s, struct gwp_sockaddr *out);
  * twice counts twice), a file may not include itself (directly or through
  * others), only regular files are read, and every file must load, or nothing
  * does.
+ *
+ * "upstream NAME {" ... "}" defines an upstream pool (see struct
+ * gwp_acl_pool) for "-j UPSTREAM --to NAME" rules anywhere in the set. A
+ * file holding a server URL with credentials that group or others can read
+ * is warned about on stderr; no message shows the credentials.
  */
 int gwp_acl_create(struct gwp_acl **out, const char *path);
 
@@ -159,6 +231,17 @@ static inline void gwp_acl_memo_reset(struct gwp_acl_memo *m)
  *   @bind    the source/interface from the last matched -j BIND rule (also a
  *            composable modifier, and likewise terminal with --accept);
  *            @bind.set is false when none matched.
+ *   @upstream/@upstream_pool  the choice of the last matched -j UPSTREAM
+ *            rule (a composable modifier too, terminal with --accept): an
+ *            enum gwp_acl_upstream, and with GWP_ACL_UPSTREAM_POOL the pool,
+ *            of which the caller then holds a reference and must drop it
+ *            (gwp_acl_req_release()), or take it over (gwp_acl_req_take_pool()).
+ *            Set only on an ACCEPT verdict; NONE and NULL otherwise.
+ *
+ * A request is a value, but after an OUTPUT evaluation it may hold an owning
+ * pointer (@upstream_pool). Do not copy it while it holds one: both copies
+ * would drop the same reference. Move the reference out with
+ * gwp_acl_req_take_pool() instead.
  *   @gen     the ruleset generation the verdict was computed against (see
  *            gwp_acl_generation()).
  *   @cacheable  false when the verdict must not be reused for an identical
@@ -174,11 +257,12 @@ struct gwp_acl_req {
 	struct gwp_acl_memo		*memo;
 
 	/*
-	 * Outputs. DNAT, MARK and BIND are independent, composable modifiers: a
-	 * single eval can set any combination (a -j MARK, then a -j BIND, then a
-	 * terminal -j DNAT can all match one connection), so they cannot share a
-	 * union. Ordered largest-first to avoid padding.
+	 * Outputs. DNAT, MARK, BIND and UPSTREAM are independent, composable
+	 * modifiers: a single eval can set any combination (a -j MARK, then a
+	 * -j BIND, then a terminal -j DNAT can all match one connection), so
+	 * they cannot share a union. Ordered largest-first to avoid padding.
 	 */
+	struct gwp_acl_pool		*upstream_pool;
 	struct gwp_sockaddr		dnat;	/* rewrite; valid iff @dnat_applied */
 	struct gwp_acl_bind		bind;	/* bind spec; valid iff @bind.set */
 	uint32_t			mark;	/* fwmark; valid iff @mark_set */
@@ -190,6 +274,7 @@ struct gwp_acl_req {
 	/* The rule's port, or 0; set only with @dnat_applied. */
 	uint16_t			dnat_port;
 	uint8_t				proto;	/* enum gwp_acl_proto */
+	uint8_t				upstream; /* enum gwp_acl_upstream */
 	bool				dnat_applied;
 	bool				mark_set;
 	bool				cacheable;
@@ -201,6 +286,32 @@ struct gwp_acl_req {
  */
 enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 					 struct gwp_acl_req *req);
+
+/*
+ * Drop what an OUTPUT evaluation left @req holding (its pool reference) and
+ * reset @req->upstream to GWP_ACL_UPSTREAM_NONE. Safe to call more than once.
+ */
+static inline void gwp_acl_req_release(struct gwp_acl_req *req)
+{
+	gwp_acl_pool_put(req->upstream_pool);
+	req->upstream_pool = NULL;
+	req->upstream = GWP_ACL_UPSTREAM_NONE;
+}
+
+/*
+ * Hand the pool reference @req holds over to the caller, who then drops it
+ * with gwp_acl_pool_put(); NULL when it holds none. @req->upstream_pool is
+ * cleared, so releasing @req afterwards drops nothing, while @req->upstream
+ * still tells what the evaluation chose.
+ */
+static inline struct gwp_acl_pool *
+gwp_acl_req_take_pool(struct gwp_acl_req *req)
+{
+	struct gwp_acl_pool *p = req->upstream_pool;
+
+	req->upstream_pool = NULL;
+	return p;
+}
 
 /*
  * The ACL's ruleset generation: it changes with every successful reload, so a
