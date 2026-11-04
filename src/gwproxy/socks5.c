@@ -659,8 +659,9 @@ static int handle_cmd_connect(struct data_arg *d)
 /*
  * UDP ASSOCIATE: the DST.ADDR/DST.PORT names the address the client will send
  * datagrams from (often 0.0.0.0:0, "not yet known"). Keep it in dst_addr; the
- * relay uses it to pin the client, or pins from the first datagram. The proxy
- * opens the relay socket and answers with its endpoint from the event loop.
+ * relay uses it to pin the client when it names the control connection's IP and
+ * a port, or pins from the first valid datagram. The proxy opens the relay socket
+ * and answers with its endpoint from the event loop.
  */
 static int handle_cmd_udp_associate(struct data_arg *d)
 {

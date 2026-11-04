@@ -50,7 +50,10 @@ and drive I/O with either the
 (default) or
 .B io_uring
 event loop. It recovers gracefully from file\-descriptor exhaustion
-(EMFILE/ENFILE), caches DNS answers for hostname targets, tries and races the
+(EMFILE/ENFILE): a worker out of descriptors stops accepting and tries again
+after 100 ms on io_uring; on epoll, once several connections' worth have been
+closed, or after 5 seconds at the latest. It caches DNS answers for hostname
+targets, tries and races the
 addresses of a multi\-homed name on either loop (see
 .BR "TARGET ADDRESS SELECTION" ),
 and can mark its own outgoing connections with
@@ -84,6 +87,8 @@ Default:
 .BR \-b ", " \-\-bind=\fIaddr:port\fR
 Address and port to listen on. IPv6 literals are written in brackets, e.g.
 .BR [::1]:1080 " or " 0.0.0.0:8080 .
+A port outside 0 to 65535, or one with anything behind its digits, is refused
+at startup, here and in every other address option.
 The default,
 .BR [::]:1080 ,
 listens on the dual\-stack IPv4/IPv6 wildcard. A SOCKS5 or HTTP proxy
@@ -91,6 +96,36 @@ listening on anything but loopback without
 .B \-\-auth\-file
 is open to every client that can reach it; gwproxy logs a warning at startup
 when it is configured that way.
+.IP
+A target that is this listener is refused (SOCKS5 reply
+.BR 0x01 ,
+HTTP
+.BR 502 ,
+and a plain or transparent client is disconnected), since a client could
+otherwise chain the proxy through itself over and over on one connection. That
+covers a hostname, a
+.B \-j DNAT
+rewrite and an upstream proxy too, and an unspecified target as the address a
+connect to it reaches: loopback, or an IPv4 source forced by
+.B \-\-bind\-source
+or
+.BR "\-j BIND" .
+The other addresses of a hostname are still tried, so the client may get through
+to one of them, and when all fail the reply is that of the last to fail, which can
+be another error code.
+Under a wildcard address it means any address the host's routing table has as
+local, local routes included, in the family the wildcard covers, with this port;
+a service of the same port number on an address the listener does not cover is
+reached as usual. Asking the routing table takes a descriptor, so while the
+descriptor table is full a SOCKS5 or HTTP target on this port number is refused
+as if it were this listener, even if it is a remote service; plain and transparent
+clients wait for a descriptor, as they do for their target socket.
+With port 0, where each worker has a port of its own,
+only the worker's own port is recognised. A path back to the listener through NAT
+or another host is not recognised either; use
+.B \-\-max\-conns\-per\-ip
+to bound what one client can do that way, noting that such connections count
+against the proxy's own address.
 .TP
 .BR \-t ", " \-\-target=\fIaddr:port\fR
 For plain TCP forwarding, the fixed destination every accepted connection is
@@ -105,7 +140,9 @@ listener, from 1 to 1024. Default:
 .TP
 .BR \-o ", " \-\-protocol\-timeout=\fIsec\fR
 Seconds allowed for a client to complete the SOCKS5/HTTP (and, if enabled, TLS)
-handshake before the connection is dropped. Default:
+handshake before the connection is dropped. This includes the lookup of the
+target's name; a client whose request is waiting for one when the time runs out
+gets a SOCKS5 reply 0x06 or an HTTP 504 first. Default:
 .BR 10 .
 .TP
 .BR \-c ", " \-\-connect\-timeout=\fIsec\fR
@@ -113,6 +150,13 @@ Seconds allowed to establish the connection to the target (or upstream proxy)
 before giving up. This bounds the whole attempt, including every address tried
 for the same name (see
 .BR "TARGET ADDRESS SELECTION" ).
+.B 0
+(or a negative value) sets no limit: the kernel still gives up on a target that
+never answers after its SYN retries, but an upstream proxy that accepts and then
+says nothing is waited for as long as the client stays. A client that resets its
+connection ends the wait at once, though with io_uring on a kernel older than
+5.13 only when the connect ends. One that has sent a FIN counts as staying, as
+it may only have finished sending and be waiting for the answer.
 Default:
 .BR 5 .
 .TP
@@ -172,6 +216,13 @@ the proxy rejects it with reply
 .B CONNECT
 unaffected; only meaningful with
 .BR \-\-as\-socks5 .
+Datagrams are taken only from the IP address of the control connection. When
+the request declares that address and a port, only that port is the client;
+when it declares any other address, or no port, the first valid datagram from
+that IP address decides the port, so another party on the same IP address can
+get there first. A client behind a NAT cannot know its outside port and is
+served by the latter rule. A client that declares the control connection's
+address with a port the NAT rewrites gets no service.
 Default:
 .BR 1 .
 .TP
@@ -263,7 +314,9 @@ iptables, is terminal \(em it accepts the connection and stops matching (DNAT
 applies to SOCKS5, HTTP, plain and transparent forwarding and, when chaining, to
 the destination handed to an upstream proxy \(em including replacing a
 .B socks5h://
-hostname with the rewritten IP \(em but not the UDP relay), or
+hostname with the rewritten IP, or for a port\-only
+.B \-\-to :\fIport\fR
+keeping the hostname and changing its port \(em but not the UDP relay), or
 .B MARK
 .RB ( OUTPUT "-only) with " \-\-set\-mark " " \fInum\fR "."
 .IP
@@ -339,12 +392,18 @@ Neither pinning needs a capability of its own:
 .B SO_BINDTODEVICE
 has been unprivileged since Linux 5.7, and binding a source address that is
 configured locally never required one.
+With no source
+.I port
+(the default) the kernel picks one at
+.BR connect (2)
+.RB ( IP_BIND_ADDRESS_NO_PORT ),
+so each destination has the whole local port range to itself.
 Binding a fixed source
 .I port
-limits concurrency to one connection per identical destination (a 4\-tuple
-clash), and defeats multi\-address racing and fallback, since two attempts of
-one connection cannot share a source port; omit the port (the default) for an
-ephemeral source port.
+limits that source to one connection at a time, whatever the destination, and
+for as long as the closed one lingers in TIME_WAIT; it also defeats
+multi\-address racing and fallback, since two attempts of one connection cannot
+share a source port.
 .RE
 .IP
 .B \-\-accept
@@ -390,6 +449,12 @@ match can deny some of a name's addresses while the connection still succeeds
 on another (see
 .BR "TARGET ADDRESS SELECTION" ).
 .IP
+One trailing dot does not count, in a
+.B \-\-domain
+value or in the requested name: "example.com." and "example.com" are the same
+name. A value that still ends in a dot without it, or is nothing but one, is a
+parse error. A regexp sees the requested name with its dot already removed.
+.IP
 .B \-\-domain\-regexp
 .I pattern
 (an alternative to
@@ -414,9 +479,21 @@ takes a PCRE instead (case\-sensitive, raw/unanchored, needs
 .BR \-\-use\-pcre ).
 It is
 .B OUTPUT
-\-only and matches nothing when the connection is unauthenticated, so it only
-has effect together with
-.BR \-\-auth\-file .
+\-only. A connection with no authenticated user has no name to match, so
+.B \-\-user
+does not match it, and the negated
+.B ! \-\-user
+.I does
+match it, the same way
+.B ! \-\-domain
+matches a target with no hostname. So
+.B "\-m user ! \-\-user alice \-j ACCEPT"
+admits anonymous clients too, unless every client has to authenticate. That
+holds for SOCKS5 and HTTP with
+.B \-\-auth\-file
+only: no connection in plain or transparent mode has a user, even with
+.BR \-\-auth\-file ,
+and the same goes for SOCKS5 and HTTP without it.
 The
 .BR \-\-user\-regexp
 option, like
@@ -504,13 +581,16 @@ accepts all clients but rejects outgoing connections to anything other than
 public unicast addresses: the unspecified addresses (on Linux a connection to
 0.0.0.0 or :: reaches the local host), loopback, private and shared (CGNAT)
 space, link\-local (including the cloud metadata service at 169.254.169.254),
-benchmarking, multicast, reserved and broadcast addresses, and the IPv6
-prefixes that embed an IPv4 address (IPv4\-compatible, NAT64, 6to4). An
-IPv4\-mapped target (::ffff:a.b.c.d) is matched as the IPv4 address it
-carries, so the IPv4 rules cover it too. A hostname is checked per resolved
-address, so a name such as
+benchmarking, documentation, multicast, reserved and broadcast addresses, the
+old 6to4 relay anycast, the IPv6 prefixes that embed an IPv4 address
+(IPv4\-compatible, SIIT, NAT64, 6to4, Teredo), ORCHID, and all of IPv6 outside
+2000::/3, the only part allocated for global unicast. An IPv4\-mapped target
+(::ffff:a.b.c.d) is matched as the IPv4 address it carries, so the IPv4 rules
+cover it too. A hostname is checked per resolved address, so a name such as
 .B localhost
-is refused for both its 127.0.0.1 and its ::1 address:
+is refused for both its 127.0.0.1 and its ::1 address. With a remote\-DNS
+upstream no address is known here, so the name itself is refused; the regexp
+rule is only there in a PCRE2 build:
 .RS
 .nf
 \-P INPUT ACCEPT
@@ -521,8 +601,12 @@ is refused for both its 127.0.0.1 and its ::1 address:
 \-A OUTPUT \-d 169.254.0.0/16 \-j REJECT
 \-A OUTPUT \-d 172.16.0.0/12 \-j REJECT
 \-A OUTPUT \-d 192.0.0.0/24 \-j REJECT
+\-A OUTPUT \-d 192.0.2.0/24 \-j REJECT
+\-A OUTPUT \-d 192.88.99.0/24 \-j REJECT
 \-A OUTPUT \-d 192.168.0.0/16 \-j REJECT
 \-A OUTPUT \-d 198.18.0.0/15 \-j REJECT
+\-A OUTPUT \-d 198.51.100.0/24 \-j REJECT
+\-A OUTPUT \-d 203.0.113.0/24 \-j REJECT
 \-A OUTPUT \-d 224.0.0.0/4 \-j REJECT
 \-A OUTPUT \-d 240.0.0.0/4 \-j REJECT
 \-A OUTPUT \-d ::/128 \-j REJECT
@@ -530,11 +614,33 @@ is refused for both its 127.0.0.1 and its ::1 address:
 \-A OUTPUT \-d ::/96 \-j REJECT
 \-A OUTPUT \-d 64:ff9b::/96 \-j REJECT
 \-A OUTPUT \-d 64:ff9b:1::/48 \-j REJECT
+\-A OUTPUT \-d ::/8 \-j REJECT
+\-A OUTPUT \-d 100::/8 \-j REJECT
+\-A OUTPUT \-d 200::/7 \-j REJECT
+\-A OUTPUT \-d 400::/6 \-j REJECT
+\-A OUTPUT \-d 800::/5 \-j REJECT
+\-A OUTPUT \-d 1000::/4 \-j REJECT
+\-A OUTPUT \-d 2001::/32 \-j REJECT
+\-A OUTPUT \-d 2001:2::/48 \-j REJECT
+\-A OUTPUT \-d 2001:10::/28 \-j REJECT
+\-A OUTPUT \-d 2001:db8::/32 \-j REJECT
 \-A OUTPUT \-d 2002::/16 \-j REJECT
+\-A OUTPUT \-d 3fff::/20 \-j REJECT
+\-A OUTPUT \-d 4000::/3 \-j REJECT
+\-A OUTPUT \-d 6000::/3 \-j REJECT
+\-A OUTPUT \-d 8000::/3 \-j REJECT
+\-A OUTPUT \-d a000::/3 \-j REJECT
+\-A OUTPUT \-d c000::/3 \-j REJECT
+\-A OUTPUT \-d e000::/4 \-j REJECT
+\-A OUTPUT \-d f000::/5 \-j REJECT
+\-A OUTPUT \-d f800::/6 \-j REJECT
 \-A OUTPUT \-d fc00::/7 \-j REJECT
+\-A OUTPUT \-d fe00::/9 \-j REJECT
 \-A OUTPUT \-d fe80::/10 \-j REJECT
 \-A OUTPUT \-d fec0::/10 \-j REJECT
 \-A OUTPUT \-d ff00::/8 \-j REJECT
+\-A OUTPUT \-m domain \-\-domain localhost \-j REJECT
+\-A OUTPUT \-m domain \-\-domain\-regexp \e.localhost$ \-j REJECT
 \-P OUTPUT ACCEPT
 .fi
 .RE
@@ -565,7 +671,13 @@ These options require a build with OpenSSL support (see
 .BR \-E ", " \-\-tls\-cert=\fIfile\fR
 PEM certificate chain presented to TLS clients. Providing it (together with
 .BR \-\-tls\-key )
-enables TLS termination on the listener.
+enables TLS termination on the listener. It needs
+.B \-\-as\-socks5=1
+or
+.BR \-\-as\-http=1 :
+with plain forwarding or
+.B \-\-as\-transparent=1
+the proxy refuses to start, as they do not terminate TLS.
 .TP
 .BR \-Y ", " \-\-tls\-key=\fIfile\fR
 PEM private key matching
@@ -613,7 +725,11 @@ rule that rewrites a destination into the forbidden family is caught as well.
 It also covers the hop to an
 .BR \-\-upstream\-proxy ,
 so an upstream whose own address is of the forbidden family is rejected at
-startup rather than failing on every connection. Likewise
+startup rather than failing on every connection, and to the destination named
+to the upstream: an address of the forbidden family, requested by the client
+or made by a
+.B \-j DNAT
+rule, is refused the same way, before the upstream is contacted. Likewise
 .B \-\-prefer\-ipv6=1
 with
 .BR \-\-outgoing\-family=ipv4 ,
@@ -632,8 +748,8 @@ With
 or
 .BR http:// ,
 the hostname is handed to the upstream and that proxy resolves it. gwproxy
-never sees the address, so the upstream may well connect over IPv6. Only the
-hop to the upstream itself is restricted. With
+never sees the address, so the upstream may well connect over IPv6. For a
+hostname, only the hop to the upstream itself is restricted. With
 .B socks5://
 the name is resolved locally, so the restriction does apply.
 .IP \(bu 2
@@ -678,7 +794,10 @@ sysctl. It has no effect when
 .B \-\-bind
 names an IPv4 address. It applies to the listener only: the SOCKS5 UDP relay
 socket stays dual\-stack on purpose, because a single\-family bind cannot
-egress the other family, so UDP ASSOCIATE to IPv4 targets keeps working.
+egress the other family, so UDP ASSOCIATE to IPv4 targets keeps working. On a
+kernel without IPv6 (booted with
+.BR ipv6.disable=1 )
+the relay socket is IPv4 only and datagrams to IPv6 targets are dropped.
 .TP
 .BR \-L ", " \-\-dns\-cache\-secs=\fIsec\fR
 Cache proxy DNS answers for this many seconds.
@@ -695,15 +814,39 @@ seconds.
 .BR \-\-dns\-cache\-max\-entries=\fInr\fR
 Bound the DNS cache to at most
 .I nr
-entries; once full, new hostnames are resolved but not cached (existing entries
-are still served and refreshed) so memory cannot grow without limit.
+entries; once full, expired entries are reclaimed to make room, and with none
+to reclaim new hostnames are resolved but not cached (existing entries are still
+served and refreshed) so memory cannot grow without limit.
 .B 0
 means unlimited. Default:
 .BR 65536 .
 .TP
 .BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
-Number of DNS resolver worker threads, at most 1024. Default:
+Number of DNS resolver worker threads kept running, at most 1024. This does not
+cap how many lookups run at once: more threads are started on demand when lookups
+are waiting, up to 64 threads or
+.IR nr ,
+whichever is larger, and those exit again after 10 seconds idle. Default:
 .BR 4 .
+.IP
+Each thread runs one blocking lookup, so the threads are shared out by client
+address, grouped as for
+.BR \-\-max\-conns\-per\-ip :
+an IPv4 address, or the /64 of an IPv6 one. A client runs at most half of the
+threads at a time, clients with lookups waiting take turns, and a quarter of the
+threads are kept for clients with no lookup running, who also go first, so slow
+names from a client or two do not hold up the others. It takes about 18 client
+addresses, at 64 threads, to use up the kept threads as well. A new client then
+waits for the next thread to come free, up to as long as one lookup takes, and
+longer with many more addresses than threads, as each of them gets a turn first.
+At most 1024 lookups wait per client and 16384 in all; a request over either
+limit is answered at once like a name
+that does not resolve (SOCKS5 REP 0x04, HTTP 502). A request for a name already
+being looked up shares that lookup, and no limit applies to it. When all clients
+arrive from one address, as behind another proxy, they count as one client; a
+larger
+.I nr
+raises its share.
 .TP
 .BR \-j ", " \-\-dns\-server=\fIaddr:port\fR
 Upstream DNS server for the built\-in raw resolver (see
@@ -713,7 +856,8 @@ Requires a build with the new DNS resolver. Default:
 .TP
 .BR \-r ", " \-\-raw\-dns=\fI0|1\fR
 Use the built\-in raw DNS resolver for SOCKS5/HTTP hostname targets instead of
-the system resolver. Requires a build with the new DNS resolver and the
+the system resolver. An IP literal target is connected to as it is and never
+sent to the DNS server. Requires a build with the new DNS resolver and the
 .B epoll
 event loop; combining it with
 .B \-\-event\-loop=io_uring
@@ -790,9 +934,11 @@ address, a bare IPv6 address, or a bracketed
 .RI [ v6 ]
 when a
 .I port
-follows. Omit the port (the default) for an ephemeral source port; pinning a
-fixed one limits concurrency to a single connection per destination and defeats
-multi\-address racing, as described under
+follows. Omit the port (the default) for an ephemeral source port, chosen per
+destination at
+.BR connect (2);
+pinning a fixed one limits that source to a single connection at a time and
+defeats multi\-address racing, as described under
 .BR \-\-acl\-file .
 A source whose address family differs from the address being dialled is
 .I skipped
@@ -802,7 +948,9 @@ leaves an IPv6 target on its default source, so setting one does not quietly
 turn a dual\-stack proxy into a single\-family one. (An ACL
 .B \-\-to\-source
 that mismatches stays an error \(em an explicit rule naming the wrong family is
-a mistake, a default that cannot apply is not.) Default: unset.
+a mistake, a default that cannot apply is not.) An IPv4\-mapped address
+.RI ( ::ffff:a.b.c.d )
+is IPv4 for this comparison, as a target and as a source. Default: unset.
 .TP
 .BR \-I ", " \-\-bind\-iface=\fIname\fR
 Pin every outgoing connection to this network interface
@@ -844,10 +992,15 @@ replaces rather than merges with
 .BR \-T ", " \-\-target\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for target\(->client data. Default:
 .BR 65536 .
+At least 256 for SOCKS5 or HTTP, and at least 1280 with
+.BR \-\-upstream\-proxy ,
+whose handshake goes through this buffer.
 .TP
 .BR \-C ", " \-\-client\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for client\(->target data. Default:
 .BR 65536 .
+At least 256 for HTTP, and at least 513 for SOCKS5, the size of its longest
+request.
 .IP
 Each wakeup reads at most one buffer and writes it out, so the buffer size
 sets the syscalls per byte of a bulk transfer: 64 KiB takes about 40%
@@ -946,6 +1099,19 @@ it is discarded. A request gwproxy cannot delimit unambiguously (both framing
 headers, a Transfer\-Encoding other than "chunked", an invalid Content\-Length,
 or a Connection header naming Content\-Length, Transfer\-Encoding or Host) is
 answered with "400 Bad Request"; a malformed chunked body closes the connection.
+A field value may hold bytes 0x80 to 0xff, which are passed on unchanged, and
+none of them makes a framing header acceptable; any other control byte than a
+tab in a value closes the connection without a reply.
+.PP
+A field that may appear only once (Authorization, Content\-Length,
+Content\-Location, Content\-Range, Content\-Type, Cookie, Date, Expect, From,
+Host, If\-Modified\-Since, If\-Range, If\-Unmodified\-Since, Max\-Forwards, Origin,
+Proxy\-Authorization, Referer or User\-Agent) is answered with "400 Bad Request"
+if it is repeated, on a CONNECT as well. The usual list fields, such as Accept or
+Cache\-Control, have their repeated lines joined with ", "; any other repeated
+field, such as X\-Forwarded\-For, keeps its separate lines, in their order. As
+with every field, each line reaches the origin spelled "Name: value", and a
+hop\-by\-hop field or one that Connection names is dropped.
 .PP
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
@@ -962,9 +1128,8 @@ once rewritten (bare LF line ends become CRLF).
 .PP
 A request header may take at most 16384 bytes, and must fit in
 .B \-\-client\-buf\-size
-as a whole (a forwarding request also once rewritten); a larger one, or one
-with more than 128 field lines, is answered with "431 Request Header Fields
-Too Large".
+as a whole; a larger one, or one with more than 128 field lines, is answered
+with "431 Request Header Fields Too Large".
 .PP
 With
 .B \-\-auth\-file
@@ -998,6 +1163,18 @@ HTTP/2\-preferring client. The OpenSSL engine is driven entirely through memory
 BIOs and never touches the socket directly. TLS termination works on both the
 epoll and io_uring event loops.
 .PP
+The end of a TLS client's stream reaches the target as a normal end of stream
+only if it is one. If a record fails to verify, the client sends a fatal alert,
+its connection is reset, its TCP stream stops in the middle of a record, or
+gwproxy itself gives up on the connection or shuts down before the client
+finished sending, the target's connection is reset (TCP RST) rather than closed,
+so that a protocol delimited by the connection closing does not take the stream
+for complete. A reset drops what the target's socket had not sent yet, which is
+no loss to a stream that was cut anyway. A TCP FIN after a whole record with no
+.B close_notify
+is still passed on as a normal end of stream: many clients close that way, and
+gwproxy cannot tell them from an attacker who injects the FIN at that point.
+.PP
 This is distinct from an HTTP
 .B CONNECT
 tunnel to an
@@ -1012,7 +1189,25 @@ holds one
 entry per line. The same store backs SOCKS5 (RFC 1929) and HTTP "Basic" (RFC
 7617) authentication; whenever it is configured, clients of either protocol
 must authenticate. gwproxy watches the file and reloads it automatically when it
-changes, so credentials can be updated without a restart.
+changes, so credentials can be updated without a restart. A file written through
+the configured name in its directory is reloaded as soon as the writer closes it,
+and a file renamed to that name at once. Any other change to the file the path
+leads to (behind a symlink, a Kubernetes secret mount, a swapped directory, unlink
+and link, or a change of its mode or owner) is seen by a
+.BR stat (2)
+of the path every second, and is reloaded once the file has not changed for 5
+seconds, so a revoked credential stops working about 6 seconds later. That wait
+is what keeps a writer's pause from being taken for the end of its work, but a
+writer that pauses for longer can still have a half written file reloaded: a
+truncated file then refuses every client, and a partial
+.B \-\-acl\-file
+can allow what the finished one rejects. Replace these files atomically (write a
+temporary file in the same directory and rename it over the old one) if that
+matters. A file that disappears or cannot be read is logged once and the current
+credentials stay in force until it comes back, and a reload that fails for want
+of descriptors or memory is retried every second; the same goes for
+.BR \-\-acl\-file .
+A FIFO or device found this way is logged once and not read.
 .SH TRANSPARENT PROXY
 .RB ( \-\-as\-transparent=1 )
 Transparent mode takes each connection's original destination from the
@@ -1053,7 +1248,29 @@ upstream is reached with an HTTP CONNECT request, which likewise resolves the
 host at the proxy. Credentials embedded in the URL authenticate to the upstream.
 An
 .B https://
-upstream (TLS to the proxy) is not supported yet.
+upstream (TLS to the proxy) is not supported yet. In transparent mode the
+upstream, of any type, is asked for the connection's original destination
+address.
+.PP
+Plain
+.B \-\-target
+forwarding through a
+.BR socks5h:// " or " http://
+upstream goes through the
+.B OUTPUT
+chain like any other, the built\-in default ACL included. An IP literal target
+is taken as an address:
+.B \-d
+rules match it,
+.B \-j DNAT
+rewrites it, and the upstream is asked for that address. A hostname is not
+resolved here: the chain sees it as with any other remote\-DNS request
+.RB ( \-m " domain matches, " \-d " does not), and it is handed to the upstream"
+unless a
+.B \-j DNAT
+to an address replaces it. A
+.B \-\-target
+that is not a valid hostname or address with a port is refused at startup.
 .SH TARGET ADDRESS SELECTION
 A hostname target of a SOCKS5 or HTTP request usually resolves to several
 addresses, and gwproxy tries them as a list of candidates rather than
@@ -1136,7 +1353,7 @@ are likewise applied per candidate, and a
 matching every candidate of a name collapses the race onto one destination,
 which is then dialled once per candidate. A candidate the chain denies is
 skipped rather than being fatal, as is one rejected by a strict
-.B \-j BIND
+.BR "\-j BIND" " or " "\-j MARK" ,
 or by the global
 .BR \-\-bind\-source / \-\-bind\-iface ;
 the request fails only once every candidate has been skipped or has failed to
@@ -1190,8 +1407,11 @@ which requires
 .SH SIGNALS
 .TP
 .BR SIGINT ", " SIGTERM
-Begin a graceful shutdown: stop accepting new connections, let workers drain,
-and exit.
+Stop at once: workers leave their event loops and every connection is closed,
+with whatever is still in its buffers or on its way discarded. There is no
+drain. A client in the middle of a transfer sees a normal end of stream after
+only part of the data, so a protocol that does not mark its own end cannot tell
+this from a complete transfer.
 .TP
 .B SIGPIPE
 Ignored, so a peer closing a connection cannot terminate the process.

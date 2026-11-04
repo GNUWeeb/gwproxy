@@ -85,6 +85,10 @@ struct gwp_http_conn {
 	size_t				res_scan;
 };
 
+_Static_assert(GWP_HTTP_REWRITE_SLACK == 1 + 1 + 1 + 20 +
+	       2 * GWNET_HTTP_HDR_MAX_FIELDS,
+	       "GWP_HTTP_REWRITE_SLACK must match the rewrite");
+
 /* Longest request header accepted, in bytes. */
 #define REQ_HDR_MAX		16384
 
@@ -1230,7 +1234,7 @@ static int res_input_fast(struct gwp_http_conn *hc, const char *in,
 static int res_input(struct gwp_http_conn *hc, const void *in, size_t len,
 		     bool eof, char *out, size_t out_cap, size_t *out_len)
 {
-	size_t o = 0, end;
+	size_t o = 0, done = 0, end;
 	ssize_t w;
 	int code;
 
@@ -1252,19 +1256,30 @@ static int res_input(struct gwp_http_conn *hc, const void *in, size_t len,
 	memcpy(hc->res_buf + hc->res_len, in, len);
 	hc->res_len += len;
 
+	/*
+	 * @done is how much of the buffer has been dealt with. It is only
+	 * moved up once, on the way out: moving what is left after each
+	 * header would make a run of interim responses cost the square of
+	 * its length.
+	 */
 	for (;;) {
-		end = find_hdr_end(hc->res_buf, hc->res_len, &hc->res_scan);
+		char *hdr = hc->res_buf + done;
+		size_t rest = hc->res_len - done;
+
+		end = find_hdr_end(hdr, rest, &hc->res_scan);
 		if (!end) {
 			if (eof)
 				return -EBADMSG;
+			if (done)
+				memmove(hc->res_buf, hdr, rest);
+			hc->res_len = rest;
 			if (hc->res_len >= hc->res_cap)
 				return -E2BIG;
 			*out_len = o;
 			return 0;
 		}
 
-		w = rewrite_res_hdr(hc->res_buf, end, out + o, out_cap - o,
-				    &code);
+		w = rewrite_res_hdr(hdr, end, out + o, out_cap - o, &code);
 		if (w < 0)
 			return (int)w;
 
@@ -1280,8 +1295,7 @@ static int res_input(struct gwp_http_conn *hc, const void *in, size_t len,
 			return -EACCES;
 
 		o += (size_t)w;
-		hc->res_len -= end;
-		memmove(hc->res_buf, hc->res_buf + end, hc->res_len);
+		done += end;
 		hc->res_scan = 0;
 
 		/* Interim (1xx): pass it on and wait for the next header. */
@@ -1289,10 +1303,11 @@ static int res_input(struct gwp_http_conn *hc, const void *in, size_t len,
 			continue;
 
 		/* Body bytes that came in behind the header follow it. */
-		if (hc->res_len > out_cap - o)
+		rest -= end;
+		if (rest > out_cap - o)
 			return -E2BIG;
-		memcpy(out + o, hc->res_buf, hc->res_len);
-		o += hc->res_len;
+		memcpy(out + o, hdr + end, rest);
+		o += rest;
 		free(hc->res_buf);
 		hc->res_buf = NULL;
 		hc->res_len = 0;

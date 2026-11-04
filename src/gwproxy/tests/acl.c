@@ -254,6 +254,14 @@ static noinline void test_domain(void)
 	assert(out(a, NULL, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 
+	/* One trailing dot in a rule is the same name without it. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m domain --domain Example.Com. -j REJECT\n"));
+	assert(out(a, NULL, "example.com", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, NULL, "other.com", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+
 	/*
 	 * A rule WITHOUT a domain match, evaluated against a query that DOES
 	 * carry a domain, must not deref the rule's NULL domain (regression:
@@ -670,6 +678,8 @@ static noinline void test_parse_errors(void)
 		"-A INPUT --dports 80 -j ACCEPT\n",	    /* --dports in INPUT */
 		"-A OUTPUT -d 1.2.3.4 -m domain --domain x -j ACCEPT\n", /* d+domain */
 		"-A OUTPUT -m domain -j REJECT\n",	    /* -m domain w/o --domain */
+		"-A OUTPUT -m domain --domain . -j REJECT\n",	    /* no name */
+		"-A OUTPUT -m domain --domain x.. -j REJECT\n",   /* never matches */
 		"-A OUTPUT -m user -j REJECT\n",	    /* -m user w/o --user */
 		"-A OUTPUT -j BOGUS\n",			    /* bad target */
 		"-A OUTPUT -x -j ACCEPT\n",		    /* unknown option */
@@ -1789,9 +1799,52 @@ static void test_file_nul(void)
 	free(path);
 }
 
+#ifdef CONFIG_PCRE
+/* Linked with --wrap, so a test can fail the context's allocation. */
+void *__real_pcre2_match_context_create_8(void *gcontext);
+void *__wrap_pcre2_match_context_create_8(void *gcontext);
+
+static bool g_fail_regex_mctx;
+
+void *__wrap_pcre2_match_context_create_8(void *gcontext)
+{
+	if (g_fail_regex_mctx)
+		return NULL;
+	return __real_pcre2_match_context_create_8(gcontext);
+}
+
+/*
+ * The first regexp rule creates the match context, so this must run before any
+ * other test parses one. Failing that allocation fails this file only.
+ */
+static noinline void test_regexp_ctx_oom_recovers(void)
+{
+	static const char rules[] =
+		"-A OUTPUT -m domain --domain-regexp ^blocked$ -j REJECT\n"
+		"-P OUTPUT ACCEPT\n";
+	struct gwp_acl *a = NULL;
+	struct gwp_sockaddr s = sa4("8.8.8.8", 80);
+
+	g_fail_regex_mctx = true;
+	assert(gwp_acl_parse_str(&a, rules));
+	g_fail_regex_mctx = false;
+
+	assert(!gwp_acl_parse_str(&a, rules));
+	assert(out(a, &s, "blocked", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, &s, "other", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+}
+#else
+static void test_regexp_ctx_oom_recovers(void)
+{
+}
+#endif
+
 static void run_tests(void)
 {
 	size_t i;
+
+	test_regexp_ctx_oom_recovers();
 
 	/* Negative cases print the offending line to stderr; run them once. */
 	test_parse_errors();

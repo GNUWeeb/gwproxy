@@ -252,6 +252,13 @@ enum {
 	EV_BIT_IOU_ATTEMPT_TIMER	= EV_BIT_ATTEMPT_TIMER,
 	EV_BIT_IOU_ATTEMPT_TIMER_DEL	= (49ull << 48ull),
 	EV_BIT_IOU_ATTEMPT_CANCEL	= (50ull << 48ull),
+
+	/*
+	 * The client watch during the connect and the upstream handshake, and
+	 * its removal, see prep_client_watch().
+	 */
+	EV_BIT_IOU_CLIENT_WATCH		= (25ull << 48ull),
+	EV_BIT_IOU_CLIENT_WATCH_DEL	= (27ull << 48ull),
 #endif
 };
 
@@ -511,6 +518,8 @@ struct gwp_conn_pair {
 	struct gwp_iou_udp	*udp_iou;
 	/* Targets a UDP association may hear from; NULL until it sends. */
 	struct gwp_udp_peers	*udp_peers;
+	/* The next pair on the epoll loop's list of pairs to free (@dead). */
+	struct gwp_conn_pair	*next_dead;
 
 	/*
 	 * The hostname the client asked for, when it used a domain target
@@ -550,9 +559,10 @@ struct gwp_conn_pair {
 	int			attempt_fd[GWP_MAX_CONN_CAND];
 
 	/*
-	 * @udp_peer is the UDP client's source address, pinned from its first
-	 * datagram (@udp_pinned); datagrams from other sources are replies,
-	 * relayed only from a target in @udp_peers.
+	 * @udp_peer is the UDP client's source address, pinned (@udp_pinned)
+	 * from its request when that names its IP and port, else from its first
+	 * valid datagram; datagrams from other sources are replies, relayed only
+	 * from a target in @udp_peers.
 	 */
 	struct gwp_sockaddr	udp_peer;
 	/* Last client->target datagram's ACL verdict; see udp_target_allowed(). */
@@ -654,6 +664,8 @@ struct gwp_conn_pair {
 	 * was appended in the meantime.
 	 */
 	bool			client_tx;
+	/* A recv of the target's data is in flight. */
+	bool			target_rx;
 #endif
 };
 
@@ -688,6 +700,13 @@ struct iou {
 	 * once per episode rather than on every retry.
 	 */
 	bool			submit_stalled;
+
+	/*
+	 * SQEs that found the SQ full while submitting failed, oldest first,
+	 * waiting for room (see get_sqe_nofail()).
+	 */
+	struct gwp_held_sqe	*held_first;
+	struct gwp_held_sqe	*held_last;
 };
 #endif
 
@@ -732,6 +751,8 @@ struct gwp_tmr_heap {
 
 struct gwp_wrk {
 	int			tcp_fd;
+	/* Where tcp_fd listens, see gwp_target_is_self(). */
+	struct gwp_sockaddr	listen_addr;
 	struct gwp_conn_slot	conn_slot;
 
 	union {
@@ -743,9 +764,12 @@ struct gwp_wrk {
 			 * Pairs torn down while the current batch of events is
 			 * handled. They are only marked dying then, and freed
 			 * once the batch is done, because a later event in the
-			 * same batch may still point at them.
+			 * same batch may still point at them. A list through
+			 * the pairs, since one event can end any number of
+			 * them (see handle_ev_dns_cq()) and none may be left
+			 * out.
 			 */
-			struct gwp_conn_pair	**dead;
+			struct gwp_conn_pair	*dead;
 			/*
 			 * The timers of every pair of this worker (see
 			 * ev/tmr.h). They drive the epoll_wait() timeout, so
@@ -760,6 +784,12 @@ struct gwp_wrk {
 			 */
 			uint64_t		retry_at_ms;
 			/*
+			 * When accept stopped for want of descriptors
+			 * (accept_is_stopped) resumes, if the descriptors
+			 * returned have not resumed it by then.
+			 */
+			uint64_t		accept_resume_at_ms;
+			/*
 			 * Plain and transparent forwarding clients whose
 			 * target socket could not be created for want of
 			 * descriptors, retried by run_retries().
@@ -768,14 +798,6 @@ struct gwp_wrk {
 			uint32_t		nr_tgt_wait;
 			uint32_t		tgt_wait_cap;
 			uint16_t		evsz;
-			uint16_t		nr_dead;
-			uint16_t		dead_cap;
-			/*
-			 * If it's true, the worker MUST call epoll_wait() again
-			 * before continue iterating over the events. Only set
-			 * when @dead is full and a pair had to be freed at once.
-			 */
-			bool			ev_need_reload;
 			/*
 			 * accept() failed for a reason that closing
 			 * descriptors does not cure: the listener is out of
@@ -783,10 +805,12 @@ struct gwp_wrk {
 			 * Any accept pause, this one or the one for running
 			 * out of descriptors (accept_is_stopped), is logged
 			 * once, until a connection is accepted again
-			 * (accept_paused).
+			 * (accept_paused). A listener that could not be put
+			 * back is retried, and logged once (accept_add_failed).
 			 */
 			bool			accept_retry;
 			bool			accept_paused;
+			bool			accept_add_failed;
 		};
 #ifdef CONFIG_IO_URING
 		struct iou	*iou;
@@ -822,6 +846,34 @@ enum {
 	GWP_EV_IO_URING
 };
 
+/*
+ * What stat() says about a reloadable file, or why it could not say. Only
+ * 64-bit members, so there is no padding and two can be compared with memcmp().
+ */
+struct gwp_file_id {
+	uint64_t	err;
+	uint64_t	dev;
+	uint64_t	ino;
+	uint64_t	mode;
+	uint64_t	size;
+	uint64_t	mtime_sec;
+	uint64_t	mtime_nsec;
+	uint64_t	ctime_sec;
+	uint64_t	ctime_nsec;
+};
+
+/*
+ * The reload thread's view of a reloadable file. @id: its identity when last
+ * read or checked. @settle_at: when a change only the check saw has been quiet
+ * for long enough, 0 when there is none. @retry: the last reload failed for
+ * want of a resource rather than because of the file.
+ */
+struct gwp_reload_file {
+	struct gwp_file_id	id;
+	uint64_t		settle_at;
+	bool			retry;
+};
+
 struct gwp_ctx {
 	/*
 	 * Set from the signal handler and from any worker that exits, read by
@@ -829,10 +881,17 @@ struct gwp_ctx {
 	 * is also safe to store from a signal handler.
 	 */
 	_Atomic(bool)			stop;
+	/* First error of the workers joined by gwp_ctx_free_threads(). */
+	int				worker_err;
 	uint8_t				ev_used;
 	struct log_handle		lh;
 	struct gwp_wrk			*workers;
 	struct gwp_sockaddr		target_addr;
+	/*
+	 * Plain --target naming a host that a remote-DNS upstream resolves
+	 * (target_addr stays unset then). Otherwise .ver is 0.
+	 */
+	struct gwp_socks5_addr		target_name;
 	struct gwp_socks5_ctx		*socks5;
 	struct gwp_auth			*auth;
 	struct gwp_ssl_ctx		*ssl_ctx;
@@ -854,12 +913,16 @@ struct gwp_ctx {
 	 * parent directories, see add_reload_watch()); -1 when neither is
 	 * configured. @reload_thread polls it and reloads the files, off the
 	 * workers; @reload_efd tells it to exit. @reload_running: the thread
-	 * was started and still needs a join.
+	 * was started and still needs a join. @auth_reload, @acl_reload: the
+	 * state of each file's periodic check; owned by the thread once it
+	 * runs.
 	 */
 	int				ino_fd;
 	int				reload_efd;
 	pthread_t			reload_thread;
 	bool				reload_running;
+	struct gwp_reload_file		auth_reload;
+	struct gwp_reload_file		acl_reload;
 	/* ACL rule store. Global to all proxy modes, unlike @auth which is
 	 * prot-only. @acl_watched: loaded from --acl-file (so reloadable),
 	 * not the built-in default rules. */
@@ -900,10 +963,12 @@ void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd);
 int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /*
- * Convert a SOCKS5 IPv4/IPv6 target to a sockaddr for the dual-stack UDP relay
- * (always AF_INET6; IPv4 is returned v4-mapped). Domain -> -EAFNOSUPPORT.
+ * Convert a SOCKS5 IPv4/IPv6 target to a sockaddr for a UDP relay socket of
+ * @family: on the dual-stack AF_INET6 socket IPv4 is returned v4-mapped, on the
+ * AF_INET one of a kernel without IPv6 a v4-mapped IPv6 target is returned as
+ * IPv4. Domain, or a true IPv6 target on AF_INET -> -EAFNOSUPPORT.
  */
-int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
+int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a, int family,
 				struct gwp_sockaddr *sa, socklen_t *slen);
 
 /* Fill a SOCKS5 UDP reply-header address from a datagram source (unmaps v4). */
@@ -978,6 +1043,7 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
  * closed, which the epoll loop credits to its accept-rearm accounting.
  */
 int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
+void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair *gcp);
 
 /* True if the ACL INPUT chain permits an incoming client for @proto (allow-all
  * with no ACL). */
@@ -990,8 +1056,24 @@ bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
  */
 bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *a);
+
+/*
+ * The address to create and connect @gcp's next outgoing socket to: the
+ * upstream proxy when chaining, else its target. Returns 0, or -EAFNOSUPPORT
+ * when --outgoing-family forbids the destination named to the upstream.
+ */
+int gwp_conn_dial_addr(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+		       struct gwp_sockaddr **addr);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
+
+/*
+ * Whether connecting to @dst, or to the upstream if there is one, would reach
+ * the listener of @w. @connected says the connection is already up. Logs a
+ * refusal; the caller drops the connection.
+ */
+bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
+			const struct gwp_sockaddr *dst, bool connected);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
 
 /* Monotonic seconds, at the coarse clock's resolution (a few ms). */
@@ -1001,6 +1083,20 @@ static inline uint32_t gwp_now_sec(void)
 
 	clock_gettime(CLOCK_MONOTONIC_COARSE, &t);
 	return (uint32_t)t.tv_sec;
+}
+
+/*
+ * Seconds until a pair's idle check is due again, or 0 once it has been idle
+ * for all of @sec. Both stamps are whole seconds, so a difference of @sec only
+ * proves that more than @sec - 1 have passed: activity at 10.7 and a check at
+ * 12.1 read as 2. Closing on that would drop an active pair early, so close
+ * only past @sec; an idle pair may live up to about a second longer than @sec.
+ */
+static inline int gwp_idle_left(uint32_t now, uint32_t last_act, int sec)
+{
+	uint32_t idle = now - last_act;
+
+	return idle > (uint32_t)sec ? 0 : sec + 1 - (int)idle;
 }
 
 /*
@@ -1015,6 +1111,18 @@ static inline bool gwp_in_upstream_hs(const struct gwp_conn_pair *gcp)
 
 	return cs >= CONN_STATE_UPSTREAM_S5_MIN &&
 	       cs <= CONN_STATE_UPSTREAM_HTTP_MAX;
+}
+
+/*
+ * Waiting for the target's name to resolve: the client's request is complete,
+ * so it is owed an answer however this ends.
+ */
+static inline bool gwp_in_dns_lookup(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs == CONN_STATE_SOCKS5_DNS_QUERY ||
+	       cs == CONN_STATE_HTTP_DNS_QUERY;
 }
 
 /* Move the data back to the start of the buffer, regaining the room in front. */
@@ -1099,7 +1207,7 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
 int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				   int err, void *out, size_t *out_len);
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
-int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+int gwp_upstream_finalize_dst(struct gwp_conn_pair *gcp);
 int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 			   size_t cap);
 
@@ -1140,19 +1248,18 @@ int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
  * handshake state and either build the next request (GWP_UPSTREAM_IO_SEND), ask
  * for more (GWP_UPSTREAM_IO_RECV), or on final success splice the downstream
  * reply and report GWP_UPSTREAM_IO_DONE. On failure returns a negative errno
- * (logging its own pr_err) and, when @notify is non-NULL, sets *@notify true if
- * the failure is a protocol-level rejection whose downstream client should be
- * told; the caller owns that notification and all timer / forwarding state.
+ * (logging its own pr_err); the caller owns telling the client, through
+ * gwp_upstream_fail_reply(), and all timer / forwarding state.
  */
-int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			     bool *notify);
+int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /*
- * The upstream handshake failed with @err and the client is to be told: put
- * its failure reply in target.buf in place of whatever the upstream sent --
- * SOCKS5 REP 0x05 for a refused CONNECT and 0x01 for anything else, an HTTP
- * client a 502. Returns the number of bytes to send to the client (0 for
- * plain forwarding, which has no reply to give), or a negative errno.
+ * The upstream handshake failed with @err, whatever the way: a refusal, a reply
+ * that makes no sense, a hangup. The client still waits for an answer to its
+ * request, so put its failure reply in target.buf in place of whatever the
+ * upstream sent -- SOCKS5 REP 0x05 for a refused CONNECT and 0x01 for anything
+ * else, an HTTP client a 502. Returns the number of bytes to send to the client
+ * (0 for plain forwarding, which has no reply to give), or a negative errno.
  */
 int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    int err);

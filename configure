@@ -462,7 +462,7 @@ add_make_var "CC" "${cc}";
 add_make_var "CXX" "${cxx}";
 add_make_var "CFLAGS" "$(echo "${CFLAGS} ${USER_CFLAGS}" | awk '{$1=$1};1')";
 add_make_var "CXXFLAGS" "$(echo "${CXXFLAGS} ${USER_CXXFLAGS}" | awk '{$1=$1};1')";
-add_make_var "LDFLAGS" "$(echo "${LDFLAGS} ${USER_LIB_LDFLAGS}" | awk '{$1=$1};1')";
+add_make_var "LDFLAGS" "$(echo "${LDFLAGS} ${USER_LDFLAGS}" | awk '{$1=$1};1')";
 add_make_var "LIB_LDFLAGS" "$(echo "${LIB_LDFLAGS} ${USER_LIB_LDFLAGS}" | awk '{$1=$1};1')";
 printf "override O=%s\n" "${build_dir}" >> $config_make;
 ln -s "${config_make}" >> /dev/null 2>&1 || true;

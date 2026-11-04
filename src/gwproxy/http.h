@@ -37,6 +37,17 @@ enum gwp_http_result {
 	GWP_HTTP_TOO_LARGE,	/* Header too long or too many fields; 431. */
 };
 
+/*
+ * The most the rewrite of a forwarding request can add to its header: "/" for
+ * an empty path, a CR on the request line, "Host: " and its CRLF for the
+ * "http://" of the URI, "Connection: close" and its CRLF plus a CR on the
+ * blank line, and for each of the 128 field lines a CR and a space after the
+ * colon. The caller keeps this much room behind whatever it reads a header
+ * into: the first read can fill the buffer, with the start of the body behind
+ * the header, and the request must not be refused for that.
+ */
+#define GWP_HTTP_REWRITE_SLACK	279
+
 /* Allocate/free a per-connection HTTP proxy state. */
 struct gwp_http_conn *gwp_http_conn_alloc(void);
 void gwp_http_conn_free(struct gwp_http_conn *hc);
@@ -72,7 +83,9 @@ bool gwp_http_conn_auth_failed(const struct gwp_http_conn *hc,
  *		part is not copied, so it must be left unchanged).
  * @buf_len	In: number of bytes in @buf. Out (FORWARD): the number after
  *		the rewrite; otherwise unchanged.
- * @cap		Room in @buf, for the rewrite of a forwarding request.
+ * @cap		Room in @buf, for the rewrite of a forwarding request. Any
+ *		request fits if this is GWP_HTTP_REWRITE_SLACK more than the
+ *		most that was read into @buf.
  * @host_p	Out (CONNECT/FORWARD): target host, NUL-terminated, owned by @hc
  *		and valid until gwp_http_conn_free().
  * @port_p	Out (CONNECT/FORWARD): target port string, same lifetime.

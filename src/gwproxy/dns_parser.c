@@ -244,7 +244,12 @@ int gwdns_parse_query(uint16_t txid, uint16_t port, const uint8_t *in,
 		case TYPE_CNAME:
 			break;
 		default:
-			return -EINVAL;
+			/*
+			 * A DNAME, an RRSIG or anything else that is not an
+			 * address does not make the addresses next to it any
+			 * less valid. @rdlength is checked, so step over it.
+			 */
+			break;
 		}
 
 		idx += rdlength;
@@ -571,6 +576,67 @@ static void test_parse_cap_and_truncation(void)
 }
 
 /*
+ * Parse a reply to a question for "a.b" made of @body: records of a type the
+ * resolver has no use for are stepped over, and the addresses still count.
+ */
+static int parse_records(const uint8_t *body, size_t body_len, uint16_t ancount,
+			 struct gwp_sockaddr *addrs, uint8_t *nr)
+{
+	static const uint8_t head[] = {
+		0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 'a', 0x01, 'b', 0x00, 0x00, 0x01, 0x00, 0x01,
+	};
+	uint8_t pkt[256];
+	uint16_t txid, n = htons(ancount);
+
+	assert(sizeof(head) + body_len <= sizeof(pkt));
+	memcpy(pkt, head, sizeof(head));
+	memcpy(&pkt[6], &n, 2);
+	memcpy(&pkt[sizeof(head)], body, body_len);
+	memcpy(&txid, pkt, 2);
+	return gwdns_parse_query(txid, 80, pkt, sizeof(head) + body_len, addrs, 2, nr);
+}
+
+static void test_parse_other_types(void)
+{
+#define RR(type, len)	0xc0, 0x0c, 0x00, (type), 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, (len)
+	static const uint8_t dname_chain[] = {
+		RR(39, 3), 0x01, 'c', 0x00,	/* DNAME */
+		RR(5, 3), 0x01, 'c', 0x00,	/* CNAME */
+		0x01, 'c', 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+		10, 0, 0, 1,
+	};
+	static const uint8_t a_txt[] = {
+		RR(1, 4), 10, 0, 0, 1,
+		RR(16, 3), 0x02, 'h', 'i',
+	};
+	static const uint8_t txt_a[] = {
+		RR(16, 3), 0x02, 'h', 'i',
+		RR(1, 4), 10, 0, 0, 1,
+	};
+	static const uint8_t txt_only[] = {
+		RR(16, 3), 0x02, 'h', 'i',
+	};
+	/* Stepped over, but not past the end of what arrived. */
+	static const uint8_t txt_overrun[] = {
+		RR(16, 200), 0x02, 'h', 'i',
+		RR(1, 4), 10, 0, 0, 1,
+	};
+#undef RR
+	struct gwp_sockaddr addrs[2];
+	uint8_t nr;
+
+	assert(!parse_records(dname_chain, sizeof(dname_chain), 3, addrs, &nr));
+	assert(nr == 1 && addrs[0].i4.sin_addr.s_addr == htonl(0x0a000001));
+	assert(!parse_records(a_txt, sizeof(a_txt), 2, addrs, &nr));
+	assert(nr == 1 && addrs[0].i4.sin_addr.s_addr == htonl(0x0a000001));
+	assert(!parse_records(txt_a, sizeof(txt_a), 2, addrs, &nr));
+	assert(nr == 1 && addrs[0].i4.sin_addr.s_addr == htonl(0x0a000001));
+	assert(parse_records(txt_only, sizeof(txt_only), 1, addrs, &nr) == -ENODATA);
+	assert(parse_records(txt_overrun, sizeof(txt_overrun), 2, addrs, &nr) == -EINVAL);
+}
+
+/*
  * Only a reply about the name, type and class we asked for is ours; the
  * name may come back in another case.
  */
@@ -628,6 +694,7 @@ static void run_all_tests(void)
 	fprintf(stderr, "test parsing DNS standard query packet for TYPE_AAAA!\n");
 	test_parse_ipv6();
 	test_parse_cap_and_truncation();
+	test_parse_other_types();
 	test_check_question();
 	fprintf(stderr, "all tests passed!\n");
 }

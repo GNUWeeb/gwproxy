@@ -30,7 +30,7 @@ SECRET="s3cr3t-Upstream-Pw"
 # (1) A URL with credentials but an unresolvable host (the space makes it
 # invalid on any resolver) is rejected at startup; the message names the user
 # and the host, and must not carry the password.
-out="$(timeout 5 "$GWPROXY" --as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
+out="$(timeout --foreground 5 "$GWPROXY" --as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
 	--upstream-proxy="http://opuser:$SECRET@bad host:1" 2>&1)"
 case $? in
 0) fail "a malformed --upstream-proxy URL was accepted" ;;
@@ -103,7 +103,7 @@ expect_reject()
 	local what="$1" want="$2"; shift 2
 	local rc=0
 
-	timeout 5 "$GWPROXY" --as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
+	timeout --foreground 5 "$GWPROXY" --as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
 		--nr-workers=1 "$@" >"$WORK/reject.out" 2>&1 || rc=$?
 	[ "$rc" = "$want" ] || {
 		sed 's/^/# /' "$WORK/reject.out" >&2

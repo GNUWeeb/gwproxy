@@ -31,9 +31,10 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
 	-subj '/CN=localhost' >/dev/null 2>&1 \
 	|| skip "openssl could not generate a test certificate"
 
-# Long enough that the greeting and this request overflow a 256-byte buffer.
-user="$(printf 'u%.0s' $(seq 126))"
-pass="$(printf 'p%.0s' $(seq 126))"
+# Long enough that the greeting and this request overflow the smallest client
+# buffer SOCKS5 allows, 513 bytes.
+user="$(printf 'u%.0s' $(seq 255))"
+pass="$(printf 'p%.0s' $(seq 255))"
 printf '%s:%s\n' "$user" "$pass" >"$WORK/auth"
 
 for loop in epoll io_uring; do
@@ -48,7 +49,7 @@ for loop in epoll io_uring; do
 
 	pp="$(pick_port)"
 	gwp_start "127.0.0.1:$pp" --as-socks5=1 --auth-file="$WORK/auth" \
-		--client-buf-size=256 --event-loop="$loop" \
+		--client-buf-size=513 --event-loop="$loop" \
 		--tls-cert="$WORK/cert.pem" --tls-key="$WORK/key.pem" --nr-workers=1
 	timeout 30 python3 "$SERVERS_DIR/tls_tunnel_client.py" splitauth "$pp" \
 		"$user" "$pass" \
@@ -56,7 +57,7 @@ for loop in epoll io_uring; do
 	kill "$GWP_PID" 2>/dev/null
 
 	pp="$(pick_port)"
-	gwp_start "127.0.0.1:$pp" --as-socks5=1 --client-buf-size=256 \
+	gwp_start "127.0.0.1:$pp" --as-socks5=1 --client-buf-size=513 \
 		--event-loop="$loop" --tls-cert="$WORK/cert.pem" \
 		--tls-key="$WORK/key.pem" --nr-workers=1
 	timeout 30 python3 "$SERVERS_DIR/tls_tunnel_client.py" splitearly "$pp" \
@@ -71,7 +72,7 @@ for loop in epoll io_uring; do
 		--nr-workers=1
 	up_pid="$GWP_PID"
 	pp="$(pick_port)"
-	gwp_start "127.0.0.1:$pp" --as-socks5=1 --client-buf-size=256 \
+	gwp_start "127.0.0.1:$pp" --as-socks5=1 --client-buf-size=513 \
 		--upstream-proxy="socks5://127.0.0.1:$up" \
 		--event-loop="$loop" --tls-cert="$WORK/cert.pem" \
 		--tls-key="$WORK/key.pem" --nr-workers=1

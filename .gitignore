@@ -10,3 +10,4 @@
 /config.log
 /config.make
 .test-out/
+__pycache__/

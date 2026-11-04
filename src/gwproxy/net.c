@@ -12,6 +12,37 @@
 #include <gwproxy/net.h>
 #include <gwproxy/common.h>
 
+/*
+ * Copy the port of an "addr:port" string to @out for getaddrinfo(): a decimal
+ * number from 0 to 65535, or a service name. Only the number needs checking
+ * here. Left to the C library, glibc wraps a number modulo 65536 and takes a
+ * signed one, so a typo would quietly mean some other port.
+ */
+static int copy_port(char *out, size_t size, const char *port)
+{
+	size_t i, l = strlen(port);
+	unsigned int v = 0;
+
+	if (!l || l >= size)
+		return -EINVAL;
+
+	if (port[0] >= '0' && port[0] <= '9') {
+		for (i = 0; i < l; i++) {
+			if (port[i] < '0' || port[i] > '9')
+				return -EINVAL;
+			v = v * 10 + (unsigned int)(port[i] - '0');
+			if (v > 65535)
+				return -EINVAL;
+		}
+	} else if (!((port[0] >= 'a' && port[0] <= 'z') ||
+		     (port[0] >= 'A' && port[0] <= 'Z'))) {
+		return -EINVAL;
+	}
+
+	memcpy(out, port, l + 1);
+	return 0;
+}
+
 __cold
 int convert_str_to_ssaddr(const char *str,
 				struct gwp_sockaddr *gs, uint16_t default_port)
@@ -20,7 +51,7 @@ int convert_str_to_ssaddr(const char *str,
 		.ai_family = AF_UNSPEC,
 		.ai_socktype = SOCK_STREAM,
 	};
-	char host[NI_MAXHOST], port[6], *p;
+	char host[NI_MAXHOST], port[32], *p;
 	struct addrinfo *res, *ai;
 	bool found = false;
 	size_t l;
@@ -64,10 +95,11 @@ int convert_str_to_ssaddr(const char *str,
 				     "0123456789-._:%")])
 		return -EINVAL;
 	if (default_port) {
-		snprintf(port, 6, "%hu", default_port);
+		snprintf(port, sizeof(port), "%hu", default_port);
 	} else {
-		strncpy(port, p + 1, sizeof(port) - 1);
-		port[sizeof(port) - 1] = '\0';
+		r = copy_port(port, sizeof(port), p + 1);
+		if (r)
+			return r;
 	}
 
 	r = getaddrinfo(host, port, &hints, &res);

@@ -18,7 +18,6 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
-#include <openssl/crypto.h>
 
 #include "ssl.h"
 
@@ -43,6 +42,8 @@ struct gwp_ssl_q {
 	 * filled behind our back: keep @tail where it is until the commit.
 	 */
 	bool		pinned;
+	/* Nothing queued can be sent any more: drop it (gwp_ssl_tx_close()). */
+	bool		closed;
 };
 
 struct gwp_ssl {
@@ -56,6 +57,10 @@ struct gwp_ssl {
 	 * nothing has been received since: reading again cannot make progress.
 	 */
 	bool		rx_starved;
+	/* The peer's close_notify has been read. */
+	bool		rx_closed;
+	/* Reading failed for good; the engine is not to be asked again. */
+	bool		rx_failed;
 };
 
 _Static_assert(GWP_SSL_RECORD_MAX >= SSL3_RT_HEADER_LENGTH +
@@ -118,6 +123,8 @@ static int q_bio_write(BIO *b, const char *in, int inl)
 	BIO_clear_retry_flags(b);
 	if (inl <= 0)
 		return 0;
+	if (q->closed)
+		return inl;
 	p = q_reserve(q, (size_t)inl);
 	if (!p)
 		return -1;
@@ -175,34 +182,40 @@ static int q_bio_create(BIO *b)
 }
 
 static BIO_METHOD *q_bio_meth;
-static CRYPTO_ONCE q_bio_once = CRYPTO_ONCE_STATIC_INIT;
 
-static void q_bio_meth_init(void)
+/*
+ * Create the method the queues' BIOs share. This belongs to creating a context:
+ * that happens at startup, before any worker runs, and a failure there stops
+ * the proxy with an error. Left to the first connection, it would fail there
+ * for good, with plaintext clients still served and nothing to show for it
+ * but TLS clients being reset.
+ */
+static int q_bio_meth_init(void)
 {
 	BIO_METHOD *m;
+
+	if (q_bio_meth)
+		return 0;
 
 	m = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK,
 			 "gwproxy queue");
 	if (!m)
-		return;
+		return -ENOMEM;
 	if (!BIO_meth_set_write(m, q_bio_write) ||
 	    !BIO_meth_set_read(m, q_bio_read) ||
 	    !BIO_meth_set_ctrl(m, q_bio_ctrl) ||
 	    !BIO_meth_set_create(m, q_bio_create)) {
 		BIO_meth_free(m);
-		return;
+		return -ENOMEM;
 	}
 	q_bio_meth = m;
+	return 0;
 }
 
 static BIO *q_bio_new(struct gwp_ssl_q *q)
 {
-	BIO *b;
+	BIO *b = BIO_new(q_bio_meth);
 
-	if (!CRYPTO_THREAD_run_once(&q_bio_once, q_bio_meth_init) ||
-	    !q_bio_meth)
-		return NULL;
-	b = BIO_new(q_bio_meth);
 	if (b)
 		BIO_set_data(b, q);
 	return b;
@@ -232,8 +245,12 @@ static int alpn_select_cb(SSL *ssl, const unsigned char **out,
 int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
 			      const char *key_file)
 {
-	struct gwp_ssl_ctx *c = calloc(1, sizeof(*c));
+	struct gwp_ssl_ctx *c;
 
+	if (q_bio_meth_init())
+		return -ENOMEM;
+
+	c = calloc(1, sizeof(*c));
 	if (!c)
 		return -ENOMEM;
 
@@ -262,8 +279,12 @@ err:
 
 int gwp_ssl_ctx_client_create(struct gwp_ssl_ctx **out)
 {
-	struct gwp_ssl_ctx *c = calloc(1, sizeof(*c));
+	struct gwp_ssl_ctx *c;
 
+	if (q_bio_meth_init())
+		return -ENOMEM;
+
+	c = calloc(1, sizeof(*c));
 	if (!c)
 		return -ENOMEM;
 
@@ -405,9 +426,29 @@ void gwp_ssl_rx_commit(struct gwp_ssl *s, size_t len)
 
 bool gwp_ssl_rx_more(struct gwp_ssl *s)
 {
+	if (s->rx_failed)
+		return false;
 	if (SSL_pending(s->ssl) > 0)
 		return true;
 	return q_len(&s->rq) > 0 && !s->rx_starved;
+}
+
+bool gwp_ssl_rx_cut(struct gwp_ssl *s)
+{
+	if (s->rx_closed)
+		return false;
+	if (s->rx_failed || q_len(&s->rq) > 0 || SSL_has_pending(s->ssl))
+		return true;
+	/*
+	 * The engine holds nothing unprocessed right after a record's header,
+	 * yet it is waiting for the body. Only this says so.
+	 */
+	return !strcmp(SSL_rstate_string(s->ssl), "RB");
+}
+
+void gwp_ssl_rx_fail(struct gwp_ssl *s)
+{
+	s->rx_failed = true;
 }
 
 int gwp_ssl_bio_read(struct gwp_ssl *s, void *buf, size_t len)
@@ -427,6 +468,21 @@ int gwp_ssl_bio_read(struct gwp_ssl *s, void *buf, size_t len)
 size_t gwp_ssl_bio_pending(struct gwp_ssl *s)
 {
 	return q_len(&s->wq);
+}
+
+void gwp_ssl_tx_close(struct gwp_ssl *s)
+{
+	s->wq.closed = true;
+	s->wq.head = s->wq.tail = 0;
+}
+
+bool gwp_ssl_tx_backlog(struct gwp_ssl *s, size_t buf_cap)
+{
+	/*
+	 * Forwarding leaves less than two buffers' worth of plaintext, plus
+	 * what the records add to it, which is far less than a third.
+	 */
+	return q_len(&s->wq) >= 3 * buf_cap + GWP_SSL_RECORD_MAX;
 }
 
 const void *gwp_ssl_bio_peek(struct gwp_ssl *s, size_t *len)
@@ -477,6 +533,8 @@ int gwp_ssl_read(struct gwp_ssl *s, void *buf, size_t len, size_t *out_len)
 	*out_len = 0;
 	if (!len)
 		return GWP_SSL_OK;
+	if (s->rx_failed)
+		return GWP_SSL_ERROR;
 
 	ERR_clear_error();
 	r = SSL_read(s->ssl, buf, cap_int(len));
@@ -484,12 +542,21 @@ int gwp_ssl_read(struct gwp_ssl *s, void *buf, size_t len, size_t *out_len)
 		*out_len = (size_t)r;
 		return GWP_SSL_OK;
 	}
-	/* A clean close_notify reports 0 bytes, not an error. */
-	if (SSL_get_error(s->ssl, r) == SSL_ERROR_ZERO_RETURN)
+	/*
+	 * A clean close_notify reports 0 bytes, not an error. Nothing can be
+	 * decrypted after it, so whatever is still queued is not more to read
+	 * (gwp_ssl_rx_more()): a caller looping on that would never get out.
+	 */
+	if (SSL_get_error(s->ssl, r) == SSL_ERROR_ZERO_RETURN) {
+		s->rx_starved = true;
+		s->rx_closed = true;
 		return GWP_SSL_OK;
+	}
 	r = map_err(s, r);
 	if (r == GWP_SSL_WANT_READ)
 		s->rx_starved = true;
+	else if (r == GWP_SSL_ERROR)
+		s->rx_failed = true;
 	return r;
 }
 

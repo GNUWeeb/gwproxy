@@ -54,6 +54,26 @@ while True:
         rr = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([127, 0, 0, 1])
         resp = txid + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question + rr
 
+    elif mode in ("dname-chain", "a-then-txt", "txt-then-a", "txt-only"):
+        # A valid answer holding record types the resolver has no use for: a
+        # DNAME with the CNAME synthesized from it (RFC 6672), or a TXT next
+        # to the address. The last has no address at all.
+        ptr = b"\xc0\x0c"
+        alt = b"\x03alt\x07example\x00"
+        addr = struct.pack("!HHIH", 1, 1, 60, 4) + bytes([127, 0, 0, 1])
+        txt = ptr + struct.pack("!HHIH", 16, 1, 60, 3) + b"\x02hi"
+        rrs = {
+            "dname-chain": [
+                ptr + struct.pack("!HHIH", 39, 1, 60, len(alt)) + alt,
+                ptr + struct.pack("!HHIH", 5, 1, 60, len(alt)) + alt,
+                alt + addr],
+            "a-then-txt": [ptr + addr, txt],
+            "txt-then-a": [txt, ptr + addr],
+            "txt-only": [txt],
+        }[mode]
+        resp = txid + struct.pack("!HHHHH", 0x8180, 1, len(rrs), 0, 0) \
+            + question + b"".join(rrs)
+
     elif mode == "uncompressed-name":
         # A perfectly legal answer whose owner NAME is a literal label rather
         # than a compression pointer. RFC 1035 permits this.

@@ -4,6 +4,9 @@
  *
  * Copyright (C) 2025 Ammar Faizi <ammarfaizi2@gnuweeb.org>
  */
+/* Before common.h defines __unused, which musl's struct stat has a field of. */
+#include <sys/stat.h>
+
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
 #include <gwproxy/log.h>
@@ -28,6 +31,7 @@
 #include <time.h>
 #include <inttypes.h>
 #include <stdatomic.h>
+#include <sched.h>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -46,6 +50,8 @@
 #include <sys/inotify.h>
 #include <poll.h>
 #include <sys/file.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 /* Long-only options (no short letter): values >= 128 are skipped by the
  * short-option string builder below. */
@@ -154,6 +160,20 @@ static const struct gwp_cfg default_opts = {
 	.as_transparent		= false
 };
 
+/*
+ * The longest SOCKS5 message a client sends, an RFC 1929 request with a name
+ * and a password of 255 bytes each. A greeting takes up to 257 bytes and a
+ * CONNECT request up to 262.
+ */
+#define GWP_SOCKS5_MIN_CLIENT_BUF	513
+
+/*
+ * target.buf holds the handshake with an upstream proxy. The longest request
+ * is an HTTP CONNECT: twice an authority of up to 261 bytes, Basic credentials
+ * of 684 and the fixed text take 1264 bytes.
+ */
+#define GWP_UPSTREAM_MIN_TARGET_BUF	1280
+
 static int setskopt_int(int fd, int level, int optname, int val);
 static uint32_t cfg_dns_restyp(const struct gwp_cfg *cfg);
 
@@ -183,8 +203,8 @@ static void show_help(const char *app)
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
 	printf("      --dns-cache-max-entries=nr  Max DNS cache entries; 0 = unlimited (default: %d)\n", default_opts.dns_cache_max_entries);
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
-	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads for SOCKS5 (default: %d)\n", default_opts.nr_dns_workers);
-	printf("                                  More are started while lookups queue up, up to 64.\n");
+	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads kept running (default: %d)\n", default_opts.nr_dns_workers);
+	printf("                                  More are started while lookups queue up, up to 64 or nr if larger.\n");
 	printf("  -c, --connect-timeout=sec       Connection to target timeout in seconds (default: %d)\n", default_opts.connect_timeout);
 	printf("      --idle-timeout=sec          Close a tunnel or UDP association idle this long; 0 = never (default: %d)\n", default_opts.idle_timeout);
 	printf("      --max-conns-per-ip=nr       Most client connections at once per IPv4 address or IPv6 /64; 0 = no cap (default: %d)\n", default_opts.max_conns_per_ip);
@@ -214,12 +234,12 @@ static void show_help(const char *app)
 	printf("                                  them wholesale for the connections it matches\n");
 	printf("  -R, --as-transparent=0|1        Transparent proxy: take the target from SO_ORIGINAL_DST (iptables REDIRECT) (default: %d)\n", default_opts.as_transparent);
 #ifdef CONFIG_HTTPS
-	printf("  -E, --tls-cert=file             PEM certificate chain; enables TLS termination on the listener (auto-detected per connection)\n");
+	printf("  -E, --tls-cert=file             PEM certificate chain; enables TLS termination on a SOCKS5 or HTTP listener (auto-detected per connection)\n");
 	printf("  -Y, --tls-key=file              PEM private key matching --tls-cert\n");
 #endif
 #ifdef CONFIG_NEW_DNS_RESOLVER
-	printf("  -j, --dns-server=addr:port      DNS server address (default: system resolver)\n");
-	printf("  -r, --raw-dns=0|1               Use raw DNS for SOCKS5 (default: %d)\n", default_opts.use_raw_dns);
+	printf("  -j, --dns-server=addr:port      DNS server address for --raw-dns (default: %s)\n", default_opts.dns_servers);
+	printf("  -r, --raw-dns=0|1               Use raw DNS for hostname targets (default: %d)\n", default_opts.use_raw_dns);
 #endif
 	printf("\n");
 }
@@ -577,6 +597,16 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		fprintf(stderr, ERR_WRAP "Error: --tls-cert and --tls-key must be provided together\n" ERR_WRAP);
 		goto einval;
 	}
+
+	/*
+	 * The TLS listener detects a ClientHello in the SOCKS5 and HTTP paths
+	 * only. Elsewhere the certificate would do nothing but log that TLS is
+	 * on while the listener speaks cleartext.
+	 */
+	if (cfg->tls_cert && !cfg->as_socks5 && !cfg->as_http) {
+		fprintf(stderr, ERR_WRAP "Error: --tls-cert needs --as-socks5=1 or --as-http=1\n" ERR_WRAP);
+		goto einval;
+	}
 #endif
 
 	if (cfg->as_transparent && (cfg->as_socks5 || cfg->as_http)) {
@@ -634,6 +664,22 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least 256 for SOCKS5 or HTTP.\n" ERR_WRAP);
 			goto einval;
 		}
+	}
+
+	/*
+	 * Each SOCKS5 message has to fit in client.buf as a whole, and the
+	 * proxy has no other way to read the rest of it.
+	 */
+	if (cfg->as_socks5 && cfg->client_buf_size < GWP_SOCKS5_MIN_CLIENT_BUF) {
+		fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be at least %d for SOCKS5.\n" ERR_WRAP,
+			GWP_SOCKS5_MIN_CLIENT_BUF);
+		goto einval;
+	}
+
+	if (cfg->upstream_proxy && cfg->target_buf_size < GWP_UPSTREAM_MIN_TARGET_BUF) {
+		fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least %d with --upstream-proxy.\n" ERR_WRAP,
+			GWP_UPSTREAM_MIN_TARGET_BUF);
+		goto einval;
 	}
 
 	return 0;
@@ -822,7 +868,8 @@ static int gwp_ctx_init_log(struct gwp_ctx *ctx)
 			r = -errno;
 			if (fd >= 0)
 				close(fd);
-			pr_err(&ctx->lh, "Failed to open log file '%s': %s",
+			/* There is no log to report this to, so not pr_err(). */
+			fprintf(stderr, "Failed to open log file '%s': %s\n",
 				cfg->log_file, strerror(-r));
 		}
 	}
@@ -972,6 +1019,14 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 		goto out_close;
 	}
 
+	slen = sizeof(w->listen_addr);
+	r = __sys_getsockname(fd, &w->listen_addr.sa, &slen);
+	if (r < 0) {
+		pr_err(&w->ctx->lh, "Failed to get the listening address: %s",
+		       strerror(-r));
+		goto out_close;
+	}
+
 	w->tcp_fd = fd;
 	pr_info(&w->ctx->lh, "Worker %u is listening on %s (fd=%d)", w->idx,
 		cfg->bind, fd);
@@ -1102,6 +1157,50 @@ static void gwp_conn_pair_drop_dns(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gwp_dns_entry_cancel(gcp->gde);
 }
 
+/*
+ * TLS tells the end of a client's stream from it being cut: a forged or broken
+ * record, a fatal alert, a reset, half a record. A pair that goes down with the
+ * target's write side not shut has not seen that end, so a plain close() would
+ * hand the target the very EOF that a protocol framed by it takes for a complete
+ * stream. Make the close reset the connection. A plaintext client has no such
+ * end to tell apart, and is left as it is.
+ *
+ * A connect attempt counts as well: the target may have accepted long before the
+ * proxy gets to see the result, and would read an empty stream as a complete one.
+ */
+#ifdef CONFIG_HTTPS
+static void gwp_set_reset_on_close(int fd)
+{
+	static const struct linger l = { .l_onoff = 1, .l_linger = 0 };
+
+	__sys_setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
+}
+#endif
+
+void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	uint8_t i;
+
+	if (!gcp->client.tls)
+		return;
+
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
+		if (gcp->attempt_fd[i] >= 0)
+			gwp_set_reset_on_close(gcp->attempt_fd[i]);
+	}
+#endif
+}
+
+static void gwp_conn_pair_abort_target(const struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	if (gcp->client.tls && gcp->target.fd >= 0 && !gcp->target.wr_shut)
+		gwp_set_reset_on_close(gcp->target.fd);
+	gwp_conn_pair_abort_attempts(gcp);
+#endif
+}
+
 __cold
 static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 {
@@ -1117,6 +1216,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 			continue;
 
 		log_conn_pair_close(w, gcp);
+		gwp_conn_pair_abort_target(gcp);
 		if (gcp->flags & GWP_CONN_FLAG_IPLIM)
 			gwp_ctx_iplim_put(w->ctx, &gcp->client_addr);
 		free_conn(&gcp->target);
@@ -1278,6 +1378,7 @@ __cold
 static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 {
 	struct gwp_wrk *w, *workers = ctx->workers;
+	void *ret;
 	int i;
 
 	if (!workers)
@@ -1291,8 +1392,10 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 			continue;
 
 		pr_dbg(&ctx->lh, "Joining worker thread %d", i);
-		pthread_join(w->thread, NULL);
+		pthread_join(w->thread, &ret);
 		w->need_join = false;
+		if ((intptr_t)ret < 0 && !ctx->worker_err)
+			ctx->worker_err = (int)(intptr_t)ret;
 	}
 
 	for (i = 0; i < ctx->cfg.nr_workers; i++)
@@ -1308,8 +1411,23 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
  * usually drains it), gwp_reload_events() turns the records into the
  * GWP_RELOAD_* files they name, and gwp_ctx_reload_files() reloads each of
  * those once.
+ *
+ * Inotify only reports changes made through the configured name in its
+ * directory. A file can also change behind a symlink, by a swap of a directory
+ * or a symlink further up the path, or by unlink and link, and neither the
+ * parent watch nor a watch on the inode sees all of those. So the thread also
+ * stat()s the paths every GWP_RELOAD_CHECK_MS and reloads a file whose
+ * gwp_file_id changed and then stayed the same for GWP_RELOAD_SETTLE_MS: inotify
+ * keeps the common case prompt, the check is what catches the other layouts.
+ *
+ * The check cannot tell a finished change from a writer that merely paused,
+ * while inotify reports the close. Hence the long wait, and it has no upper
+ * limit: reading too soon can put a half written file in force, which for an
+ * ACL can let through what the finished file rejects.
  */
 #define GWP_INO_BUF_SIZE	4096
+#define GWP_RELOAD_CHECK_MS	1000
+#define GWP_RELOAD_SETTLE_MS	5000
 #define GWP_RELOAD_AUTH		(1u << 0)
 #define GWP_RELOAD_ACL		(1u << 1)
 
@@ -1351,6 +1469,112 @@ static int add_reload_watch(int ino_fd, const char *path)
 
 	r = inotify_add_watch(ino_fd, dir, IN_CLOSE_WRITE | IN_MOVED_TO);
 	return (r < 0) ? -errno : r;
+}
+
+/*
+ * Take the identity of the file @path resolves to now. Beyond a FIFO's or a
+ * device's identity nothing is compared: writing to it is not a new version of
+ * it. The ctime is what catches a rewrite that restores the mtime, at the price
+ * of a harmless reload after a chmod or a new hard link.
+ */
+static void gwp_file_id_read(const char *path, struct gwp_file_id *id)
+{
+	struct stat st;
+
+	memset(id, 0, sizeof(*id));
+	if (stat(path, &st)) {
+		id->err = (uint64_t)errno;
+		return;
+	}
+	id->dev = (uint64_t)st.st_dev;
+	id->ino = (uint64_t)st.st_ino;
+	id->mode = (uint64_t)(st.st_mode & S_IFMT);
+	if (!S_ISREG(st.st_mode))
+		return;
+	id->size = (uint64_t)st.st_size;
+	id->mtime_sec = (uint64_t)st.st_mtim.tv_sec;
+	id->mtime_nsec = (uint64_t)st.st_mtim.tv_nsec;
+	id->ctime_sec = (uint64_t)st.st_ctim.tv_sec;
+	id->ctime_nsec = (uint64_t)st.st_ctim.tv_nsec;
+}
+
+/* Refresh @id from @path and tell whether it differs from what it was. */
+static bool gwp_file_id_changed(const char *path, struct gwp_file_id *id)
+{
+	struct gwp_file_id cur;
+
+	gwp_file_id_read(path, &cur);
+	if (!memcmp(&cur, id, sizeof(cur)))
+		return false;
+	*id = cur;
+	return true;
+}
+
+/*
+ * Tell whether the periodic check should reload @path now. A change only starts
+ * the wait for it to settle, and any further change restarts that wait. Opening
+ * a FIFO or a device could block for a writer that never comes, stopping every
+ * later reload and shutdown, so one that only the check found is left alone
+ * until the path leads to something else.
+ */
+static bool gwp_reload_check_file(struct gwp_ctx *ctx, const char *path,
+				  struct gwp_reload_file *rf, uint64_t now)
+{
+	if (gwp_file_id_changed(path, &rf->id)) {
+		rf->settle_at = now + GWP_RELOAD_SETTLE_MS;
+		return false;
+	}
+	if (!rf->settle_at)
+		return rf->retry;
+	if (now < rf->settle_at)
+		return false;
+	if (rf->id.err || rf->id.mode == S_IFREG)
+		return true;
+
+	rf->settle_at = 0;
+	rf->retry = false;
+	pr_warn(&ctx->lh, "Not reloading '%s': not a regular file; keeping its current contents",
+		path);
+	return false;
+}
+
+/* The GWP_RELOAD_* files the periodic check wants reloaded now. */
+static unsigned gwp_reload_check(struct gwp_ctx *ctx, uint64_t now)
+{
+	unsigned flags = 0;
+
+	if (ctx->auth && gwp_reload_check_file(ctx, ctx->cfg.auth_file,
+					       &ctx->auth_reload, now))
+		flags |= GWP_RELOAD_AUTH;
+	if (ctx->acl_watched && gwp_reload_check_file(ctx, ctx->cfg.acl_file,
+						      &ctx->acl_reload, now))
+		flags |= GWP_RELOAD_ACL;
+	return flags;
+}
+
+/*
+ * Record the identity right before the file is read, so a change made during
+ * or after that read differs from it and is reloaded in turn, while a file that
+ * failed to load is not read (and logged) again until it changes.
+ */
+static void gwp_reload_begin(const char *path, struct gwp_reload_file *rf)
+{
+	gwp_file_id_read(path, &rf->id);
+	rf->settle_at = 0;
+}
+
+/*
+ * Note the outcome @r of a reload and tell whether a failure is to be logged.
+ * Running out of descriptors or memory says nothing about the file, and its new
+ * contents would otherwise be lost until it changes again, so such a reload is
+ * retried at each check, logged only the first time.
+ */
+static bool gwp_reload_end(struct gwp_reload_file *rf, int r)
+{
+	bool was_retry = rf->retry;
+
+	rf->retry = r == -EMFILE || r == -ENFILE || r == -ENOMEM;
+	return r && !(was_retry && rf->retry);
 }
 
 /* True when inotify record @e names the basename of @path (NULL: never). */
@@ -1400,16 +1624,22 @@ static unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
 /* Reload the files named by @flags (GWP_RELOAD_*), logging the outcome. */
 static void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 {
+	int r;
+
 	if ((flags & GWP_RELOAD_AUTH) && ctx->auth) {
-		if (gwp_auth_reload(ctx->auth))
+		gwp_reload_begin(ctx->cfg.auth_file, &ctx->auth_reload);
+		r = gwp_auth_reload(ctx->auth);
+		if (gwp_reload_end(&ctx->auth_reload, r))
 			pr_warn(&ctx->lh, "Failed to reload authentication file; keeping current credentials");
-		else
+		else if (!r)
 			pr_info(&ctx->lh, "Reloaded authentication file");
 	}
 	if ((flags & GWP_RELOAD_ACL) && ctx->acl_watched) {
-		if (gwp_acl_reload(ctx->acl))
+		gwp_reload_begin(ctx->cfg.acl_file, &ctx->acl_reload);
+		r = gwp_acl_reload(ctx->acl);
+		if (gwp_reload_end(&ctx->acl_reload, r))
 			pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
-		else
+		else if (!r)
 			pr_info(&ctx->lh, "Reloaded ACL file");
 	}
 }
@@ -1463,6 +1693,9 @@ static uint64_t gwp_reload_now_ms(void)
  * none of its connections meanwhile, so the files are reloaded here instead.
  * The stores publish a new set under their own locks, so no worker waits for
  * more than that swap.
+ *
+ * The paths are checked every GWP_RELOAD_CHECK_MS. The first check, at once,
+ * catches a change made since the startup load.
  */
 static void *gwp_reload_thread(void *arg)
 {
@@ -1473,16 +1706,15 @@ static void *gwp_reload_thread(void *arg)
 		{ .fd = ctx->ino_fd, .events = POLLIN },
 		{ .fd = ctx->reload_efd, .events = POLLIN },
 	};
-	uint64_t now, first = 0, last = 0, due = 0;
+	uint64_t now, first = 0, due = 0, next_check = 0;
 	unsigned flags, pending = 0;
 	int r, timeout;
 
 	for (;;) {
-		timeout = -1;
-		if (pending) {
-			now = gwp_reload_now_ms();
-			timeout = due > now ? (int)(due - now) : 0;
-		}
+		uint64_t wake = pending && due < next_check ? due : next_check;
+
+		now = gwp_reload_now_ms();
+		timeout = wake > now ? (int)(wake - now) : 0;
 
 		r = poll(pfd, 2, timeout);
 		if (r < 0) {
@@ -1494,23 +1726,28 @@ static void *gwp_reload_thread(void *arg)
 		if (pfd[1].revents)
 			return NULL;
 
+		flags = 0;
 		if (pfd[0].revents) {
-			flags = 0;
 			r = gwp_reload_drain(ctx, buf, &flags);
 			if (r < 0)
 				break;
-			if (flags) {
-				last = gwp_reload_now_ms();
-				if (!pending)
-					first = last;
-				pending |= flags;
-				due = last + GWP_RELOAD_QUIET_MS;
-				if (due > first + GWP_RELOAD_MAX_WAIT_MS)
-					due = first + GWP_RELOAD_MAX_WAIT_MS;
-			}
 		}
 
-		if (!pending || gwp_reload_now_ms() < due)
+		now = gwp_reload_now_ms();
+		if (now >= next_check) {
+			flags |= gwp_reload_check(ctx, now);
+			next_check = now + GWP_RELOAD_CHECK_MS;
+		}
+		if (flags) {
+			if (!pending)
+				first = now;
+			pending |= flags;
+			due = now + GWP_RELOAD_QUIET_MS;
+			if (due > first + GWP_RELOAD_MAX_WAIT_MS)
+				due = first + GWP_RELOAD_MAX_WAIT_MS;
+		}
+
+		if (!pending || now < due)
 			continue;
 		gwp_ctx_reload_files(ctx, pending);
 		pending = 0;
@@ -1648,6 +1885,8 @@ static int gwp_ctx_init_auth(struct gwp_ctx *ctx)
 		return 0;
 	}
 
+	/* Before the load: a change made after it must differ from this. */
+	gwp_file_id_read(cfg->auth_file, &ctx->auth_reload.id);
 	r = gwp_auth_create(&ctx->auth, cfg->auth_file);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to load auth file '%s': %s",
@@ -1676,8 +1915,15 @@ static void gwp_ctx_free_auth(struct gwp_ctx *ctx)
  * "localhost" resolves to both families, so leaving any of these out lets a
  * client reach loopback-only services anyway. 169.254/16 holds the cloud
  * metadata endpoint. The IPv6 transition prefixes (IPv4-compatible ::/96,
- * NAT64, 6to4) can embed any of the IPv4 ranges above. ::ffff:a.b.c.d needs no
- * rule of its own: the matcher folds it into IPv4 before comparing.
+ * NAT64, 6to4, Teredo, SIIT's ::ffff:0:a.b.c.d) can embed any of the IPv4
+ * ranges above. ::ffff:a.b.c.d needs no rule of its own: the matcher folds it
+ * into IPv4 before comparing, which also keeps ::/8 from covering it.
+ *
+ * The rest is what the IANA special-purpose registries do not call globally
+ * reachable (documentation, benchmarking, ORCHID, the old 6to4 relay anycast),
+ * and all of IPv6 outside 2000::/3, the only part allocated for global unicast.
+ * That takes in the discard prefixes 100::/64 and 100:0:0:1::/64 under 100::/8,
+ * SRv6 5f00::/16 under 4000::/3, and SIIT under ::/8.
  *
  * ::/128 and ::1/128 are listed even though ::/96 covers them, so that each
  * of them is rejected by a rule of its own.
@@ -1692,8 +1938,12 @@ static const char gwp_acl_default_rules[] =
 	"-A OUTPUT -d 169.254.0.0/16 -j REJECT\n"
 	"-A OUTPUT -d 172.16.0.0/12 -j REJECT\n"
 	"-A OUTPUT -d 192.0.0.0/24 -j REJECT\n"
+	"-A OUTPUT -d 192.0.2.0/24 -j REJECT\n"
+	"-A OUTPUT -d 192.88.99.0/24 -j REJECT\n"
 	"-A OUTPUT -d 192.168.0.0/16 -j REJECT\n"
 	"-A OUTPUT -d 198.18.0.0/15 -j REJECT\n"
+	"-A OUTPUT -d 198.51.100.0/24 -j REJECT\n"
+	"-A OUTPUT -d 203.0.113.0/24 -j REJECT\n"
 	"-A OUTPUT -d 224.0.0.0/4 -j REJECT\n"
 	"-A OUTPUT -d 240.0.0.0/4 -j REJECT\n"
 	/* IPv6 */
@@ -1702,8 +1952,28 @@ static const char gwp_acl_default_rules[] =
 	"-A OUTPUT -d ::/96 -j REJECT\n"
 	"-A OUTPUT -d 64:ff9b::/96 -j REJECT\n"
 	"-A OUTPUT -d 64:ff9b:1::/48 -j REJECT\n"
+	"-A OUTPUT -d ::/8 -j REJECT\n"
+	"-A OUTPUT -d 100::/8 -j REJECT\n"
+	"-A OUTPUT -d 200::/7 -j REJECT\n"
+	"-A OUTPUT -d 400::/6 -j REJECT\n"
+	"-A OUTPUT -d 800::/5 -j REJECT\n"
+	"-A OUTPUT -d 1000::/4 -j REJECT\n"
+	"-A OUTPUT -d 2001::/32 -j REJECT\n"
+	"-A OUTPUT -d 2001:2::/48 -j REJECT\n"
+	"-A OUTPUT -d 2001:10::/28 -j REJECT\n"
+	"-A OUTPUT -d 2001:db8::/32 -j REJECT\n"
 	"-A OUTPUT -d 2002::/16 -j REJECT\n"
+	"-A OUTPUT -d 3fff::/20 -j REJECT\n"
+	"-A OUTPUT -d 4000::/3 -j REJECT\n"
+	"-A OUTPUT -d 6000::/3 -j REJECT\n"
+	"-A OUTPUT -d 8000::/3 -j REJECT\n"
+	"-A OUTPUT -d a000::/3 -j REJECT\n"
+	"-A OUTPUT -d c000::/3 -j REJECT\n"
+	"-A OUTPUT -d e000::/4 -j REJECT\n"
+	"-A OUTPUT -d f000::/5 -j REJECT\n"
+	"-A OUTPUT -d f800::/6 -j REJECT\n"
 	"-A OUTPUT -d fc00::/7 -j REJECT\n"
+	"-A OUTPUT -d fe00::/9 -j REJECT\n"
 	"-A OUTPUT -d fe80::/10 -j REJECT\n"
 	"-A OUTPUT -d fec0::/10 -j REJECT\n"
 	"-A OUTPUT -d ff00::/8 -j REJECT\n"
@@ -1752,6 +2022,8 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 		return 0;
 	}
 
+	/* Before the load: a change made after it must differ from this. */
+	gwp_file_id_read(cfg->acl_file, &ctx->acl_reload.id);
 	r = gwp_acl_create(&ctx->acl, cfg->acl_file);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to load ACL file '%s': %s",
@@ -1864,6 +2136,8 @@ static uint16_t sa_port_h(const struct gwp_sockaddr *s)
 
 static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 				      struct gwp_socks5_addr *out);
+static int upstream_target_init(struct gwp_ctx *ctx);
+static int parse_port(const char *s, uint16_t *port);
 
 /*
  * Fill the inputs of an OUTPUT request for @target (NULL when only a domain is
@@ -1894,7 +2168,9 @@ static void acl_out_req(struct gwp_acl_req *req,
  * eval) when there is no ACL, or nothing to match on. When a matching -j DNAT
  * rule produced a concrete address, the rewritten destination is written back
  * to *@target (for the direct connection and, via the caller, the upstream)
- * and *@dnat_out (when non-NULL) is set true. Composable -j MARK / -j BIND
+ * and *@dnat_out (when non-NULL) is set true. A port-only -j DNAT of a request
+ * that only has a domain has no address to write there: *@dnat_port_out (when
+ * non-NULL) gets the new port instead, 0 for none. Composable -j MARK / -j BIND
  * modifiers are surfaced in *@so_out. @memo (may be NULL) carries the
  * -m domain/-m user results between evaluations of the same request.
  */
@@ -1904,7 +2180,7 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 				    const char *domain, const char *user,
 				    struct gwp_acl_memo *memo,
 				    struct gwp_conn_sockopt *so_out,
-				    bool *dnat_out,
+				    bool *dnat_out, uint16_t *dnat_port_out,
 				    enum gwp_acl_proto proto)
 {
 	int fam = target ? target->sa.sa_family : 0;
@@ -1916,6 +2192,8 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 		memset(so_out, 0, sizeof(*so_out));
 	if (dnat_out)
 		*dnat_out = false;
+	if (dnat_port_out)
+		*dnat_port_out = 0;
 
 	if (!ctx->acl)
 		return GWP_ACL_ACCEPT;
@@ -1935,7 +2213,7 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	 * Apply a matched DNAT when it produced a concrete address, rewriting
 	 * the destination for both the direct path (*target) and, via the
 	 * caller, the upstream destination. A port-only DNAT with no base IP
-	 * (e.g. a socks5h domain request) yields no address and is skipped.
+	 * (e.g. a socks5h domain request) yields no address, just the port.
 	 */
 	if (req.dnat_applied && req.dnat.sa.sa_family) {
 		if (have_ip)
@@ -1947,6 +2225,10 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 		*target = req.dnat;
 		if (dnat_out)
 			*dnat_out = true;
+	} else if (req.dnat_applied && req.dnat_port && dnat_port_out) {
+		pr_info(&ctx->lh, "ACL DNAT %s -> port %u",
+			domain ? domain : "?", req.dnat_port);
+		*dnat_port_out = req.dnat_port;
 	}
 	/* Surface composable -j MARK / -j BIND to the socket-creation path. */
 	if (so_out && req.mark_set) {
@@ -1966,7 +2248,7 @@ bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     struct gwp_conn_sockopt *so,
 			     enum gwp_acl_proto proto)
 {
-	return acl_out(ctx, client, target, 0, NULL, NULL, NULL, so, NULL,
+	return acl_out(ctx, client, target, 0, NULL, NULL, NULL, so, NULL, NULL,
 		       proto) == GWP_ACL_ACCEPT;
 }
 
@@ -2048,8 +2330,11 @@ static void udp_peer_canon(struct gwp_sockaddr *a)
 	static const uint8_t v4_any[4];
 	uint8_t *b = a->i6.sin6_addr.s6_addr;
 
-	if (a->sa.sa_family != AF_INET6)
+	if (a->sa.sa_family == AF_INET) {
+		if (a->i4.sin_addr.s_addr == htonl(INADDR_ANY))
+			a->i4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 		return;
+	}
 	if (IN6_IS_ADDR_UNSPECIFIED(&a->i6.sin6_addr))
 		a->i6.sin6_addr = in6addr_loopback;
 	else if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr) &&
@@ -2131,9 +2416,19 @@ static bool udp_reply_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 {
-	uint16_t dport = 0;
+	uint16_t dport = 0, dnat_port = 0;
 	bool dnat = false;
 	enum gwp_acl_verdict v;
+
+	/*
+	 * Plain forwarding to a --target the upstream resolves: the request is
+	 * for that name. Set it each time, since a connect retried for want of
+	 * a descriptor must be judged afresh, not as an earlier DNAT left it.
+	 */
+	if (ctx->target_name.ver) {
+		gcp->up_dst = ctx->target_name;
+		gcp->req_domain = ctx->target_name.domain.str;
+	}
 
 	/*
 	 * Only a walk over several candidates evaluates the same domain and
@@ -2146,9 +2441,13 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 	v = acl_out(ctx, &gcp->client_addr, &gcp->target_addr, dport,
 		    gcp->req_domain, gcp_req_user(gcp),
 		    gcp->nr_cand > 1 ? &gcp->acl_memo : NULL,
-		    &gcp->acl_sockopt, &dnat, GWP_ACL_PROTO_TCP);
+		    &gcp->acl_sockopt, &dnat, &dnat_port, GWP_ACL_PROTO_TCP);
 	if (v != GWP_ACL_ACCEPT)
 		return false;
+
+	/* The hostname stays for the upstream to resolve, on the new port. */
+	if (dnat_port && gcp->up_dst.ver == GWP_SOCKS5_ATYP_DOMAIN)
+		gcp->up_dst.port = htons(dnat_port);
 
 	/*
 	 * When chaining to an upstream by remote DNS (socks5h), up_dst carries
@@ -2700,12 +2999,12 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 		const char *t = ctx->cfg.target;
 
 		/*
-		 * With socks5h:// the upstream proxy resolves the target, so
-		 * we must not resolve --target locally; keep it as a hostname
-		 * to hand to the proxy later.
+		 * With a remote-DNS upstream the proxy resolves the target, so
+		 * we must not resolve --target locally; keep a hostname to hand
+		 * to the proxy later.
 		 */
 		if (ctx->upstream.enabled && ctx->upstream.remote_dns)
-			r = 0;
+			r = upstream_target_init(ctx);
 		else
 			r = convert_str_to_ssaddr(t, &ctx->target_addr, 0);
 		if (r) {
@@ -2896,9 +3195,12 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 	r = init_conn(&gcp->target, cfg->target_buf_size);
 	if (r)
 		goto out_free_gcp;
-	r = init_conn(&gcp->client, cfg->client_buf_size);
+	/* Room behind the buffer for an HTTP request's rewrite to grow into. */
+	r = init_conn(&gcp->client,
+		      (uint32_t)cfg->client_buf_size + GWP_HTTP_REWRITE_SLACK);
 	if (r)
 		goto out_free_target_conn;
+	gcp->client.cap = (uint32_t)cfg->client_buf_size;
 
 	gcp->timer_fd = -1;
 	gcp->udp_fd = -1;
@@ -2961,6 +3263,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return -EINVAL;
 
 	log_conn_pair_close(w, gcp);
+	gwp_conn_pair_abort_target(gcp);
 
 	/*
 	 * Every way a client goes away ends here (or, at shutdown, in
@@ -3017,6 +3320,9 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  */
 #ifndef SO_MARK
 #define SO_MARK 36
+#endif
+#ifndef IP_BIND_ADDRESS_NO_PORT
+#define IP_BIND_ADDRESS_NO_PORT 24
 #endif
 #ifndef SO_ORIGINAL_DST
 #define SO_ORIGINAL_DST 80
@@ -3078,6 +3384,70 @@ static int setskopt_int(int fd, int level, int optname, int value)
 	return __sys_setsockopt(fd, level, optname, &value, sizeof(value));
 }
 
+/* Write the IPv4-mapped IPv6 form (::ffff:a.b.c.d) of a 4-byte address. */
+static void set_v4mapped(struct in6_addr *a6, const void *v4)
+{
+	memset(a6, 0, sizeof(*a6));
+	a6->s6_addr[10] = 0xff;
+	a6->s6_addr[11] = 0xff;
+	memcpy(&a6->s6_addr[12], v4, 4);
+}
+
+/* Canonicalise an address to (is_v4, pointer to its 4- or 16-byte IP). */
+static void sockaddr_canon_ip(const struct gwp_sockaddr *a, bool *is_v4,
+			      const uint8_t **ip)
+{
+	if (a->sa.sa_family == AF_INET) {
+		*is_v4 = true;
+		*ip = (const uint8_t *)&a->i4.sin_addr;
+		return;
+	}
+	if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr)) {
+		*is_v4 = true;
+		*ip = &a->i6.sin6_addr.s6_addr[12];
+		return;
+	}
+	*is_v4 = false;
+	*ip = a->i6.sin6_addr.s6_addr;
+}
+
+/*
+ * Write to @out the form of source @src that a socket about to dial @dst can
+ * bind. An IPv4-mapped address is IPv4 traffic on an AF_INET6 socket, so what
+ * has to match is the canonical family, and the spelling then follows the
+ * socket's: @dst decides, as the socket was created with its family. Returns
+ * false when @src is of the other family and cannot apply to @dst.
+ */
+static bool conn_bind_src(struct gwp_sockaddr *out,
+			  const struct gwp_sockaddr *src,
+			  const struct gwp_sockaddr *dst)
+{
+	const uint8_t *src_ip, *dst_ip;
+	bool src_v4, dst_v4;
+
+	sockaddr_canon_ip(src, &src_v4, &src_ip);
+	sockaddr_canon_ip(dst, &dst_v4, &dst_ip);
+	if (src_v4 != dst_v4)
+		return false;
+
+	if (src->sa.sa_family == dst->sa.sa_family) {
+		*out = *src;
+		return true;
+	}
+
+	memset(out, 0, sizeof(*out));
+	if (dst->sa.sa_family == AF_INET) {
+		out->i4.sin_family = AF_INET;
+		out->i4.sin_port = src->i6.sin6_port;
+		memcpy(&out->i4.sin_addr, src_ip, 4);
+	} else {
+		out->i6.sin6_family = AF_INET6;
+		out->i6.sin6_port = src->i4.sin_port;
+		set_v4mapped(&out->i6.sin6_addr, src_ip);
+	}
+	return true;
+}
+
 /*
  * Apply a bind spec to socket @fd before connect: pin the outgoing interface
  * (SO_BINDTODEVICE) and/or source address (bind()). Strict -- any failure is
@@ -3095,7 +3465,9 @@ static int setskopt_int(int fd, int level, int optname, int value)
  * refused, whereas the global default must not turn a dual-stack proxy into a
  * single-family one -- an IPv4 --bind-source simply does not apply to an IPv6
  * target, so the source is skipped and the connection proceeds. An interface
- * has no family, so --bind-iface still applies to every target.
+ * has no family, so --bind-iface still applies to every target. A v4-mapped
+ * address is IPv4 here, as it is to --outgoing-family and the ACL: were it to
+ * count as IPv6, a client could dodge an IPv4 source by spelling its target so.
  */
 static int apply_conn_bind(struct gwp_wrk *w, int fd,
 			   const struct gwp_sockaddr *dst,
@@ -3116,11 +3488,13 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 	}
 
 	if (b->have_src) {
-		const struct gwp_sockaddr *s = &b->src;
+		struct gwp_sockaddr src;
+		const struct gwp_sockaddr *s = &src;
 		socklen_t len;
+		in_port_t port;
 
 		/* The source family must match the socket/target family. */
-		if (s->sa.sa_family != dst->sa.sa_family) {
+		if (!conn_bind_src(&src, &b->src, dst)) {
 			if (global) {
 				pr_dbg(&w->ctx->lh,
 				       "bind default: --bind-source does not apply to target %s (other address family)",
@@ -3135,6 +3509,20 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 
 		len = (s->sa.sa_family == AF_INET) ? sizeof(struct sockaddr_in)
 						   : sizeof(struct sockaddr_in6);
+
+		/*
+		 * With no port asked for, leave choosing one to connect(), which
+		 * knows the destination and only needs a unique 4-tuple. bind()
+		 * alone would take the port for every destination, TIME_WAIT
+		 * included, capping all egress from this source at one local
+		 * port range. Not fatal: only pre-4.2 kernels refuse it, and the
+		 * source is pinned either way. IPv6 sockets take it at SOL_IP too.
+		 */
+		port = (s->sa.sa_family == AF_INET) ? s->i4.sin_port
+						    : s->i6.sin6_port;
+		if (!port)
+			setskopt_int(fd, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, 1);
+
 		r = __sys_bind(fd, &s->sa, len);
 		if (unlikely(r < 0)) {
 			pr_err(&w->ctx->lh, "%s: bind(%s) failed: %s",
@@ -3395,7 +3783,7 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
-		ip_to_str(&gcp->target_addr), ip_to_str(&gcp->client_addr),
+		gwp_upstream_dst_str(gcp), ip_to_str(&gcp->client_addr),
 		gcp->idx);
 
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
@@ -3424,12 +3812,14 @@ static int queue_dns_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				const char *host, uint16_t port, int res)
 {
 	struct gwp_dns_ctx *dns = w->ctx->dns;
+	struct gwp_iplim_key client;
 	struct gwp_dns_entry *gde;
 
+	gwp_iplim_key(&gcp->client_addr, &client);
 	if (res)
 		gde = gwp_dns_queue_result(dns, w->idx, host, port, gcp, res);
 	else
-		gde = gwp_dns_queue(dns, w->idx, host, port, gcp);
+		gde = gwp_dns_queue(dns, w->idx, host, port, &client, gcp);
 	if (unlikely(!gde)) {
 		pr_err(&w->ctx->lh, "Failed to allocate DNS entry for %s:%hu", host, port);
 		return -ENOMEM;
@@ -3493,7 +3883,7 @@ static int upstream_dst_from_hostport(const char *hostport,
 {
 	char buf[300], *colon, *host;
 	size_t hl, n = strlen(hostport);
-	int port;
+	uint16_t port;
 
 	if (n == 0 || n >= sizeof(buf))
 		return -EINVAL;
@@ -3503,8 +3893,7 @@ static int upstream_dst_from_hostport(const char *hostport,
 	if (!colon)
 		return -EINVAL;
 	*colon = '\0';
-	port = atoi(colon + 1);
-	if (port <= 0 || port > 65535)
+	if (parse_port(colon + 1, &port) || !port)
 		return -EINVAL;
 
 	host = buf;
@@ -3514,16 +3903,9 @@ static int upstream_dst_from_hostport(const char *hostport,
 		host++;
 	}
 
-	return upstream_dst_from_domain(host, (uint16_t)port, out);
+	return upstream_dst_from_domain(host, port, out);
 }
 
-/*
- * Finalize gcp->up_dst (the destination requested from the upstream proxy)
- * right before the client handshake. If a socks5h domain was already captured
- * during protocol parsing, keep it; otherwise derive it from the resolved
- * target IP (socks5://), or from the configured --target host for plain mode
- * with socks5h://.
- */
 /*
  * Whether a client-requested hostname is fit for the ACL, the resolver and an
  * upstream CONNECT request: an IPv6 literal, or letters, digits, '-' and '_'
@@ -3596,15 +3978,16 @@ int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 	return 0;
 }
 
-int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/*
+ * Finalize gcp->up_dst (the destination requested from the upstream proxy)
+ * right before the client handshake. A hostname for the upstream to resolve is
+ * already there, requested by the client or configured with --target; anything
+ * else goes by the target address, as the ACL may have rewritten it.
+ */
+int gwp_upstream_finalize_dst(struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
-
 	if (gcp->up_dst.ver != 0)
 		return 0;
-
-	if (ctx->upstream.remote_dns && !ctx->cfg.as_socks5 && !ctx->cfg.as_http)
-		return upstream_dst_from_hostport(ctx->cfg.target, &gcp->up_dst);
 
 	return upstream_dst_from_sockaddr(&gcp->target_addr, &gcp->up_dst);
 }
@@ -3671,6 +4054,36 @@ static bool req_host_ip(const char *host, uint16_t port, struct gwp_sockaddr *sa
 	return false;
 }
 
+/*
+ * Take --target apart for a remote-DNS upstream, without resolving anything. It
+ * goes by the rules of a hostname a client requests (see
+ * prepare_target_addr_domain()), and the ACL needs it: an address is the
+ * target, for -d rules and DNAT, and a name is matched by -m domain.
+ */
+__cold
+static int upstream_target_init(struct gwp_ctx *ctx)
+{
+	struct gwp_socks5_addr *dst = &ctx->target_name;
+	uint16_t port;
+	int r;
+
+	r = upstream_dst_from_hostport(ctx->cfg.target, dst);
+	if (!r && !req_host_valid(dst->domain.str))
+		r = -EINVAL;
+	if (r) {
+		dst->ver = 0;
+		return r;
+	}
+
+	if (dst->domain.str[dst->domain.len - 1] == '.')
+		dst->domain.str[--dst->domain.len] = '\0';
+
+	port = ntohs(dst->port);
+	if (req_host_ip(dst->domain.str, port, &ctx->target_addr))
+		dst->ver = 0;
+	return 0;
+}
+
 static int prepare_target_addr_domain(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp,
 				      char *host, uint16_t port)
@@ -3722,6 +4135,18 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	}
 
 	if (cfg->use_raw_dns) {
+		struct gwp_sockaddr sa;
+
+		/*
+		 * An address is the target, not a name to ask the server about:
+		 * the query would tell the server where the client is going, and
+		 * its answer would choose where the tunnel goes. The system
+		 * resolver parses these itself.
+		 */
+		if (req_host_ip(host, port, &sa)) {
+			gwp_conn_set_single_candidate(gcp, &sa);
+			return 0;
+		}
 		return gwp_raw_dns_resolve(w, gcp, host, port);
 	} else {
 		struct gwp_sockaddr addrs[GWP_MAX_CONN_CAND];
@@ -3935,38 +4360,11 @@ static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
-/* Write the IPv4-mapped IPv6 form (::ffff:a.b.c.d) of a 4-byte address. */
-static void set_v4mapped(struct in6_addr *a6, const void *v4)
-{
-	memset(a6, 0, sizeof(*a6));
-	a6->s6_addr[10] = 0xff;
-	a6->s6_addr[11] = 0xff;
-	memcpy(&a6->s6_addr[12], v4, 4);
-}
-
-/* Canonicalise an address to (is_v4, pointer to its 4- or 16-byte IP). */
-static void sockaddr_canon_ip(const struct gwp_sockaddr *a, bool *is_v4,
-			      const uint8_t **ip)
-{
-	if (a->sa.sa_family == AF_INET) {
-		*is_v4 = true;
-		*ip = (const uint8_t *)&a->i4.sin_addr;
-		return;
-	}
-	if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr)) {
-		*is_v4 = true;
-		*ip = &a->i6.sin6_addr.s6_addr[12];
-		return;
-	}
-	*is_v4 = false;
-	*ip = a->i6.sin6_addr.s6_addr;
-}
-
 /*
  * True when @a may be dialled under --outgoing-family.
  *
  * The comparison must be v4-mapped aware: the SOCKS5 UDP relay hands targets
- * over as ::ffff:a.b.c.d on its dual-stack socket, so a bare
+ * over as ::ffff:a.b.c.d on a dual-stack socket, so a bare
  * sa_family == AF_INET6 test would refuse ordinary IPv4 traffic.
  */
 bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
@@ -3984,11 +4382,40 @@ bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
 	return !is_v4;
 }
 
+int gwp_conn_dial_addr(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+		       struct gwp_sockaddr **addr)
+{
+	int fam = gcp->target_addr.sa.sa_family;
+
+	if (!ctx->upstream.enabled) {
+		*addr = &gcp->target_addr;
+		return 0;
+	}
+
+	/*
+	 * --outgoing-family also binds an address the upstream will be asked
+	 * for, requested by the client or made by a -j DNAT: it is not this
+	 * proxy that dials it, but it is this proxy that sends it there. Only a
+	 * hostname for the upstream to resolve is out of reach. A DNAT that
+	 * replaced such a hostname has updated target_addr too.
+	 */
+	if (gcp->up_dst.ver != GWP_SOCKS5_ATYP_DOMAIN &&
+	    (fam == AF_INET || fam == AF_INET6) &&
+	    !gwp_ctx_outgoing_family_ok(ctx, &gcp->target_addr)) {
+		pr_info(&ctx->lh, "--outgoing-family refuses target %s",
+			ip_to_str(&gcp->target_addr));
+		return -EAFNOSUPPORT;
+	}
+
+	*addr = &ctx->upstream.addr;
+	return 0;
+}
+
 
 /*
  * Compare two addresses by IP only (not port), treating an IPv4 address and its
- * IPv4-mapped IPv6 form as equal. The UDP relay socket is dual-stack, so a
- * datagram's source is always AF_INET6 (v4-mapped for an IPv4 peer) while the
+ * IPv4-mapped IPv6 form as equal. The UDP relay socket is normally dual-stack,
+ * so a datagram's source is AF_INET6 (v4-mapped for an IPv4 peer) while the
  * pinned client address may be either family; this bridges them.
  */
 bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr *b)
@@ -4001,6 +4428,202 @@ bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr 
 	if (av4 != bv4)
 		return false;
 	return !memcmp(ai, bi, av4 ? 4 : 16);
+}
+
+/*
+ * Ask the routing table whether connections to @a stay on this host, secondary
+ * addresses and local routes of either family included. The reply is written
+ * while the request is sent, so nothing here waits. An error reply is a route
+ * that does not exist or leads nowhere. Returns 1 or 0, or a negative errno when
+ * the kernel could not be asked.
+ */
+static int route_is_local(const struct gwp_sockaddr *a)
+{
+	struct {
+		struct nlmsghdr	nh;
+		struct rtmsg	rt;
+		struct rtattr	dst;
+		uint8_t		ip[16];
+	} req;
+	union {
+		struct nlmsghdr	nh;
+		char		buf[1024];
+	} rsp;
+	const struct rtmsg *rt = NLMSG_DATA(&rsp.nh);
+	const uint8_t *ip;
+	uint32_t ip_len;
+	ssize_t n;
+	bool v4;
+	int fd;
+
+	sockaddr_canon_ip(a, &v4, &ip);
+	ip_len = v4 ? 4 : 16;
+
+	memset(&req, 0, sizeof(req));
+	req.nh.nlmsg_len = (uint32_t)(NLMSG_LENGTH(sizeof(req.rt)) + RTA_LENGTH(ip_len));
+	req.nh.nlmsg_type = RTM_GETROUTE;
+	req.nh.nlmsg_flags = NLM_F_REQUEST;
+	req.rt.rtm_family = v4 ? AF_INET : AF_INET6;
+	req.rt.rtm_dst_len = (uint8_t)(ip_len * 8);
+	req.dst.rta_type = RTA_DST;
+	req.dst.rta_len = (uint16_t)RTA_LENGTH(ip_len);
+	memcpy(req.ip, ip, ip_len);
+
+	fd = __sys_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
+			  NETLINK_ROUTE);
+	if (fd < 0)
+		return fd;
+	n = __sys_send(fd, &req, req.nh.nlmsg_len, 0);
+	if (n >= 0)
+		n = __sys_recv(fd, &rsp, sizeof(rsp), 0);
+	__sys_close(fd);
+
+	if (n < 0)
+		return (int)n;
+	if (n < (ssize_t)NLMSG_HDRLEN)
+		return -EIO;
+	if (rsp.nh.nlmsg_type == NLMSG_ERROR)
+		return 0;
+	if (rsp.nh.nlmsg_type != RTM_NEWROUTE ||
+	    n < (ssize_t)NLMSG_LENGTH(sizeof(*rt)))
+		return -EIO;
+	return rt->rtm_type == RTN_LOCAL;
+}
+
+/*
+ * Whether @a is an address of this host. Where netlink is shut off, bind() is the
+ * next best: it has no word on IPv6 local routes and says yes to anything under
+ * ip_nonlocal_bind, though EADDRINUSE is the ephemeral ports running out, for an
+ * address that is local. Returns 1 or 0, or a negative errno with no descriptor to
+ * ask with.
+ */
+static int ip_is_local(const struct gwp_sockaddr *a)
+{
+	struct gwp_sockaddr s = *a;
+	socklen_t len;
+	int fd, r;
+
+	r = route_is_local(a);
+	if (r >= 0)
+		return r;
+
+	if (a->sa.sa_family == AF_INET) {
+		s.i4.sin_port = 0;
+		len = sizeof(s.i4);
+	} else {
+		s.i6.sin6_port = 0;
+		len = sizeof(s.i6);
+	}
+
+	fd = __sys_socket(a->sa.sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return fd;
+	r = __sys_bind(fd, &s.sa, len);
+	__sys_close(fd);
+	return !r || r == -EADDRINUSE;
+}
+
+/*
+ * Write to @out the address connect() actually goes to for @dst. The unspecified
+ * address means loopback on IPv6. On IPv4 it means the source of the socket when
+ * one is forced (see gwp_create_sock_target() for which one applies), and
+ * 127.0.0.1 otherwise.
+ */
+static void target_connect_addr(const struct gwp_wrk *w,
+				const struct gwp_conn_pair *gcp,
+				const struct gwp_sockaddr *dst,
+				struct gwp_sockaddr *out)
+{
+	static const uint8_t any[sizeof(struct in6_addr)];
+	static const uint8_t lo4[4] = { 127, 0, 0, 1 };
+	const struct gwp_acl_bind *b = gcp->acl_sockopt.bind.set ?
+				       &gcp->acl_sockopt.bind : &w->ctx->bind_def;
+	const uint8_t *ip;
+	bool v4;
+
+	*out = *dst;
+	sockaddr_canon_ip(dst, &v4, &ip);
+	if (memcmp(ip, any, v4 ? 4 : 16))
+		return;
+
+	if (!v4) {
+		out->i6.sin6_addr = in6addr_loopback;
+		return;
+	}
+
+	if (b->set && b->have_src && conn_bind_src(out, &b->src, dst)) {
+		sockaddr_canon_ip(out, &v4, &ip);
+		if (memcmp(ip, any, 4))
+			return;
+	}
+
+	*out = *dst;
+	if (dst->sa.sa_family == AF_INET)
+		memcpy(&out->i4.sin_addr, lo4, 4);
+	else
+		set_v4mapped(&out->i6.sin6_addr, lo4);
+}
+
+/*
+ * A client must not get to connect the proxy to itself: the bytes it pipelines
+ * behind the request are passed on once the target is up, so they make the next
+ * request, and one connection and a few KB nest the proxy in itself thousands
+ * of times, each hop one more pair of descriptors. A proxy request is asked about
+ * when its attempt has connected: no client bytes have moved yet, so the chain
+ * ends at the first hop, and the failure takes the way of a refused connect, reply
+ * included.
+ *
+ * Plain forwarding needs no client bytes: each hop dials the next by itself, and
+ * by the time a connection is seen to be up the next hop is on its way, and it
+ * goes on after the client has left. So plain forwarding is asked about before
+ * the connect, and the connection is never made.
+ *
+ * Only the port is looked at for every connection. The rest is for the few that
+ * match, so it costs ordinary traffic nothing. A path back through NAT or another
+ * host cannot be told from here.
+ *
+ * A full descriptor table leaves nothing to ask the kernel with. Before a connect
+ * the answer is then no: the caller's own socket will not be had either, it waits
+ * for a descriptor and comes back here with one. With @connected there is no
+ * coming back and the answer is yes, as a no would let the hop through, and so on
+ * for each two descriptors freed: the chain would soak up all of them and keep the
+ * table full. The price is that a remote service on the listener's port number is
+ * refused for as long as the table is full.
+ */
+bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
+			const struct gwp_sockaddr *dst, bool connected)
+{
+	static const uint8_t any[sizeof(struct in6_addr)];
+	const struct gwp_sockaddr *lst = &w->listen_addr;
+	struct gwp_sockaddr to;
+	const uint8_t *lip, *dip;
+	bool lv4, dv4, self, unsure = false;
+
+	if (w->ctx->upstream.enabled)
+		dst = &w->ctx->upstream.addr;
+	if (sa_port_h(dst) != sa_port_h(lst))
+		return false;
+
+	sockaddr_canon_ip(lst, &lv4, &lip);
+	target_connect_addr(w, gcp, dst, &to);
+	sockaddr_canon_ip(&to, &dv4, &dip);
+	if (memcmp(lip, any, lv4 ? 4 : 16)) {
+		self = gwp_sockaddr_ip_eq(&to, lst);
+	} else if (lv4 ? !dv4 : (dv4 && w->ctx->cfg.bind_ipv6_only)) {
+		self = false;		/* a family the wildcard leaves out */
+	} else {
+		int r = ip_is_local(&to);
+
+		unsure = r < 0;
+		self = unsure ? connected : r;
+	}
+
+	if (self)
+		pr_info(&w->ctx->lh,
+			"Refused a target that %s this proxy: %s (idx=%u, ca=%s)",
+			unsure ? "may be" : "is",
+			ip_to_str(dst), gcp->idx, ip_to_str(&gcp->client_addr));
+	return self;
 }
 
 bool gwp_sockaddr_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr *b)
@@ -4029,14 +4652,12 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 	} else {
 		/*
 		 * Until the client is pinned nothing can be relayed back, so
-		 * accept only its first datagram, and only from the same IP as
-		 * its TCP control connection (RFC 1928); this keeps an off-path
-		 * source from hijacking the association.
+		 * accept only its first valid datagram, and only from the same
+		 * IP as its TCP control connection (RFC 1928); this keeps an
+		 * off-path source from hijacking the association.
 		 */
 		if (!gwp_sockaddr_ip_eq(src, &gcp->client_addr))
 			return GWP_UDP_DROP;
-		gcp->udp_peer = *src;
-		gcp->udp_pinned = true;
 		client_dgram = true;
 	}
 
@@ -4049,14 +4670,25 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 
 		if (gwp_socks5_udp_parse_hdr(base, n, &dst, &hdr_len))
 			return GWP_UDP_DROP;
-		if (gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen))
-			return GWP_UDP_DROP;	/* domain target: unsupported */
+		/* A source has the relay socket's family: see addr_to_sockaddr. */
+		if (gwp_socks5_addr_to_sockaddr(&dst, src->sa.sa_family, &tsa,
+						&tslen))
+			return GWP_UDP_DROP;	/* no way to reach this target */
 		/*
-		 * --outgoing-family. tsa is v4-mapped for an IPv4 target on this
+		 * --outgoing-family. tsa is v4-mapped for an IPv4 target on a
 		 * dual-stack relay socket, which the predicate accounts for.
 		 */
 		if (!gwp_ctx_outgoing_family_ok(w->ctx, &tsa))
 			return GWP_UDP_DROP;	/* wrong family for this proxy */
+		/*
+		 * Pin only now: a datagram that cannot be relayed whatever the
+		 * rules say must not lock the real client out. The ACL below
+		 * judges the pinned address, so this comes before it.
+		 */
+		if (!gcp->udp_pinned) {
+			gcp->udp_peer = *src;
+			gcp->udp_pinned = true;
+		}
 		if (!udp_target_allowed(w->ctx, gcp, &tsa))
 			return GWP_UDP_DROP;	/* ACL denied this datagram */
 		/* Only a target the client has sent to may answer it. */
@@ -4080,32 +4712,48 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 						     : 3 + 1 + 16 + 2;
 		if (gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen))
 			return GWP_UDP_DROP;
-		/* The relay is dual-stack, so udp_peer is always AF_INET6. */
 		out->buf = base - h;
 		out->len = h + n;
 		out->dst = gcp->udp_peer;
-		out->dstlen = sizeof(gcp->udp_peer.i6);
+		out->dstlen = gcp->udp_peer.sa.sa_family == AF_INET ?
+			      sizeof(gcp->udp_peer.i4) : sizeof(gcp->udp_peer.i6);
 		return GWP_UDP_TO_CLIENT;
 	}
 }
 
-int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
+int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a, int family,
 				struct gwp_sockaddr *sa, socklen_t *slen)
 {
-	/*
-	 * The relay socket is dual-stack AF_INET6, so every target is expressed
-	 * as an IPv6 sockaddr: an IPv4 target becomes its IPv4-mapped form so
-	 * one socket can reach both families.
-	 */
 	memset(sa, 0, sizeof(*sa));
 	switch (a->ver) {
 	case GWP_SOCKS5_ATYP_IPV4:
+		if (family == AF_INET) {
+			sa->i4.sin_family = AF_INET;
+			memcpy(&sa->i4.sin_addr, a->ip4, 4);
+			sa->i4.sin_port = a->port;
+			*slen = sizeof(sa->i4);
+			return 0;
+		}
+		/*
+		 * A dual-stack AF_INET6 relay socket expresses every target as
+		 * an IPv6 sockaddr: an IPv4 target becomes its IPv4-mapped form
+		 * so one socket can reach both families.
+		 */
 		sa->i6.sin6_family = AF_INET6;
 		set_v4mapped(&sa->i6.sin6_addr, a->ip4);
 		sa->i6.sin6_port = a->port;
 		*slen = sizeof(sa->i6);
 		return 0;
 	case GWP_SOCKS5_ATYP_IPV6:
+		if (family == AF_INET) {
+			if (!IN6_IS_ADDR_V4MAPPED((const struct in6_addr *)a->ip6))
+				return -EAFNOSUPPORT;
+			sa->i4.sin_family = AF_INET;
+			memcpy(&sa->i4.sin_addr, a->ip6 + 12, 4);
+			sa->i4.sin_port = a->port;
+			*slen = sizeof(sa->i4);
+			return 0;
+		}
 		sa->i6.sin6_family = AF_INET6;
 		memcpy(&sa->i6.sin6_addr, a->ip6, 16);
 		sa->i6.sin6_port = a->port;
@@ -4118,9 +4766,9 @@ int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
 }
 
 /*
- * Fill a SOCKS5 header address from a UDP reply's source. The relay is
- * dual-stack so the source is AF_INET6; a v4-mapped source is unmapped back to
- * an IPv4 ATYP so the client sees the target it actually addressed.
+ * Fill a SOCKS5 header address from a UDP reply's source. A dual-stack relay
+ * sees a source as AF_INET6; a v4-mapped source is unmapped back to an IPv4 ATYP
+ * so the client sees the target it actually addressed.
  */
 void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 					 struct gwp_socks5_addr *a)
@@ -4142,6 +4790,32 @@ void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 	a->port = src->i6.sin6_port;
 }
 
+/*
+ * Pin the UDP client up front when its request says where it will send from
+ * (RFC 1928: the server MAY use DST.ADDR and DST.PORT to limit access), so that
+ * another port on its IP cannot take the association by sending first. Only a
+ * declared port together with the control connection's own IP counts: a client
+ * that declares another address, or none, may be behind a NAT and have its port
+ * rewritten too, and it would be cut off. Such a client is pinned from its first
+ * valid datagram instead.
+ */
+static void udp_pin_declared(struct gwp_conn_pair *gcp, int family)
+{
+	const struct gwp_socks5_addr *d = &gcp->s5_conn->dst_addr;
+	struct gwp_sockaddr sa;
+	socklen_t slen;
+
+	if (!d->port || gwp_socks5_addr_to_sockaddr(d, family, &sa, &slen))
+		return;
+	if (!gwp_sockaddr_ip_eq(&sa, &gcp->client_addr))
+		return;
+	/* The bytes carry no scope, which a link-local peer needs to be sent to. */
+	if (family == AF_INET6 && gcp->client_addr.sa.sa_family == AF_INET6)
+		sa.i6.sin6_scope_id = gcp->client_addr.i6.sin6_scope_id;
+	gcp->udp_peer = sa;
+	gcp->udp_pinned = true;
+}
+
 int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
@@ -4149,6 +4823,7 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_socks5_addr bnd;
 	struct gwp_sockaddr local, relay;
 	socklen_t slen = sizeof(local);
+	socklen_t relay_len;
 	int fd = -1, r, rep = GWP_SOCKS5_REP_SUCCESS;
 	size_t out_len;
 
@@ -4184,6 +4859,9 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * (getsockname() on the control fd), paired with the relay's ephemeral
 	 * port. Widening the bind to the wildcard does not change the threat
 	 * model: the port is ephemeral and the client is IP-pinned.
+	 *
+	 * A kernel without IPv6 (ipv6.disable=1) has no such socket, and no
+	 * IPv6 targets either: use an IPv4 wildcard socket there.
 	 */
 	r = __sys_getsockname(gcp->client.fd, &local.sa, &slen);
 	if (r < 0) {
@@ -4193,22 +4871,28 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		goto reply;
 	}
 
+	memset(&relay, 0, sizeof(relay));
 	fd = __sys_socket(AF_INET6, type, 0);
+	if (fd == -EAFNOSUPPORT) {
+		fd = __sys_socket(AF_INET, type, 0);
+		relay.i4.sin_family = AF_INET;
+		relay_len = sizeof(relay.i4);
+	} else {
+		relay.i6.sin6_family = AF_INET6;
+		relay_len = sizeof(relay.i6);
+	}
 	if (fd < 0) {
 		pr_err(&ctx->lh, "UDP associate: socket() failed: %s", strerror(-fd));
 		rep = GWP_SOCKS5_REP_FAILURE;
 		goto reply;
 	}
 
-	setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
+	if (relay.sa.sa_family == AF_INET6)
+		setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
 	if (ctx->cfg.mark)
 		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)ctx->cfg.mark);
 
-	memset(&relay, 0, sizeof(relay));
-	relay.i6.sin6_family = AF_INET6;
-	relay.i6.sin6_addr = in6addr_any;
-	relay.i6.sin6_port = 0;
-	r = __sys_bind(fd, &relay.sa, sizeof(relay.i6));
+	r = __sys_bind(fd, &relay.sa, relay_len);
 	if (r < 0) {
 		pr_err(&ctx->lh, "UDP associate: bind() failed: %s", strerror(-r));
 		__sys_close(fd);
@@ -4217,7 +4901,6 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		goto reply;
 	}
 
-	/* BND.ADDR from the control connection, BND.PORT from the relay socket. */
 	slen = sizeof(relay);
 	r = __sys_getsockname(fd, &relay.sa, &slen);
 	if (r < 0) {
@@ -4228,15 +4911,16 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		rep = GWP_SOCKS5_REP_FAILURE;
 		goto reply;
 	}
-	if (local.sa.sa_family == AF_INET) {
-		bnd.ver = GWP_SOCKS5_ATYP_IPV4;
-		memcpy(bnd.ip4, &local.i4.sin_addr, 4);
-	} else {
-		bnd.ver = GWP_SOCKS5_ATYP_IPV6;
-		memcpy(bnd.ip6, &local.i6.sin6_addr, 16);
-	}
-	bnd.port = relay.i6.sin6_port;
+	/*
+	 * BND.ADDR from the control connection, BND.PORT from the relay socket.
+	 * An IPv4 client of a dual-stack listener is told an IPv4 address, not
+	 * the v4-mapped form of it that getsockname() reports.
+	 */
+	gwp_socks5_reply_addr_from_sockaddr(&local, &bnd);
+	bnd.port = relay.sa.sa_family == AF_INET ? relay.i4.sin_port :
+						   relay.i6.sin6_port;
 
+	udp_pin_declared(gcp, relay.sa.sa_family);
 	gcp->udp_fd = fd;
 	pr_info(&ctx->lh,
 		"SOCKS5 UDP ASSOCIATE relay bound (idx=%u, cfd=%d, ufd=%d)",
@@ -4623,16 +5307,20 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	/*
 	 * A forwarding request is rewritten in place, ready to go to the
-	 * origin; any other header is dropped once it has been dealt with.
+	 * origin, in the buffer and the room kept behind it, which from then
+	 * on is simply part of the buffer; any other header is dropped once
+	 * it has been dealt with.
 	 */
 	len = gcp->client.len;
 	r = gwp_http_conn_process(gcp->http_conn, ctx->auth, gcp->client.buf,
-				  &len, gcp->client.cap, &host, &port,
-				  &hdr_len);
-	if (r == GWP_HTTP_FORWARD)
+				  &len, gcp->client.cap + GWP_HTTP_REWRITE_SLACK,
+				  &host, &port, &hdr_len);
+	if (r == GWP_HTTP_FORWARD) {
 		gcp->client.len = (uint32_t)len;
-	else
+		gcp->client.cap += GWP_HTTP_REWRITE_SLACK;
+	} else {
 		gwp_conn_buf_advance(&gcp->client, hdr_len);
+	}
 
 	switch (r) {
 	case GWP_HTTP_NEED_MORE:
@@ -4776,7 +5464,8 @@ static int gwp_ctx_run(struct gwp_ctx *ctx)
 	return (int)(intptr_t)gwp_ctx_thread_entry(&ctx->workers[0]);
 }
 
-static struct gwp_ctx *g_ctx = NULL;
+static struct gwp_ctx *_Atomic g_ctx = NULL;
+static atomic_int g_nr_sig_handlers = 0;
 
 /*
  * Runs on whichever thread the signal lands on, possibly in the middle of a
@@ -4787,12 +5476,39 @@ __cold
 static void sig_handler(int sig)
 {
 	int saved_errno = errno;
+	struct gwp_ctx *ctx;
 
-	if (g_ctx)
-		gwp_ctx_stop(g_ctx);
+	atomic_fetch_add(&g_nr_sig_handlers, 1);
+	ctx = atomic_load(&g_ctx);
+	if (ctx)
+		gwp_ctx_stop(ctx);
+	atomic_fetch_sub(&g_nr_sig_handlers, 1);
 
 	errno = saved_errno;
 	(void)sig;
+}
+
+/*
+ * The context is about to go, and main()'s frame with it, but a signal can
+ * still arrive: timeout(1) sends its SIGTERM twice, and exit() may take a while
+ * yet. Have the handler leave it alone, and wait out one running on another
+ * thread. This thread is the last one left once the context is freed, so keep
+ * the signals pending on it from here on: there is nothing left for them to
+ * stop, and one landing in exit() can upset what runs there, such as the
+ * leak check of a sanitizer build, which stops the process with ptrace.
+ */
+__cold
+static void sig_handler_detach_ctx(void)
+{
+	sigset_t set;
+
+	sigemptyset(&set);
+	sigaddset(&set, SIGINT);
+	sigaddset(&set, SIGTERM);
+	pthread_sigmask(SIG_BLOCK, &set, NULL);
+	atomic_store(&g_ctx, NULL);
+	while (atomic_load(&g_nr_sig_handlers))
+		sched_yield();
 }
 
 static void prepare_rlimit(void)
@@ -4814,13 +5530,47 @@ static void prepare_rlimit(void)
 	}
 }
 
+/*
+ * Give any of fds 0-2 that was closed to /dev/null. The default log target is
+ * fd 1 whatever it has become: left closed, the next descriptor we open takes
+ * its number, and the log lines go to the PID file or a client's socket.
+ */
+__cold
+static int open_std_fds(void)
+{
+	int fd;
+
+	for (fd = 0; fd <= 2; fd++) {
+		if (fcntl(fd, F_GETFD) >= 0 || errno != EBADF)
+			continue;
+		/* The lowest free number, so this one: the lower ones are open. */
+		if (open("/dev/null", O_RDWR) < 0)
+			return -errno;
+	}
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
-	struct sigaction sa = { .sa_handler = &sig_handler };
+	struct sigaction sa = { .sa_handler = SIG_IGN };
 	struct gwp_ctx ctx;
 	int r;
 
 	memset(&ctx, 0, sizeof(ctx));
+	r = open_std_fds();
+	if (r < 0) {
+		fprintf(stderr, "Failed to open /dev/null: %s\n", strerror(-r));
+		goto out;
+	}
+
+	/* Before the first log line: its target may be a pipe nobody reads. */
+	r = sigaction(SIGPIPE, &sa, NULL);
+	if (r < 0) {
+		r = -errno;
+		fprintf(stderr, "Failed to set signal handlers: %s\n", strerror(-r));
+		goto out;
+	}
+
 	r = parse_options(argc, argv, &ctx.cfg);
 	if (r < 0)
 		goto out;
@@ -4830,11 +5580,10 @@ int main(int argc, char *argv[])
 	if (r < 0)
 		goto out;
 
-	g_ctx = &ctx;
+	atomic_store(&g_ctx, &ctx);
+	sa.sa_handler = &sig_handler;
 	r |= sigaction(SIGINT, &sa, NULL);
 	r |= sigaction(SIGTERM, &sa, NULL);
-	sa.sa_handler = SIG_IGN;
-	r |= sigaction(SIGPIPE, &sa, NULL);
 	if (r < 0) {
 		r = -errno;
 		fprintf(stderr, "Failed to set signal handlers: %s\n", strerror(-r));
@@ -4843,7 +5592,11 @@ int main(int argc, char *argv[])
 
 	r = gwp_ctx_run(&ctx);
 out_free:
+	sig_handler_detach_ctx();
 	gwp_ctx_free(&ctx);
+	/* Worker 0 leaves cleanly when another worker's error stopped it. */
+	if (!r)
+		r = ctx.worker_err;
 out:
 	return -r;
 }
