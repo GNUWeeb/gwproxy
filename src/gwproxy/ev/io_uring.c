@@ -522,7 +522,7 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * that as soon as the next candidate joins the race. attempt_addr[] is
 	 * per-slot and stays put for as long as the attempt is in flight.
 	 */
-	if (!ctx->upstream.enabled)
+	if (!gcp->upstream)
 		ca = &gcp->attempt_addr[slot];
 
 	if (ca->sa.sa_family == AF_INET)
@@ -816,7 +816,7 @@ static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return;			/* nothing left to start */
 	if (ctx->cfg.connect_attempt_delay <= 0)
 		return;			/* racing disabled: fall back only */
-	if (ctx->upstream.enabled)
+	if (gcp->upstream)
 		return;			/* one proxy, nothing to race */
 
 	__arm_attempt_timer(w, gcp, ctx->cfg.connect_attempt_delay);
@@ -1792,11 +1792,11 @@ static bool client_send_busy(struct gwp_conn_pair *gcp)
  * Connected to the upstream proxy, but the handshake with it has not begun:
  * finish_target_connect() left that to the completion of a client send.
  */
-static bool upstream_start_held(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static bool upstream_start_held(struct gwp_conn_pair *gcp)
 {
 	int cs = gcp->conn_state;
 
-	return w->ctx->upstream.enabled && gcp->target.fd >= 0 &&
+	return gcp->upstream && gcp->target.fd >= 0 &&
 	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
 }
 
@@ -1895,7 +1895,7 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * also take the request for what is left of the reply. Leave the
 	 * handshake to that completion (handle_ev_client_send()).
 	 */
-	if (w->ctx->upstream.enabled) {
+	if (gcp->upstream) {
 		if (client_send_busy(gcp))
 			return 0;
 		return upstream_iou_start(w, gcp);
@@ -2350,7 +2350,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (gcp->target.len > 0 ||
 		    gwp_ssl_bio_pending(gcp->client.tls) > 0) {
 			send_client_tls(w, gcp);
-		} else if (upstream_start_held(w, gcp)) {
+		} else if (upstream_start_held(gcp)) {
 			return upstream_iou_start(w, gcp);
 		} else if (t->prot_resume) {
 			t->prot_resume = false;
@@ -2380,7 +2380,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	/* The reply is out; the upstream handshake may use target.buf now. */
-	if (upstream_start_held(w, gcp))
+	if (upstream_start_held(gcp))
 		return upstream_iou_start(w, gcp);
 
 	/*
@@ -2508,7 +2508,7 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * -j MARK or -j BIND, which is this candidate's alone: the
 		 * next one may well carry another, or none.
 		 */
-		if (w->ctx->upstream.enabled && !gcp->acl_sockopt.mark_set &&
+		if (gcp->upstream && !gcp->acl_sockopt.mark_set &&
 		    !gcp->acl_sockopt.bind.set)
 			break;
 	}

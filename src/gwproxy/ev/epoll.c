@@ -643,7 +643,7 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * Force the connect-result path so the upstream handshake runs
 	 * (see handle_ev_target_conn_result).
 	 */
-	if (ctx->upstream.enabled)
+	if (gcp->upstream)
 		gcp->is_target_alive = false;
 
 	return register_new_client(w, gcp, EV_BIT_CLIENT);
@@ -1505,7 +1505,7 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
  * ------------------------------------------------------------------------
  * Upstream SOCKS5 proxy client handshake (epoll).
  *
- * When ctx->upstream.enabled, the "target" socket is connected to an upstream
+ * When gcp->upstream is set, the "target" socket is connected to an upstream
  * SOCKS5 proxy rather than the real destination. Before forwarding, we perform
  * the SOCKS5 client handshake on that socket:
  *
@@ -1692,11 +1692,11 @@ static bool client_reply_pending(struct gwp_conn_pair *gcp)
  * Connected to the upstream proxy, but the handshake with it has not begun:
  * upstream_hold() left that until the client has its reply.
  */
-static bool upstream_start_held(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static bool upstream_start_held(struct gwp_conn_pair *gcp)
 {
 	int cs = gcp->conn_state;
 
-	return w->ctx->upstream.enabled && gcp->target.fd >= 0 &&
+	return gcp->upstream && gcp->target.fd >= 0 &&
 	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
 }
 
@@ -1827,7 +1827,6 @@ __hot
 static int handle_ev_target_conn_result(struct gwp_wrk *w,
 					struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
 	int r;
 
 	/*
@@ -1835,7 +1834,7 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 	 * before forwarding; the connect timer is kept to bound it, also while
 	 * the client's reply is still being flushed (upstream_hold()).
 	 */
-	if (ctx->upstream.enabled) {
+	if (gcp->upstream) {
 		if (client_reply_pending(gcp))
 			return upstream_hold(w, gcp);
 		return upstream_start(w, gcp);
@@ -2202,7 +2201,7 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * Held before the upstream handshake, the target is watched only for
 	 * a hangup: the upstream went away before it was spoken to.
 	 */
-	if (unlikely(upstream_start_held(w, gcp)))
+	if (unlikely(upstream_start_held(gcp)))
 		return -ECONNRESET;
 
 	if (unlikely(ev->events & EPOLLERR)) {
@@ -2332,7 +2331,7 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (gwp_in_upstream_hs(gcp))
 		return handle_ev_client_upstream_hs(w, gcp, ev);
 
-	if (unlikely(upstream_start_held(w, gcp)))
+	if (unlikely(upstream_start_held(gcp)))
 		return handle_ev_client_held(w, gcp, ev);
 
 	if (ev->events & (EPOLLIN | EPOLLHUP)) {
@@ -2518,7 +2517,7 @@ static int arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return 0;			/* nothing left to start */
 	if (w->ctx->cfg.connect_attempt_delay <= 0)
 		return 0;			/* racing disabled: fall back only */
-	if (w->ctx->upstream.enabled)
+	if (gcp->upstream)
 		return 0;			/* one proxy, nothing to race */
 
 	ms = w->ctx->cfg.connect_attempt_delay;
@@ -2597,7 +2596,7 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * -j MARK or -j BIND, which is this candidate's alone: the
 		 * next one may well carry another, or none.
 		 */
-		if (w->ctx->upstream.enabled && !gcp->acl_sockopt.mark_set &&
+		if (gcp->upstream && !gcp->acl_sockopt.mark_set &&
 		    !gcp->acl_sockopt.bind.set)
 			break;
 	}
