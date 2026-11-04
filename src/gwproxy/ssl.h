@@ -43,13 +43,21 @@ int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
 			      const char *key_file);
 /*
  * Create a client SSL_CTX for the unit tests. It does NOT verify the peer:
- * any certificate is accepted and no host name is checked or sent. Before
- * anything connects to a real server with it (an https:// upstream proxy,
- * say), it needs SSL_VERIFY_PEER with a trust store, and each connection
- * needs SSL_set1_host() and SSL_set_tlsext_host_name() for the server's
- * name; without them an on-path attacker can read the proxy credentials.
+ * any certificate is accepted and no host name is checked or sent. Anything
+ * that connects to a real server uses gwp_ssl_ctx_client_verify_create();
+ * without verification an on-path attacker can read what is sent to it.
  */
 int gwp_ssl_ctx_client_create(struct gwp_ssl_ctx **out);
+/*
+ * Create a client SSL_CTX that verifies the server's certificate chain
+ * (SSL_VERIFY_PEER) against the CA certificates in @ca_file (PEM), or the
+ * system's default trust store when @ca_file is NULL. Each connection must
+ * also name the server, gwp_ssl_set_peer_name(), for its certificate to be
+ * checked against that name. Returns 0, -ENOMEM, or -EINVAL when @ca_file
+ * cannot be read or holds no certificate (gwp_ssl_errstr() says why).
+ */
+int gwp_ssl_ctx_client_verify_create(struct gwp_ssl_ctx **out,
+				     const char *ca_file);
 void gwp_ssl_ctx_free(struct gwp_ssl_ctx *ctx);
 
 /*
@@ -148,6 +156,25 @@ int gwp_ssl_write(struct gwp_ssl *s, const void *buf, size_t len,
  * queues one, so a caller waiting for the BIO to drain may call it again.
  */
 int gwp_ssl_shutdown(struct gwp_ssl *s);
+
+/*
+ * Name the server a client connection must reach, before its handshake. A DNS
+ * name is sent as SNI, and the certificate must carry it among its DNS names
+ * (no partial wildcards; the subject's CN never counts). With @is_ip, @host is
+ * an IPv4 or IPv6 address literal, which is not sent, and the certificate must
+ * carry it as an IP address. Returns 0, or -EINVAL when @host cannot be used.
+ */
+int gwp_ssl_set_peer_name(struct gwp_ssl *s, const char *host, bool is_ip);
+
+/* Whether the handshake has completed (and so the peer has been verified). */
+bool gwp_ssl_hs_done(struct gwp_ssl *s);
+
+/*
+ * Why the server's certificate was refused, for a handshake that failed in
+ * its verification (gwp_ssl_handshake() returned GWP_SSL_ERROR), or NULL when
+ * it was not refused.
+ */
+const char *gwp_ssl_verify_errstr(struct gwp_ssl *s);
 
 /*
  * Set the client-side ALPN protocol list (@protos in ALPN wire form: each entry
