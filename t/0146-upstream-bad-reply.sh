@@ -6,7 +6,8 @@
 # hangup or a reset get a SOCKS5 client REP 0x01 and an HTTP client a 502, as
 # a refused CONNECT gets REP 0x05 and a 502. A plain forwarding client has no
 # reply to wait for, and must get no bytes at all. Every case ends at once
-# rather than at a timeout.
+# rather than at a timeout. The log names whose fault each failure is: a
+# refused CONNECT the destination's, garbage the upstream's, a 403 nobody's.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -79,6 +80,12 @@ check()
 	esac
 }
 
+# logged <label> <log> <text>: the proxy's log has a line containing <text>.
+logged()
+{
+	grep -qF -- "$3" "$2" || fail "$1: no log line with: $3"
+}
+
 s5_up="$(pick_port)"
 python3 "$SERVERS_DIR/upstream_faults.py" socks5 "$s5_up" "$fault" \
 	>"$WORK/up.s5.log" 2>&1 &
@@ -108,6 +115,11 @@ for loop in epoll io_uring; do
 	done
 	kill "$GWP_PID" 2>/dev/null
 	wait "$GWP_PID" 2>/dev/null
+	log="$WORK/gwp.$pp.log"
+	logged "[$loop] socks5 upstream" "$log" \
+		"Upstream SOCKS5 CONNECT failed (rep=0x05, class=destination,"
+	logged "[$loop] socks5 upstream" "$log" \
+		"Upstream proxy sent a malformed reply (class=upstream,"
 
 	pp="$(pick_port)"
 	gwp_start "127.0.0.1:$pp" --as-socks5=1 --as-http=1 --event-loop="$loop" \
@@ -122,6 +134,11 @@ for loop in epoll io_uring; do
 	done
 	kill "$GWP_PID" 2>/dev/null
 	wait "$GWP_PID" 2>/dev/null
+	log="$WORK/gwp.$pp.log"
+	logged "[$loop] http upstream" "$log" \
+		"Upstream HTTP CONNECT failed (status=403, class=neutral,"
+	logged "[$loop] http upstream" "$log" \
+		"Upstream proxy sent a malformed reply (class=upstream,"
 
 	# A plain forwarding client is owed nothing, and gets nothing.
 	pp="$(pick_port)"

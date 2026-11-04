@@ -9,6 +9,7 @@
 
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
+#include <gwproxy/upstream.h>
 
 /*
  * Upstream proxy chaining: the SOCKS5/HTTP CONNECT handshake this proxy speaks
@@ -28,6 +29,12 @@
  * IPv6 bound address. An HTTP client's is 19 bytes.
  */
 #define UPSTREAM_CLIENT_REPLY_MAX	22
+
+/* The class of a handshake failure, as its log line names it. */
+static const char *fail_class(enum gwp_upstream_end end, int val)
+{
+	return gwp_upstream_fail_class_str(gwp_upstream_fail_classify(end, val));
+}
 
 /*
  * While the reply to a CONNECT is awaited, target.cap leaves this much of the
@@ -155,8 +162,8 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return r ? r : GWP_UPSTREAM_IO_SEND;
 		}
 
-		pr_err(&ctx->lh, "Upstream SOCKS5 proxy selected no acceptable auth method (0x%02x)",
-			method);
+		pr_err(&ctx->lh, "Upstream SOCKS5 proxy selected no acceptable auth method (0x%02x, class=%s)",
+			method, fail_class(GWP_UPSTREAM_END_S5_METHOD, method));
 		return -EACCES;
 	}
 	case CONN_STATE_UPSTREAM_S5_AUTH: {
@@ -168,7 +175,8 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 		gwp_conn_buf_advance(&gcp->target, 2);
 		if (status != 0x00) {
-			pr_err(&ctx->lh, "Upstream SOCKS5 authentication failed (idx=%u)",
+			pr_err(&ctx->lh, "Upstream SOCKS5 authentication failed (status=0x%02x, class=%s, idx=%u)",
+				status, fail_class(GWP_UPSTREAM_END_S5_AUTH, status),
 				gcp->idx);
 			return -EACCES;
 		}
@@ -184,8 +192,9 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return r == -EAGAIN ? GWP_UPSTREAM_IO_RECV : r;
 
 		if (rep != GWP_SOCKS5_REP_SUCCESS) {
-			pr_err(&ctx->lh, "Upstream SOCKS5 CONNECT failed (rep=0x%02x, idx=%u, dst=%s)",
-				rep, gcp->idx, gwp_upstream_dst_str(gcp));
+			pr_err(&ctx->lh, "Upstream SOCKS5 CONNECT failed (rep=0x%02x, class=%s, idx=%u, dst=%s)",
+				rep, fail_class(GWP_UPSTREAM_END_S5_REP, rep),
+				gcp->idx, gwp_upstream_dst_str(gcp));
 			return -ECONNREFUSED;
 		}
 		r = gwp_upstream_splice_reply(w, gcp, consumed);
@@ -210,16 +219,18 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * holds the client until the connect timeout, so fail it now.
 	 */
 	if (r == -EAGAIN && gcp->target.len >= gcp->target.cap) {
-		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT reply header too large (idx=%u, dst=%s)",
-			gcp->idx, gwp_upstream_dst_str(gcp));
+		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT reply header too large (class=%s, idx=%u, dst=%s)",
+			fail_class(GWP_UPSTREAM_END_MALFORMED, 0), gcp->idx,
+			gwp_upstream_dst_str(gcp));
 		return -EMSGSIZE;
 	}
 	if (r)
 		return r == -EAGAIN ? GWP_UPSTREAM_IO_RECV : r;
 
 	if (status < 200 || status >= 300) {
-		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT failed (status=%d, idx=%u, dst=%s)",
-			status, gcp->idx, gwp_upstream_dst_str(gcp));
+		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT failed (status=%d, class=%s, idx=%u, dst=%s)",
+			status, fail_class(GWP_UPSTREAM_END_HTTP, status),
+			gcp->idx, gwp_upstream_dst_str(gcp));
 		return -ECONNREFUSED;
 	}
 	r = gwp_upstream_splice_reply(w, gcp, consumed);
@@ -259,8 +270,9 @@ int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		r = s5_parse(w, gcp);
 
 	if (r == -EINVAL)
-		pr_err(&w->ctx->lh, "Upstream proxy sent a malformed reply (idx=%u, dst=%s)",
-			gcp->idx, gwp_upstream_dst_str(gcp));
+		pr_err(&w->ctx->lh, "Upstream proxy sent a malformed reply (class=%s, idx=%u, dst=%s)",
+			fail_class(GWP_UPSTREAM_END_MALFORMED, 0), gcp->idx,
+			gwp_upstream_dst_str(gcp));
 	return r;
 }
 
