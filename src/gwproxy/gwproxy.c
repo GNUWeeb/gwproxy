@@ -1472,30 +1472,41 @@ static int add_reload_watch(int ino_fd, const char *path)
 }
 
 /*
- * Take the identity of the file @path resolves to now. Beyond a FIFO's or a
- * device's identity nothing is compared: writing to it is not a new version of
- * it. The ctime is what catches a rewrite that restores the mtime, at the price
- * of a harmless reload after a chmod or a new hard link.
+ * The identity of a file as @st describes it, or as missing for the reason
+ * @err (a positive errno; @st is not read then). Beyond a FIFO's or a device's
+ * identity nothing is compared: writing to it is not a new version of it. The
+ * ctime is what catches a rewrite that restores the mtime, at the price of a
+ * harmless reload after a chmod or a new hard link.
  */
+static void gwp_file_id_from_stat(const struct stat *st, int err,
+				  struct gwp_file_id *id)
+{
+	memset(id, 0, sizeof(*id));
+	if (err) {
+		id->err = (uint64_t)err;
+		return;
+	}
+	id->dev = (uint64_t)st->st_dev;
+	id->ino = (uint64_t)st->st_ino;
+	id->mode = (uint64_t)(st->st_mode & S_IFMT);
+	if (!S_ISREG(st->st_mode))
+		return;
+	id->size = (uint64_t)st->st_size;
+	id->mtime_sec = (uint64_t)st->st_mtim.tv_sec;
+	id->mtime_nsec = (uint64_t)st->st_mtim.tv_nsec;
+	id->ctime_sec = (uint64_t)st->st_ctim.tv_sec;
+	id->ctime_nsec = (uint64_t)st->st_ctim.tv_nsec;
+}
+
+/* Take the identity of the file @path resolves to now. */
 static void gwp_file_id_read(const char *path, struct gwp_file_id *id)
 {
 	struct stat st;
 
-	memset(id, 0, sizeof(*id));
-	if (stat(path, &st)) {
-		id->err = (uint64_t)errno;
-		return;
-	}
-	id->dev = (uint64_t)st.st_dev;
-	id->ino = (uint64_t)st.st_ino;
-	id->mode = (uint64_t)(st.st_mode & S_IFMT);
-	if (!S_ISREG(st.st_mode))
-		return;
-	id->size = (uint64_t)st.st_size;
-	id->mtime_sec = (uint64_t)st.st_mtim.tv_sec;
-	id->mtime_nsec = (uint64_t)st.st_mtim.tv_nsec;
-	id->ctime_sec = (uint64_t)st.st_ctim.tv_sec;
-	id->ctime_nsec = (uint64_t)st.st_ctim.tv_nsec;
+	if (stat(path, &st))
+		gwp_file_id_from_stat(NULL, errno, id);
+	else
+		gwp_file_id_from_stat(&st, 0, id);
 }
 
 /* Refresh @id from @path and tell whether it differs from what it was. */
@@ -1508,6 +1519,108 @@ static bool gwp_file_id_changed(const char *path, struct gwp_file_id *id)
 		return false;
 	*id = cur;
 	return true;
+}
+
+static void gwp_acl_files_free(struct gwp_reload_acl_file *v, size_t nr)
+{
+	size_t i;
+
+	for (i = 0; i < nr; i++)
+		free(v[i].path);
+	free(v);
+}
+
+/*
+ * Make ctx->acl_files follow the files of the ACL's last load or reload (see
+ * gwp_acl_file()), which change as includes are added or dropped. A file that
+ * stays keeps its state, and so the identity taken before it was read; so does
+ * a new one, from what the load saw right before reading it. A stat() taken
+ * now could already see a change made since, which would then never be
+ * reloaded, as no watch on a new directory existed yet to report it. With
+ * @watch, a new file's directory gets a watch, and a watch that neither the
+ * new set nor the auth file needs any more is removed. On failure (out of
+ * memory) the set stays as it was.
+ */
+static int gwp_acl_files_sync(struct gwp_ctx *ctx, bool watch)
+{
+	struct gwp_reload_acl_file *old = ctx->acl_files, *nv;
+	size_t nr_old = ctx->nr_acl_files, nr = 0, i, j;
+	struct stat st;
+	ssize_t *from;
+	int r = 0;
+
+	while (gwp_acl_file(ctx->acl, nr))
+		nr++;
+	nv = calloc(nr ? nr : 1, sizeof(*nv));
+	from = calloc(nr ? nr : 1, sizeof(*from));
+	if (!nv || !from) {
+		r = -ENOMEM;
+		goto out;
+	}
+
+	/* Everything that can fail first, so a failure changes nothing. */
+	for (i = 0; i < nr; i++) {
+		const char *path = gwp_acl_file(ctx->acl, i);
+
+		from[i] = -1;
+		for (j = 0; j < nr_old; j++) {
+			if (!strcmp(old[j].path, path)) {
+				from[i] = (ssize_t)j;
+				break;
+			}
+		}
+		if (from[i] >= 0)
+			continue;
+		nv[i].path = strdup(path);
+		if (!nv[i].path) {
+			for (j = 0; j < i; j++)
+				free(nv[j].path);
+			r = -ENOMEM;
+			goto out;
+		}
+	}
+
+	for (i = 0; i < nr; i++) {
+		int sr, wd;
+
+		if (from[i] >= 0) {
+			nv[i] = old[from[i]];
+			old[from[i]].path = NULL;
+			continue;
+		}
+		nv[i].wd = -1;
+		sr = gwp_acl_file_stat(ctx->acl, i, &st);
+		gwp_file_id_from_stat(&st, sr < 0 ? -sr : 0, &nv[i].rf.id);
+		if (!watch)
+			continue;
+		wd = add_reload_watch(ctx->ino_fd, nv[i].path);
+		if (wd < 0)
+			pr_warn(&ctx->lh, "Failed to add inotify watch for '%s', checking it every second only: %s",
+				nv[i].path, strerror(-wd));
+		else
+			nv[i].wd = wd;
+	}
+
+	for (j = 0; watch && j < nr_old; j++) {
+		int wd = old[j].wd;
+
+		if (!old[j].path || wd < 0 || wd == ctx->auth_wd)
+			continue;
+		for (i = 0; i < nr && nv[i].wd != wd; i++)
+			;
+		/* Two dropped files may share one; the second call fails. */
+		if (i == nr)
+			inotify_rm_watch(ctx->ino_fd, wd);
+	}
+
+	gwp_acl_files_free(old, nr_old);
+	ctx->acl_files = nv;
+	ctx->nr_acl_files = nr;
+	nv = NULL;
+out:
+	free(nv);
+	free(from);
+	return r;
 }
 
 /*
@@ -1542,13 +1655,17 @@ static bool gwp_reload_check_file(struct gwp_ctx *ctx, const char *path,
 static unsigned gwp_reload_check(struct gwp_ctx *ctx, uint64_t now)
 {
 	unsigned flags = 0;
+	size_t i;
 
 	if (ctx->auth && gwp_reload_check_file(ctx, ctx->cfg.auth_file,
 					       &ctx->auth_reload, now))
 		flags |= GWP_RELOAD_AUTH;
-	if (ctx->acl_watched && gwp_reload_check_file(ctx, ctx->cfg.acl_file,
-						      &ctx->acl_reload, now))
-		flags |= GWP_RELOAD_ACL;
+	for (i = 0; ctx->acl_watched && i < ctx->nr_acl_files; i++) {
+		struct gwp_reload_acl_file *f = &ctx->acl_files[i];
+
+		if (gwp_reload_check_file(ctx, f->path, &f->rf, now))
+			flags |= GWP_RELOAD_ACL;
+	}
 	return flags;
 }
 
@@ -1593,9 +1710,8 @@ static unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
 				  size_t len)
 {
 	const char *auth = ctx->auth ? ctx->cfg.auth_file : NULL;
-	const char *acl = ctx->acl_watched ? ctx->cfg.acl_file : NULL;
 	unsigned flags = 0;
-	size_t off = 0;
+	size_t off = 0, i;
 
 	while (off + sizeof(struct inotify_event) <= len) {
 		const struct inotify_event *e =
@@ -1614,8 +1730,18 @@ static unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
 			break;
 		if (inotify_names(e, auth))
 			flags |= GWP_RELOAD_AUTH;
-		if (inotify_names(e, acl))
-			flags |= GWP_RELOAD_ACL;
+		for (i = 0; ctx->acl_watched && i < ctx->nr_acl_files; i++) {
+			const struct gwp_reload_acl_file *f = &ctx->acl_files[i];
+
+			/*
+			 * Files of the set can share a basename, so the
+			 * directory the record came from must match too.
+			 */
+			if (e->wd == f->wd && inotify_names(e, f->path)) {
+				flags |= GWP_RELOAD_ACL;
+				break;
+			}
+		}
 		off += rec;
 	}
 	return flags;
@@ -1635,9 +1761,29 @@ static void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 			pr_info(&ctx->lh, "Reloaded authentication file");
 	}
 	if ((flags & GWP_RELOAD_ACL) && ctx->acl_watched) {
-		gwp_reload_begin(ctx->cfg.acl_file, &ctx->acl_reload);
+		bool log_err = false;
+		size_t i;
+		int rs;
+
+		for (i = 0; i < ctx->nr_acl_files; i++)
+			gwp_reload_begin(ctx->acl_files[i].path,
+					 &ctx->acl_files[i].rf);
 		r = gwp_acl_reload(ctx->acl);
-		if (gwp_reload_end(&ctx->acl_reload, r))
+		rs = gwp_acl_files_sync(ctx, true);
+		if (rs)
+			pr_warn(&ctx->lh, "Failed to update the ACL files watched for reload: %s",
+				strerror(-rs));
+		/*
+		 * The set reloads as one, so each file carries its outcome;
+		 * the --acl-file, always the first, says whether to log it.
+		 */
+		for (i = 0; i < ctx->nr_acl_files; i++) {
+			bool e = gwp_reload_end(&ctx->acl_files[i].rf, r);
+
+			if (!i)
+				log_err = e;
+		}
+		if (log_err)
 			pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
 		else if (!r)
 			pr_info(&ctx->lh, "Reloaded ACL file");
@@ -1759,19 +1905,21 @@ static void *gwp_reload_thread(void *arg)
 }
 
 /*
- * One inotify instance watches both the auth file and the ACL file, so when
- * they share a directory each event is read once, not once per store. The
- * reload thread polls it. Leaves ino_fd at -1 and starts no thread when
- * neither file is configured.
+ * One inotify instance watches the auth file and the files of the ACL (the
+ * --acl-file and those it includes), so when they share a directory each
+ * event is read once, not once per file. The reload thread polls it. Leaves
+ * ino_fd at -1 and starts no thread when neither file is configured.
  */
 static int gwp_ctx_init_reload(struct gwp_ctx *ctx)
 {
 	struct gwp_cfg *cfg = &ctx->cfg;
 	sigset_t all, old;
+	size_t i;
 	int r;
 
 	ctx->ino_fd = -1;
 	ctx->reload_efd = -1;
+	ctx->auth_wd = -1;
 	ctx->reload_running = false;
 	if (!ctx->auth && !ctx->acl_watched)
 		return 0;
@@ -1794,17 +1942,21 @@ static int gwp_ctx_init_reload(struct gwp_ctx *ctx)
 		}
 		pr_dbg(&ctx->lh, "Inotify watch added for '%s' (wd=%d)",
 			cfg->auth_file, r);
+		ctx->auth_wd = r;
 	}
 
-	if (ctx->acl_watched) {
-		r = add_reload_watch(ctx->ino_fd, cfg->acl_file);
+	for (i = 0; ctx->acl_watched && i < ctx->nr_acl_files; i++) {
+		struct gwp_reload_acl_file *f = &ctx->acl_files[i];
+
+		r = add_reload_watch(ctx->ino_fd, f->path);
 		if (r < 0) {
 			pr_err(&ctx->lh, "Failed to add inotify watch for '%s': %s",
-				cfg->acl_file, strerror(-r));
+				f->path, strerror(-r));
 			goto out_err;
 		}
 		pr_dbg(&ctx->lh, "Inotify watch added for '%s' (wd=%d)",
-			cfg->acl_file, r);
+			f->path, r);
+		f->wd = r;
 	}
 
 	r = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -1839,6 +1991,9 @@ out_err:
 	}
 	__sys_close(ctx->ino_fd);
 	ctx->ino_fd = -1;
+	ctx->auth_wd = -1;
+	for (i = 0; i < ctx->nr_acl_files; i++)
+		ctx->acl_files[i].wd = -1;
 	return r;
 }
 
@@ -1989,11 +2144,11 @@ static const char gwp_acl_default_rules[] =
 
 /*
  * Load the ACL rule file (--acl-file); gwp_ctx_init_reload() then watches it
- * so it is hot-reloaded, like the auth store. Unlike auth (prot-only), the ACL
- * is global to every proxy mode, so this is initialised from gwp_ctx_init()
- * regardless of SOCKS5/HTTP/transparent/plain forwarding. With no file it
- * applies the built-in default ACL (not watched), unless --acl-allow-all
- * leaves it disabled (NULL).
+ * and the files it includes, so it is hot-reloaded, like the auth store.
+ * Unlike auth (prot-only), the ACL is global to every proxy mode, so this is
+ * initialised from gwp_ctx_init() regardless of SOCKS5/HTTP/transparent/plain
+ * forwarding. With no file it applies the built-in default ACL (not watched),
+ * unless --acl-allow-all leaves it disabled (NULL).
  */
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 {
@@ -2002,6 +2157,8 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 
 	ctx->acl = NULL;
 	ctx->acl_watched = false;
+	ctx->acl_files = NULL;
+	ctx->nr_acl_files = 0;
 
 	if (!cfg->acl_file || !*cfg->acl_file) {
 		if (cfg->acl_allow_all) {
@@ -2022,18 +2179,44 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 		return 0;
 	}
 
-	/* Before the load: a change made after it must differ from this. */
-	gwp_file_id_read(cfg->acl_file, &ctx->acl_reload.id);
+	/*
+	 * Before the load: a change made after it must differ from this. The
+	 * files it includes are only known after it; theirs is taken then.
+	 */
+	ctx->acl_files = calloc(1, sizeof(*ctx->acl_files));
+	if (!ctx->acl_files)
+		return -ENOMEM;
+	ctx->acl_files[0].path = strdup(cfg->acl_file);
+	if (!ctx->acl_files[0].path) {
+		r = -ENOMEM;
+		goto out_err;
+	}
+	ctx->acl_files[0].wd = -1;
+	ctx->nr_acl_files = 1;
+	gwp_file_id_read(cfg->acl_file, &ctx->acl_files[0].rf.id);
+
 	r = gwp_acl_create(&ctx->acl, cfg->acl_file);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to load ACL file '%s': %s",
 			cfg->acl_file, strerror(-r));
-		return r;
+		goto out_err;
+	}
+	r = gwp_acl_files_sync(ctx, false);
+	if (r < 0) {
+		gwp_acl_destroy(ctx->acl);
+		ctx->acl = NULL;
+		goto out_err;
 	}
 
 	ctx->acl_watched = true;
 	pr_info(&ctx->lh, "Loaded ACL file '%s'", cfg->acl_file);
 	return 0;
+
+out_err:
+	gwp_acl_files_free(ctx->acl_files, ctx->nr_acl_files);
+	ctx->acl_files = NULL;
+	ctx->nr_acl_files = 0;
+	return r;
 }
 
 static void gwp_ctx_free_acl(struct gwp_ctx *ctx)
@@ -2041,6 +2224,9 @@ static void gwp_ctx_free_acl(struct gwp_ctx *ctx)
 	gwp_acl_destroy(ctx->acl);
 	ctx->acl = NULL;
 	ctx->acl_watched = false;
+	gwp_acl_files_free(ctx->acl_files, ctx->nr_acl_files);
+	ctx->acl_files = NULL;
+	ctx->nr_acl_files = 0;
 }
 
 /*

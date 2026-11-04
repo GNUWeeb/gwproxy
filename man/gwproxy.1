@@ -309,7 +309,12 @@ included, must be a regular file (a FIFO or a device is refused rather than
 waited on) and is held to the same checks (not empty, no NUL byte, not changed
 while read, no malformed line), and
 the set loads whole or not at all: any failure refuses it at startup, or keeps
-the previous rules on reload.
+the previous rules on reload. Every file of the set is watched like the
+.B \-\-acl\-file
+itself, and a change to any of them reloads the whole set. The watched files
+follow the include lines: a file named by a new line is watched from that
+reload on, even while it is still missing (create it and the set reloads), and
+one whose line is gone no longer is.
 .IP \(bu 3
 .BI "\-A " "chain [matches] " "\fB\-j\fR " target
 \(em append a rule. Matches, each negatable with a leading

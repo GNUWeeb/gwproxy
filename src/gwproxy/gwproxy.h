@@ -874,6 +874,17 @@ struct gwp_reload_file {
 	bool			retry;
 };
 
+/*
+ * One file of the ACL rule set (the --acl-file or a file it includes), as the
+ * reload thread watches it. @wd: the inotify watch on its directory, -1 when
+ * there is none (the periodic check still covers it).
+ */
+struct gwp_reload_acl_file {
+	char			*path;
+	int			wd;
+	struct gwp_reload_file	rf;
+};
+
 struct gwp_ctx {
 	/*
 	 * Set from the signal handler and from any worker that exits, read by
@@ -913,16 +924,19 @@ struct gwp_ctx {
 	 * parent directories, see add_reload_watch()); -1 when neither is
 	 * configured. @reload_thread polls it and reloads the files, off the
 	 * workers; @reload_efd tells it to exit. @reload_running: the thread
-	 * was started and still needs a join. @auth_reload, @acl_reload: the
-	 * state of each file's periodic check; owned by the thread once it
-	 * runs.
+	 * was started and still needs a join. @auth_reload, @acl_files: the
+	 * state of each file's periodic check, the ACL's for each file of its
+	 * set (see gwp_acl_file()); owned by the thread once it runs.
+	 * @auth_wd: the watch on the auth file's directory, -1 when none.
 	 */
 	int				ino_fd;
 	int				reload_efd;
+	int				auth_wd;
 	pthread_t			reload_thread;
 	bool				reload_running;
 	struct gwp_reload_file		auth_reload;
-	struct gwp_reload_file		acl_reload;
+	struct gwp_reload_acl_file	*acl_files;
+	size_t				nr_acl_files;
 	/* ACL rule store. Global to all proxy modes, unlike @auth which is
 	 * prot-only. @acl_watched: loaded from --acl-file (so reloadable),
 	 * not the built-in default rules. */
