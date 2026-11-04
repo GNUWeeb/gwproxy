@@ -101,9 +101,9 @@ int gwp_upstream_splice_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 }
 
 /* Build the SOCKS5 user/pass auth request; advance to the AUTH-reply state. */
-static int build_userpass(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int build_userpass(struct gwp_conn_pair *gcp)
 {
-	struct gwp_upstream *up = &w->ctx->upstream;
+	struct gwp_upstream *up = gcp->upstream;
 	size_t len = gcp->target.cap;
 	int r;
 
@@ -157,8 +157,8 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			r = build_connect(gcp);
 			return r ? r : GWP_UPSTREAM_IO_SEND;
 		}
-		if (method == 0x02 && ctx->upstream.has_auth) {
-			r = build_userpass(w, gcp);
+		if (method == 0x02 && gcp->upstream->has_auth) {
+			r = build_userpass(gcp);
 			return r ? r : GWP_UPSTREAM_IO_SEND;
 		}
 
@@ -289,7 +289,7 @@ static int s5_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return r;
 	}
 
-	r = gwp_socks5_cli_build_greeting(ctx->upstream.has_auth,
+	r = gwp_socks5_cli_build_greeting(gcp->upstream->has_auth,
 					  gcp->target.buf, &len);
 	if (unlikely(r))
 		return r;
@@ -304,7 +304,7 @@ static int s5_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 static int http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_upstream *up = &w->ctx->upstream;
+	struct gwp_upstream *up = gcp->upstream;
 	char authority[300];
 	size_t len = 0;
 	int r;
@@ -339,7 +339,7 @@ static int http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	if (w->ctx->upstream.type == GWP_UPSTREAM_HTTP)
+	if (gcp->upstream->type == GWP_UPSTREAM_HTTP)
 		return http_start(w, gcp);
 	return s5_start(w, gcp);
 }

@@ -1229,6 +1229,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		gwp_conn_pair_drop_dns(w, gcp);
 		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
 		free(gcp->udp_peers);
+		gwp_conn_set_upstream(gcp, NULL);
 
 		/*
 		 * s5_conn and http_conn share a union, so the protocol object
@@ -2457,7 +2458,7 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 	 * up_dst is still unset here (ver == 0) and is finalised from the
 	 * (already rewritten) target_addr after the upstream connects.
 	 */
-	if (dnat && ctx->upstream.enabled && gcp->up_dst.ver != 0) {
+	if (dnat && gcp->upstream && gcp->up_dst.ver != 0) {
 		__be16 orig_port = gcp->up_dst.port;
 
 		upstream_dst_from_sockaddr(&gcp->target_addr, &gcp->up_dst);
@@ -2666,7 +2667,6 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 	uint16_t def_port;
 	bool has_port;
 	size_t n;
-	int r;
 
 	memset(up, 0, sizeof(*up));
 
@@ -2740,12 +2740,7 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 		has_port = strchr(host, ':') != NULL;
 	}
 
-	r = convert_str_to_ssaddr(host, &up->addr, has_port ? 0 : def_port);
-	if (r)
-		return r;
-
-	up->enabled = true;
-	return 0;
+	return convert_str_to_ssaddr(host, &up->addr, has_port ? 0 : def_port);
 }
 
 /*
@@ -2906,6 +2901,144 @@ static void gwp_ctx_free_tls(struct gwp_ctx *ctx)
 }
 #endif /* CONFIG_HTTPS */
 
+/*
+ * --upstream-proxy and --upstream-proxy-auth-file: build the default upstream
+ * pool, of the one server they name. The pool owns that server's first
+ * reference; every connection through it takes one more.
+ */
+__cold
+static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
+{
+	struct gwp_upstream_pool *pool = &ctx->upstream_pool;
+	const char *url = ctx->cfg.upstream_proxy;
+	struct gwp_upstream *up;
+	size_t off, len;
+	int r;
+
+	if (!url)
+		return 0;
+
+	up = calloc(1, sizeof(*up));
+	if (!up)
+		return -ENOMEM;
+	pool->srv = calloc(1, sizeof(*pool->srv));
+	if (!pool->srv) {
+		free(up);
+		return -ENOMEM;
+	}
+
+	r = gwp_parse_upstream(url, up);
+	if (r) {
+		/* Name the URL, but never its password. */
+		if (!upstream_pass_span(url, &off, &len)) {
+			off = strlen(url);
+			len = 0;
+		}
+		pr_err(&ctx->lh, "Invalid --upstream-proxy value '%.*s%s%s'",
+		       (int)off, url, len ? "***" : "", url + off + len);
+		goto out_free;
+	}
+	if (ctx->cfg.upstream_auth_file) {
+		const char *path = ctx->cfg.upstream_auth_file;
+
+		/* Two sources for one secret: refuse to guess. */
+		if (up->has_auth) {
+			pr_err(&ctx->lh, "--upstream-proxy carries credentials and --upstream-proxy-auth-file is given; use one of them");
+			r = -EINVAL;
+			goto out_free;
+		}
+		r = upstream_read_auth(path, up);
+		if (r == -EINVAL) {
+			pr_err(&ctx->lh, "Invalid --upstream-proxy-auth-file '%s': want one line of user:password, each 1..255 bytes (password may be empty)",
+			       path);
+			goto out_free;
+		} else if (r) {
+			pr_err(&ctx->lh, "Cannot read --upstream-proxy-auth-file '%s': %s",
+			       path, strerror(-r));
+			goto out_free;
+		}
+	}
+	if (up->use_tls) {
+		pr_err(&ctx->lh, "An https:// (TLS) upstream proxy is not supported yet; use http:// or socks5[h]://");
+		r = -ENOTSUP;
+		goto out_free;
+	}
+	/*
+	 * The upstream proxy is itself an outgoing connection, so it is
+	 * subject to --outgoing-family. Catching it here turns what
+	 * would be an every-connection failure into one startup error.
+	 */
+	if (!gwp_ctx_outgoing_family_ok(ctx, &up->addr)) {
+		pr_err(&ctx->lh, "--upstream-proxy address %s is not allowed by --outgoing-family",
+		       ip_to_str(&up->addr));
+		r = -EAFNOSUPPORT;
+		goto out_free;
+	}
+	pr_info(&ctx->lh, "Routing outgoing connections via upstream %s proxy %s (%s DNS)",
+		up->type == GWP_UPSTREAM_HTTP ? "HTTP" : "SOCKS5",
+		ip_to_str(&up->addr),
+		up->remote_dns ? "remote" : "local");
+
+	atomic_init(&up->refcnt, 1);
+	pool->srv[0] = up;
+	pool->nr = 1;
+	return 0;
+
+out_free:
+	explicit_bzero(up, sizeof(*up));
+	free(up);
+	free(pool->srv);
+	pool->srv = NULL;
+	return r;
+}
+
+/*
+ * Drop the default pool's servers, after the workers and so every connection
+ * are gone: each server should be down to the pool's own reference by now.
+ * Anything else is a reference a connection teardown failed to drop (or
+ * dropped twice), which would leak (or free early) a server once pools come
+ * and go on an ACL reload; say so.
+ */
+__cold
+static void gwp_ctx_free_upstream(struct gwp_ctx *ctx)
+{
+	struct gwp_upstream_pool *pool = &ctx->upstream_pool;
+	uint32_t i, refs;
+
+	for (i = 0; i < pool->nr; i++) {
+		struct gwp_upstream *up = pool->srv[i];
+
+		refs = atomic_load_explicit(&up->refcnt, memory_order_acquire);
+		if (refs != 1)
+			pr_err(&ctx->lh, "BUG: upstream proxy %s has %u references left at exit, want 1",
+			       ip_to_str(&up->addr), refs);
+		else
+			pr_dbg(&ctx->lh, "Upstream proxy %s: all connection references dropped",
+			       ip_to_str(&up->addr));
+		gwp_upstream_put(up);
+	}
+	free(pool->srv);
+	pool->srv = NULL;
+	pool->nr = 0;
+}
+
+void gwp_upstream_put(struct gwp_upstream *up)
+{
+	if (atomic_fetch_sub_explicit(&up->refcnt, 1, memory_order_acq_rel) != 1)
+		return;
+	explicit_bzero(up, sizeof(*up));
+	free(up);
+}
+
+void gwp_conn_set_upstream(struct gwp_conn_pair *gcp, struct gwp_upstream *up)
+{
+	if (up)
+		gwp_upstream_get(up);
+	if (gcp->upstream)
+		gwp_upstream_put(gcp->upstream);
+	gcp->upstream = up;
+}
+
 __cold
 static int gwp_ctx_init(struct gwp_ctx *ctx)
 {
@@ -2934,62 +3067,9 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (r < 0)
 		goto out_free_log;
 
-	if (ctx->cfg.upstream_proxy) {
-		const char *url = ctx->cfg.upstream_proxy;
-		size_t off, len;
-
-		r = gwp_parse_upstream(url, &ctx->upstream);
-		if (r) {
-			/* Name the URL, but never its password. */
-			if (!upstream_pass_span(url, &off, &len)) {
-				off = strlen(url);
-				len = 0;
-			}
-			pr_err(&ctx->lh, "Invalid --upstream-proxy value '%.*s%s%s'",
-			       (int)off, url, len ? "***" : "", url + off + len);
-			goto out_free_log;
-		}
-		if (ctx->cfg.upstream_auth_file) {
-			const char *path = ctx->cfg.upstream_auth_file;
-
-			/* Two sources for one secret: refuse to guess. */
-			if (ctx->upstream.has_auth) {
-				pr_err(&ctx->lh, "--upstream-proxy carries credentials and --upstream-proxy-auth-file is given; use one of them");
-				r = -EINVAL;
-				goto out_free_log;
-			}
-			r = upstream_read_auth(path, &ctx->upstream);
-			if (r == -EINVAL) {
-				pr_err(&ctx->lh, "Invalid --upstream-proxy-auth-file '%s': want one line of user:password, each 1..255 bytes (password may be empty)",
-				       path);
-				goto out_free_log;
-			} else if (r) {
-				pr_err(&ctx->lh, "Cannot read --upstream-proxy-auth-file '%s': %s",
-				       path, strerror(-r));
-				goto out_free_log;
-			}
-		}
-		if (ctx->upstream.use_tls) {
-			pr_err(&ctx->lh, "An https:// (TLS) upstream proxy is not supported yet; use http:// or socks5[h]://");
-			r = -ENOTSUP;
-			goto out_free_log;
-		}
-		/*
-		 * The upstream proxy is itself an outgoing connection, so it is
-		 * subject to --outgoing-family. Catching it here turns what
-		 * would be an every-connection failure into one startup error.
-		 */
-		if (!gwp_ctx_outgoing_family_ok(ctx, &ctx->upstream.addr)) {
-			pr_err(&ctx->lh, "--upstream-proxy address %s is not allowed by --outgoing-family",
-			       ip_to_str(&ctx->upstream.addr));
-			r = -EAFNOSUPPORT;
-			goto out_free_log;
-		}
-		pr_info(&ctx->lh, "Routing outgoing connections via upstream %s proxy %s (%s DNS)",
-			ctx->upstream.type == GWP_UPSTREAM_HTTP ? "HTTP" : "SOCKS5",
-			ip_to_str(&ctx->upstream.addr),
-			ctx->upstream.remote_dns ? "remote" : "local");
-	}
+	r = gwp_ctx_init_upstream(ctx);
+	if (r < 0)
+		goto out_free_log;
 
 	/*
 	 * A transparent proxy takes the target from SO_ORIGINAL_DST per
@@ -3003,7 +3083,8 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 		 * we must not resolve --target locally; keep a hostname to hand
 		 * to the proxy later.
 		 */
-		if (ctx->upstream.enabled && ctx->upstream.remote_dns)
+		if (ctx->upstream_pool.nr &&
+		    ctx->upstream_pool.srv[0]->remote_dns)
 			r = upstream_target_init(ctx);
 		else
 			r = convert_str_to_ssaddr(t, &ctx->target_addr, 0);
@@ -3077,6 +3158,7 @@ out_free_tls:
 	gwp_ctx_free_tls(ctx);
 out_free_log:
 	gwp_ctx_free_pid_file(ctx);
+	gwp_ctx_free_upstream(ctx);
 	gwp_ctx_free_log(ctx);
 	return r;
 }
@@ -3100,6 +3182,7 @@ static void gwp_ctx_free(struct gwp_ctx *ctx)
 	gwp_ctx_free_prot(ctx);
 	gwp_ctx_free_tls(ctx);
 	gwp_ctx_free_pid_file(ctx);
+	gwp_ctx_free_upstream(ctx);
 	gwp_ctx_free_log(ctx);
 }
 
@@ -3210,6 +3293,9 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 	gcs->pairs[gcs->nr++] = gcp;
 	gcp->flags = 0;
 	gcp->prot_type = GWP_PROT_TYPE_NONE;
+	/* Every connection goes through the default pool, when there is one. */
+	if (ctx->upstream_pool.nr)
+		gwp_conn_set_upstream(gcp, ctx->upstream_pool.srv[0]);
 	return gcp;
 
 out_free_target_conn:
@@ -3289,6 +3375,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		__sys_close(gcp->udp_fd);
 	gwp_conn_close_attempts(gcp);
 	free(gcp->udp_peers);
+	gwp_conn_set_upstream(gcp, NULL);
 
 	gwp_conn_pair_drop_dns(w, gcp);
 
@@ -4116,7 +4203,7 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	 * socks5h://: don't resolve locally; hand the hostname to the upstream
 	 * proxy. up_dst carries the domain and we're ready to connect.
 	 */
-	if (ctx->upstream.enabled && ctx->upstream.remote_dns) {
+	if (gcp->upstream && gcp->upstream->remote_dns) {
 		struct gwp_sockaddr sa;
 
 		if (!port)
@@ -4387,7 +4474,7 @@ int gwp_conn_dial_addr(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 {
 	int fam = gcp->target_addr.sa.sa_family;
 
-	if (!ctx->upstream.enabled) {
+	if (!gcp->upstream) {
 		*addr = &gcp->target_addr;
 		return 0;
 	}
@@ -4407,7 +4494,7 @@ int gwp_conn_dial_addr(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		return -EAFNOSUPPORT;
 	}
 
-	*addr = &ctx->upstream.addr;
+	*addr = &gcp->upstream->addr;
 	return 0;
 }
 
@@ -4599,8 +4686,8 @@ bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
 	const uint8_t *lip, *dip;
 	bool lv4, dv4, self, unsure = false;
 
-	if (w->ctx->upstream.enabled)
-		dst = &w->ctx->upstream.addr;
+	if (gcp->upstream)
+		dst = &gcp->upstream->addr;
 	if (sa_port_h(dst) != sa_port_h(lst))
 		return false;
 
@@ -4833,7 +4920,7 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * implemented. Binding a local relay here would silently bypass the
 	 * configured chain, so refuse the command instead.
 	 */
-	if (ctx->upstream.enabled) {
+	if (gcp->upstream) {
 		rep = GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED;
 		goto reply;
 	}

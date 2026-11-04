@@ -123,14 +123,17 @@ enum {
 };
 
 /*
- * Parsed form of the --upstream-proxy option. When @enabled, every outgoing
- * connection is routed through this upstream proxy instead of being connected
- * to directly. The URL scheme picks @type (socks5[h]:// vs http[s]://) and, for
- * HTTP, whether the hop to the proxy is TLS (@use_tls, https://). Populated once
- * at startup and shared read-only by all workers.
+ * One upstream proxy server, parsed from a URL such as --upstream-proxy's. A
+ * connection that chains through it holds a reference (gwp_conn_pair::upstream)
+ * and dials it instead of its target. The URL scheme picks @type (socks5[h]://
+ * vs http[s]://) and, for HTTP, whether the hop to the proxy is TLS (@use_tls,
+ * https://). Read-only once set up and shared by all workers; @refcnt keeps it
+ * alive for as long as a pool or a connection still uses it, so a pool can go
+ * away (an ACL reload) while connections through its servers carry on. Freed
+ * by the gwp_upstream_put() that drops the last reference.
  */
 struct gwp_upstream {
-	bool			enabled;
+	_Atomic(uint32_t)	refcnt;
 	uint8_t			type;		/* GWP_UPSTREAM_SOCKS5 / HTTP */
 	bool			remote_dns;	/* socks5h:// (proxy resolves) */
 	bool			use_tls;	/* https:// (TLS to the proxy) */
@@ -143,6 +146,24 @@ struct gwp_upstream {
 };
 
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up);
+
+/*
+ * A set of upstream servers to pick from. --upstream-proxy makes the default
+ * pool (gwp_ctx::upstream_pool), of one server; @nr is 0 when there is none,
+ * and connections then go direct. The pool holds a reference to each server.
+ */
+struct gwp_upstream_pool {
+	uint32_t		nr;
+	struct gwp_upstream	**srv;
+};
+
+static inline struct gwp_upstream *gwp_upstream_get(struct gwp_upstream *up)
+{
+	atomic_fetch_add_explicit(&up->refcnt, 1, memory_order_relaxed);
+	return up;
+}
+
+void gwp_upstream_put(struct gwp_upstream *up);
 
 /*
  * How many of a name's addresses one connection may try. The resolver can hand
@@ -520,6 +541,12 @@ struct gwp_conn_pair {
 	struct gwp_udp_peers	*udp_peers;
 	/* The next pair on the epoll loop's list of pairs to free (@dead). */
 	struct gwp_conn_pair	*next_dead;
+	/*
+	 * The upstream proxy this pair chains through, NULL to connect
+	 * direct. Holds a reference, dropped when the pair is freed; set it
+	 * with gwp_conn_set_upstream().
+	 */
+	struct gwp_upstream	*upstream;
 
 	/*
 	 * The hostname the client asked for, when it used a domain target
@@ -603,7 +630,7 @@ struct gwp_conn_pair {
 
 	/*
 	 * Destination requested from the upstream SOCKS5 proxy. Only used
-	 * when ctx->upstream.enabled. For socks5:// this is filled from
+	 * when @upstream is set. For socks5:// this is filled from
 	 * target_addr (an IP); for socks5h:// it carries the hostname.
 	 *
 	 * This is the single largest member (262 bytes, mostly the 256-byte
@@ -896,7 +923,8 @@ struct gwp_ctx {
 	struct gwp_auth			*auth;
 	struct gwp_ssl_ctx		*ssl_ctx;
 	struct gwp_dns_ctx		*dns;
-	struct gwp_upstream		upstream;
+	/* --upstream-proxy; see struct gwp_upstream_pool. */
+	struct gwp_upstream_pool	upstream_pool;
 	/*
 	 * Parsed --bind-source/--bind-iface: the source pin applied to every
 	 * outgoing connection that no ACL -j BIND rule claimed. Built once at
@@ -941,6 +969,8 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w);
 bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+/* Make @gcp chain through @up (NULL: go direct), dropping what it had. */
+void gwp_conn_set_upstream(struct gwp_conn_pair *gcp, struct gwp_upstream *up);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
