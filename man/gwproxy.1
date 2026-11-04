@@ -904,13 +904,18 @@ selects the proxy type:
 .BR socks5://[user:pass@]host:port ,
 a SOCKS5 proxy that resolves target hostnames locally;
 .BR socks5h://[user:pass@]host:port ,
-a SOCKS5 proxy that resolves them itself; or
+a SOCKS5 proxy that resolves them itself;
 .BR http://[user:pass@]host:port ,
-an HTTP proxy reached with an HTTP CONNECT request. Optional
+an HTTP proxy reached with an HTTP CONNECT request; or
+.BR https://[user:pass@]host:port ,
+the same over TLS, which needs a build with OpenSSL support (see
+.B UPSTREAM CHAINING
+for what is verified). The host may be a name or an IP address literal, an
+IPv6 one in brackets. Optional
 .B user:pass
 supplies username/password authentication to the upstream (RFC\ 1929 for
-SOCKS5, HTTP Basic for HTTP). The port defaults to 1080 for SOCKS5 and 8080
-for HTTP.
+SOCKS5, HTTP Basic for HTTP and HTTPS). The port defaults to 1080 for SOCKS5
+and 8080 for HTTP and HTTPS.
 gwproxy overwrites the password in its command line with
 .B ***
 as soon as it has read it, but other local users can still catch it there in
@@ -935,6 +940,17 @@ password may contain any character except a line break, including
 and
 .BR : .
 The URL must not carry credentials of its own when this option is given.
+.TP
+.BR \-\-upstream\-ca\-file=\fIfile\fR
+Verify an
+.B https://
+upstream proxy's certificate against the CA certificates in
+.I file
+(PEM, one or more) instead of the system's default trust store. Needs an
+.B https://
+.BR \-\-upstream\-proxy ;
+a file that cannot be read or holds no certificate is an error at startup.
+Only in builds with OpenSSL support.
 .SS Networking
 .TP
 .BR \-M ", " \-\-mark=\fInr\fR
@@ -1274,9 +1290,7 @@ defers name resolution to the upstream proxy. An
 .B http://
 upstream is reached with an HTTP CONNECT request, which likewise resolves the
 host at the proxy. Credentials embedded in the URL authenticate to the upstream.
-An
-.B https://
-upstream (TLS to the proxy) is not supported yet. In transparent mode the
+In transparent mode the
 upstream, of any type, is asked for the connection's original destination
 address.
 .PP
@@ -1299,6 +1313,51 @@ unless a
 to an address replaces it. A
 .B \-\-target
 that is not a valid hostname or address with a port is refused at startup.
+.PP
+An
+.B https://
+upstream is an HTTP proxy reached over TLS: the HTTP CONNECT request, its
+credentials and the tunnel behind it all go through the TLS session, on
+both event loops. Nothing is sent to the proxy before the TLS handshake has
+completed and its certificate has been verified. The certificate chain must
+lead to a CA in the system's default trust store (OpenSSL's, which honours
+the
+.B SSL_CERT_FILE
+and
+.B SSL_CERT_DIR
+environment variables) or, with
+.BR \-\-upstream\-ca\-file ,
+to one in that file, and the certificate must be valid at the time. It must
+also be the URL's host's: a name must be among the certificate's DNS names
+(a wildcard covers one whole label at most; the subject's common name does
+not count), and is sent as the TLS server
+name (SNI); an IP address literal must be among its IP addresses, and is not
+sent as SNI. TLS 1.2 is the oldest version accepted. A handshake that fails,
+or a certificate that is refused, fails the connection as any other upstream
+failure does (SOCKS5 reply 0x01, HTTP 502 to the client) and is logged with
+the reason, for example
+.IR "certificate verify failed: hostname mismatch" .
+.PP
+The end of the upstream's stream reaches the client as a normal end of stream
+only if it is one, as for a TLS client in the other direction (see
+.BR "TLS TERMINATION" ).
+Once the tunnel through an
+.B https://
+upstream is up, the client's connection is reset (TCP RST) rather than closed
+whenever the pair goes down before the client's side was shut after a whole
+stream: when the upstream's stream is cut (a record that fails to verify, a
+fatal alert, a reset, a stream that stops in the middle of a record), and
+equally on any other teardown, including
+.B \-\-idle\-timeout
+and gwproxy shutting down. A tunnel that fails before it is up, and a 502
+gwproxy sends in place of an unusable response to a forwarded request, end
+with a normal close. When the client is done sending, the upstream is sent a
+.B close_notify
+before the TCP FIN. A TLS client
+.RB ( \-\-tls\-cert )
+may chain through an
+.B https://
+upstream; each side has its own TLS session.
 .SH TARGET ADDRESS SELECTION
 A hostname target of a SOCKS5 or HTTP request usually resolves to several
 addresses, and gwproxy tries them as a list of candidates rather than
@@ -1506,6 +1565,15 @@ Chain every outgoing connection through an upstream proxy (SOCKS5 or HTTP):
 .EX
 gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \\
     \-\-upstream\-proxy=socks5h://user:pass@1.2.3.4:1080
+.EE
+.RE
+.PP
+The same through an HTTPS proxy, whose certificate a private CA issued:
+.RS 4
+.EX
+gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \\
+    \-\-upstream\-proxy=https://user:pass@proxy.example.net:3129 \\
+    \-\-upstream\-ca\-file=/etc/gwproxy/proxy\-ca.pem
 .EE
 .RE
 .PP

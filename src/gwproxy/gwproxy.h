@@ -113,6 +113,8 @@ struct gwp_cfg {
 	bool		as_transparent;
 	const char	*tls_cert;
 	const char	*tls_key;
+	/* CA certificates to verify an https:// upstream proxy with. */
+	const char	*upstream_ca_file;
 };
 
 struct gwp_ctx;
@@ -138,9 +140,16 @@ struct gwp_upstream {
 	bool			remote_dns;	/* socks5h:// (proxy resolves) */
 	bool			use_tls;	/* https:// (TLS to the proxy) */
 	bool			has_auth;
+	/* @host is an IP literal, not a DNS name (gwp_upstream_url_host()). */
+	bool			host_is_ip;
 	uint8_t			ulen;
 	uint8_t			plen;
 	struct gwp_sockaddr	addr;		/* proxy endpoint */
+	/*
+	 * The host as the URL wrote it, which @addr was resolved from: the
+	 * name an https:// upstream's certificate is checked against.
+	 */
+	char			host[256];
 	char			user[256];
 	char			pass[256];
 };
@@ -345,6 +354,12 @@ enum {
 	 */
 	CONN_STATE_UPSTREAM_HTTP_MIN	= 300,
 	CONN_STATE_UPSTREAM_HTTP_CONNECT = 301,	/* await "HTTP/1.x 2xx"      */
+	/*
+	 * https:// only: the TLS handshake with the proxy, before the CONNECT.
+	 * The event loops drive it themselves (gwp_upstream_tls_start()); it
+	 * sends nothing of ours and leaves gcp->target's buffer alone.
+	 */
+	CONN_STATE_UPSTREAM_TLS_HS	= 302,
 	CONN_STATE_UPSTREAM_HTTP_MAX	= 399,
 
 	CONN_STATE_HTTP_MIN		= 400,
@@ -401,11 +416,11 @@ struct gwp_conn {
 	bool		wr_shut;
 
 	/*
-	 * TLS state for this endpoint (HTTPS proxy). NULL for a plaintext
-	 * endpoint; only the client side is ever TLS in this cut. Once set and
-	 * the handshake has completed, __do_recv()/__do_send() transparently
-	 * decrypt/encrypt through it. Owned here and released in
-	 * gwp_free_conn_pair().
+	 * TLS state for this endpoint, NULL for a plaintext one: the client's
+	 * when it connected with TLS (--tls-cert), the target's when it is an
+	 * https:// upstream proxy. Once set and the handshake has completed,
+	 * __do_recv()/__do_send() transparently decrypt/encrypt through it.
+	 * Owned here and released in gwp_free_conn_pair().
 	 */
 	struct gwp_ssl	*tls;
 };
@@ -519,6 +534,8 @@ struct gwp_conn_pair {
 	 * handshake starts, freed in gwp_free_conn_pair().
 	 */
 	struct gwp_iou_tls		*tls_io;
+	/* The same for the target, when it is an https:// upstream proxy. */
+	struct gwp_iou_tls		*up_tls_io;
 #endif
 #endif
 
@@ -933,6 +950,8 @@ struct gwp_ctx {
 	struct gwp_socks5_ctx		*socks5;
 	struct gwp_auth			*auth;
 	struct gwp_ssl_ctx		*ssl_ctx;
+	/* The client side of TLS to an https:// upstream proxy, else NULL. */
+	struct gwp_ssl_ctx		*up_ssl_ctx;
 	struct gwp_dns_ctx		*dns;
 	/* --upstream-proxy; see struct gwp_upstream_pool. */
 	struct gwp_upstream_pool	upstream_pool;
@@ -1307,6 +1326,28 @@ int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
  */
 int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    int err);
+
+#ifdef CONFIG_HTTPS
+/*
+ * Connected to an https:// upstream proxy: set up the target's TLS engine, in
+ * client role and naming the proxy as its URL does, and enter
+ * CONN_STATE_UPSTREAM_TLS_HS. The event loop then drives the handshake and
+ * calls gwp_upstream_hs_start() only once it has completed, with the proxy's
+ * certificate verified. Returns 0 or a negative errno.
+ */
+int gwp_upstream_tls_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/* The TLS handshake with the upstream proxy failed: log why. */
+void gwp_upstream_tls_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * The https:// upstream's stream has ended, and the end was a cut rather than
+ * one to pass on to the client (gwp_ssl_rx_cut()). An end the proxy made
+ * itself, when the HTTP forwarding filter answered 502 in place of an unusable
+ * response, is not one: the 502 is complete, whatever the engine still holds.
+ */
+bool gwp_upstream_tls_cut(struct gwp_conn_pair *gcp);
+#endif
 
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);

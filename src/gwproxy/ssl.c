@@ -18,6 +18,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
+#include <openssl/x509v3.h>
 
 #include "ssl.h"
 
@@ -301,6 +302,49 @@ int gwp_ssl_ctx_client_create(struct gwp_ssl_ctx **out)
 	return 0;
 }
 
+int gwp_ssl_ctx_client_verify_create(struct gwp_ssl_ctx **out,
+				     const char *ca_file)
+{
+	struct gwp_ssl_ctx *c;
+	int r;
+
+	if (q_bio_meth_init())
+		return -ENOMEM;
+
+	c = calloc(1, sizeof(*c));
+	if (!c)
+		return -ENOMEM;
+
+	c->ctx = SSL_CTX_new(TLS_client_method());
+	if (!c->ctx) {
+		free(c);
+		return -ENOMEM;
+	}
+
+	if (SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION) != 1) {
+		SSL_CTX_free(c->ctx);
+		free(c);
+		return -EINVAL;
+	}
+	SSL_CTX_set_verify(c->ctx, SSL_VERIFY_PEER, NULL);
+	/*
+	 * A CA file that loads no certificate at all fails here, rather than
+	 * leave every handshake to fail later for want of a trust anchor.
+	 */
+	if (ca_file)
+		r = SSL_CTX_load_verify_locations(c->ctx, ca_file, NULL);
+	else
+		r = SSL_CTX_set_default_verify_paths(c->ctx);
+	if (r != 1) {
+		SSL_CTX_free(c->ctx);
+		free(c);
+		return -EINVAL;
+	}
+
+	*out = c;
+	return 0;
+}
+
 void gwp_ssl_ctx_free(struct gwp_ssl_ctx *ctx)
 {
 	if (!ctx)
@@ -363,6 +407,38 @@ void gwp_ssl_free(struct gwp_ssl *s)
 	free(s->rq.buf);
 	free(s->wq.buf);
 	free(s);
+}
+
+int gwp_ssl_set_peer_name(struct gwp_ssl *s, const char *host, bool is_ip)
+{
+	if (is_ip) {
+		X509_VERIFY_PARAM *vp = SSL_get0_param(s->ssl);
+
+		return X509_VERIFY_PARAM_set1_ip_asc(vp, host) == 1 ? 0 : -EINVAL;
+	}
+
+	/*
+	 * Only the certificate's DNS names count: without NEVER_CHECK_SUBJECT
+	 * OpenSSL falls back to the subject's CN when there are none.
+	 */
+	SSL_set_hostflags(s->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS |
+				  X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
+	if (SSL_set_tlsext_host_name(s->ssl, host) != 1 ||
+	    SSL_set1_host(s->ssl, host) != 1)
+		return -EINVAL;
+	return 0;
+}
+
+bool gwp_ssl_hs_done(struct gwp_ssl *s)
+{
+	return SSL_is_init_finished(s->ssl) == 1;
+}
+
+const char *gwp_ssl_verify_errstr(struct gwp_ssl *s)
+{
+	long v = SSL_get_verify_result(s->ssl);
+
+	return v == X509_V_OK ? NULL : X509_verify_cert_error_string(v);
 }
 
 int gwp_ssl_set_alpn(struct gwp_ssl *s, const void *protos, size_t len)

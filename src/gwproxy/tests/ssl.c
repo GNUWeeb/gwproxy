@@ -14,6 +14,7 @@
 #include <gwproxy/ssl.h>
 #include <openssl/bio.h>
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -48,6 +49,68 @@ static const char TEST_KEY[] =
 "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg06tEro8+4H54N+6u\n"
 "wTV6gRn6yqtpSjNe2b7OJQrnuiShRANCAAR6wF4KRXESxPLwqMguiJmwFPIZ8iVg\n"
 "TlIZaY/UgosFJXa/tUHwMIT3hEKlMIPb/+ERhbYMdNsheDzzVbSqfMiq\n"
+"-----END PRIVATE KEY-----\n";
+
+/*
+ * A test CA (CN=gwproxy test CA) and a certificate it issued for CN=localhost,
+ * with the subject alternative names DNS:localhost and IP:127.0.0.1, all EC
+ * P-256 and valid until 2126.
+ */
+static const char TEST_CA_CERT[] =
+"-----BEGIN CERTIFICATE-----\n"
+"MIIBijCCATGgAwIBAgIUdmtgOZOQ6M2M87YcJo4bpomWILowCgYIKoZIzj0EAwIw\n"
+"GjEYMBYGA1UEAwwPZ3dwcm94eSB0ZXN0IENBMCAXDTI2MTEwNDEyNTAxMVoYDzIx\n"
+"MjYxMDExMTI1MDExWjAaMRgwFgYDVQQDDA9nd3Byb3h5IHRlc3QgQ0EwWTATBgcq\n"
+"hkjOPQIBBggqhkjOPQMBBwNCAARCfbSzUzoN7AiHkpEaoV3y5+v3OuSAPElwr0B0\n"
+"BiABNrQMZvD6jkHjebaoSCyjTwYgwjNBEr2XIItKhcBPQFCAo1MwUTAdBgNVHQ4E\n"
+"FgQUEcmCb88puKbw6w+neIq+7ipd9CQwHwYDVR0jBBgwFoAUEcmCb88puKbw6w+n\n"
+"eIq+7ipd9CQwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiADvTRt\n"
+"ObPvNBLqk8KWgYhbz1hPpBBGOVxPQHY1mv/RgQIgVNo+hhS7j2nX8z39kif8jKKR\n"
+"iK8uL+fmXmZICTBcSSM=\n"
+"-----END CERTIFICATE-----\n";
+
+static const char TEST_LEAF_CERT[] =
+"-----BEGIN CERTIFICATE-----\n"
+"MIIBiDCCAS6gAwIBAgIBAjAKBggqhkjOPQQDAjAaMRgwFgYDVQQDDA9nd3Byb3h5\n"
+"IHRlc3QgQ0EwIBcNMjYxMTA0MTI1MDExWhgPMjEyNjEwMTExMjUwMTFaMBQxEjAQ\n"
+"BgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJwM6Xq7\n"
+"MJtMwi+4QYRauLacxzASgvzc50wSJ+jhbxEn2MRFgJWYTprDTiHYXpyu1WEcjp+q\n"
+"23uGG2S6xQvkaxejaTBnMBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAJBgNV\n"
+"HRMEAjAAMB0GA1UdDgQWBBQ3BWRqk7adYz0iAlbomHqfNOcqtzAfBgNVHSMEGDAW\n"
+"gBQRyYJvzym4pvDrD6d4ir7uKl30JDAKBggqhkjOPQQDAgNIADBFAiEA0wLDqAhQ\n"
+"p1njFASQxnCQcYJUceVfWUxRzBAjs/OJWQACIBdrf6S5chcu7ot9fosmEvHNU/lM\n"
+"gm26ye7zrIZL+BGE\n"
+"-----END CERTIFICATE-----\n";
+
+static const char TEST_LEAF_KEY[] =
+"-----BEGIN PRIVATE KEY-----\n"
+"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgJcGrlbi40+/sz75z\n"
+"qTdjaKblRCSMdD9yltollifQqqShRANCAAScDOl6uzCbTMIvuEGEWri2nMcwEoL8\n"
+"3OdMEifo4W8RJ9jERYCVmE6aw04h2F6crtVhHI6fqtt7hhtkusUL5GsX\n"
+"-----END PRIVATE KEY-----\n";
+
+/*
+ * A certificate the same CA issued with CN=localhost and no subject
+ * alternative names at all, valid until 2126: a name is checked against the
+ * DNS names alone, never against the CN.
+ */
+static const char TEST_CN_ONLY_CERT[] =
+"-----BEGIN CERTIFICATE-----\n"
+"MIIBbTCCARKgAwIBAgIBAzAKBggqhkjOPQQDAjAaMRgwFgYDVQQDDA9nd3Byb3h5\n"
+"IHRlc3QgQ0EwIBcNMjYxMTA0MTQyNjIzWhgPMjEyNjEwMTExNDI2MjNaMBQxEjAQ\n"
+"BgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABIZlp+zf\n"
+"A6y3jXmwoC1VXQyN/tTScHT4dcciyYWoEpUGCZkPQFMBF4TUJipp9GH/5hgf2eAk\n"
+"CylQG3ZRXXg/L5KjTTBLMAkGA1UdEwQCMAAwHQYDVR0OBBYEFEw5/zCY8EFJEj4H\n"
+"Mal79U7Bqyj0MB8GA1UdIwQYMBaAFBHJgm/PKbim8OsPp3iKvu4qXfQkMAoGCCqG\n"
+"SM49BAMCA0kAMEYCIQCvojZsDGTxLE0PDMAX341i+6wGU/Xdg48B1QgG+YK7CgIh\n"
+"ALJSAN7jencHiHEwfemfHNQMLS/hqbN2nS17gmWd/HS7\n"
+"-----END CERTIFICATE-----\n";
+
+static const char TEST_CN_ONLY_KEY[] =
+"-----BEGIN PRIVATE KEY-----\n"
+"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg/NcxJd1YMpavg1Ih\n"
+"ZSfIM65ZBeNq28/NYawmPdPNIUyhRANCAASGZafs3wOst415sKAtVV0Mjf7U0nB0\n"
+"+HXHIsmFqBKVBgmZD0BTAReE1CYqafRh/+YYH9ngJAspUBt2UV14Py+S\n"
 "-----END PRIVATE KEY-----\n";
 
 /* Linked with --wrap=BIO_meth_new, so that the call can be made to fail. */
@@ -432,6 +495,162 @@ static void test_bio_method_failure(void)
 	PRTEST_OK();
 }
 
+/* A temporary file holding @data; its name goes to @path (a mkstemp template). */
+static void temp_file(char *path, const char *data)
+{
+	int fd = mkstemp(path);
+
+	assert(fd >= 0);
+	close(fd);
+	write_file(path, data);
+}
+
+/*
+ * Run a handshake that may fail. Returns GWP_SSL_OK once both sides are done,
+ * or GWP_SSL_ERROR as soon as either side fails.
+ */
+static int try_handshake(struct gwp_ssl *cli, struct gwp_ssl *srv)
+{
+	int cs, ss, rounds = 0;
+
+	do {
+		cs = gwp_ssl_handshake(cli);
+		shuttle(cli, srv);
+		if (cs == GWP_SSL_ERROR)
+			return cs;
+		ss = gwp_ssl_handshake(srv);
+		shuttle(srv, cli);
+		if (ss == GWP_SSL_ERROR)
+			return ss;
+		assert(++rounds < 32);
+	} while (cs != GWP_SSL_OK || ss != GWP_SSL_OK);
+
+	return GWP_SSL_OK;
+}
+
+/*
+ * Connect a verifying client named @host to a server of @sctx. Check that the
+ * ClientHello carries @host (as SNI) only when it is a name, that the handshake
+ * ends as @want_ok says, and that a refusal says why, with @want_why in it.
+ */
+static void verify_case(struct gwp_ssl_ctx *sctx, struct gwp_ssl_ctx *cctx,
+			const char *host, bool is_ip, bool want_ok,
+			const char *want_why)
+{
+	struct gwp_ssl *srv, *cli;
+	const char *why;
+	const void *p;
+	size_t len;
+	bool sni;
+	int r;
+
+	srv = gwp_ssl_server_new(sctx);
+	cli = gwp_ssl_client_new(cctx);
+	assert(srv && cli);
+	assert(!gwp_ssl_set_peer_name(cli, host, is_ip));
+
+	/* The ClientHello goes out in the clear: look for the name in it. */
+	assert(gwp_ssl_handshake(cli) == GWP_SSL_WANT_READ);
+	p = gwp_ssl_bio_peek(cli, &len);
+	assert(p && len);
+	sni = memmem(p, len, host, strlen(host)) != NULL;
+	assert(sni == !is_ip);
+
+	r = try_handshake(cli, srv);
+	why = gwp_ssl_verify_errstr(cli);
+	if (want_ok) {
+		assert(r == GWP_SSL_OK);
+		assert(!why);
+		round_trip(cli, srv, "CONNECT", 7);
+		round_trip(srv, cli, "200", 3);
+	} else {
+		assert(r == GWP_SSL_ERROR);
+		assert(why);
+		if (!strstr(why, want_why)) {
+			fprintf(stderr, "%s: refused for '%s', want '%s'\n",
+				host, why, want_why);
+			assert(0);
+		}
+	}
+
+	gwp_ssl_free(srv);
+	gwp_ssl_free(cli);
+}
+
+/*
+ * The client an https:// upstream proxy is reached with: it verifies the
+ * certificate chain against the CA file it is given and the name it is told,
+ * a DNS name sent as SNI and an IP address not.
+ */
+static void test_client_verify(void)
+{
+	char ca[] = "/tmp/gwp_ssl_ca.XXXXXX";
+	char leaf[] = "/tmp/gwp_ssl_leaf.XXXXXX";
+	char lkey[] = "/tmp/gwp_ssl_lkey.XXXXXX";
+	char self[] = "/tmp/gwp_ssl_cert.XXXXXX";
+	char skey[] = "/tmp/gwp_ssl_key.XXXXXX";
+	char empty[] = "/tmp/gwp_ssl_empty.XXXXXX";
+	char cn[] = "/tmp/gwp_ssl_cn.XXXXXX";
+	char cnkey[] = "/tmp/gwp_ssl_cnkey.XXXXXX";
+	struct gwp_ssl_ctx *good = NULL, *selfs = NULL, *cctx = NULL;
+	struct gwp_ssl_ctx *cnonly = NULL;
+	struct gwp_ssl_ctx *sys = NULL, *bad = NULL;
+
+	temp_file(ca, TEST_CA_CERT);
+	temp_file(leaf, TEST_LEAF_CERT);
+	temp_file(lkey, TEST_LEAF_KEY);
+	temp_file(self, TEST_CERT);
+	temp_file(skey, TEST_KEY);
+	temp_file(empty, "");
+	temp_file(cn, TEST_CN_ONLY_CERT);
+	temp_file(cnkey, TEST_CN_ONLY_KEY);
+
+	assert(!gwp_ssl_ctx_server_create(&good, leaf, lkey));
+	assert(!gwp_ssl_ctx_server_create(&selfs, self, skey));
+	assert(!gwp_ssl_ctx_server_create(&cnonly, cn, cnkey));
+	assert(!gwp_ssl_ctx_client_verify_create(&cctx, ca));
+
+	/* Issued by the CA, for the name or the address asked for. */
+	verify_case(good, cctx, "localhost", false, true, NULL);
+	verify_case(good, cctx, "127.0.0.1", true, true, NULL);
+
+	/* Issued by the CA, but for another name or address. */
+	verify_case(good, cctx, "proxy.example", false, false, "mismatch");
+	verify_case(good, cctx, "127.0.0.2", true, false, "mismatch");
+	verify_case(good, cctx, "::1", true, false, "mismatch");
+
+	/* Issued by the CA, with the name only as the CN: not good enough. */
+	verify_case(cnonly, cctx, "localhost", false, false, "mismatch");
+
+	/* Right name, but nobody we trust vouches for it. */
+	verify_case(selfs, cctx, "localhost", false, false, "self");
+
+	/* The system's trust store does not know the test CA either. */
+	assert(!gwp_ssl_ctx_client_verify_create(&sys, NULL));
+	verify_case(good, sys, "localhost", false, false, "issuer");
+
+	/* A CA file that cannot be read, or holds no certificate. */
+	assert(gwp_ssl_ctx_client_verify_create(&bad, "/nonexistent/ca.pem") == -EINVAL);
+	assert(gwp_ssl_ctx_client_verify_create(&bad, empty) == -EINVAL);
+	assert(gwp_ssl_ctx_client_verify_create(&bad, lkey) == -EINVAL);
+	assert(!bad);
+
+	gwp_ssl_ctx_free(good);
+	gwp_ssl_ctx_free(selfs);
+	gwp_ssl_ctx_free(cnonly);
+	gwp_ssl_ctx_free(cctx);
+	gwp_ssl_ctx_free(sys);
+	unlink(ca);
+	unlink(leaf);
+	unlink(lkey);
+	unlink(self);
+	unlink(skey);
+	unlink(empty);
+	unlink(cn);
+	unlink(cnkey);
+	PRTEST_OK();
+}
+
 int main(void)
 {
 	size_t i;
@@ -444,6 +663,7 @@ int main(void)
 		test_alpn_negotiation();
 		test_rx_cut();
 	}
+	test_client_verify();
 
 	printf("All tests passed!\n");
 	return 0;

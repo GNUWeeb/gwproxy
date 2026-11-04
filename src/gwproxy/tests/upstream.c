@@ -3,13 +3,15 @@
  * Copyright (C) 2026  Alviro Iskandar Setiawan <alviro.iskandar@gnuweeb.org>
  *
  * Unit tests for the upstream handshake failure classes (upstream.h): every
- * way a handshake can end, and whose fault it is.
+ * way a handshake can end, and whose fault it is. Also the host an upstream
+ * URL names, as TLS checks it.
  */
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
 #include <gwproxy/upstream.h>
 #include <assert.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -133,6 +135,54 @@ static void test_str(void)
 	assert(!strcmp(gwp_upstream_fail_class_str(N), "neutral"));
 }
 
+static void check_host(const char *hostport, int want_r, const char *want,
+		       bool want_ip, int line)
+{
+	char out[16];
+	bool is_ip = !want_ip;
+	int r;
+
+	memset(out, 'x', sizeof(out));
+	r = gwp_upstream_url_host(hostport, out, sizeof(out), &is_ip);
+	if (r != want_r || (!r && (strcmp(out, want) || is_ip != want_ip))) {
+		fprintf(stderr, "line %d: '%s': got %d '%.*s' ip=%d, want %d '%s' ip=%d\n",
+			line, hostport, r, (int)sizeof(out), out, is_ip,
+			want_r, want ? want : "", want_ip);
+		assert(0);
+	}
+	nr_checks++;
+}
+
+#define HOST(hp, name, ip)	check_host((hp), 0, (name), (ip), __LINE__)
+#define BAD_HOST(hp)		check_host((hp), -EINVAL, NULL, false, __LINE__)
+
+/*
+ * The host an https:// upstream is checked against: a DNS name goes out as
+ * SNI and is matched against the certificate's names, an address literal is
+ * matched against its IP addresses only.
+ */
+static void test_url_host(void)
+{
+	HOST("proxy.example:443", "proxy.example", false);
+	HOST("proxy.example", "proxy.example", false);
+	HOST("localhost:8080", "localhost", false);
+	HOST("127.0.0.1:3128", "127.0.0.1", true);
+	HOST("127.0.0.1", "127.0.0.1", true);
+	HOST("[::1]:443", "::1", true);
+	HOST("[2001:db8::7]", "2001:db8::7", true);
+	/* Not an address literal inet_pton() accepts: a name. */
+	HOST("127.1:80", "127.1", false);
+	HOST("1.2.3.4.5:80", "1.2.3.4.5", false);
+	/* Just fits: 15 bytes and the NUL. */
+	HOST("abcdefghijklmno:1", "abcdefghijklmno", false);
+
+	BAD_HOST("");
+	BAD_HOST(":443");
+	BAD_HOST("[]:443");
+	BAD_HOST("[::1:443");
+	BAD_HOST("abcdefghijklmnop:1");
+}
+
 int main(void)
 {
 	test_connect();
@@ -141,6 +191,7 @@ int main(void)
 	test_s5_rep();
 	test_http();
 	test_str();
+	test_url_host();
 	printf("upstream: %u checks passed\n", nr_checks);
 	return 0;
 }

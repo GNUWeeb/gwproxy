@@ -1084,18 +1084,26 @@ static bool adj_epl_out(struct gwp_conn *src, struct gwp_conn *dst)
 }
 
 /*
- * Whether to leave the client's input alone until it has read what the TLS
- * engine has for it (see gwp_ssl_tx_backlog()).
+ * Whether to leave @c's input alone until its peer has read what the TLS
+ * engine has for it (see gwp_ssl_tx_backlog()). @c is the client, or the target
+ * when that is an https:// upstream proxy. What is forwarded to @c comes from
+ * the other side's buffer, whose size bounds it.
  */
-static bool client_rx_held(struct gwp_conn_pair __unused *gcp)
+static bool conn_rx_held(struct gwp_conn_pair __unused *gcp,
+			 struct gwp_conn __unused *c)
 {
 #ifdef CONFIG_HTTPS
-	struct gwp_conn *c = &gcp->client;
+	struct gwp_conn *o = c == &gcp->client ? &gcp->target : &gcp->client;
 
 	if (c->tls)
-		return gwp_ssl_tx_backlog(c->tls, gcp->target.cap);
+		return gwp_ssl_tx_backlog(c->tls, o->cap);
 #endif
 	return false;
+}
+
+static bool client_rx_held(struct gwp_conn_pair *gcp)
+{
+	return conn_rx_held(gcp, &gcp->client);
 }
 
 static bool adj_epl_in(struct gwp_conn *src, bool hold)
@@ -1167,7 +1175,8 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 */
 	if (gcp->is_target_alive) {
 		target_need_ctl |= adj_epl_out(&gcp->client, &gcp->target);
-		target_need_ctl |= adj_epl_in(&gcp->target, false);
+		target_need_ctl |= adj_epl_in(&gcp->target,
+					      conn_rx_held(gcp, &gcp->target));
 	}
 
 	if (client_need_ctl) {
@@ -1456,7 +1465,7 @@ static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	do {
 		full = false;
-		if (do_recv && !(src == &gcp->client && client_rx_held(gcp))) {
+		if (do_recv && !conn_rx_held(gcp, src)) {
 			uint32_t from = src->len;
 
 			ret = splice_recv(src, first);
@@ -1645,6 +1654,19 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Whether some of the request to the upstream proxy is still to be sent: in
+ * target.buf, or for an https:// upstream also as ciphertext in the engine.
+ */
+static bool upstream_tx_pending(struct gwp_conn_pair *gcp)
+{
+#ifdef CONFIG_HTTPS
+	if (gcp->target.tls && gwp_ssl_bio_pending(gcp->target.tls) > 0)
+		return true;
+#endif
+	return gcp->target.len > 0;
+}
+
+/*
  * Send the request the handshake has just queued. It is tried at once rather
  * than after another EPOLLOUT: the socket has just connected or answered, so
  * it almost always takes the whole request, and then the reply is all there is
@@ -1658,18 +1680,90 @@ static int upstream_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (unlikely(sr < 0))
 		return (int)sr;
 
-	if (gcp->target.len)
+	if (upstream_tx_pending(gcp))
 		return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
 
 	gcp->up_tx = false;
 	return upstream_arm(w, gcp, EPOLLIN | EPOLLRDHUP);
 }
 
-/* Begin the upstream-proxy handshake and send its first request. */
+#ifdef CONFIG_HTTPS
+static int upstream_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * The TLS handshake with an https:// upstream proxy: take in what it sent,
+ * step the handshake and flush what that produced. Once it is complete, start
+ * the CONNECT over it. @events is the target's epoll event, 0 to just step.
+ */
+static int upstream_tls_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   uint32_t events)
+{
+	struct gwp_conn *t = &gcp->target;
+	uint32_t mask = EPOLLIN | EPOLLRDHUP;
+	ssize_t n;
+	size_t len;
+	void *p;
+	int hs, r;
+
+	if (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) {
+		p = gwp_ssl_rx_space(t->tls, GWP_SSL_RECORD_MAX, &len);
+		if (unlikely(!p))
+			return -ENOMEM;
+		n = __sys_recv(t->fd, p, len, MSG_NOSIGNAL);
+		gwp_ssl_rx_commit(t->tls, n > 0 ? (size_t)n : 0);
+		if (n == 0)
+			return -ECONNRESET;
+		if (n < 0 && n != -EAGAIN && n != -EINTR)
+			return (int)n;
+	}
+
+	hs = gwp_ssl_handshake(t->tls);
+	if (hs == GWP_SSL_ERROR) {
+		gwp_upstream_tls_fail(w, gcp);
+		/* The alert tells the proxy why; best effort. */
+		tls_flush_hs(t);
+		return -EPROTO;
+	}
+
+	r = tls_flush_hs(t);
+	if (unlikely(r))
+		return r;
+
+	if (hs == GWP_SSL_OK) {
+		pr_dbg(&w->ctx->lh, "Upstream TLS handshake complete (idx=%u)",
+			gcp->idx);
+		return upstream_start(w, gcp);
+	}
+
+	if (gwp_ssl_bio_pending(t->tls) > 0)
+		mask |= EPOLLOUT;
+	return upstream_arm(w, gcp, mask);
+}
+#endif
+
+/*
+ * Begin the upstream-proxy handshake and send its first request. An https://
+ * upstream gets there only once the TLS handshake with it has completed, and
+ * its certificate has been verified: nothing of ours goes out before that.
+ */
 static int upstream_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	int r = gwp_upstream_hs_start(w, gcp);
+	int r;
 
+#ifdef CONFIG_HTTPS
+	/* Not before the handshake has finished, whoever calls. */
+	if (gcp->upstream->use_tls &&
+	    (!gcp->target.tls || !gwp_ssl_hs_done(gcp->target.tls))) {
+		if (!gcp->target.tls) {
+			r = gwp_upstream_tls_start(w, gcp);
+			if (unlikely(r))
+				return upstream_fail(w, gcp, r);
+		}
+		return upstream_tls_io(w, gcp, 0);
+	}
+#endif
+
+	r = gwp_upstream_hs_start(w, gcp);
 	if (r == GWP_UPSTREAM_IO_SEND)
 		r = upstream_send(w, gcp);
 	return r < 0 ? upstream_fail(w, gcp, r) : r;
@@ -1730,13 +1824,18 @@ static int upstream_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	ssize_t sr;
 	int r;
 
+#ifdef CONFIG_HTTPS
+	if (gcp->conn_state == CONN_STATE_UPSTREAM_TLS_HS)
+		return upstream_tls_io(w, gcp, ev->events);
+#endif
+
 	/* Transmit phase: flush the pending request to the proxy. */
 	if (gcp->up_tx) {
 		if (ev->events & EPOLLOUT) {
 			sr = __do_send(&gcp->target, &gcp->target);
 			if (unlikely(sr < 0))
 				return (int)sr;
-			if (gcp->target.len == 0)
+			if (!upstream_tx_pending(gcp))
 				gcp->up_tx = false;
 		}
 
@@ -1755,17 +1854,32 @@ static int upstream_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		sr = __do_recv(&gcp->target);
 		if (unlikely(sr < 0))
 			return (int)sr;
-		if (unlikely(gcp->target.rd_eof))
-			return -ECONNRESET;
 	}
 
+	/*
+	 * The end of the stream fails the handshake only once what came before
+	 * it has been looked at: an https:// upstream's refusal and its
+	 * close_notify are decrypted in one go.
+	 */
 	r = gwp_upstream_hs_on_reply(w, gcp);
 	switch (r) {
 	case GWP_UPSTREAM_IO_SEND:
 		return upstream_send(w, gcp);
 	case GWP_UPSTREAM_IO_RECV:
-		if (ev->events & (EPOLLRDHUP | EPOLLHUP))
+		if (gcp->target.rd_eof || (ev->events & (EPOLLRDHUP | EPOLLHUP)))
 			return -ECONNRESET;
+#ifdef CONFIG_HTTPS
+		/*
+		 * The engine may have records of its own to send in answer
+		 * (a KeyUpdate); target.buf holds the partial reply, not
+		 * anything to send.
+		 */
+		if (gcp->target.tls) {
+			r = tls_flush_hs(&gcp->target);
+			if (unlikely(r))
+				return r;
+		}
+#endif
 		return upstream_arm(w, gcp, EPOLLIN | EPOLLRDHUP);
 	case GWP_UPSTREAM_IO_DONE:
 		return upstream_finish(w, gcp);
@@ -1949,17 +2063,16 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 }
 
 /*
- * The target is done and its data has been handed to the client side. Before
- * the client's write side can be shut, a TLS client is owed a close_notify,
- * and all of the ciphertext must have left: a slow client may not have taken
- * it yet, and adj_epl_out() keeps EPOLLOUT armed to flush the rest and come
- * back here. Returns 1 when the write side can be shut, 0 to wait, or <0 on
- * error.
+ * The other side is done and its data has been handed to @c's side. Before
+ * @c's write side can be shut, a TLS peer (a TLS client, an https:// upstream
+ * proxy) is owed a close_notify, and all of the ciphertext must have left: a
+ * slow peer may not have taken it yet, and adj_epl_out() keeps EPOLLOUT armed
+ * to flush the rest and come back here. Returns 1 when the write side can be
+ * shut, 0 to wait, or <0 on error.
  */
-static int client_wr_flushed(struct gwp_conn_pair __unused *gcp)
+static int conn_wr_flushed(struct gwp_conn __unused *c)
 {
 #ifdef CONFIG_HTTPS
-	struct gwp_conn *c = &gcp->client;
 	int r;
 
 	if (c->tls) {
@@ -1975,30 +2088,37 @@ static int client_wr_flushed(struct gwp_conn_pair __unused *gcp)
 }
 
 /*
- * While the client's input is held up (client_rx_held()), the engine can be left
- * with whole records whose ciphertext has already left the socket. No EPOLLIN
- * brings those back, and whichever send takes the hold away may be the last
- * event for a while, so whoever gets here takes them in.
+ * While @c's input is held up (conn_rx_held()), the engine can be left with
+ * whole records whose ciphertext has already left the socket. No EPOLLIN brings
+ * those back, and whichever send takes the hold away may be the last event for
+ * a while, so whoever gets here takes them in. The same goes for records that
+ * came in behind an https:// upstream proxy's reply to the CONNECT, which the
+ * reply's buffer had no room for. @c is the client, or the target when it is
+ * an https:// upstream proxy, and @t the other side.
  *
  * This never reads the socket, which is what the EPOLLIN that adj_epl_in() gives
  * back is for: the work is bounded by what the engine holds, however busy the
- * client is. Doing so can put the send queue over the limit again, with the
+ * peer is. Doing so can put the send queue over the limit again, with the
  * EPOLLOUT edge that took it down long used up and the mask unchanged, so always
  * send what it produced. Either that empties the queue or the socket fills up,
  * and then a new edge follows.
  */
-static int client_rx_resume(struct gwp_wrk __unused *w,
-			    struct gwp_conn_pair __unused *gcp)
+static int conn_rx_resume(struct gwp_wrk __unused *w,
+			  struct gwp_conn_pair __unused *gcp,
+			  struct gwp_conn __unused *c,
+			  struct gwp_conn __unused *t)
 {
 #ifdef CONFIG_HTTPS
-	struct gwp_conn *c = &gcp->client, *t = &gcp->target;
 	bool again = true;
 	ssize_t ret;
 
 	if (!c->tls || t->wr_shut)
 		return 0;
+	/* Until the tunnel is up, the target's engine is the handshake's. */
+	if (c == &gcp->target && !gcp->is_target_alive)
+		return 0;
 
-	while (again && !client_rx_held(gcp) && c->len < c->cap &&
+	while (again && !conn_rx_held(gcp, c) && c->len < c->cap &&
 	       gwp_ssl_rx_more(c->tls)) {
 		uint32_t from = c->len;
 
@@ -2014,9 +2134,9 @@ static int client_rx_resume(struct gwp_wrk __unused *w,
 		}
 
 		/* Otherwise the engine has run out of what it can decrypt. */
-		again = c->len == c->cap || client_rx_held(gcp);
+		again = c->len == c->cap || conn_rx_held(gcp, c);
 
-		if (gcp->is_target_alive) {
+		if (t != &gcp->target || gcp->is_target_alive) {
 			ret = __do_send(c, t);
 			if (unlikely(ret < 0))
 				return (int)ret;
@@ -2048,12 +2168,20 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	bool shut_client = false, shut_target = false, done;
 	int r;
 
-	r = client_rx_resume(w, gcp);
+	r = conn_rx_resume(w, gcp, &gcp->client, &gcp->target);
+	if (unlikely(r))
+		return r;
+	r = conn_rx_resume(w, gcp, &gcp->target, &gcp->client);
 	if (unlikely(r))
 		return r;
 
 	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
-		r = client_wr_flushed(gcp);
+#ifdef CONFIG_HTTPS
+		/* As for a TLS client below: not an end to pass on. */
+		if (gwp_upstream_tls_cut(gcp))
+			return -ECONNRESET;
+#endif
+		r = conn_wr_flushed(&gcp->client);
 		if (r < 0)
 			return r;
 		/*
@@ -2086,8 +2214,17 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * nothing, though, so the pair goes now.
 		 */
 		if (gcp->is_target_alive) {
-			shut_target = true;
-			gcp->target.wr_shut = true;
+			r = conn_wr_flushed(&gcp->target);
+			if (r < 0)
+				return r;
+			if (r) {
+				shut_target = true;
+				gcp->target.wr_shut = true;
+#ifdef CONFIG_HTTPS
+				if (gcp->target.tls)
+					gwp_ssl_tx_close(gcp->target.tls);
+#endif
+			}
 		} else if (gcp->client.wr_shut) {
 			return -ECONNRESET;
 		}

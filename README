@@ -37,8 +37,9 @@ Features
     redirected names the proxy itself as its destination, so it is refused.
   - Upstream proxy chaining: route every outgoing connection through a
     next-hop SOCKS5 proxy (socks5:// local or socks5h:// remote name
-    resolution) or HTTP CONNECT proxy (http://), with optional
-    username/password auth.
+    resolution) or HTTP CONNECT proxy (http://, or https:// over TLS with
+    the proxy's certificate verified, in builds with --use-openssl), with
+    optional username/password auth.
   - SO_MARK (fwmark) on outgoing connections, for policy routing / iptables
     matching.
   - Source pinning for outgoing connections: --bind-source binds them to a
@@ -156,6 +157,11 @@ Run './gwproxy --help' for the complete list of options. A few examples:
   ./gwproxy --bind='[::]:1080' --as-socks5=1 \
       --upstream-proxy=socks5h://1.2.3.4:1080 \
       --upstream-proxy-auth-file=up-auth.txt
+
+  # The same through an HTTPS proxy, verified against a private CA
+  ./gwproxy --bind='[::]:1080' --as-socks5=1 \
+      --upstream-proxy=https://proxy.example.net:3129 \
+      --upstream-ca-file=proxy-ca.pem
 
   # Use the io_uring event loop, and set SO_MARK 100 on outgoing packets
   ./gwproxy --bind='[::]:1080' --as-socks5=1 --event-loop=io_uring --mark=100
