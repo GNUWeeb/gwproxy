@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <netinet/in.h>
+#include <sys/stat.h>
 #include <gwproxy/net.h>
 
 enum gwp_acl_verdict {
@@ -59,20 +60,50 @@ int gwp_acl_parse_bind_source(const char *s, struct gwp_sockaddr *out);
 /*
  * Parse an ACL rule file at @path into a new ACL. Returns 0 and stores the ACL
  * in *@out on success; a negative errno on failure (a bad rule is reported to
- * stderr with its line number). An empty/NULL @path yields *@out == NULL,
- * meaning "no ACL" (everything allowed) -- callers treat that as disabled.
+ * stderr with its file and line number). An empty/NULL @path yields
+ * *@out == NULL, meaning "no ACL" (everything allowed) -- callers treat that
+ * as disabled.
+ *
+ * A line "include PATH;" parses the file PATH in its place: a relative PATH is
+ * taken from the directory of the file that holds the line. Includes nest up
+ * to 8 levels below @path, one load reads at most 64 files (a file included
+ * twice counts twice), a file may not include itself (directly or through
+ * others), only regular files are read, and every file must load, or nothing
+ * does.
  */
 int gwp_acl_create(struct gwp_acl **out, const char *path);
 
-/* Parse an ACL from an in-memory NUL-terminated rule text (used by tests). */
+/*
+ * Parse an ACL from an in-memory NUL-terminated rule text (the built-in
+ * default and tests). It has no directory, so "include" is refused.
+ */
 int gwp_acl_parse_str(struct gwp_acl **out, const char *text);
 
 /*
- * Re-read the file the ACL was created from and atomically swap in the new
- * rules. On any parse error the previous rules are kept and a negative errno is
- * returned.
+ * Re-read the file the ACL was created from, and the files it includes, and
+ * atomically swap in the new rules. On any error the previous rules are kept
+ * and a negative errno is returned.
  */
 int gwp_acl_reload(struct gwp_acl *acl);
+
+/*
+ * The @i-th file the last gwp_acl_create() or gwp_acl_reload() of @acl read
+ * or tried to read, the file it was created from first and the included ones
+ * after it, each once; NULL past the last one, and for an ACL from text. A
+ * reload replaces the list even when it fails (a change to any of those files
+ * can make the next one succeed), so these are the files to watch. Valid
+ * until the next reload; call it only from the thread that reloads.
+ */
+const char *gwp_acl_file(const struct gwp_acl *acl, size_t i);
+
+/*
+ * What fstat() said about the @i-th file of gwp_acl_file() right before it was
+ * read: returns 0 and fills *@st, or the negative errno that opening it failed
+ * with (-ENOENT past the last file). A change made to the file after that
+ * differs from *@st, even one made while the load was still running, which a
+ * stat() taken after the load could not tell from what was read.
+ */
+int gwp_acl_file_stat(const struct gwp_acl *acl, size_t i, struct stat *st);
 
 /* Free an ACL (NULL is a no-op). */
 void gwp_acl_destroy(struct gwp_acl *acl);

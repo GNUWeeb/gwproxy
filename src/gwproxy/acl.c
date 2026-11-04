@@ -17,6 +17,9 @@
 #include <sched.h>
 #include <time.h>
 #include <sys/random.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
@@ -229,6 +232,12 @@ struct gwp_acl_ruleset {
 struct gwp_acl {
 	_Atomic(struct gwp_acl_ruleset *) rs;
 	char			*path;
+	/*
+	 * The files the last load or reload read or tried to read, @path
+	 * first; see gwp_acl_file(). Only the reloading thread touches them.
+	 */
+	struct acl_file		*files;
+	size_t			nr_files;
 	/* Serialises reloads; evaluations never take it. */
 	pthread_mutex_t		reload_lock;
 	/* Bumped by every successful reload; see gwp_acl_generation(). */
@@ -248,6 +257,64 @@ struct gwp_acl {
 #define ACL_SUM_OUT_REJECT	(1u << 3)
 
 #define ACL_MAX_TOKENS	32
+
+/*
+ * How deep "include" may nest. The --acl-file is level 0 and a file it
+ * includes is level 1, so a chain of at most ACL_MAX_INCLUDE_DEPTH + 1 files
+ * loads. That is room for any sensible layout, while a runaway chain ends
+ * with a message instead of a file descriptor per level.
+ */
+#define ACL_MAX_INCLUDE_DEPTH	8
+
+/*
+ * How many files one load may read, the top file and every include counted,
+ * a file included twice twice. The depth cap alone would let a file that
+ * includes the next one twice, at every level, read 2^8 files, and one that
+ * includes it k times k^8.
+ */
+#define ACL_MAX_FILES		64
+
+/*
+ * A file a load read or tried to read: what fstat() said right before it was
+ * read, or why it could not be opened (@err, a positive errno; 0 when @st is
+ * valid). Recorded for the first read of a file the load reads twice.
+ */
+struct acl_file {
+	char		*path;
+	int		err;
+	struct stat	st;
+};
+
+/* The identity of a file being parsed, for the include cycle check. */
+struct acl_file_key {
+	dev_t	dev;
+	ino_t	ino;
+};
+
+/*
+ * One load of a rule set, from text (gwp_acl_parse_str) or from a file and
+ * the files it includes (gwp_acl_create, gwp_acl_reload).
+ *   @files: every path the load read or tried to read, the top file first,
+ *     each once. Whether the load succeeds or not, a change to any of them
+ *     can change the outcome of the next one (a fixed rule, a missing file
+ *     created), so they are what a reload watches.
+ *   @path: the file whose lines are being parsed; NULL for text.
+ *   @stack, @depth: the files being parsed, the top file first.
+ *   @nr_loads: files read so far, see ACL_MAX_FILES.
+ *   @include_failed: the error parse_line() returned came from an include.
+ */
+struct acl_load {
+	struct gwp_acl_ruleset	*rs;
+	struct acl_file		*files;
+	size_t			nr_files;
+	const char		*path;
+	struct acl_file_key	stack[ACL_MAX_INCLUDE_DEPTH + 1];
+	unsigned		depth;
+	unsigned		nr_loads;
+	bool			include_failed;
+};
+
+static int load_file(struct acl_load *ld, const char *path);
 
 #ifdef CONFIG_PCRE
 /*
@@ -1256,7 +1323,61 @@ out:
 	return ret;
 }
 
-static int parse_line(struct gwp_acl_ruleset *rs, char *line)
+/*
+ * The path of the file that "include @inc" names in the file @parent: @inc
+ * itself when absolute, else @inc in @parent's directory. Malloc'd, or NULL.
+ */
+static char *include_path(const char *parent, const char *inc)
+{
+	const char *slash = strrchr(parent, '/');
+	char *path;
+
+	if (inc[0] == '/' || !slash)
+		return strdup(inc);
+	if (asprintf(&path, "%.*s/%s", (int)(slash - parent), parent, inc) < 0)
+		return NULL;
+	return path;
+}
+
+/*
+ * "include PATH;": parse the file PATH here, as if its lines stood in place
+ * of this one. The ';' may also stand alone as the last word, but it must be
+ * there, and PATH is one word (no quoting, no globs).
+ */
+static int parse_include(struct acl_load *ld, char **tok, int n)
+{
+	char *inc, *path;
+	size_t len;
+	int r;
+
+	if (n == 3 && !strcmp(tok[2], ";")) {
+		inc = tok[1];
+	} else if (n == 2 && (len = strlen(tok[1])) > 1 &&
+		   tok[1][len - 1] == ';') {
+		tok[1][len - 1] = '\0';
+		inc = tok[1];
+	} else {
+		return -EINVAL;
+	}
+	if (strchr(inc, ';'))
+		return -EINVAL;
+
+	if (!ld->path) {
+		fprintf(stderr, "acl: include is only valid in a rule file\n");
+		return -EINVAL;
+	}
+
+	path = include_path(ld->path, inc);
+	if (!path)
+		return -ENOMEM;
+	r = load_file(ld, path);
+	free(path);
+	if (r)
+		ld->include_failed = true;
+	return r;
+}
+
+static int parse_line(struct acl_load *ld, char *line)
 {
 	char *tok[ACL_MAX_TOKENS];
 	char *hash;
@@ -1281,9 +1402,11 @@ static int parse_line(struct gwp_acl_ruleset *rs, char *line)
 		return 0;		/* blank / comment-only */
 
 	if (!strcmp(tok[0], "-P"))
-		return parse_policy(rs, tok, n);
+		return parse_policy(ld->rs, tok, n);
 	if (!strcmp(tok[0], "-A"))
-		return parse_rule(rs, tok, n);
+		return parse_rule(ld->rs, tok, n);
+	if (!strcmp(tok[0], "include"))
+		return parse_include(ld, tok, n);
 	return -EINVAL;
 }
 
@@ -1660,47 +1783,104 @@ static int ruleset_index(struct gwp_acl_ruleset *rs)
 	return ret;
 }
 
-static int parse_text(struct gwp_acl_ruleset *rs, const char *text)
+static void load_init(struct acl_load *ld, struct gwp_acl_ruleset *rs)
 {
-	char *copy, *cursor, *line;
-	unsigned lineno = 0;
-	int r = 0;
-
+	memset(ld, 0, sizeof(*ld));
+	ld->rs = rs;
 	ruleset_init(rs);
+}
 
-	copy = strdup(text);
-	if (!copy)
-		return -ENOMEM;
-
-	cursor = copy;
-	while ((line = strsep(&cursor, "\n")) != NULL) {
-		lineno++;
-		r = parse_line(rs, line);
-		if (r) {
-			fprintf(stderr, "acl: parse error on line %u: %s\n",
-				lineno, strerror(-r));
-			break;
-		}
-	}
+/* End a load whose parse returned @r: index the rules, or free them. */
+static int load_finish(struct acl_load *ld, int r)
+{
 	if (!r)
-		r = ruleset_index(rs);
+		r = ruleset_index(ld->rs);
 	if (r)
-		ruleset_free(rs);
-
-	free(copy);
+		ruleset_free(ld->rs);
 	return r;
 }
 
-static int read_file(const char *path, char **out)
+static void files_free(struct acl_file *files, size_t nr)
+{
+	size_t i;
+
+	for (i = 0; i < nr; i++)
+		free(files[i].path);
+	free(files);
+}
+
+/*
+ * Add @path to @ld->files unless it is there already. Returns the new entry,
+ * for the caller to record the file's identity in, or NULL: when the file is
+ * listed already (*@r = 0) or memory ran out (*@r = -ENOMEM).
+ */
+static struct acl_file *load_note_file(struct acl_load *ld, const char *path,
+				       int *r)
+{
+	struct acl_file *v;
+	char *dup;
+	size_t i;
+
+	*r = 0;
+	for (i = 0; i < ld->nr_files; i++) {
+		if (!strcmp(ld->files[i].path, path))
+			return NULL;
+	}
+	dup = strdup(path);
+	if (!dup)
+		goto oom;
+	v = realloc(ld->files, (ld->nr_files + 1) * sizeof(*v));
+	if (!v) {
+		free(dup);
+		goto oom;
+	}
+	ld->files = v;
+	v = &v[ld->nr_files++];
+	memset(v, 0, sizeof(*v));
+	v->path = dup;
+	v->err = EIO;
+	return v;
+oom:
+	*r = -ENOMEM;
+	return NULL;
+}
+
+/* Parse the rule text @text (modified in place) line by line into @ld. */
+static int parse_lines(struct acl_load *ld, char *text)
+{
+	char *cursor = text, *line;
+	unsigned lineno = 0;
+	int r;
+
+	while ((line = strsep(&cursor, "\n")) != NULL) {
+		lineno++;
+		ld->include_failed = false;
+		r = parse_line(ld, line);
+		if (!r)
+			continue;
+		if (ld->include_failed)
+			fprintf(stderr, "acl: %s: line %u: failed to include a file\n",
+				ld->path, lineno);
+		else if (ld->path)
+			fprintf(stderr, "acl: %s: parse error on line %u: %s\n",
+				ld->path, lineno, strerror(-r));
+		else
+			fprintf(stderr, "acl: parse error on line %u: %s\n",
+				lineno, strerror(-r));
+		return r;
+	}
+	return 0;
+}
+
+/*
+ * Read the whole of the open file @fp, which this closes, into a malloc'd
+ * NUL-terminated string at *@out. @path is for the messages.
+ */
+static int read_file(FILE *fp, const char *path, char **out)
 {
 	long sz;
 	char *buf;
 	size_t rd;
-	FILE *fp;
-
-	fp = fopen(path, "rb");
-	if (!fp)
-		return -errno;
 
 	if (fseek(fp, 0, SEEK_END) || (sz = ftell(fp)) < 0 ||
 	    fseek(fp, 0, SEEK_SET)) {
@@ -1750,6 +1930,105 @@ static int read_file(const char *path, char **out)
 	buf[rd] = '\0';
 	*out = buf;
 	return 0;
+}
+
+/*
+ * Parse the rule file @path into @ld, and through its include lines the
+ * files it includes. A file that is still being parsed further up the chain
+ * (compared by identity, so another name for it is no way round) would
+ * include itself forever and is refused, and so is a chain deeper than
+ * ACL_MAX_INCLUDE_DEPTH or a load of more than ACL_MAX_FILES files.
+ *
+ * Only a regular file is read. The open does not block, so a FIFO (or a
+ * device) put in place of a rule file is refused instead of stopping the
+ * reload, and every later one, until a writer comes along.
+ */
+static int load_file(struct acl_load *ld, const char *path)
+{
+	const char *parent = ld->path;
+	struct acl_file *rec;
+	struct stat st;
+	char *text;
+	unsigned i;
+	FILE *fp;
+	int fd, r;
+
+	if (++ld->nr_loads > ACL_MAX_FILES) {
+		fprintf(stderr, "acl: %s: more than %d files in one load\n",
+			path, ACL_MAX_FILES);
+		return -E2BIG;
+	}
+
+	rec = load_note_file(ld, path, &r);
+	if (r)
+		return r;
+
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0) {
+		r = -errno;
+		if (rec)
+			rec->err = -r;
+		/* The caller reports the top file, by its option. */
+		if (parent)
+			fprintf(stderr, "acl: %s: %s\n", path, strerror(-r));
+		return r;
+	}
+	if (fstat(fd, &st)) {
+		r = -errno;
+		if (rec)
+			rec->err = -r;
+		close(fd);
+		return r;
+	}
+	/*
+	 * Taken before the read, so a change made from here on differs from
+	 * it, and the reload watch cannot mistake it for what was read.
+	 */
+	if (rec) {
+		rec->err = 0;
+		rec->st = st;
+	}
+
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "acl: %s: not a regular file\n", path);
+		close(fd);
+		return -EINVAL;
+	}
+	if (ld->depth > ACL_MAX_INCLUDE_DEPTH) {
+		fprintf(stderr, "acl: %s: includes nest deeper than %d levels\n",
+			path, ACL_MAX_INCLUDE_DEPTH);
+		close(fd);
+		return -ELOOP;
+	}
+	for (i = 0; i < ld->depth; i++) {
+		if (ld->stack[i].dev == st.st_dev &&
+		    ld->stack[i].ino == st.st_ino) {
+			fprintf(stderr, "acl: %s: include cycle, the file includes itself\n",
+				path);
+			close(fd);
+			return -ELOOP;
+		}
+	}
+
+	fp = fdopen(fd, "rb");
+	if (!fp) {
+		r = -errno;
+		close(fd);
+		return r;
+	}
+	r = read_file(fp, path, &text);
+	if (r)
+		return r;
+
+	ld->stack[ld->depth].dev = st.st_dev;
+	ld->stack[ld->depth].ino = st.st_ino;
+	ld->depth++;
+	ld->path = path;
+	r = parse_lines(ld, text);
+	ld->path = parent;
+	ld->depth--;
+	free(text);
+	return r;
 }
 
 /*
@@ -1962,47 +2241,63 @@ static void rs_retire(struct gwp_acl_ruleset *old)
 	ruleset_destroy(old);
 }
 
-int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
+/* A new ACL that publishes @rs, which it takes on success. */
+static int acl_alloc(struct gwp_acl **out, struct gwp_acl_ruleset *rs)
 {
-	struct gwp_acl_ruleset *rs;
 	struct gwp_acl *acl;
 	int r;
 
 	acl = calloc(1, sizeof(*acl));
-	rs = malloc(sizeof(*rs));
-	if (!acl || !rs) {
-		free(acl);
-		free(rs);
+	if (!acl)
 		return -ENOMEM;
-	}
 
 	r = pthread_mutex_init(&acl->reload_lock, NULL);
 	if (r) {
 		free(acl);
-		free(rs);
 		return -r;
 	}
 
-	r = parse_text(rs, text);
-	if (r) {
-		pthread_mutex_destroy(&acl->reload_lock);
-		free(acl);
-		free(rs);
-		return r;
-	}
 	rs->gen = 0;
 	atomic_init(&acl->rs, rs);
 	atomic_init(&acl->gen, 0);
 	atomic_init(&acl->sum, ruleset_summary(rs));
-
 	*out = acl;
 	return 0;
 }
 
+int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
+{
+	struct gwp_acl_ruleset *rs;
+	struct acl_load ld;
+	char *copy;
+	int r;
+
+	rs = malloc(sizeof(*rs));
+	copy = strdup(text);
+	if (!rs || !copy) {
+		free(rs);
+		free(copy);
+		return -ENOMEM;
+	}
+
+	load_init(&ld, rs);
+	r = load_finish(&ld, parse_lines(&ld, copy));
+	free(copy);
+	if (!r) {
+		r = acl_alloc(out, rs);
+		if (r)
+			ruleset_free(rs);
+	}
+	if (r)
+		free(rs);
+	return r;
+}
+
 int gwp_acl_create(struct gwp_acl **out, const char *path)
 {
+	struct gwp_acl_ruleset *rs;
 	struct gwp_acl *acl;
-	char *text;
+	struct acl_load ld;
 	int r;
 
 	if (!path || !path[0]) {
@@ -2010,15 +2305,25 @@ int gwp_acl_create(struct gwp_acl **out, const char *path)
 		return 0;
 	}
 
-	r = read_file(path, &text);
-	if (r)
-		return r;
+	rs = malloc(sizeof(*rs));
+	if (!rs)
+		return -ENOMEM;
 
-	r = gwp_acl_parse_str(&acl, text);
-	free(text);
-	if (r)
+	load_init(&ld, rs);
+	r = load_finish(&ld, load_file(&ld, path));
+	if (!r) {
+		r = acl_alloc(&acl, rs);
+		if (r)
+			ruleset_free(rs);
+	}
+	if (r) {
+		free(rs);
+		files_free(ld.files, ld.nr_files);
 		return r;
+	}
 
+	acl->files = ld.files;
+	acl->nr_files = ld.nr_files;
 	acl->path = strdup(path);
 	if (!acl->path) {
 		gwp_acl_destroy(acl);
@@ -2032,30 +2337,40 @@ int gwp_acl_create(struct gwp_acl **out, const char *path)
 int gwp_acl_reload(struct gwp_acl *acl)
 {
 	struct gwp_acl_ruleset *rs, *old;
+	struct acl_load ld;
 	uint32_t gen;
-	char *text;
 	int r;
 
 	if (!acl || !acl->path)
 		return -EINVAL;
 
-	r = read_file(acl->path, &text);
-	if (r)
-		return r;
-
 	rs = malloc(sizeof(*rs));
-	if (!rs) {
-		free(text);
+	if (!rs)
 		return -ENOMEM;
+
+	load_init(&ld, rs);
+	r = load_finish(&ld, load_file(&ld, acl->path));
+
+	/*
+	 * The files this attempt met replace the list even when it failed:
+	 * they are the ones whose change can make the next attempt succeed.
+	 * Running out of memory may have cut the list short, though, and
+	 * says nothing about the files, so then the old list stays.
+	 */
+	pthread_mutex_lock(&acl->reload_lock);
+	if (r == -ENOMEM) {
+		files_free(ld.files, ld.nr_files);
+	} else {
+		files_free(acl->files, acl->nr_files);
+		acl->files = ld.files;
+		acl->nr_files = ld.nr_files;
 	}
-	r = parse_text(rs, text);
-	free(text);
 	if (r) {
+		pthread_mutex_unlock(&acl->reload_lock);
 		free(rs);
 		return r;			/* keep the old rules */
 	}
 
-	pthread_mutex_lock(&acl->reload_lock);
 	gen = atomic_load_explicit(&acl->gen, memory_order_relaxed) + 1;
 	rs->gen = gen;
 	old = atomic_exchange_explicit(&acl->rs, rs, memory_order_seq_cst);
@@ -2074,6 +2389,23 @@ int gwp_acl_reload(struct gwp_acl *acl)
 	return 0;
 }
 
+const char *gwp_acl_file(const struct gwp_acl *acl, size_t i)
+{
+	if (!acl || i >= acl->nr_files)
+		return NULL;
+	return acl->files[i].path;
+}
+
+int gwp_acl_file_stat(const struct gwp_acl *acl, size_t i, struct stat *st)
+{
+	if (!acl || i >= acl->nr_files)
+		return -ENOENT;
+	if (acl->files[i].err)
+		return -acl->files[i].err;
+	*st = acl->files[i].st;
+	return 0;
+}
+
 /* The caller guarantees that no evaluation is running or will start. */
 void gwp_acl_destroy(struct gwp_acl *acl)
 {
@@ -2081,6 +2413,7 @@ void gwp_acl_destroy(struct gwp_acl *acl)
 		return;
 	ruleset_destroy(atomic_load_explicit(&acl->rs, memory_order_relaxed));
 	pthread_mutex_destroy(&acl->reload_lock);
+	files_free(acl->files, acl->nr_files);
 	free(acl->path);
 	free(acl);
 }
