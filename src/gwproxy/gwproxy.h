@@ -138,9 +138,16 @@ struct gwp_upstream {
 	bool			remote_dns;	/* socks5h:// (proxy resolves) */
 	bool			use_tls;	/* https:// (TLS to the proxy) */
 	bool			has_auth;
+	/* @host is an IP literal, not a DNS name (gwp_upstream_url_host()). */
+	bool			host_is_ip;
 	uint8_t			ulen;
 	uint8_t			plen;
 	struct gwp_sockaddr	addr;		/* proxy endpoint */
+	/*
+	 * The host as the URL wrote it, which @addr was resolved from: the
+	 * name an https:// upstream's certificate is checked against.
+	 */
+	char			host[256];
 	char			user[256];
 	char			pass[256];
 };

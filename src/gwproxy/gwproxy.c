@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 
 #include <gwproxy/gwproxy.h>
+#include <gwproxy/upstream.h>
 #include <gwproxy/common.h>
 #include <gwproxy/log.h>
 #include <gwproxy/acl.h>
@@ -2727,6 +2728,10 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 	} else {
 		host = buf;
 	}
+
+	if (gwp_upstream_url_host(host, up->host, sizeof(up->host),
+				  &up->host_is_ip))
+		return -EINVAL;
 
 	/*
 	 * convert_str_to_ssaddr() ignores an explicit port in the string when

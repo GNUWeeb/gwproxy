@@ -9,12 +9,18 @@
  * either (a policy refusal, a generic error). Only the first kind should count
  * against the upstream's health.
  *
+ * Also how an upstream URL names its host, for TLS (gwp_upstream_url_host()).
+ *
  * Self-contained (libc only) so it can be unit-tested alone.
  */
 #ifndef GWP_UPSTREAM_H
 #define GWP_UPSTREAM_H
 
 #include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <string.h>
+#include <arpa/inet.h>
 
 enum gwp_upstream_fail_class {
 	GWP_UPSTREAM_FAIL_NEUTRAL	= 0,	/* not counted */
@@ -133,6 +139,41 @@ gwp_upstream_fail_class_str(enum gwp_upstream_fail_class c)
 	default:
 		return "neutral";
 	}
+}
+
+/*
+ * The host of an upstream URL's "host[:port]" or "[v6addr]:port", without the
+ * port and the brackets: the name a TLS upstream's certificate must carry.
+ * Copies it to @out (@size bytes, NUL included) and sets *@is_ip when it is an
+ * IPv4 or IPv6 address literal, which is checked against the certificate's IP
+ * addresses and never sent as SNI, rather than a DNS name. Returns 0, or
+ * -EINVAL when the host is empty or does not fit.
+ */
+static inline int gwp_upstream_url_host(const char *hostport, char *out,
+					size_t size, bool *is_ip)
+{
+	unsigned char addr[16];
+	const char *end;
+	size_t n;
+
+	if (hostport[0] == '[') {
+		end = strchr(++hostport, ']');
+		if (!end)
+			return -EINVAL;
+	} else {
+		end = strchr(hostport, ':');
+		if (!end)
+			end = hostport + strlen(hostport);
+	}
+
+	n = (size_t)(end - hostport);
+	if (!n || n >= size)
+		return -EINVAL;
+	memcpy(out, hostport, n);
+	out[n] = '\0';
+	*is_ip = inet_pton(AF_INET, out, addr) == 1 ||
+		 inet_pton(AF_INET6, out, addr) == 1;
+	return 0;
 }
 
 #endif /* GWP_UPSTREAM_H */
