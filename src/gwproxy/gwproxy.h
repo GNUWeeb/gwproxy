@@ -113,6 +113,8 @@ struct gwp_cfg {
 	bool		as_transparent;
 	const char	*tls_cert;
 	const char	*tls_key;
+	/* CA certificates to verify an https:// upstream proxy with. */
+	const char	*upstream_ca_file;
 };
 
 struct gwp_ctx;

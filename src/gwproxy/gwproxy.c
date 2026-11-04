@@ -64,6 +64,7 @@ enum {
 	OPT_IDLE_TIMEOUT,
 	OPT_UPSTREAM_AUTH_FILE,
 	OPT_MAX_CONNS_PER_IP,
+	OPT_UPSTREAM_CA_FILE,
 };
 
 /*
@@ -115,6 +116,7 @@ static const struct option long_opts[] = {
 #ifdef CONFIG_HTTPS
 	{ "tls-cert",		required_argument,	NULL,	'E' },
 	{ "tls-key",		required_argument,	NULL,	'Y' },
+	{ "upstream-ca-file",	required_argument,	NULL,	OPT_UPSTREAM_CA_FILE },
 #endif
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	{ "dns-server",		required_argument,	NULL,	'j' },
@@ -225,8 +227,15 @@ static void show_help(const char *app)
 	printf("                                  URL: socks5://[user:pass@]host:port  (local DNS)\n");
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
 	printf("                                       http://[user:pass@]host:port    (HTTP CONNECT)\n");
+#ifdef CONFIG_HTTPS
+	printf("                                       https://[user:pass@]host:port   (HTTP CONNECT over TLS)\n");
+#endif
 	printf("      --upstream-proxy-auth-file=file  Read the upstream proxy's user:pass from the first line of file\n");
 	printf("                                  instead of the URL, where other local users can see it\n");
+#ifdef CONFIG_HTTPS
+	printf("      --upstream-ca-file=file     PEM CA certificates to verify an https:// upstream proxy with\n");
+	printf("                                  (default: the system's trust store)\n");
+#endif
 	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN or CAP_NET_RAW; 0 = off)\n");
 	printf("  -B, --bind-source=ip[:port]     Bind outgoing connections to this source address (default -j BIND --to-source)\n");
 	printf("                                  Skipped for targets of the other address family; omit the port for an ephemeral one\n");
@@ -567,6 +576,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'Y':
 			cfg->tls_key = optarg;
 			break;
+		case OPT_UPSTREAM_CA_FILE:
+			cfg->upstream_ca_file = optarg;
+			break;
 #endif
 		case 'j':
 			cfg->dns_servers = optarg;
@@ -627,6 +639,12 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 
 	if (cfg->upstream_auth_file && !cfg->upstream_proxy) {
 		fprintf(stderr, ERR_WRAP "Error: --upstream-proxy-auth-file needs --upstream-proxy\n" ERR_WRAP);
+		goto einval;
+	}
+
+	/* The URL's scheme is checked once it is parsed (upstream_init_tls()). */
+	if (cfg->upstream_ca_file && !cfg->upstream_proxy) {
+		fprintf(stderr, ERR_WRAP "Error: --upstream-ca-file needs an https:// --upstream-proxy\n" ERR_WRAP);
 		goto einval;
 	}
 
@@ -2919,20 +2937,49 @@ static void gwp_ctx_free_tls(struct gwp_ctx *ctx)
 #ifdef CONFIG_HTTPS
 /*
  * An https:// upstream proxy: the client TLS context its connections use,
- * verifying the proxy's certificate against the system's trust store. The
- * proxy's name is tried on a connection here, so a host OpenSSL cannot use
- * (for SNI, say) fails now rather than every connection.
+ * verifying the proxy's certificate against --upstream-ca-file, or else the
+ * system's trust store. The proxy's name is tried on a connection here, so a
+ * host OpenSSL cannot use (for SNI, say) fails now rather than every
+ * connection.
  */
 __cold
 static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
 {
+	const char *ca = ctx->cfg.upstream_ca_file;
 	struct gwp_ssl *s;
-	int r;
+	int r, fd;
 
-	r = gwp_ssl_ctx_client_verify_create(&ctx->up_ssl_ctx, NULL);
+	if (!up->use_tls) {
+		if (ca) {
+			pr_err(&ctx->lh, "--upstream-ca-file needs an https:// --upstream-proxy");
+			return -EINVAL;
+		}
+		return 0;
+	}
+
+	/*
+	 * OpenSSL only says that it loaded no certificate. Say why, when the
+	 * file cannot be read at all.
+	 */
+	if (ca) {
+		fd = open(ca, O_RDONLY | O_CLOEXEC);
+		if (fd < 0) {
+			r = -errno;
+			pr_err(&ctx->lh, "Cannot read --upstream-ca-file '%s': %s",
+			       ca, strerror(-r));
+			return r;
+		}
+		close(fd);
+	}
+
+	r = gwp_ssl_ctx_client_verify_create(&ctx->up_ssl_ctx, ca);
 	if (r) {
-		pr_err(&ctx->lh, "Cannot set up TLS to the https:// upstream proxy: %s",
-		       gwp_ssl_errstr());
+		if (ca)
+			pr_err(&ctx->lh, "No usable CA certificate in --upstream-ca-file '%s': %s",
+			       ca, gwp_ssl_errstr());
+		else
+			pr_err(&ctx->lh, "Cannot set up TLS to the https:// upstream proxy: %s",
+			       gwp_ssl_errstr());
 		return r;
 	}
 
@@ -2947,8 +2994,9 @@ static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
 		return r;
 	}
 
-	pr_info(&ctx->lh, "TLS to the upstream proxy: verifying %s %s against the system's trust store",
-		up->host_is_ip ? "address" : "name", up->host);
+	pr_info(&ctx->lh, "TLS to the upstream proxy: verifying %s %s against %s",
+		up->host_is_ip ? "address" : "name", up->host,
+		ca ? ca : "the system's trust store");
 	return 0;
 }
 
@@ -2959,9 +3007,10 @@ static void upstream_free_tls(struct gwp_ctx *ctx)
 	ctx->up_ssl_ctx = NULL;
 }
 #else /* !CONFIG_HTTPS */
-static int upstream_init_tls(struct gwp_ctx *ctx,
-			     struct gwp_upstream __unused *up)
+static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
 {
+	if (!up->use_tls)
+		return 0;
 	pr_err(&ctx->lh, "An https:// (TLS) upstream proxy needs gwproxy built with OpenSSL; use http:// or socks5[h]://");
 	return -ENOTSUP;
 }
@@ -3028,11 +3077,9 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 			goto out_free;
 		}
 	}
-	if (up->use_tls) {
-		r = upstream_init_tls(ctx, up);
-		if (r)
-			goto out_free;
-	}
+	r = upstream_init_tls(ctx, up);
+	if (r)
+		goto out_free;
 	/*
 	 * The upstream proxy is itself an outgoing connection, so it is
 	 * subject to --outgoing-family. Catching it here turns what
