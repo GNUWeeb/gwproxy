@@ -1168,6 +1168,11 @@ static void gwp_conn_pair_drop_dns(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  *
  * A connect attempt counts as well: the target may have accepted long before the
  * proxy gets to see the result, and would read an empty stream as a complete one.
+ *
+ * The same holds the other way round for an https:// upstream proxy once the
+ * tunnel through it is up: a client whose write side was not shut has not seen
+ * the end of the upstream's stream, and gets a reset. Before that, the client
+ * may still be owed its failure reply, which a reset would throw away.
  */
 #ifdef CONFIG_HTTPS
 static void gwp_set_reset_on_close(int fd)
@@ -1198,6 +1203,9 @@ static void gwp_conn_pair_abort_target(const struct gwp_conn_pair __unused *gcp)
 #ifdef CONFIG_HTTPS
 	if (gcp->client.tls && gcp->target.fd >= 0 && !gcp->target.wr_shut)
 		gwp_set_reset_on_close(gcp->target.fd);
+	if (gcp->target.tls && gcp->is_target_alive && gcp->client.fd >= 0 &&
+	    !gcp->client.wr_shut)
+		gwp_set_reset_on_close(gcp->client.fd);
 	gwp_conn_pair_abort_attempts(gcp);
 #endif
 }
@@ -1248,6 +1256,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 
 #ifdef CONFIG_HTTPS
 		gwp_ssl_free(gcp->client.tls);
+		gwp_ssl_free(gcp->target.tls);
 #if defined(CONFIG_IO_URING)
 		free(gcp->tls_io);
 #endif
@@ -2906,6 +2915,66 @@ static void gwp_ctx_free_tls(struct gwp_ctx *ctx)
 }
 #endif /* CONFIG_HTTPS */
 
+#ifdef CONFIG_HTTPS
+/*
+ * An https:// upstream proxy: the client TLS context its connections use,
+ * verifying the proxy's certificate against the system's trust store. The
+ * proxy's name is tried on a connection here, so a host OpenSSL cannot use
+ * (for SNI, say) fails now rather than every connection.
+ */
+__cold
+static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
+{
+	struct gwp_ssl *s;
+	int r;
+
+	if (ev_is_io_uring(&ctx->cfg)) {
+		pr_err(&ctx->lh, "An https:// (TLS) upstream proxy is not supported with --event-loop=io_uring yet");
+		return -ENOTSUP;
+	}
+
+	r = gwp_ssl_ctx_client_verify_create(&ctx->up_ssl_ctx, NULL);
+	if (r) {
+		pr_err(&ctx->lh, "Cannot set up TLS to the https:// upstream proxy: %s",
+		       gwp_ssl_errstr());
+		return r;
+	}
+
+	s = gwp_ssl_client_new(ctx->up_ssl_ctx);
+	if (!s)
+		return -ENOMEM;
+	r = gwp_ssl_set_peer_name(s, up->host, up->host_is_ip);
+	gwp_ssl_free(s);
+	if (r) {
+		pr_err(&ctx->lh, "--upstream-proxy host '%s' cannot be checked as a TLS server name",
+		       up->host);
+		return r;
+	}
+
+	pr_info(&ctx->lh, "TLS to the upstream proxy: verifying %s %s against the system's trust store",
+		up->host_is_ip ? "address" : "name", up->host);
+	return 0;
+}
+
+__cold
+static void upstream_free_tls(struct gwp_ctx *ctx)
+{
+	gwp_ssl_ctx_free(ctx->up_ssl_ctx);
+	ctx->up_ssl_ctx = NULL;
+}
+#else /* !CONFIG_HTTPS */
+static int upstream_init_tls(struct gwp_ctx *ctx,
+			     struct gwp_upstream __unused *up)
+{
+	pr_err(&ctx->lh, "An https:// (TLS) upstream proxy needs gwproxy built with OpenSSL; use http:// or socks5[h]://");
+	return -ENOTSUP;
+}
+
+static void upstream_free_tls(struct gwp_ctx __unused *ctx)
+{
+}
+#endif /* CONFIG_HTTPS */
+
 /*
  * --upstream-proxy and --upstream-proxy-auth-file: build the default upstream
  * pool, of the one server they name. The pool owns that server's first
@@ -2964,9 +3033,9 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 		}
 	}
 	if (up->use_tls) {
-		pr_err(&ctx->lh, "An https:// (TLS) upstream proxy is not supported yet; use http:// or socks5[h]://");
-		r = -ENOTSUP;
-		goto out_free;
+		r = upstream_init_tls(ctx, up);
+		if (r)
+			goto out_free;
 	}
 	/*
 	 * The upstream proxy is itself an outgoing connection, so it is
@@ -2980,7 +3049,8 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 		goto out_free;
 	}
 	pr_info(&ctx->lh, "Routing outgoing connections via upstream %s proxy %s (%s DNS)",
-		up->type == GWP_UPSTREAM_HTTP ? "HTTP" : "SOCKS5",
+		up->type == GWP_UPSTREAM_SOCKS5 ? "SOCKS5" :
+		up->use_tls ? "HTTPS" : "HTTP",
 		ip_to_str(&up->addr),
 		up->remote_dns ? "remote" : "local");
 
@@ -2990,6 +3060,7 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 	return 0;
 
 out_free:
+	upstream_free_tls(ctx);
 	explicit_bzero(up, sizeof(*up));
 	free(up);
 	free(pool->srv);
@@ -3025,6 +3096,7 @@ static void gwp_ctx_free_upstream(struct gwp_ctx *ctx)
 	free(pool->srv);
 	pool->srv = NULL;
 	pool->nr = 0;
+	upstream_free_tls(ctx);
 }
 
 void gwp_upstream_put(struct gwp_upstream *up)
@@ -3395,6 +3467,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 #ifdef CONFIG_HTTPS
 	gwp_ssl_free(gcp->client.tls);
+	gwp_ssl_free(gcp->target.tls);
 #if defined(CONFIG_IO_URING)
 	free(gcp->tls_io);	/* flat buffer struct; NULL unless io_uring+TLS */
 #endif

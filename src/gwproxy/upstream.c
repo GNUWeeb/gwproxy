@@ -10,6 +10,9 @@
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
 #include <gwproxy/upstream.h>
+#ifdef CONFIG_HTTPS
+#include <gwproxy/ssl.h>
+#endif
 
 /*
  * Upstream proxy chaining: the SOCKS5/HTTP CONNECT handshake this proxy speaks
@@ -343,3 +346,48 @@ int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return http_start(w, gcp);
 	return s5_start(w, gcp);
 }
+
+#ifdef CONFIG_HTTPS
+int gwp_upstream_tls_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream *up = gcp->upstream;
+	struct gwp_ssl *s;
+
+	s = gwp_ssl_client_new(w->ctx->up_ssl_ctx);
+	if (unlikely(!s))
+		return -ENOMEM;
+
+	/* The name was tried at startup (gwp_ctx_init_upstream()). */
+	if (unlikely(gwp_ssl_set_peer_name(s, up->host, up->host_is_ip))) {
+		gwp_ssl_free(s);
+		return -ENOMEM;
+	}
+
+	gcp->target.tls = s;
+	gcp->conn_state = CONN_STATE_UPSTREAM_TLS_HS;
+	pr_dbg(&w->ctx->lh, "Upstream TLS handshake started (idx=%u, host=%s)",
+		gcp->idx, up->host);
+	return 0;
+}
+
+void gwp_upstream_tls_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream *up = gcp->upstream;
+	const char *why = gwp_ssl_verify_errstr(gcp->target.tls);
+
+	pr_err(&w->ctx->lh, "Upstream TLS handshake failed (class=%s, idx=%u, host=%s, up=%s): %s%s",
+		fail_class(GWP_UPSTREAM_END_TLS, 0), gcp->idx, up->host,
+		ip_to_str(&up->addr), why ? "certificate verify failed: " : "",
+		why ? why : gwp_ssl_errstr());
+}
+
+bool gwp_upstream_tls_cut(struct gwp_conn_pair *gcp)
+{
+	if (!gcp->target.tls)
+		return false;
+	if (gwp_http_fwd_active(gcp) &&
+	    gwp_http_fwd_res_state(gcp->http_conn) == GWP_HTTP_RES_FAILED)
+		return false;
+	return gwp_ssl_rx_cut(gcp->target.tls);
+}
+#endif /* CONFIG_HTTPS */
