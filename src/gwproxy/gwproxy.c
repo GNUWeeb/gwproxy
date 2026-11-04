@@ -1259,6 +1259,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		gwp_ssl_free(gcp->target.tls);
 #if defined(CONFIG_IO_URING)
 		free(gcp->tls_io);
+		free(gcp->up_tls_io);
 #endif
 #endif
 
@@ -2928,11 +2929,6 @@ static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
 	struct gwp_ssl *s;
 	int r;
 
-	if (ev_is_io_uring(&ctx->cfg)) {
-		pr_err(&ctx->lh, "An https:// (TLS) upstream proxy is not supported with --event-loop=io_uring yet");
-		return -ENOTSUP;
-	}
-
 	r = gwp_ssl_ctx_client_verify_create(&ctx->up_ssl_ctx, NULL);
 	if (r) {
 		pr_err(&ctx->lh, "Cannot set up TLS to the https:// upstream proxy: %s",
@@ -3470,6 +3466,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gwp_ssl_free(gcp->target.tls);
 #if defined(CONFIG_IO_URING)
 	free(gcp->tls_io);	/* flat buffer struct; NULL unless io_uring+TLS */
+	free(gcp->up_tls_io);	/* likewise, for an https:// upstream */
 #endif
 #endif
 

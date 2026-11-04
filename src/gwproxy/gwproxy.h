@@ -532,6 +532,8 @@ struct gwp_conn_pair {
 	 * handshake starts, freed in gwp_free_conn_pair().
 	 */
 	struct gwp_iou_tls		*tls_io;
+	/* The same for the target, when it is an https:// upstream proxy. */
+	struct gwp_iou_tls		*up_tls_io;
 #endif
 #endif
 
