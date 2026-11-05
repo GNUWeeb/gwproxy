@@ -1140,9 +1140,13 @@ request per connection.
 Only that one request reaches the origin: its body, delimited by Content\-Length
 or chunked Transfer\-Encoding, is forwarded, and anything the client sends after
 it is discarded. A request gwproxy cannot delimit unambiguously (both framing
-headers, a Transfer\-Encoding other than "chunked", an invalid Content\-Length,
-or a Connection header naming Content\-Length, Transfer\-Encoding or Host) is
-answered with "400 Bad Request"; a malformed chunked body closes the connection.
+headers, a Transfer\-Encoding other than "chunked", a Content\-Length that is
+not plain digits or exceeds 9223372036854775807, the largest signed 64\-bit
+integer, or a Connection header naming Content\-Length, Transfer\-Encoding or
+Host) is answered with "400 Bad Request". So is a malformed chunked body, including a
+chunk extension off the grammar of RFC 9112 Section 7.1.1 (an empty extension,
+an unterminated quoted string, whitespace before the line end), when it comes
+with the header; one that turns out malformed later closes the connection.
 A field value may hold bytes 0x80 to 0xff, which are passed on unchanged, and
 none of them makes a framing header acceptable; any other control byte than a
 tab in a value closes the connection without a reply.
@@ -1156,6 +1160,14 @@ Cache\-Control, have their repeated lines joined with ", "; any other repeated
 field, such as X\-Forwarded\-For, keeps its separate lines, in their order. As
 with every field, each line reaches the origin spelled "Name: value", and a
 hop\-by\-hop field or one that Connection names is dropped.
+.PP
+A forwarding request with a field name that reads, in any case and with each
+"_" taken for "\-", as Content\-Length, Transfer\-Encoding, Host or a hop\-by\-hop
+field (Connection, Proxy\-Connection, Keep\-Alive, TE, Trailer, Upgrade,
+Proxy\-Authorization, Proxy\-Authenticate), such as Content_Length, is answered
+with "400 Bad Request": an origin that maps "_" and "\-" to the same name, as CGI
+does, could read it as the field itself. Other names with underscores are
+forwarded unchanged.
 .PP
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client

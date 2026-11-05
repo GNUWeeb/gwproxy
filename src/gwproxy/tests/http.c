@@ -442,7 +442,9 @@ static void test_req_framing(void)
 		"5\r\nhello\r\n"
 		"1A;ext=\"v\"\r\nabcdefghijklmnopqrstuvwxyz\r\n"
 		"0003 ;x\r\nabc\r\n"
-		"0\r\nX-Trailer: t\r\nX-T: v\r\n\r\n";
+		"2 ; a ; b = c\t;d=\"q \\\" ;\\\\\";e=\"\"\r\nde\r\n"
+		"1;\tn=\"obs\xa0\" ;m\r\nf\r\n"
+		"0;last=1\r\nX-Trailer: t\r\nX-T: v\r\n\r\n";
 	static const char *const bad_hdr[] = {
 		"POST http://h/ HTTP/1.1\r\nContent-Length: 1\r\n"
 		"Transfer-Encoding: chunked\r\n\r\n",
@@ -452,6 +454,20 @@ static void test_req_framing(void)
 		"POST http://h/ HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
 		"POST http://h/ HTTP/1.1\r\n"
 		"Content-Length: 99999999999999999999\r\n\r\n",
+		/* More than a signed 64-bit integer holds. */
+		"POST http://h/ HTTP/1.1\r\n"
+		"Content-Length: 9223372036854775808\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\n"
+		"Content-Length: 9223372036854775810\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\n"
+		"Content-Length: 18446744073709551615\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\n"
+		"Content-Length: 18446744073709551616\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: +4\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 4 4\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 4\t4\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 4,4\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 0x4\r\n\r\n",
 	};
 	static const char *const bad_chunked[] = {
 		"5\nhello\r\n0\r\n\r\n",	/* bare LF */
@@ -468,6 +484,33 @@ static void test_req_framing(void)
 		"100000005\r\nhello\r\n0\r\n\r\n",
 		"5 6\r\nhello\r\n0\r\n\r\n",	/* bare-space extension */
 		"5 \r\nhello\r\n0\r\n\r\n",
+		/* Chunk extensions off the RFC 9112 Section 7.1.1 grammar. */
+		"5;\r\nhello\r\n0\r\n\r\n",	/* empty extension */
+		"5;;a\r\nhello\r\n0\r\n\r\n",
+		"5;a;\r\nhello\r\n0\r\n\r\n",
+		"5; \r\nhello\r\n0\r\n\r\n",
+		"5;=b\r\nhello\r\n0\r\n\r\n",	/* no name */
+		"5;a=\r\nhello\r\n0\r\n\r\n",	/* no value */
+		"5;a= \r\nhello\r\n0\r\n\r\n",
+		"5;a==b\r\nhello\r\n0\r\n\r\n",
+		"5;a b\r\nhello\r\n0\r\n\r\n",	/* two names */
+		"5;a=b c\r\nhello\r\n0\r\n\r\n",	/* two values */
+		"5;a \r\nhello\r\n0\r\n\r\n",	/* BWS before CRLF */
+		"5;a=b \r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\" \r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\"c\r\nhello\r\n0\r\n\r\n",
+		"5;a(b)\r\nhello\r\n0\r\n\r\n",	/* not a token */
+		"5;a=b,c\r\nhello\r\n0\r\n\r\n",
+		"5;a=b\"c\"\r\nhello\r\n0\r\n\r\n",
+		"5;a\xa0\r\nhello\r\n0\r\n\r\n",
+		/* Unterminated quoted-string, as an origin may read it. */
+		"35;a=\"\r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\\\"\r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\\\r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\x01\"\r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\x7f\"\r\nhello\r\n0\r\n\r\n",
+		"5;a=\"\nb\"\r\nhello\r\n0\r\n\r\n",
+		"0;\r\n\r\n",			/* on the last chunk too */
 	};
 	char body[256];
 	size_t fwd, step, i;
@@ -482,6 +525,16 @@ static void test_req_framing(void)
 		assert(!req_body("POST http://h/ HTTP/1.1\r\n"
 				 "Content-Length: 5\r\n\r\n", body, step, &fwd));
 		assert(fwd == 5);
+
+		/* The largest Content-Length taken, leading zeros or not. */
+		assert(!req_body("POST http://h/ HTTP/1.1\r\nContent-Length: "
+				 "9223372036854775807\r\n\r\n", body, step,
+				 &fwd));
+		assert(fwd == strlen(body));
+		assert(!req_body("POST http://h/ HTTP/1.1\r\nContent-Length: "
+				 "  09223372036854775807 \r\n\r\n", body, step,
+				 &fwd));
+		assert(fwd == strlen(body));
 
 		/* No framing: no body; a pipelined request goes nowhere. */
 		assert(!req_body("GET http://h/ HTTP/1.1\r\n\r\n", next, step,
@@ -1147,6 +1200,67 @@ static void test_res_interim_run(void)
 }
 
 /*
+ * A field name that reads as Content-Length, Transfer-Encoding, Host or a
+ * hop-by-hop field once its '_' are taken for '-' is refused in a forwarding
+ * request, in any case; other names with underscores go on as they came.
+ */
+static void test_underscore_alias(void)
+{
+	static const char *const bad[] = {
+		"Content_Length: 4", "content_length: 4", "CONTENT_LENGTH: 4",
+		"Transfer_Encoding: chunked", "transfer_encoding: gzip",
+		"Proxy_Connection: close", "Keep_Alive: 1",
+		"Proxy_Authorization: Basic eDp5", "Proxy_Authenticate: x",
+		"PROXY_authorization: x",
+	};
+	static const char good[] =
+		"POST http://e/ HTTP/1.1\r\n"
+		"X_Custom: 1\r\nContent_Type: t\r\nMax_Forwards: 2\r\n"
+		"_: z\r\nContent__Length: 1\r\nContent-Length_: 1\r\n"
+		"Content_Lengthx: 1\r\nXContent_Length: 1\r\n"
+		"Host_: h\r\nTE_: x\r\nContent-Length: 4\r\n\r\n";
+	static const char good_want[] =
+		"POST / HTTP/1.1\r\nHost: e\r\n"
+		"X_Custom: 1\r\nContent_Type: t\r\nMax_Forwards: 2\r\n"
+		"_: z\r\nContent__Length: 1\r\nContent-Length_: 1\r\n"
+		"Content_Lengthx: 1\r\nXContent_Length: 1\r\n"
+		"Host_: h\r\nTE_: x\r\nContent-Length: 4\r\n"
+		"Connection: close\r\n\r\n";
+	struct gwp_http_conn *hc;
+	char *host, *port, buf[256];
+	const char *req;
+	size_t req_len, i;
+
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		snprintf(buf, sizeof(buf), "POST http://e/ HTTP/1.1\r\n"
+			 "X-A: 1\r\n%s\r\nContent-Length: 4\r\n\r\n",
+			 bad[i]);
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
+		       GWP_HTTP_BAD_REQUEST);
+		gwp_http_conn_free(hc);
+	}
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, good, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	assert(req_len == sizeof(good_want) - 1);
+	assert(!memcmp(req, good_want, req_len));
+	gwp_http_conn_free(hc);
+
+	/* A CONNECT's fields go nowhere: nothing to refuse there. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, "CONNECT e:443 HTTP/1.1\r\n"
+		   "Content_Length: 4\r\n\r\n", &host, &port, &req,
+		   &req_len) == GWP_HTTP_CONNECT);
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+/*
  * A field that may appear only once, sent twice, is answered with 400 rather
  * than a silent close, however it is spelled and whatever the request is;
  * repeated list fields are still merged and any other repeated field goes on
@@ -1653,6 +1767,7 @@ int main(void)
 		test_errors();
 		test_field_obs_text();
 		test_duplicate_field();
+		test_underscore_alias();
 		test_header_limits();
 	test_forward_in_place();
 		test_forward_rewrite_slack();

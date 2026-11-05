@@ -477,6 +477,56 @@ too_big:
 	return -E2BIG;
 }
 
+/*
+ * Whether the field name @k (@klen bytes) is, reading every '_' as '-', one of
+ * the fields this proxy delimits, routes or drops a request by, without being
+ * that field: Content_Length, transfer_encoding, Proxy_Connection, ... Such a
+ * name is an ordinary field here and goes on to the origin, where a CGI-style
+ * server maps '-' and '_' to the same variable and may read it as the real
+ * one: a second Content-Length the proxy never saw, or a hop-by-hop field it
+ * believes it dropped.
+ */
+static bool is_underscore_alias(const char *k, size_t klen)
+{
+#define UA(s)	{ s, sizeof(s) - 1 }
+	static const struct {
+		const char	*name;
+		size_t		len;
+	} special[] = {
+		UA("Content-Length"), UA("Transfer-Encoding"), UA("Host"),
+		/* Those is_hop_by_hop() drops. */
+		UA("Connection"), UA("Proxy-Connection"), UA("Keep-Alive"),
+		UA("TE"), UA("Trailer"), UA("Upgrade"),
+		UA("Proxy-Authorization"), UA("Proxy-Authenticate"),
+	};
+#undef UA
+	size_t i, j;
+
+	if (!memchr(k, '_', klen))
+		return false;
+
+	for (i = 0; i < sizeof(special) / sizeof(special[0]); i++) {
+		if (special[i].len != klen)
+			continue;
+		for (j = 0; j < klen; j++) {
+			unsigned char a = (unsigned char)k[j];
+			unsigned char b = (unsigned char)special[i].name[j];
+
+			if (a == '_')
+				a = '-';
+			if (a >= 'A' && a <= 'Z')
+				a |= 0x20;
+			if (b >= 'A' && b <= 'Z')
+				b |= 0x20;
+			if (a != b)
+				break;
+		}
+		if (j == klen)
+			return true;
+	}
+	return false;
+}
+
 enum req_body {
 	REQ_BODY_DONE = 0,	/* No body, or all of it has been seen. */
 	REQ_BODY_LENGTH,	/* Content-Length; req_rem bytes to go. */
@@ -515,11 +565,21 @@ static int set_req_framing(struct gwp_http_conn *hc)
 	if (cl) {
 		if (!cll)
 			return -EBADMSG;
+		/*
+		 * Digits only: no sign, no white space between them (around
+		 * them it is OWS, already trimmed), no list. And no more than
+		 * a signed 64-bit integer holds, which is what most origins
+		 * parse it into: past that one may wrap around and read a
+		 * short body where this proxy forwards a long one. A body of
+		 * many GiB is still well below.
+		 */
 		for (i = 0; i < cll; i++) {
+			uint64_t d = (uint64_t)(cl[i] - '0');
+
 			if (cl[i] < '0' || cl[i] > '9' ||
-			    len > (UINT64_MAX - 9) / 10)
+			    len > ((uint64_t)INT64_MAX - d) / 10)
 				return -EBADMSG;
-			len = len * 10 + (uint64_t)(cl[i] - '0');
+			len = len * 10 + d;
 		}
 	}
 
@@ -557,6 +617,7 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 	const char *authority, *slash, *path;
 	char sbuf[REQ_FAST_MAX], *out = sbuf;
 	ssize_t w;
+	size_t i;
 	int r;
 
 	/* Only absolute-form http:// URIs are supported (no TLS termination). */
@@ -586,6 +647,15 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 	} else {
 		path = "/";
 		path_len = 1;
+	}
+
+	for (i = 0; i < hc->req_hdr.fields.nr; i++) {
+		const struct gwnet_http_hdr_fields *ff = &hc->req_hdr.fields;
+		const struct gwnet_http_hdr_field *f = &ff->ff[i];
+
+		if (is_underscore_alias(gwnet_http_hdr_field_key(ff, f),
+					f->klen))
+			return GWP_HTTP_BAD_REQUEST;
 	}
 
 	r = set_req_framing(hc);
@@ -827,7 +897,15 @@ static bool is_field_char(unsigned char c)
 enum {
 	CH_SIZE = 0,	/* chunk-size hex digits */
 	CH_BWS,		/* whitespace between chunk-size and ';' */
-	CH_EXT,		/* chunk extensions, up to CR */
+	CH_EXT,		/* after ';': BWS, then a chunk-ext-name */
+	CH_EXT_NAME,	/* chunk-ext-name */
+	CH_EXT_NAME_BWS,	/* whitespace after the name: '=' or ';' */
+	CH_EXT_EQ,	/* after '=': BWS, then a chunk-ext-val */
+	CH_EXT_TOKEN,	/* chunk-ext-val as a token */
+	CH_EXT_QSTR,	/* chunk-ext-val as a quoted-string */
+	CH_EXT_QPAIR,	/* the byte after a '\' in a quoted-string */
+	CH_EXT_END,	/* after a value: ';' or CR */
+	CH_EXT_END_BWS,	/* whitespace after a value: ';' */
 	CH_SIZE_LF,	/* LF ending the chunk-size line */
 	CH_DATA,	/* chunk data, req_rem bytes to go */
 	CH_DATA_CR,	/* CRLF after chunk data */
@@ -900,11 +978,72 @@ static int scan_chunked(struct gwp_http_conn *hc, const unsigned char *p,
 			else if (c != ' ' && c != '\t')
 				return -EBADMSG;
 			break;
+		/*
+		 * chunk-ext = *( BWS ";" BWS chunk-ext-name
+		 *                [ BWS "=" BWS chunk-ext-val ] )
+		 * (RFC 9112 Section 7.1.1), the name a token and the value a
+		 * token or a quoted-string. Nothing here reads the extensions,
+		 * but an origin does: one that stops a quoted-string at the
+		 * CRLF and one that runs it on past it see different chunks.
+		 * Anything off the grammar -- an empty extension, an
+		 * unterminated quoted-string, whitespace before the CRLF --
+		 * is refused rather than passed on for the origin to guess at.
+		 */
 		case CH_EXT:
-			if (c == '\r')
+			if (is_tchar(c))
+				hc->chunk_st = CH_EXT_NAME;
+			else if (c != ' ' && c != '\t')
+				return -EBADMSG;
+			break;
+		case CH_EXT_NAME:
+		case CH_EXT_NAME_BWS:
+			if (c == '=')
+				hc->chunk_st = CH_EXT_EQ;
+			else if (c == ';')
+				hc->chunk_st = CH_EXT;
+			else if (c == ' ' || c == '\t')
+				hc->chunk_st = CH_EXT_NAME_BWS;
+			else if (c == '\r' && hc->chunk_st == CH_EXT_NAME)
 				hc->chunk_st = CH_SIZE_LF;
+			else if (!is_tchar(c) || hc->chunk_st != CH_EXT_NAME)
+				return -EBADMSG;
+			break;
+		case CH_EXT_EQ:
+			if (c == '"')
+				hc->chunk_st = CH_EXT_QSTR;
+			else if (is_tchar(c))
+				hc->chunk_st = CH_EXT_TOKEN;
+			else if (c != ' ' && c != '\t')
+				return -EBADMSG;
+			break;
+		case CH_EXT_TOKEN:
+		case CH_EXT_END:
+		case CH_EXT_END_BWS:
+			if (hc->chunk_st == CH_EXT_TOKEN && is_tchar(c))
+				break;
+			if (c == ';')
+				hc->chunk_st = CH_EXT;
+			else if (c == ' ' || c == '\t')
+				hc->chunk_st = CH_EXT_END_BWS;
+			else if (c == '\r' && hc->chunk_st != CH_EXT_END_BWS)
+				hc->chunk_st = CH_SIZE_LF;
+			else
+				return -EBADMSG;
+			break;
+		case CH_EXT_QSTR:
+			/* qdtext: HTAB, SP, VCHAR but '"' and '\', obs-text */
+			if (c == '"')
+				hc->chunk_st = CH_EXT_END;
+			else if (c == '\\')
+				hc->chunk_st = CH_EXT_QPAIR;
 			else if (!is_field_char(c))
 				return -EBADMSG;
+			break;
+		case CH_EXT_QPAIR:
+			/* quoted-pair: '\' then HTAB, SP, VCHAR or obs-text */
+			if (!is_field_char(c))
+				return -EBADMSG;
+			hc->chunk_st = CH_EXT_QSTR;
 			break;
 		case CH_SIZE_LF:
 			if (c != '\n')
