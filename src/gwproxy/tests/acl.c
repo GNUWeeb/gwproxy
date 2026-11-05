@@ -707,6 +707,11 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT -j ACCEPT --to-iface eth0\n",	    /* --to-iface w/o BIND */
 		"-A INPUT -j BIND --to-iface eth0\n",		    /* BIND in INPUT */
 		"-A OUTPUT -j BIND --to-source notanip\n",	    /* bad source */
+		"-A OUTPUT -j BIND --to-source 10.0.0.1:80x\n",   /* port junk */
+		"-A OUTPUT -j BIND --to-source 10.0.0.1:65536\n", /* port range */
+		"-A OUTPUT -j BIND --to-source 10.0.0.1:+80\n",   /* port sign */
+		"-A OUTPUT -j BIND --to-source [::1]:-18446744073709551535\n", /* 81 */
+		"-A OUTPUT -j BIND --to-source 10.0.0.1:\n",	    /* empty port */
 		"-A OUTPUT -j BIND --to-source 1.1.1.1 --to-source 2.2.2.2\n", /* dup src */
 		"-A OUTPUT -j BIND --to-iface toolonginterfacename0\n", /* iface >= 16 */
 		"-A OUTPUT -j ACCEPT --accept\n",		    /* --accept on ACCEPT */

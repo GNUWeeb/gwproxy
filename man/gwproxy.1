@@ -1105,8 +1105,9 @@ address, a bare IPv6 address, or a bracketed
 .RI [ v6 ]
 when a
 .I port
-follows. Omit the port (the default) for an ephemeral source port, chosen per
-destination at
+follows. The port is written in decimal digits only, 0 to 65535; anything else
+is refused at startup. Omit the port (the default) for an ephemeral source
+port, chosen per destination at
 .BR connect (2);
 pinning a fixed one limits that source to a single connection at a time and
 defeats multi\-address racing, as described under
