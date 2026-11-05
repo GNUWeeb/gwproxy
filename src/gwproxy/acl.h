@@ -97,6 +97,13 @@ const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i);
  */
 void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i);
 
+/*
+ * The pool's round-robin cursor: the value before this call's increment,
+ * from 0 on, shared by every thread and wrapping at 2^32. A reload makes
+ * new pools, whose cursors start again from 0.
+ */
+uint32_t gwp_acl_pool_next(struct gwp_acl_pool *p);
+
 /* Take another reference to @p. */
 void gwp_acl_pool_get(struct gwp_acl_pool *p);
 

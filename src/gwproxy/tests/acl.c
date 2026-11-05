@@ -2401,6 +2401,13 @@ static noinline void test_upstream_pools(void)
 		       "http://[2001:db8::1]:8080"));
 	assert(!strcmp(gwp_acl_pool_server_url(p, 3), "http://proxy.example"));
 	assert(!gwp_acl_pool_server_url(p, 4));
+	/* The cursor counts picks, for every holder of the pool alike. */
+	assert(gwp_acl_pool_next(p) == 0);
+	assert(gwp_acl_pool_next(p) == 1);
+	gwp_acl_req_release(&req);
+	assert(up_eval(a, "frank", &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream_pool == p);
+	assert(gwp_acl_pool_next(req.upstream_pool) == 2);
 	gwp_acl_req_release(&req);
 
 	assert(up_eval(a, "dave", &req) == GWP_ACL_ACCEPT);

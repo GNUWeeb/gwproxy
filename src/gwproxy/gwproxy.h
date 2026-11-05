@@ -16,6 +16,7 @@
 #include <gwproxy/dns.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/iplimit.h>
+#include <gwproxy/upstream_lb.h>
 #include <gwproxy/log.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -158,6 +159,12 @@ struct gwp_upstream {
 	 * one less once this one is freed; NULL for --upstream-proxy's.
 	 */
 	_Atomic(uint32_t)	*live;
+	/*
+	 * What all servers of this one's identity share (gwp_ctx::up_tab),
+	 * held until this one is freed: among others, how many pairs use
+	 * it now, one for each pair whose gwp_conn_pair::upstream it is.
+	 */
+	struct gwp_up_state	*state;
 };
 
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up);
@@ -571,8 +578,9 @@ struct gwp_conn_pair {
 	struct gwp_conn_pair	*next_dead;
 	/*
 	 * The upstream proxy this pair chains through, NULL to connect
-	 * direct. Holds a reference, dropped when the pair is freed; set it
-	 * with gwp_conn_set_upstream().
+	 * direct. Holds a reference, and a slot of its open-pair count,
+	 * both dropped when the pair is freed; set it only with
+	 * gwp_conn_set_upstream().
 	 */
 	struct gwp_upstream	*upstream;
 
@@ -967,6 +975,11 @@ struct gwp_ctx {
 	/* --upstream-proxy; see struct gwp_upstream_pool. */
 	struct gwp_upstream_pool	upstream_pool;
 	/*
+	 * The shared state of every upstream server, the default one and
+	 * the ACL pools', by identity (struct gwp_up_table).
+	 */
+	struct gwp_up_table		*up_tab;
+	/*
 	 * Parsed --bind-source/--bind-iface: the source pin applied to every
 	 * outgoing connection that no ACL -j BIND rule claimed. Built once at
 	 * startup so the connect path never parses anything, and shaped like an
@@ -1025,7 +1038,8 @@ bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 /* Make @gcp chain through @up (NULL: go direct), dropping what it had. */
-void gwp_conn_set_upstream(struct gwp_conn_pair *gcp, struct gwp_upstream *up);
+void gwp_conn_set_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+			   struct gwp_upstream *up);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);

@@ -89,6 +89,8 @@ struct gwp_acl_dnat {
  */
 struct gwp_acl_pool {
 	_Atomic(uint32_t)	ref;
+	/* gwp_acl_pool_next(): the one thing in a pool that changes. */
+	_Atomic(uint32_t)	cursor;
 	uint32_t		nr_servers;
 	/* The server URLs as written, credentials included. */
 	char			**servers;
@@ -1097,6 +1099,11 @@ void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i)
 	return i < p->nr_servers && p->srv ? p->srv[i] : NULL;
 }
 
+uint32_t gwp_acl_pool_next(struct gwp_acl_pool *p)
+{
+	return atomic_fetch_add_explicit(&p->cursor, 1, memory_order_relaxed);
+}
+
 void gwp_acl_pool_get(struct gwp_acl_pool *p)
 {
 	atomic_fetch_add_explicit(&p->ref, 1, memory_order_relaxed);
@@ -1314,6 +1321,7 @@ static int parse_pool_open(struct acl_load *ld, char **tok, int n)
 	if (!p)
 		return -ENOMEM;
 	atomic_init(&p->ref, 1);
+	atomic_init(&p->cursor, 0);
 	p->method = GWP_ACL_POOL_ROUND_ROBIN;
 	strcpy(p->name, tok[1]);
 	rs->pools[rs->nr_pools++] = p;
