@@ -56,10 +56,12 @@ import time
 MAX_GROWTH = 8 << 20    # how much the proxy's memory may grow
 STALL_SECS = 3          # no progress for this long: the client has been stopped
 # Answers that are kept make the proxy grow by 1.5 MiB or more over these, counted
-# from where a sanitizer's quarantine has filled up: it takes about 1 MiB itself.
+# from where the proxy has handled SHUT_SETTLE of them: a sanitizer's quarantine
+# has filled up by then, and it takes about 1 MiB itself.
 SHUT_UPDATES = 128 << 10
 SHUT_SETTLE = 32 << 10
 SHUT_GROWTH = 1 << 20
+SHUT_STALL = 30         # the origin got nothing for this long: it is stuck
 BURST_SNDBUF = 256 << 10  # one read gets the engine past its limit with less
 BURST_RUN = 20          # OpenSSL allows 32 KeyUpdates without data in between
 STRAND_ROUNDS = 3       # it depends on timing: this makes it show nearly always
@@ -565,20 +567,40 @@ def shut(port, pid):
         n = LIB.SSL_read(c.ssl, c.buf, len(c.buf))
         if n <= 0:
             break
+
+    # Each KeyUpdate goes with a byte, so what the origin got is how many of
+    # them the proxy has handled. The client can be far ahead of that: the
+    # sockets hold tens of thousands of them, and a proxy slowed down by load
+    # may have handled only a few thousand by the time SHUT_SETTLE are sent.
+    # Count from the proxy's progress, and look again once it is done.
+    before = None
+
+    def settled():
+        nonlocal before
+        if before is None and sink.count >= SHUT_SETTLE:
+            before = vm_hwm(pid)
+        return before is not None
+
     sent = 0
     while sent < SHUT_UPDATES:
         c.key_update()
         c.write(b"x")
         sent += 1
-        if sent == SHUT_SETTLE:
-            before = vm_hwm(pid)
-        elif sent > SHUT_SETTLE and sent % 4096 == 0:
-            check_growth(pid, before, SHUT_GROWTH, sent, "KeyUpdates")
-    deadline = time.monotonic() + 60
+        if sent % 1024 == 0 and settled() and sent % 4096 == 0:
+            check_growth(pid, before, SHUT_GROWTH, sink.count,
+                         "KeyUpdates handled")
+    # The proxy may still have most of them to handle, at its own pace: give
+    # up only once it has stopped.
+    seen, moved = -1, time.monotonic()
     while sink.count < sent:
-        if time.monotonic() > deadline:
+        if sink.count != seen:
+            seen, moved = sink.count, time.monotonic()
+        elif time.monotonic() - moved > SHUT_STALL:
             return "origin got %d of %d bytes" % (sink.count, sent)
-        time.sleep(0.1)
+        settled()
+        time.sleep(0.01)
+    settled()
+    check_growth(pid, before, SHUT_GROWTH, sent, "KeyUpdates")
     return None
 
 
