@@ -1909,6 +1909,10 @@ only part of the data, so a protocol that does not mark its own end cannot tell
 this from a complete transfer. The process exits once a reload in progress is
 over (see
 .BR "RELOADING THE FILES" ).
+Early in the startup, while it loads its files, the signal ends the process
+at once. From when it starts its threads and opens its listeners until its
+handler is in place, the signal is held instead, and then stops the proxy as
+above, with exit status 0.
 .TP
 .B SIGHUP
 Reload

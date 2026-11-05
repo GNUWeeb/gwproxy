@@ -4096,6 +4096,18 @@ void gwp_conn_upstream_up(struct gwp_conn_pair *gcp)
 	gcp->up_pool = NULL;
 }
 
+/* Block or unblock (@how) SIGINT and SIGTERM on the calling thread. */
+__cold
+static void gwp_block_stop_signals(int how)
+{
+	sigset_t set;
+
+	sigemptyset(&set);
+	sigaddset(&set, SIGINT);
+	sigaddset(&set, SIGTERM);
+	pthread_sigmask(how, &set, NULL);
+}
+
 __cold
 static int gwp_ctx_init(struct gwp_ctx *ctx)
 {
@@ -4193,6 +4205,19 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	r = gwp_ctx_init_reload(ctx);
 	if (r < 0)
 		goto out_free_iplim;
+
+	/*
+	 * From here on threads start (the DNS workers) and the listeners
+	 * open, and either would make a SIGINT or SIGTERM with no handler
+	 * yet a death by signal: the default action, which skips the
+	 * cleanup and fails whatever waited for the proxy to listen. Keep
+	 * them pending instead, as SIGHUP is from the top of main(), so the
+	 * handler takes them as a stop once it is in place; the threads
+	 * started meanwhile inherit the block, so they never land there.
+	 * Before this point a signal still stops a slow or stuck startup
+	 * (a log FIFO with no reader, a large ACL file) at once.
+	 */
+	gwp_block_stop_signals(SIG_BLOCK);
 
 	r = gwp_ctx_init_dns(ctx);
 	if (r < 0)
@@ -6827,6 +6852,13 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Failed to set signal handlers: %s\n", strerror(-r));
 		goto out_free;
 	}
+	/*
+	 * A SIGINT or SIGTERM held since gwp_ctx_init() started the threads
+	 * is taken here and stops the proxy before a worker runs: each worker
+	 * finds ctx.stop set and leaves its loop at once, and the proxy exits
+	 * as on any other stop.
+	 */
+	gwp_block_stop_signals(SIG_UNBLOCK);
 	pthread_sigmask(SIG_UNBLOCK, &hup, NULL);
 
 	r = gwp_ctx_run(&ctx);
