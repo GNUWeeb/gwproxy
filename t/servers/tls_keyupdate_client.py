@@ -412,6 +412,43 @@ def burst(port, pid):
     return None
 
 
+def stall_state(pid, c, sink, sent, stuck):
+    """What a stalled round looks like, for the test's log: where the bytes
+    the origin is short of could be, and what the proxy is waiting on."""
+    import os
+    import subprocess
+
+    out = ["origin got %d of %d bytes, stuck message %s" %
+           (sink.count, sent, "still unsent" if stuck else "sent")]
+    try:
+        r = subprocess.run(["ss", "-tnmiep"], capture_output=True, text=True,
+                           timeout=5).stdout.splitlines()
+        for i, l in enumerate(r):
+            if "pid=%s," % pid in l:
+                out += ["  ss " + x.strip() for x in r[i:i + 2]]
+    except (OSError, subprocess.SubprocessError):
+        out.append("  ss: not available")
+    fds = "/proc/%s/fd" % pid
+    try:
+        for fd in sorted(os.listdir(fds), key=int):
+            try:
+                if os.readlink("%s/%s" % (fds, fd)) != "anon_inode:[io_uring]":
+                    continue
+                with open("/proc/%s/fdinfo/%s" % (pid, fd)) as f:
+                    out += ["  io_uring fd %s: %s" % (fd, l.rstrip())
+                            for l in f.read().splitlines()[:200]]
+            except OSError:
+                pass
+    except OSError:
+        out.append("  /proc/%s: gone" % pid)
+    try:
+        ti = c.s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
+        out.append("  client tcp_info %d bytes: %s" % (len(ti), ti[:104].hex()))
+    except OSError:
+        pass
+    return "\n".join(out)
+
+
 def strand_round(port, pid):
     sink = Talker()
     # Its receive buffer is left to the kernel. Set, it cannot grow, and a
@@ -472,6 +509,7 @@ def strand_round(port, pid):
         if now > deadline or (not stuck and now - moved > STRAND_STALL):
             err = "tunnel did not resume: origin got %d of %d bytes" % (
                 sink.count, sent)
+            err += "\n" + stall_state(pid, c, sink, sent, stuck)
             break
         try:
             if not c.s.recv(random.choice((256, 512, 1024, 4096))):
