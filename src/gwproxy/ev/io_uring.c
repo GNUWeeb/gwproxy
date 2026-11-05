@@ -2094,6 +2094,7 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 static int upstream_iou_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			     int err)
 {
+	gwp_conn_upstream_failed(w, gcp, err);
 	if (gwp_upstream_fail_reply(w, gcp, err) > 0)
 		prep_send_client(w, gcp);
 	return err;
@@ -2575,6 +2576,14 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		    gwp_in_dns_lookup(gcp)) {
 			uint32_t len;
 
+			/* Not while the name resolves: no upstream yet. */
+			if (!gwp_in_dns_lookup(gcp)) {
+				gwp_upstream_note_end(gcp,
+						      GWP_UPSTREAM_END_TIMEOUT,
+						      gwp_upstream_timeout_val(gcp));
+				gwp_conn_upstream_failed(w, gcp, r);
+			}
+
 			if (gwp_in_upstream_hs(gcp)) {
 				gcp->target.len = 0;
 				gwp_conn_buf_compact(&gcp->target);
@@ -3015,6 +3024,7 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 exhausted:
 	pr_dbg(&w->ctx->lh, "No target address left to try (idx=%u): %s",
 		gcp->idx, strerror(-err));
+	gwp_conn_upstream_failed(w, gcp, err);
 
 	/*
 	 * Report the failure instead of just hanging up, so the client learns

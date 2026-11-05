@@ -167,6 +167,7 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 		pr_err(&ctx->lh, "Upstream SOCKS5 proxy selected no acceptable auth method (0x%02x, class=%s)",
 			method, fail_class(GWP_UPSTREAM_END_S5_METHOD, method));
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_S5_METHOD, method);
 		return -EACCES;
 	}
 	case CONN_STATE_UPSTREAM_S5_AUTH: {
@@ -181,6 +182,8 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			pr_err(&ctx->lh, "Upstream SOCKS5 authentication failed (status=0x%02x, class=%s, idx=%u)",
 				status, fail_class(GWP_UPSTREAM_END_S5_AUTH, status),
 				gcp->idx);
+			gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_S5_AUTH,
+					      status);
 			return -EACCES;
 		}
 		r = build_connect(gcp);
@@ -198,6 +201,7 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			pr_err(&ctx->lh, "Upstream SOCKS5 CONNECT failed (rep=0x%02x, class=%s, idx=%u, dst=%s)",
 				rep, fail_class(GWP_UPSTREAM_END_S5_REP, rep),
 				gcp->idx, gwp_upstream_dst_str(gcp));
+			gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_S5_REP, rep);
 			return -ECONNREFUSED;
 		}
 		r = gwp_upstream_splice_reply(w, gcp, consumed);
@@ -225,6 +229,7 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT reply header too large (class=%s, idx=%u, dst=%s)",
 			fail_class(GWP_UPSTREAM_END_MALFORMED, 0), gcp->idx,
 			gwp_upstream_dst_str(gcp));
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_MALFORMED, 0);
 		return -EMSGSIZE;
 	}
 	if (r)
@@ -234,6 +239,7 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT failed (status=%d, class=%s, idx=%u, dst=%s)",
 			status, fail_class(GWP_UPSTREAM_END_HTTP, status),
 			gcp->idx, gwp_upstream_dst_str(gcp));
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_HTTP, status);
 		return -ECONNREFUSED;
 	}
 	r = gwp_upstream_splice_reply(w, gcp, consumed);
@@ -244,6 +250,14 @@ int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    int err)
 {
 	int r;
+
+	/*
+	 * Answered already: the failure came back up through a second
+	 * caller (upstream_start() inside the TLS step, say). What is left
+	 * of that answer is still to be sent; nothing is added.
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
+		return 0;
 
 	gcp->target.len = 0;
 	gwp_conn_buf_compact(&gcp->target);
@@ -272,10 +286,12 @@ int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	else
 		r = s5_parse(w, gcp);
 
-	if (r == -EINVAL)
+	if (r == -EINVAL) {
 		pr_err(&w->ctx->lh, "Upstream proxy sent a malformed reply (class=%s, idx=%u, dst=%s)",
 			fail_class(GWP_UPSTREAM_END_MALFORMED, 0), gcp->idx,
 			gwp_upstream_dst_str(gcp));
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_MALFORMED, 0);
+	}
 	return r;
 }
 
@@ -379,6 +395,7 @@ void gwp_upstream_tls_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		fail_class(GWP_UPSTREAM_END_TLS, 0), gcp->idx, up->host,
 		ip_to_str(&up->addr), why ? "certificate verify failed: " : "",
 		why ? why : gwp_ssl_errstr());
+	gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TLS, 0);
 }
 
 bool gwp_upstream_tls_cut(struct gwp_conn_pair *gcp)

@@ -631,9 +631,12 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	target_fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt,
 					   &gcp->is_target_alive, true);
 	if (target_fd < 0) {
-		if (target_fd != -EMFILE && target_fd != -ENFILE)
+		if (target_fd != -EMFILE && target_fd != -ENFILE) {
 			pr_err(&ctx->lh, "Failed to create target socket: %s",
 				strerror(-target_fd));
+			/* A connect refused at once, say. */
+			gwp_conn_upstream_failed(w, gcp, target_fd);
+		}
 		return target_fd;
 	}
 	gcp->target.fd = target_fd;
@@ -1539,7 +1542,10 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
 static int upstream_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			 int err)
 {
-	int r = gwp_upstream_fail_reply(w, gcp, err);
+	int r;
+
+	gwp_conn_upstream_failed(w, gcp, err);
+	r = gwp_upstream_fail_reply(w, gcp, err);
 
 	if (r > 0) {
 		ssize_t sr = __do_send(&gcp->target, &gcp->client);
@@ -1759,7 +1765,12 @@ static int upstream_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			if (unlikely(r))
 				return upstream_fail(w, gcp, r);
 		}
-		return upstream_tls_io(w, gcp, 0);
+		/*
+		 * Its first flight can fail at once (an upstream that resets
+		 * before the ClientHello): that is a failure like any other.
+		 */
+		r = upstream_tls_io(w, gcp, 0);
+		return r < 0 ? upstream_fail(w, gcp, r) : r;
 	}
 #endif
 
@@ -2338,14 +2349,19 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * Held before the upstream handshake, the target is watched only for
 	 * a hangup: the upstream went away before it was spoken to.
 	 */
-	if (unlikely(upstream_start_held(gcp)))
+	if (unlikely(upstream_start_held(gcp))) {
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_HUP, 0);
+		gwp_conn_upstream_failed(w, gcp, -ECONNRESET);
 		return -ECONNRESET;
+	}
 
 	if (unlikely(ev->events & EPOLLERR)) {
 		if (!gcp->is_target_alive) {
 			r = handle_ev_target_conn_err(w, gcp);
 			if (gwp_in_upstream_hs(gcp))
 				return upstream_fail(w, gcp, r);
+			/* Plain forwarding's connect to its upstream. */
+			gwp_conn_upstream_failed(w, gcp, r);
 			return r;
 		}
 
@@ -2539,6 +2555,12 @@ static int handle_conn_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	     gwp_in_dns_lookup(gcp)) && !gcp->is_target_alive) {
 		uint32_t len;
 
+		/* Not while the name resolves: no upstream is involved yet. */
+		if (!gwp_in_dns_lookup(gcp)) {
+			gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TIMEOUT,
+					      gwp_upstream_timeout_val(gcp));
+			gwp_conn_upstream_failed(w, gcp, -ETIMEDOUT);
+		}
 		if (gwp_in_upstream_hs(gcp))
 			gcp->target.len = 0;
 		len = gcp->target.len;
@@ -2758,6 +2780,7 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 exhausted:
 	pr_dbg(&w->ctx->lh, "No target address left to try (idx=%u): %s",
 		gcp->idx, strerror(-err));
+	gwp_conn_upstream_failed(w, gcp, err);
 
 	if (!gwp_conn_fail_reply(w, gcp, err) && gcp->target.len) {
 		ssize_t sr = __do_send(&gcp->target, &gcp->client);

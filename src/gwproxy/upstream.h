@@ -34,15 +34,47 @@ enum gwp_upstream_fail_class {
  */
 enum gwp_upstream_end {
 	GWP_UPSTREAM_END_CONNECT,	/* TCP connect failed; errno, any sign */
-	GWP_UPSTREAM_END_TLS,		/* TLS handshake failed; unused */
+	GWP_UPSTREAM_END_TLS,		/* TLS handshake failed */
 	GWP_UPSTREAM_END_S5_METHOD,	/* SOCKS5 method we cannot use */
 	GWP_UPSTREAM_END_S5_AUTH,	/* SOCKS5 user/password status */
 	GWP_UPSTREAM_END_S5_REP,	/* SOCKS5 CONNECT REP */
 	GWP_UPSTREAM_END_HTTP,		/* HTTP CONNECT status code */
-	GWP_UPSTREAM_END_MALFORMED,	/* reply does not parse; unused */
-	GWP_UPSTREAM_END_HUP,		/* upstream hung up; unused */
-	GWP_UPSTREAM_END_TIMEOUT,	/* no reply in time; unused */
+	GWP_UPSTREAM_END_MALFORMED,	/* reply does not parse */
+	GWP_UPSTREAM_END_HUP,		/* upstream hung up; errno, or 0 */
+	/*
+	 * Out of time; 0 while the upstream still owed us its part before
+	 * our CONNECT request (the TCP connect, the TLS handshake, the
+	 * SOCKS5 method and auth), else (waiting for the CONNECT's reply,
+	 * which the destination may hold up) not the upstream's fault.
+	 */
+	GWP_UPSTREAM_END_TIMEOUT,
 };
+
+/* How an upstream handshake ended, for a log line. */
+static inline const char *gwp_upstream_end_str(enum gwp_upstream_end end)
+{
+	switch (end) {
+	case GWP_UPSTREAM_END_CONNECT:
+		return "connect";
+	case GWP_UPSTREAM_END_TLS:
+		return "tls";
+	case GWP_UPSTREAM_END_S5_METHOD:
+		return "socks5-method";
+	case GWP_UPSTREAM_END_S5_AUTH:
+		return "socks5-auth";
+	case GWP_UPSTREAM_END_S5_REP:
+		return "socks5-rep";
+	case GWP_UPSTREAM_END_HTTP:
+		return "http-status";
+	case GWP_UPSTREAM_END_MALFORMED:
+		return "malformed";
+	case GWP_UPSTREAM_END_HUP:
+		return "hangup";
+	case GWP_UPSTREAM_END_TIMEOUT:
+	default:
+		return "timeout";
+	}
+}
 
 static inline enum gwp_upstream_fail_class
 gwp_upstream_s5_rep_class(int rep)
@@ -117,11 +149,14 @@ gwp_upstream_fail_classify(enum gwp_upstream_end end, int val)
 		return gwp_upstream_s5_rep_class(val);
 	case GWP_UPSTREAM_END_HTTP:
 		return gwp_upstream_http_class(val);
+	case GWP_UPSTREAM_END_TIMEOUT:
+		/* A destination that never answers holds the CONNECT up. */
+		return val ? GWP_UPSTREAM_FAIL_NEUTRAL :
+			     GWP_UPSTREAM_FAIL_UPSTREAM;
 	case GWP_UPSTREAM_END_TLS:
 	case GWP_UPSTREAM_END_S5_METHOD:
 	case GWP_UPSTREAM_END_MALFORMED:
 	case GWP_UPSTREAM_END_HUP:
-	case GWP_UPSTREAM_END_TIMEOUT:
 	default:
 		return GWP_UPSTREAM_FAIL_UPSTREAM;
 	}

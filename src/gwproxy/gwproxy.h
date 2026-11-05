@@ -16,6 +16,7 @@
 #include <gwproxy/dns.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/iplimit.h>
+#include <gwproxy/upstream.h>
 #include <gwproxy/upstream_lb.h>
 #include <gwproxy/log.h>
 #include <assert.h>
@@ -470,6 +471,18 @@ enum {
 	 * no later OUTPUT evaluation may change it.
 	 */
 	GWP_CONN_FLAG_UP_PICKED		= (1ull << 6ull),
+	/*
+	 * The attempt through the pair's upstream has failed and been
+	 * classified (gwp_conn_upstream_failed()): another way the same
+	 * failure surfaces must not count it again.
+	 */
+	GWP_CONN_FLAG_UP_FAILED		= (1ull << 7ull),
+	/*
+	 * The client has been given its failure reply (gwp_conn_fail_reply()),
+	 * so a failure that surfaces again on its way out gives no second
+	 * one (gwp_upstream_fail_reply()).
+	 */
+	GWP_CONN_FLAG_FAIL_REPLIED	= (1ull << 9ull),
 };
 
 enum {
@@ -687,6 +700,15 @@ struct gwp_conn_pair {
 	 * searched from its start again on every read.
 	 */
 	uint32_t		up_scan;
+
+	/*
+	 * How the attempt through the upstream failed, when the place that
+	 * saw it knows better than the errno it returns: an enum
+	 * gwp_upstream_end plus one, 0 when none was noted, and its value
+	 * (gwp_upstream_note_end()).
+	 */
+	uint16_t		up_val;
+	uint8_t			up_end;
 
 	/* One-byte scalars last, so they pack instead of each opening a hole. */
 	bool			is_target_alive;
@@ -1040,6 +1062,33 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 /* Make @gcp chain through @up (NULL: go direct), dropping what it had. */
 void gwp_conn_set_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			   struct gwp_upstream *up);
+
+/*
+ * Say how the attempt through @gcp's upstream failed (@end, with @val as
+ * enum gwp_upstream_end documents), where that is known better than from
+ * the errno the failure returns. The first note stands.
+ */
+static inline void gwp_upstream_note_end(struct gwp_conn_pair *gcp,
+					 enum gwp_upstream_end end, int val)
+{
+	if (gcp->up_end)
+		return;
+	gcp->up_end = (uint8_t)end + 1;
+	gcp->up_val = (uint16_t)(val < 0 ? 0 : val > 0xffff ? 0xffff : val);
+}
+
+/*
+ * The attempt through @gcp's upstream failed with @err, before the tunnel
+ * was up: a connect, the TLS or proxy handshake, or the time they had.
+ * Every way such an attempt fails, on both event loops, ends here, and
+ * the first call per attempt classifies it (gwp_upstream_fail_classify(),
+ * from the noted end, else from @err) and logs it; later calls for the
+ * same attempt do nothing. Returns the class, NEUTRAL for a later call or
+ * a pair with no upstream.
+ */
+enum gwp_upstream_fail_class
+gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			 int err);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
@@ -1210,6 +1259,27 @@ static inline bool gwp_in_upstream_hs(const struct gwp_conn_pair *gcp)
 
 	return cs >= CONN_STATE_UPSTREAM_S5_MIN &&
 	       cs <= CONN_STATE_UPSTREAM_HTTP_MAX;
+}
+
+/*
+ * The value of a GWP_UPSTREAM_END_TIMEOUT for @gcp's attempt (see enum
+ * gwp_upstream_end): 0 while the upstream owes us its part, the connect or
+ * the handshake up to our CONNECT request; 1 once that request is out and
+ * its reply is awaited, or while the handshake waits on our own client
+ * (its reply still being flushed), neither the upstream's fault.
+ */
+static inline int gwp_upstream_timeout_val(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	if (cs == CONN_STATE_UPSTREAM_S5_CONNECT ||
+	    cs == CONN_STATE_UPSTREAM_HTTP_CONNECT)
+		return !gcp->up_tx;
+	if (gwp_in_upstream_hs(gcp))
+		return 0;
+	/* Connected, but held for the client (upstream_start_held()). */
+	return gcp->upstream && gcp->target.fd >= 0 &&
+	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
 }
 
 /*

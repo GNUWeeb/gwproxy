@@ -3894,6 +3894,67 @@ void gwp_conn_set_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	gwp_upstream_put(old);
 }
 
+/*
+ * How an attempt through the upstream failed, from the errno it failed
+ * with, when nothing more telling was noted: the proxy hanging up on the
+ * handshake, or the connect (the timers note their timeouts).
+ */
+static enum gwp_upstream_end upstream_end_of(struct gwp_conn_pair *gcp,
+					     int err)
+{
+	if (gwp_in_upstream_hs(gcp) &&
+	    (err == -ECONNRESET || err == -EPIPE || err == -ECONNABORTED))
+		return GWP_UPSTREAM_END_HUP;
+	return GWP_UPSTREAM_END_CONNECT;
+}
+
+enum gwp_upstream_fail_class
+gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			 int err)
+{
+	enum gwp_upstream_fail_class cls;
+	enum gwp_upstream_end end;
+	struct gwp_upstream *up = gcp->upstream;
+	unsigned int val;
+	char why[64];
+
+	if (!up || gcp->is_target_alive || (gcp->flags & GWP_CONN_FLAG_UP_FAILED))
+		return GWP_UPSTREAM_FAIL_NEUTRAL;
+	gcp->flags |= GWP_CONN_FLAG_UP_FAILED;
+
+	if (gcp->up_end) {
+		end = (enum gwp_upstream_end)(gcp->up_end - 1);
+		val = gcp->up_val;
+	} else {
+		end = upstream_end_of(gcp, err);
+		val = (unsigned int)(err < 0 ? -err : err);
+	}
+	cls = gwp_upstream_fail_classify(end, (int)val);
+
+	switch (end) {
+	case GWP_UPSTREAM_END_CONNECT:
+	case GWP_UPSTREAM_END_HUP:
+		snprintf(why, sizeof(why), "%s",
+			 val ? strerror((int)val) : "-");
+		break;
+	case GWP_UPSTREAM_END_S5_METHOD:
+	case GWP_UPSTREAM_END_S5_AUTH:
+	case GWP_UPSTREAM_END_S5_REP:
+		snprintf(why, sizeof(why), "0x%02x", val);
+		break;
+	case GWP_UPSTREAM_END_HTTP:
+		snprintf(why, sizeof(why), "%u", val);
+		break;
+	default:
+		snprintf(why, sizeof(why), "-");
+		break;
+	}
+	pr_dbg(&w->ctx->lh, "Upstream attempt failed (idx=%u, up=%s, end=%s, class=%s): %s",
+	       gcp->idx, ip_to_str(&up->addr), gwp_upstream_end_str(end),
+	       gwp_upstream_fail_class_str(cls), why);
+	return cls;
+}
+
 __cold
 static int gwp_ctx_init(struct gwp_ctx *ctx)
 {
@@ -4705,6 +4766,7 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	 */
 	bool timed_out = (err == -ETIMEDOUT || err == -ETIME);
 
+	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
 	if (timed_out)
 		err = -ETIMEDOUT;
 
