@@ -359,18 +359,19 @@ that ends the block; each line between holds one directive ending in
 adds a server, with a URL as
 .B \-\-upstream\-proxy
 takes it
-.RB ( socks5:// ", " socks5h:// " or " http:// ,
+.RB ( socks5:// ", " socks5h:// ", " http:// " or " https:// ,
 optional
 .BR user:pass@ ,
 a name, an IPv4 address or a bracketed IPv6 one, an optional port), and
 .B least_conn;
 (at most once) sets the method; round\-robin is the default.
 .B https://
-servers are not supported in a pool yet. A pool has 1 to 64 servers, and all
-of them must resolve target names the same way:
+servers need a build with OpenSSL support; without it they fail the load.
+A pool has 1 to 64 servers, and all of them must resolve target names the
+same way:
 .B socks5://
 servers have gwproxy resolve them,
-.BR socks5h:// " and " http://
+.BR socks5h:// ", " http:// " and " https://
 servers resolve them themselves, and a pool mixing the two is refused. A
 .I name
 is 1 to 64 letters, digits,
@@ -1054,15 +1055,25 @@ and
 The URL must not carry credentials of its own when this option is given.
 .TP
 .BR \-\-upstream\-ca\-file=\fIfile\fR
-Verify an
+Verify the certificates of
 .B https://
-upstream proxy's certificate against the CA certificates in
+upstream proxies against the CA certificates in
 .I file
-(PEM, one or more) instead of the system's default trust store. Needs an
+(PEM, one or more) instead of the system's default trust store: of an
 .B https://
-.BR \-\-upstream\-proxy ;
-a file that cannot be read or holds no certificate is an error at startup.
-Only in builds with OpenSSL support.
+.B \-\-upstream\-proxy
+and of the
+.B https://
+servers of the ACL file's upstream pools alike, one trust store for all.
+Needs an
+.B https://
+.B \-\-upstream\-proxy
+or an
+.BR \-\-acl\-file ;
+it is read once, at startup, and a file that cannot be read or holds no
+certificate is an error then, even when no pool has an
+.B https://
+server yet. Only in builds with OpenSSL support.
 .SS Networking
 .TP
 .BR \-M ", " \-\-mark=\fInr\fR
@@ -1562,6 +1573,23 @@ upstream web {
 \-A OUTPUT \-m domain \-\-domain intranet.example \-j UPSTREAM \-\-to DIRECT
 .EE
 .RE
+.PP
+A pool's
+.B https://
+servers are verified as an
+.B https://
+.B \-\-upstream\-proxy
+is (see above), against the same trust store, the system's or
+.BR \-\-upstream\-ca\-file ,
+each against its own host, which is sent as SNI when it is a name. A pool
+may mix
+.B https://
+servers with
+.BR http:// " and " socks5h://
+ones. An
+.B https://
+server may come in with a reload into a proxy that had none, and one whose
+host cannot be used as a TLS server name fails the load like any bad server.
 .PP
 The upstream is decided once per connection, before its target's name is
 resolved, from what is known then: the user, the client's address and port,
