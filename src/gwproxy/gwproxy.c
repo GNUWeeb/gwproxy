@@ -2789,7 +2789,8 @@ static uint32_t pool_pick_server(struct gwp_acl_pool *pool)
 		/* None is a bug conn_pick_upstream() reports; never pick it. */
 		open[i] = up ? gwp_up_state_open(up->state) : UINT32_MAX;
 	}
-	return gwp_up_lb_pick(lc, gwp_acl_pool_next(pool), open, nr);
+	return gwp_up_lb_pick(lc, gwp_acl_pool_next(pool), open, NULL, nr,
+			      UINT32_MAX);
 }
 
 /*

@@ -16,6 +16,20 @@
  * the entries its predecessor used, counts and all, and an entry goes away
  * with the last server object of its identity.
  *
+ * The entry also holds the server's passive health: the times of its last
+ * upstream-side failures, and whether it is ejected, and until when. Too
+ * many failures in a short time take the server out of its pools' picks
+ * for a while (gwp_up_state_fail(), gwp_up_lb_pick()). Like the counts, it
+ * follows the identity across a reload, and starts fresh once the last
+ * object of the identity is gone. Times are monotonic milliseconds, passed
+ * in by the caller, so the rules can be tested without a clock. They are
+ * 32 bits wide, as some 32-bit targets have no lock-free 64-bit atomics:
+ * they wrap every 2^32 ms (about 49.7 days), and are only ever compared by
+ * their difference as a signed 32-bit number, which is right across the
+ * wrap for times less than 2^31 ms (about 24.8 days) apart; the window
+ * and the ejection are far shorter. 0 is reserved for "none", and a time
+ * that comes out as 0 is taken as 1.
+ *
  * Self-contained (net.h types and libc only) so it can be unit-tested alone.
  */
 #ifndef GWP_UPSTREAM_LB_H
@@ -57,15 +71,34 @@ void gwp_up_key_init(struct gwp_up_key *key, enum gwp_up_scheme scheme,
 		     const struct gwp_sockaddr *addr, const char *user,
 		     size_t ulen);
 
+/*
+ * Passive health, fixed in this version: GWP_UP_EJECT_FAILS upstream-side
+ * failures with no more than GWP_UP_EJECT_WINDOW_MS from the first to the
+ * last eject a server for GWP_UP_EJECT_MS.
+ */
+#define GWP_UP_EJECT_FAILS	3u
+#define GWP_UP_EJECT_WINDOW_MS	30000u
+#define GWP_UP_EJECT_MS		300000u
+
 struct gwp_up_table;
 
-/* One identity's shared state. Only @nr_open is for the caller to touch. */
+/*
+ * One identity's shared state. Only @nr_open is for the caller to touch;
+ * the health fields go through gwp_up_state_fail() and _ejected().
+ */
 struct gwp_up_state {
 	/*
 	 * Connection pairs that were given a server of this identity and
 	 * have not given it back yet: gwp_up_state_take() and _give().
 	 */
 	_Atomic(uint32_t)	nr_open;
+
+	/* How many failures were ever recorded; picks the slot of the next. */
+	_Atomic(uint32_t)	fail_seq;
+	/* When the last GWP_UP_EJECT_FAILS failures were, 0 for none. */
+	_Atomic(uint32_t)	fail_at[GWP_UP_EJECT_FAILS];
+	/* When the ejection ends, 0 while the server is in service. */
+	_Atomic(uint32_t)	eject_end;
 
 	/* The table's own: under its lock. */
 	uint32_t		ref;
@@ -129,15 +162,59 @@ static inline uint32_t gwp_up_state_give(struct gwp_up_state *s)
 }
 
 /*
+ * Record an upstream-side failure of @s at @now. Returns true when it is
+ * the one that ejects the server: the last GWP_UP_EJECT_FAILS failures,
+ * this one included, fall within GWP_UP_EJECT_WINDOW_MS, and the server
+ * was in service. It is then ejected until @now + GWP_UP_EJECT_MS; the
+ * caller logs that. Any thread, no lock.
+ *
+ * Concurrent failures each take a slot of their own, and the last one to
+ * store its time sees all the others', so failures from several workers
+ * that are enough to eject do; the ejection itself is a compare-and-swap,
+ * so exactly one of them returns true. A failure while the server is
+ * ejected is recorded but neither extends nor repeats the ejection; one
+ * soon after the ejection ends can eject again, as the failures recorded
+ * meanwhile still count. A success changes nothing: failures leave the
+ * window by age only.
+ *
+ * A failure recorded a multiple of 2^32 ms ago, give or take the window,
+ * reads as recent again; it takes three of them, or two and a new one, to
+ * eject, so this is left as it is.
+ */
+bool gwp_up_state_fail(struct gwp_up_state *s, uint32_t now);
+
+/*
+ * How many milliseconds the ejection of @s still has to run at @now, 0
+ * when the server is in service. An ejection that has run out by @now is
+ * ended here, and *@back, when not NULL, says whether it was this call that
+ * ended it, so that exactly one caller logs the server's return. Any
+ * thread, no lock. An ejection nobody looked at for 2^31 ms or more may
+ * read as running again, for at most its 5 minutes.
+ */
+uint32_t gwp_up_state_ejected(struct gwp_up_state *s, uint32_t now,
+			      bool *back);
+
+/*
  * Which of a pool's @nr servers (@nr > 0) the next connection goes to. @rr
  * is the pool's round-robin cursor for this pick (it advances once per
- * pick, whatever the method). Round-robin takes server @rr % @nr.
- * Least-connections (@least_conn) takes the server with the fewest open
- * pairs in @open[] (one count per server, in pool order), and among equals
- * the first one from @rr % @nr on, wrapping: the cursor moving on rotates
- * the ties, so servers that are equally loaded share the new connections.
+ * pick, whatever the method). @eject[] holds, per server in pool order,
+ * how long its ejection still runs (gwp_up_state_ejected()), 0 while it is
+ * in service (NULL: all are); the
+ * pick only takes a server in service, other than @skip (UINT32_MAX for
+ * none). Round-robin takes the (@rr % n)-th of the n servers it may take,
+ * in pool order, so an ejected server's share is spread evenly over the
+ * rest. Least-connections (@least_conn) takes the one with the fewest
+ * open pairs in @open[] (one count per server, in pool order), and among
+ * equals the first one from that same server on, wrapping: the cursor
+ * moving on rotates the ties, so servers that are equally loaded share
+ * the new connections.
+ *
+ * When no server may be taken: with no @skip, every server is ejected,
+ * and the one whose ejection ends soonest is taken (ties from @rr % @nr
+ * on), so a pool is never left without a server; with a @skip (a retry,
+ * which goes only to another server in service) UINT32_MAX.
  */
 uint32_t gwp_up_lb_pick(bool least_conn, uint32_t rr, const uint32_t *open,
-			uint32_t nr);
+			const uint32_t *eject, uint32_t nr, uint32_t skip);
 
 #endif /* #ifndef GWP_UPSTREAM_LB_H */
