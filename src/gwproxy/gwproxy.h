@@ -153,6 +153,11 @@ struct gwp_upstream {
 	char			host[256];
 	char			user[256];
 	char			pass[256];
+	/*
+	 * Counts the live servers of the ACL's pools (gwp_ctx::nr_acl_srv),
+	 * one less once this one is freed; NULL for --upstream-proxy's.
+	 */
+	_Atomic(uint32_t)	*live;
 };
 
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up);
@@ -994,6 +999,13 @@ struct gwp_ctx {
 	 * not the built-in default rules. */
 	struct gwp_acl			*acl;
 	bool				acl_watched;
+	/*
+	 * Make the servers of the ACL's upstream pools when a load reads
+	 * them (struct gwp_acl_server_ops). @nr_acl_srv counts those still
+	 * alive: held by a pool, or by a connection after its pool is gone.
+	 */
+	struct gwp_acl_server_ops	acl_srv_ops;
+	_Atomic(uint32_t)		nr_acl_srv;
 	/* Client connections per address, for --max-conns-per-ip; NULL when
 	 * there is no cap, so the accept path costs nothing then. */
 	struct gwp_iplim		*iplim;

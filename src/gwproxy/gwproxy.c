@@ -2285,6 +2285,10 @@ static const char gwp_acl_default_rules[] =
  * forwarding. With no file it applies the built-in default ACL (not reloaded),
  * unless --acl-allow-all leaves it disabled (NULL).
  */
+static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
+			size_t size);
+static void acl_srv_put(void *arg, void *srv);
+
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 {
 	struct gwp_cfg *cfg = &ctx->cfg;
@@ -2294,6 +2298,10 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 	ctx->acl_watched = false;
 	ctx->acl_files = NULL;
 	ctx->nr_acl_files = 0;
+	ctx->acl_srv_ops.make = acl_srv_make;
+	ctx->acl_srv_ops.put = acl_srv_put;
+	ctx->acl_srv_ops.arg = ctx;
+	atomic_init(&ctx->nr_acl_srv, 0);
 
 	if (!cfg->acl_file || !*cfg->acl_file) {
 		if (cfg->acl_allow_all) {
@@ -2330,7 +2338,7 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 	ctx->nr_acl_files = 1;
 	gwp_file_id_read(cfg->acl_file, &ctx->acl_files[0].rf.id);
 
-	r = gwp_acl_create(&ctx->acl, cfg->acl_file);
+	r = gwp_acl_create_ops(&ctx->acl, cfg->acl_file, &ctx->acl_srv_ops);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to load ACL file '%s': %s",
 			cfg->acl_file, strerror(-r));
@@ -2356,7 +2364,20 @@ out_err:
 
 static void gwp_ctx_free_acl(struct gwp_ctx *ctx)
 {
+	uint32_t left;
+
 	gwp_acl_destroy(ctx->acl);
+	/*
+	 * The workers are gone, and their connections with them, and so are
+	 * the pools: no pool server may be left. One that is was not given
+	 * back by a connection teardown.
+	 */
+	left = atomic_load_explicit(&ctx->nr_acl_srv, memory_order_acquire);
+	if (left)
+		pr_err(&ctx->lh, "BUG: %u upstream pool server(s) still referenced at exit, want 0",
+		       left);
+	else if (ctx->acl_watched)
+		pr_dbg(&ctx->lh, "Upstream pool servers: all connection references dropped");
 	ctx->acl = NULL;
 	ctx->acl_watched = false;
 	gwp_acl_files_free(ctx->acl_files, ctx->nr_acl_files);
@@ -3500,10 +3521,70 @@ static void gwp_ctx_free_upstream(struct gwp_ctx *ctx)
 
 void gwp_upstream_put(struct gwp_upstream *up)
 {
+	_Atomic(uint32_t) *live;
+
 	if (atomic_fetch_sub_explicit(&up->refcnt, 1, memory_order_acq_rel) != 1)
 		return;
+	live = up->live;
 	explicit_bzero(up, sizeof(*up));
 	free(up);
+	if (live)
+		atomic_fetch_sub_explicit(live, 1, memory_order_release);
+}
+
+/*
+ * Make an upstream pool's server of @url, for the ACL load that reads it
+ * (struct gwp_acl_server_ops): parsed, resolved and checked once here, so a
+ * server no connection could use fails the load with its file and line,
+ * and a connection only ever takes a reference. @url passed acl.c's shape
+ * check; @why must not quote it, as it may hold a password.
+ */
+__cold
+static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
+			size_t size)
+{
+	struct gwp_ctx *ctx = arg;
+	struct gwp_upstream *up;
+	int r;
+
+	up = calloc(1, sizeof(*up));
+	if (!up)
+		return -ENOMEM;
+
+	r = gwp_parse_upstream(url, up);
+	if (r == -EHOSTUNREACH) {
+		snprintf(why, size, "host %s does not resolve", up->host);
+	} else if (r) {
+		snprintf(why, size, "the host is not a valid name or address");
+	} else if (up->use_tls) {
+		/* acl.c refuses these; the TLS context is not set up for them. */
+		snprintf(why, size, "https:// is not supported in a pool yet");
+		r = -ENOTSUP;
+	} else if (!gwp_ctx_outgoing_family_ok(ctx, &up->addr)) {
+		snprintf(why, size, "address %s is not allowed by --outgoing-family",
+			 ip_to_str(&up->addr));
+		r = -EAFNOSUPPORT;
+	} else if (ctx->cfg.target_buf_size < GWP_UPSTREAM_MIN_TARGET_BUF) {
+		snprintf(why, size, "an upstream needs --target-buf-size of at least %d",
+			 GWP_UPSTREAM_MIN_TARGET_BUF);
+		r = -EINVAL;
+	}
+	if (r) {
+		explicit_bzero(up, sizeof(*up));
+		free(up);
+		return r;
+	}
+
+	atomic_init(&up->refcnt, 1);
+	up->live = &ctx->nr_acl_srv;
+	atomic_fetch_add_explicit(&ctx->nr_acl_srv, 1, memory_order_relaxed);
+	*srv = up;
+	return 0;
+}
+
+static void acl_srv_put(void __unused *arg, void *srv)
+{
+	gwp_upstream_put(srv);
 }
 
 void gwp_conn_set_upstream(struct gwp_conn_pair *gcp, struct gwp_upstream *up)
