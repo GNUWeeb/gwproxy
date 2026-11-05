@@ -2050,6 +2050,7 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->up_tx = false;
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
+	gwp_conn_upstream_up(gcp);
 
 	r = gwp_http_fwd_begin(w, gcp);
 	if (r)

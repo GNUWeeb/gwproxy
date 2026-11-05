@@ -184,6 +184,15 @@ static inline uint32_t gwp_up_state_give(struct gwp_up_state *s)
 bool gwp_up_state_fail(struct gwp_up_state *s, uint32_t now);
 
 /*
+ * Whether @s may be ejected, without a clock: false means it is in
+ * service, true that gwp_up_state_ejected() has to tell.
+ */
+static inline bool gwp_up_state_may_be_ejected(struct gwp_up_state *s)
+{
+	return atomic_load_explicit(&s->eject_end, memory_order_relaxed) != 0;
+}
+
+/*
  * How many milliseconds the ejection of @s still has to run at @now, 0
  * when the server is in service. An ejection that has run out by @now is
  * ended here, and *@back, when not NULL, says whether it was this call that

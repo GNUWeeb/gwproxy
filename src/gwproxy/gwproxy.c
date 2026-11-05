@@ -2765,32 +2765,95 @@ static bool udp_reply_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 }
 
 /*
- * Which of @pool's servers (from 0) the next pair goes to, by the pool's
- * method: round-robin, the default, takes them in turn; least_conn the one
- * with the fewest open pairs, ties in round-robin order. Both turn on the
+ * Name the server @up for a log line: the @idx-th (from 0) of @pool, or the
+ * default upstream (no @pool). An address, never a URL: it may hold a
+ * password.
+ */
+static const char *up_desc(const struct gwp_acl_pool *pool, uint32_t idx,
+			   struct gwp_upstream *up, char *buf, size_t size)
+{
+	if (pool)
+		snprintf(buf, size, "pool %s server %u (%s)",
+			 gwp_acl_pool_name(pool), idx + 1, ip_to_str(&up->addr));
+	else
+		snprintf(buf, size, "default upstream (%s)",
+			 ip_to_str(&up->addr));
+	return buf;
+}
+
+/*
+ * How many milliseconds the ejection of @up (the @idx-th server of @pool,
+ * or the default upstream) still runs, 0 while it is in service. Reads the
+ * clock into *@now only when it may be ejected and *@now is still 0; the
+ * health state takes it truncated to 32 bits. The caller that sees
+ * an ejection run out logs the server's return, once per ejection however
+ * many pools list the server.
+ */
+static uint32_t up_ejected(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
+			   uint32_t idx, struct gwp_upstream *up, uint64_t *now)
+{
+	char desc[320];
+	uint32_t left;
+	bool back;
+
+	if (!gwp_up_state_may_be_ejected(up->state))
+		return 0;
+	if (!*now)
+		*now = gwp_now_ms();
+	left = gwp_up_state_ejected(up->state, (uint32_t)*now, &back);
+	if (back)
+		pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
+			up_desc(pool, idx, up, desc, sizeof(desc)));
+	return left;
+}
+
+/*
+ * Which of @pool's servers (from 0) a pair goes to, by the pool's method:
+ * round-robin, the default, takes them in turn; least_conn the one with
+ * the fewest open pairs, ties in round-robin order. Both turn on the
  * pool's cursor, shared by all workers, and least_conn reads the counts
  * all workers keep (struct gwp_up_state), which carry across reloads.
  * Workers picking at the same time may see the same counts and choose the
  * same server; the next picks see the result, which is close enough.
+ *
+ * Only servers in service are taken; with all of them ejected, the one
+ * back soonest. With @skip, the server of @skip's place whose attempt
+ * failed, it is a retry: another server in service, the next one after
+ * @skip in pool order (least_conn: the fewest open, ties from there), or
+ * UINT32_MAX for none; a retry leaves the cursor alone, so the pool's
+ * turns go on as if the failed pick had worked.
  */
-static uint32_t pool_pick_server(struct gwp_acl_pool *pool)
+static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
+				 uint32_t skip)
 {
-	uint32_t nr = gwp_acl_pool_nr_servers(pool), open[64], i;
+	uint32_t nr = gwp_acl_pool_nr_servers(pool), open[64], eject[64], i, rr;
 	bool lc = gwp_acl_pool_method(pool) == GWP_ACL_POOL_LEAST_CONN;
+	uint64_t now = 0;
 	struct gwp_upstream *up;
+	bool any = false;
 
-	if (nr <= 1)
+	/* None is a bug conn_pick_upstream() reports. */
+	if (unlikely(!nr))
 		return 0;
 	/* acl.c allows 64; past that, the first 64 are all it can pick. */
 	if (unlikely(nr > sizeof(open) / sizeof(open[0])))
 		nr = sizeof(open) / sizeof(open[0]);
-	for (i = 0; lc && i < nr; i++) {
+	for (i = 0; i < nr; i++) {
 		up = gwp_acl_pool_server(pool, i);
-		/* None is a bug conn_pick_upstream() reports; never pick it. */
-		open[i] = up ? gwp_up_state_open(up->state) : UINT32_MAX;
+		if (unlikely(!up)) {
+			/* Likewise; never pick it. */
+			open[i] = UINT32_MAX;
+			eject[i] = UINT32_MAX;
+			any = true;
+			continue;
+		}
+		if (lc)
+			open[i] = gwp_up_state_open(up->state);
+		eject[i] = up_ejected(ctx, pool, i, up, &now);
+		any |= eject[i] != 0;
 	}
-	return gwp_up_lb_pick(lc, gwp_acl_pool_next(pool), open, NULL, nr,
-			      UINT32_MAX);
+	rr = skip == UINT32_MAX ? gwp_acl_pool_next(pool) : skip;
+	return gwp_up_lb_pick(lc, rr, open, any ? eject : NULL, nr, skip);
 }
 
 /*
@@ -2831,7 +2894,7 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		 * The pool holds its servers, so the one picked is there; the
 		 * pair takes its own reference, and the pool's goes with @req.
 		 */
-		i = pool_pick_server(req.upstream_pool);
+		i = pool_pick_server(ctx, req.upstream_pool, UINT32_MAX);
 		up = gwp_acl_pool_server(req.upstream_pool, i);
 		if (unlikely(!up)) {
 			/* Never past the pool: refuse, not the default. */
@@ -2841,10 +2904,16 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			break;
 		}
 		gwp_conn_set_upstream(ctx, gcp, up);
+		/* Kept for the logs and the retry, until the tunnel is up. */
+		gcp->up_pool = gwp_acl_req_take_pool(&req);
+		gcp->up_srv = (uint8_t)i;
 		pr_dbg(&ctx->lh, "Upstream for idx=%u: pool %s server %u, %s (%s), %u open",
-		       gcp->idx, gwp_acl_pool_name(req.upstream_pool), i + 1,
+		       gcp->idx, gwp_acl_pool_name(gcp->up_pool), i + 1,
 		       ip_to_str(&up->addr), up->host,
 		       gwp_up_state_open(up->state));
+		if (gwp_up_state_may_be_ejected(up->state))
+			pr_dbg(&ctx->lh, "Upstream pool %s has every server ejected; idx=%u takes server %u, back soonest",
+			       gwp_acl_pool_name(gcp->up_pool), gcp->idx, i + 1);
 		break;
 	case GWP_ACL_UPSTREAM_DIRECT:
 		gwp_conn_set_upstream(ctx, gcp, NULL);
@@ -3882,6 +3951,8 @@ void gwp_conn_set_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		gwp_up_state_take(up->state);
 	}
 	gcp->upstream = up;
+	if (!up)
+		gwp_conn_upstream_up(gcp);	/* no pool without a server */
 	if (!old)
 		return;
 
@@ -3953,7 +4024,28 @@ gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	pr_dbg(&w->ctx->lh, "Upstream attempt failed (idx=%u, up=%s, end=%s, class=%s): %s",
 	       gcp->idx, ip_to_str(&up->addr), gwp_upstream_end_str(end),
 	       gwp_upstream_fail_class_str(cls), why);
+
+	/* Only the upstream's own failures count against its health. */
+	if (cls == GWP_UPSTREAM_FAIL_UPSTREAM) {
+		uint64_t now = gwp_now_ms();
+		char desc[320];
+
+		/* An ejection that ran out is ended (and logged) first. */
+		up_ejected(w->ctx, gcp->up_pool, gcp->up_srv, up, &now);
+		if (gwp_up_state_fail(up->state, (uint32_t)now))
+			pr_warn(&w->ctx->lh, "Upstream %s ejected for %u s after %u failures in %u s",
+				up_desc(gcp->up_pool, gcp->up_srv, up, desc,
+					sizeof(desc)),
+				GWP_UP_EJECT_MS / 1000, GWP_UP_EJECT_FAILS,
+				GWP_UP_EJECT_WINDOW_MS / 1000);
+	}
 	return cls;
+}
+
+void gwp_conn_upstream_up(struct gwp_conn_pair *gcp)
+{
+	gwp_acl_pool_put(gcp->up_pool);
+	gcp->up_pool = NULL;
 }
 
 __cold
@@ -4216,8 +4308,13 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 	gcp->flags = 0;
 	gcp->prot_type = GWP_PROT_TYPE_NONE;
 	/* Every connection goes through the default pool, when there is one. */
-	if (ctx->upstream_pool.nr)
+	if (ctx->upstream_pool.nr) {
+		uint64_t now = 0;
+
 		gwp_conn_set_upstream(ctx, gcp, ctx->upstream_pool.srv[0]);
+		/* Its only server: an ejection only shows in the log. */
+		up_ejected(ctx, NULL, 0, gcp->upstream, &now);
+	}
 	return gcp;
 
 out_free_target_conn:

@@ -596,6 +596,14 @@ struct gwp_conn_pair {
 	 * gwp_conn_set_upstream().
 	 */
 	struct gwp_upstream	*upstream;
+	/*
+	 * The ACL pool @upstream was picked from, with a reference, NULL for
+	 * the default (--upstream-proxy) or none; held only until the tunnel
+	 * is up (gwp_conn_upstream_up()), for the logs and the retry that
+	 * may need another of its servers. @up_srv is @upstream's place in
+	 * it.
+	 */
+	struct gwp_acl_pool	*up_pool;
 
 	/*
 	 * The hostname the client asked for, when it used a domain target
@@ -709,6 +717,7 @@ struct gwp_conn_pair {
 	 */
 	uint16_t		up_val;
 	uint8_t			up_end;
+	uint8_t			up_srv;
 
 	/* One-byte scalars last, so they pack instead of each opening a hole. */
 	bool			is_target_alive;
@@ -1089,6 +1098,12 @@ static inline void gwp_upstream_note_end(struct gwp_conn_pair *gcp,
 enum gwp_upstream_fail_class
 gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			 int err);
+
+/*
+ * The tunnel through @gcp's upstream is up: what was kept for a failure
+ * (the pool reference) goes.
+ */
+void gwp_conn_upstream_up(struct gwp_conn_pair *gcp);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
@@ -1223,6 +1238,15 @@ int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
 			const struct gwp_sockaddr *dst, bool connected);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
+
+/* Monotonic milliseconds, at the coarse clock's resolution (a few ms). */
+static inline uint64_t gwp_now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC_COARSE, &t);
+	return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
 
 /* Monotonic seconds, at the coarse clock's resolution (a few ms). */
 static inline uint32_t gwp_now_sec(void)
