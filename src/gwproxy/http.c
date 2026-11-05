@@ -477,6 +477,56 @@ too_big:
 	return -E2BIG;
 }
 
+/*
+ * Whether the field name @k (@klen bytes) is, reading every '_' as '-', one of
+ * the fields this proxy delimits, routes or drops a request by, without being
+ * that field: Content_Length, transfer_encoding, Proxy_Connection, ... Such a
+ * name is an ordinary field here and goes on to the origin, where a CGI-style
+ * server maps '-' and '_' to the same variable and may read it as the real
+ * one: a second Content-Length the proxy never saw, or a hop-by-hop field it
+ * believes it dropped.
+ */
+static bool is_underscore_alias(const char *k, size_t klen)
+{
+#define UA(s)	{ s, sizeof(s) - 1 }
+	static const struct {
+		const char	*name;
+		size_t		len;
+	} special[] = {
+		UA("Content-Length"), UA("Transfer-Encoding"), UA("Host"),
+		/* Those is_hop_by_hop() drops. */
+		UA("Connection"), UA("Proxy-Connection"), UA("Keep-Alive"),
+		UA("TE"), UA("Trailer"), UA("Upgrade"),
+		UA("Proxy-Authorization"), UA("Proxy-Authenticate"),
+	};
+#undef UA
+	size_t i, j;
+
+	if (!memchr(k, '_', klen))
+		return false;
+
+	for (i = 0; i < sizeof(special) / sizeof(special[0]); i++) {
+		if (special[i].len != klen)
+			continue;
+		for (j = 0; j < klen; j++) {
+			unsigned char a = (unsigned char)k[j];
+			unsigned char b = (unsigned char)special[i].name[j];
+
+			if (a == '_')
+				a = '-';
+			if (a >= 'A' && a <= 'Z')
+				a |= 0x20;
+			if (b >= 'A' && b <= 'Z')
+				b |= 0x20;
+			if (a != b)
+				break;
+		}
+		if (j == klen)
+			return true;
+	}
+	return false;
+}
+
 enum req_body {
 	REQ_BODY_DONE = 0,	/* No body, or all of it has been seen. */
 	REQ_BODY_LENGTH,	/* Content-Length; req_rem bytes to go. */
@@ -567,6 +617,7 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 	const char *authority, *slash, *path;
 	char sbuf[REQ_FAST_MAX], *out = sbuf;
 	ssize_t w;
+	size_t i;
 	int r;
 
 	/* Only absolute-form http:// URIs are supported (no TLS termination). */
@@ -596,6 +647,15 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 	} else {
 		path = "/";
 		path_len = 1;
+	}
+
+	for (i = 0; i < hc->req_hdr.fields.nr; i++) {
+		const struct gwnet_http_hdr_fields *ff = &hc->req_hdr.fields;
+		const struct gwnet_http_hdr_field *f = &ff->ff[i];
+
+		if (is_underscore_alias(gwnet_http_hdr_field_key(ff, f),
+					f->klen))
+			return GWP_HTTP_BAD_REQUEST;
 	}
 
 	r = set_req_framing(hc);

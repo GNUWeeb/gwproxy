@@ -1161,6 +1161,14 @@ field, such as X\-Forwarded\-For, keeps its separate lines, in their order. As
 with every field, each line reaches the origin spelled "Name: value", and a
 hop\-by\-hop field or one that Connection names is dropped.
 .PP
+A forwarding request with a field name that reads, in any case and with each
+"_" taken for "\-", as Content\-Length, Transfer\-Encoding, Host or a hop\-by\-hop
+field (Connection, Proxy\-Connection, Keep\-Alive, TE, Trailer, Upgrade,
+Proxy\-Authorization, Proxy\-Authenticate), such as Content_Length, is answered
+with "400 Bad Request": an origin that maps "_" and "\-" to the same name, as CGI
+does, could read it as the field itself. Other names with underscores are
+forwarded unchanged.
+.PP
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
 does not send another request on the connection, and the connection is closed
