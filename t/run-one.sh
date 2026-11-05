@@ -13,11 +13,13 @@
 #
 #	<PASS|FAIL|SKIP> <seconds> <name>
 #
-# Each test runs in its OWN PROCESS GROUP (setsid). That does two things:
-# a test that ignores SIGTERM can still be killed as a group, and the group is
-# the handle used to reap anything it leaked -- a process keeps its process
-# group after being orphaned, so proxies left by a SIGKILLed test are still
-# reachable. It also keeps concurrent tests from killing each other's proxies.
+# Each test runs in its OWN SESSION (setsid), and the session is the handle used
+# to reap anything it leaked: a process keeps its session after being orphaned,
+# so proxies left by a SIGKILLed test are still reachable, and so are processes
+# that moved to a process group of their own, as timeout(1) moves its command.
+# Every process of the session is signalled by PID, SIGTERM then SIGKILL, so a
+# test that ignores SIGTERM still goes, and concurrent tests, each in a session
+# of its own, cannot kill each other's proxies.
 
 set -u
 
@@ -39,58 +41,132 @@ mkdir -p "$(dirname "$res")"
 
 start=$SECONDS
 
-# Own process group, so the whole tree can be signalled and reaped as a unit.
+# sess_pids <sid>: set PIDS to the processes of session <sid>, zombies left
+# out: no signal reaches them, and their parents reap them. Bash builtins only,
+# as the watchdog runs this between the deadline and the SIGTERM (see below).
+# Only the comm field of stat may hold spaces or ')', so it is split after the
+# last ") ".
+sess_pids()
+{
+	local d st f
+
+	PIDS=()
+	for d in /proc/[0-9]*; do
+		{ read -r st <"$d/stat"; } 2>/dev/null || continue
+		st=${st##*) }
+		f=($st)
+		[ "${f[3]}" = "$1" ] && [ "${f[0]}" != Z ] && PIDS+=("${d#/proc/}")
+	done
+	return 0
+}
+
+# sess_kill <sid> <tenths>: SIGTERM every process of session <sid>, give them
+# <tenths> tenths of a second to exit, then SIGKILL what is left until nothing
+# is, since a process may fork in between. Never this script's own session.
+sess_kill()
+{
+	local sid="$1" i own
+
+	case "$sid" in
+	''|0|*[!0-9]*) return 1 ;;
+	esac
+	{ read -r own </proc/$$/stat; } 2>/dev/null || return 1
+	own=${own##*) }
+	own=($own)
+	[ "${own[3]}" != "$sid" ] || return 1
+
+	sess_pids "$sid"
+	[ ${#PIDS[@]} -gt 0 ] || return 0
+	kill -TERM "${PIDS[@]}" 2>/dev/null
+	for ((i = 0; i < $2; i++)); do
+		sleep 0.1
+		sess_pids "$sid"
+		[ ${#PIDS[@]} -gt 0 ] || return 0
+	done
+	for ((i = 0; i < 50; i++)); do
+		kill -KILL "${PIDS[@]}" 2>/dev/null
+		sleep 0.1
+		sess_pids "$sid"
+		[ ${#PIDS[@]} -gt 0 ] || return 0
+	done
+	return 1
+}
+
+# Own session, so the whole tree can be signalled and reaped as a unit. Run in
+# the background, setsid is not a process group leader and calls setsid() in
+# place, so $! is both the test's PID and its session ID.
 if [ "$kind" = unit ]; then
 	setsid env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$ROOT" "$cmd" \
 		>"$log" 2>&1 &
 else
 	setsid env GWPROXY="$GWPROXY" bash "$cmd" >"$log" 2>&1 &
 fi
-pgid=$!
+sid=$!
 
-# Watchdog: SIGTERM the group at the deadline, SIGKILL shortly after.
+# Watchdog: SIGTERM the session at the deadline, SIGKILL shortly after.
 #
-# It gets its OWN process group so that cancelling it below takes the sleep it
-# is blocked on with it. Signalling only the subshell leaves that sleep running
-# for the rest of the timeout, holding every descriptor it inherited -- make's
-# jobserver pipe among them, which keeps `make -jN test` blocked long after the
-# last test has finished.
+# It gets its OWN session so that cancelling its process group below takes the
+# sleep it is blocked on with it, and so that it is not among the processes it
+# signals. Signalling only the subshell leaves that sleep running for the rest
+# of the timeout, holding every descriptor it inherited -- make's jobserver pipe
+# among them, which keeps `make -jN test` blocked long after the last test has
+# finished.
 #
 # Before that it records what the test is stuck on: a test that hangs usually
 # prints nothing, and it is gone by the time anyone can look. From /proc alone,
-# as ps differs between the systems the tests run on.
-setsid bash -c '
+# as ps differs between the systems the tests run on, and with bash builtins:
+# the scan runs between the deadline and the SIGTERM, and a fork per process on
+# the host (a few thousand on a busy one) took seconds, during which a test past
+# its deadline could still finish and pass.
+#
+# Its first line, written as the deadline passes, also tells the runner that
+# the test timed out: such a test fails whatever its exit status, as one that
+# catches SIGTERM and exits 0, or that ends while the scan runs, would pass.
+setsid bash -c "$(declare -f sess_pids sess_kill)"'
 	sleep "$1"
-	for d in /proc/[0-9]*; do
-		st="$(sed "s/.*) //" "$d/stat" 2>/dev/null)" || continue
-		read -r _ _ _ sid _ <<<"$st"
-		[ "$sid" = "$2" ] || continue
-		echo "pid ${d#/proc/}: $(tr "\\0" " " <"$d/cmdline")"
-		grep -E "^(SigBlk|SigIgn|SigCgt):" "$d/status"
+	echo "timed out after $1 s" >"$3"
+	sess_pids "$2"
+	for p in "${PIDS[@]}"; do
+		d=/proc/$p
+		cmd=
+		while IFS= read -r -d "" a; do
+			cmd+="$a "
+		done 2>/dev/null <"$d/cmdline"
+		echo "pid $p: $cmd"
+		while read -r l; do
+			case "$l" in
+			SigBlk:*|SigIgn:*|SigCgt:*) echo "$l" ;;
+			esac
+		done 2>/dev/null <"$d/status"
 		for t in "$d"/task/*; do
-			echo "  task ${t##*/} $(cat "$t/comm")" \
-				"state=$(sed "s/.*) //;s/ .*//" "$t/stat")" \
-				"wchan=$(cat "$t/wchan" 2>/dev/null)" \
-				"syscall=$(cat "$t/syscall" 2>/dev/null)"
+			comm= st= wchan=
+			{ read -r comm <"$t/comm"; } 2>/dev/null
+			{ read -r st <"$t/stat"; } 2>/dev/null
+			st=${st##*) }
+			{ read -r wchan <"$t/wchan"; } 2>/dev/null
+			echo "  task ${t##*/} $comm state=${st%% *} wchan=$wchan"
 		done
-	done >"$3" 2>&1
-	kill -TERM -"$2" 2>/dev/null
-	sleep 5
-	kill -KILL -"$2" 2>/dev/null
-' watchdog "$TIMEOUT" "$pgid" "$stuck" </dev/null >/dev/null 2>&1 &
+	done >>"$3" 2>&1
+	sess_kill "$2" 50
+' watchdog "$TIMEOUT" "$sid" "$stuck" </dev/null >/dev/null 2>&1 &
 watchdog=$!
 
 rc=0
-wait "$pgid" || rc=$?
+wait "$sid" || rc=$?
+
+# Cancel the watchdog. Its process group exists only once setsid(1) has called
+# setsid(), which on a loaded host can come after a short test has ended: the
+# group alone then names nothing, and the runner waits out the whole timeout
+# for the watchdog. Its PID reaches it before and after setsid(), and the group
+# then reaches the sleep it may have started, which can only exist after.
+kill -TERM "$watchdog" 2>/dev/null
 kill -TERM -"$watchdog" 2>/dev/null
 wait "$watchdog" 2>/dev/null
 
-# Reap whatever the test left. Signalling the group catches proxies the test
-# never cleaned up -- an orphan keeps its process group -- and touches only this
-# test, so the other tests in a parallel run are unaffected.
-kill -TERM -"$pgid" 2>/dev/null
-sleep 0.2
-kill -KILL -"$pgid" 2>/dev/null
+# Reap whatever the test left: proxies it never cleaned up, and anything that
+# left its process group, such as a command run under timeout(1). The session
+# holds only this test, so the other tests in a parallel run are unaffected.
+sess_kill "$sid" 2
 
 elapsed=$((SECONDS - start))
 
@@ -99,6 +175,7 @@ case "$kind:$rc" in
 integ:77) status=SKIP ;;
 *)	status=FAIL ;;
 esac
+[ ! -s "$stuck" ] || status=FAIL
 
 printf '%s %s %s\n' "$status" "$elapsed" "$name" >"$res"
 
