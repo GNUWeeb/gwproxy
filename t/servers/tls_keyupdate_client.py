@@ -68,6 +68,7 @@ STRAND_SNDBUF = 128 << 10
 STRAND_DATA = b"x" * 64
 STRAND_TALK = b"p" * 200
 STRAND_STALL = 30       # the origin got nothing for this long: it is stuck
+STRAND_MSS = 8192       # what the client sends in, see strand_round()
 
 SSL_ERROR_WANT_READ = 2
 SSL_ERROR_WANT_WRITE = 3
@@ -128,8 +129,10 @@ def check_growth(pid, before, limit, count, what):
 
 
 class Client:
-    def __init__(self, port, rcvbuf=0):
+    def __init__(self, port, rcvbuf=0, mss=0):
         self.s = socket.socket()
+        if mss:
+            self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, mss)
         if rcvbuf:
             self.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
             self.s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, rcvbuf)
@@ -460,7 +463,17 @@ def strand_round(port, pid):
     # while its answers are not taken, reads nothing from the client
     # either. Left alone, the buffer grows instead, and only the window
     # holds the proxy up, which reopens as soon as the client reads.
-    c = Client(port)
+    #
+    # Its segments are kept small, as on any real network. On the loopback
+    # they can be as large as half the most the proxy ever offered, and
+    # once the flood has queued them up that large, the window the proxy
+    # offers later may stay below one of them: the client then sends only
+    # when its zero-window probe timer runs out, and every segment of the
+    # origin's talk that the proxy passes on puts that timer off again. On
+    # CI that kept the client from sending anything for the whole 100 s,
+    # with the proxy waiting for it, nothing of its own queued, and an
+    # empty receive queue.
+    c = Client(port, mss=STRAND_MSS)
     connect_tunnel(c, sink)
     c.s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, STRAND_SNDBUF)
     c.s.setblocking(False)
