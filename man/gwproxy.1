@@ -1380,8 +1380,8 @@ and the
 .B \-\-acl\-file
 with every file it includes, all at once and with no further wait: sending it
 says the files are ready. Each file that fails to load (missing, unreadable,
-malformed) is logged and keeps its current contents in force, while the other
-one is still reloaded; each outcome is logged
+malformed) is logged with the reason and keeps its current contents in force,
+while the other one is still reloaded; each outcome is logged
 .RB ( "Reloaded ACL file" ,
 .BR "Failed to reload authentication file" ,
 \&...). A

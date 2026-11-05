@@ -12,6 +12,8 @@
 #    says why and keeps the current credentials in force; a regular file put
 #    back is applied by the next one; SIGTERM still exits at once.
 #  - The same with --watch-files=1, where the rename itself starts a reload.
+#  - A reload that fails for another reason, here a missing auth or ACL file,
+#    says which.
 #
 # Exercised on every available event loop.
 
@@ -136,6 +138,23 @@ for loop in epoll io_uring; do
 		|| fail "[$loop] a watched FIFO dropped the current credentials"
 	stop_now "$loop"
 	rm -f "$WORK/auth"
+
+	# A reload that fails says why, for the ACL file too.
+	printf 'dave:pw-d\n' >"$WORK/auth"
+	printf -- '-P INPUT ACCEPT\n-P OUTPUT ACCEPT\n' >"$WORK/acl"
+	pp="$(pick_port)"
+	log="$WORK/gwp.$pp.log"
+	gwp_start "127.0.0.1:$pp" --as-socks5=1 --event-loop="$loop" \
+		--auth-file="$WORK/auth" --acl-file="$WORK/acl"
+	rm -f "$WORK/auth" "$WORK/acl"
+	gwp_hup "$GWP_PID" "$log" 2
+	grep -q "Failed to reload authentication file: No such file or directory" "$log" \
+		|| fail "[$loop] a failed auth reload did not say why"
+	grep -q "Failed to reload ACL file: No such file or directory" "$log" \
+		|| fail "[$loop] a failed ACL reload did not say why"
+	fetch "$pp" dave pw-d \
+		|| fail "[$loop] a missing auth file dropped the current credentials"
+	stop_now "$loop"
 done
 
 pass

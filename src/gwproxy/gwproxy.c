@@ -1802,7 +1802,8 @@ static void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 		gwp_reload_begin(ctx->cfg.auth_file, &ctx->auth_reload);
 		r = gwp_auth_reload(ctx->auth);
 		if (gwp_reload_end(&ctx->auth_reload, r))
-			pr_warn(&ctx->lh, "Failed to reload authentication file; keeping current credentials");
+			pr_warn(&ctx->lh, "Failed to reload authentication file: %s; keeping current credentials",
+				strerror(-r));
 		else if (!r)
 			pr_info(&ctx->lh, "Reloaded authentication file");
 	}
@@ -1830,7 +1831,8 @@ static void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 				log_err = e;
 		}
 		if (log_err)
-			pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
+			pr_warn(&ctx->lh, "Failed to reload ACL file: %s; keeping current rules",
+				strerror(-r));
 		else if (!r)
 			pr_info(&ctx->lh, "Reloaded ACL file");
 	}
