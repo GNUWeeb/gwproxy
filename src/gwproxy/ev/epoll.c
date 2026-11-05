@@ -1616,7 +1616,8 @@ static int upstream_redial(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r;
 
 	if (gcp->target.fd >= 0) {
-		/* Closing it takes it out of the epoll set too. */
+		/* Not by closing it alone; see ep_del(). */
+		ep_del(w, gcp->target.fd);
 		__sys_close(gcp->target.fd);
 		gcp->target.fd = -1;
 		gcp->target.ep_mask = 0;
@@ -2042,9 +2043,12 @@ static int adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int fd = gcp->attempt_fd[slot];
 	int closed, r;
+	uint8_t i;
 
 	gcp->attempt_fd[slot] = -1;
 	tmr_disarm(w, gcp, GWP_TMR_ATTEMPT);
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++)
+		ep_del(w, gcp->attempt_fd[i]);	/* the losers; see ep_del() */
 	closed = gwp_conn_close_attempts(gcp);
 	if (closed) {
 		/*
@@ -2154,6 +2158,7 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 			strerror(err), fd, gcp->idx,
 			ip_to_str(&gcp->target_addr));
 
+		ep_del(w, fd);
 		__sys_close(fd);
 		gcp->attempt_fd[slot] = -1;
 		r = credit_fd_closed(w, 1);
