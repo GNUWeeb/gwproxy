@@ -2974,6 +2974,57 @@ static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
 }
 
 /*
+ * Is the host of @up, as its URL names it, worth resolving? An address literal
+ * is (gwp_upstream_url_host() has set @host_is_ip), and so is a DNS name:
+ * labels of 1 to 63 letters, digits, '-' and '_', none at either end of a
+ * label with a '-', and one trailing dot, which is dropped. A name of digits
+ * and dots only is an IPv4 address in one of the forms inet_aton() takes
+ * ("127.1" too, which resolved before this check), and is then rewritten
+ * in the usual dotted form; one that does not parse, such as "999.999.1.1",
+ * is refused, where a resolver would look it up as a name.
+ */
+static bool upstream_host_ok(struct gwp_upstream *up)
+{
+	char c, prev = '.', *host = up->host;
+	size_t n = strlen(host), label = 0, i;
+	struct in_addr a4;
+
+	if (up->host_is_ip)
+		return true;
+	if (n > 1 && host[n - 1] == '.')
+		host[--n] = '\0';
+	if (!n || n > 253)
+		return false;
+
+	if (strspn(host, "0123456789.") == n) {
+		if (!inet_aton(host, &a4) ||
+		    !inet_ntop(AF_INET, &a4, host, sizeof(up->host)))
+			return false;
+		up->host_is_ip = true;
+		return true;
+	}
+
+	for (i = 0; (c = host[i]); i++) {
+		if (c == '.') {
+			if (!label || prev == '-')
+				return false;
+			label = 0;
+		} else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			   (c >= '0' && c <= '9') || c == '_' ||
+			   (c == '-' && label)) {
+			label++;
+		} else {
+			return false;
+		}
+		if (label > 63)
+			return false;
+		prev = c;
+	}
+
+	return label && prev != '-';
+}
+
+/*
  * Parse a --upstream-proxy URL of the form:
  *
  *    socks5://[user:pass@]host:port     (gwproxy resolves the target)
@@ -2982,6 +3033,8 @@ static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
  *    https://[user:pass@]host:port      (HTTP CONNECT, TLS to the proxy)
  *
  * The port is optional and defaults to 1080 for socks5 and 8080 for http.
+ * Returns 0, -EINVAL for a URL that is not one of those, or -EHOSTUNREACH
+ * when its host name does not resolve.
  */
 __cold
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
@@ -3053,7 +3106,8 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 	}
 
 	if (gwp_upstream_url_host(host, up->host, sizeof(up->host),
-				  &up->host_is_ip))
+				  &up->host_is_ip) ||
+	    !upstream_host_ok(up))
 		return -EINVAL;
 
 	/*
@@ -3068,7 +3122,9 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 		has_port = strchr(host, ':') != NULL;
 	}
 
-	return convert_str_to_ssaddr(host, &up->addr, has_port ? 0 : def_port);
+	if (convert_str_to_ssaddr(host, &up->addr, has_port ? 0 : def_port))
+		return up->host_is_ip ? -EINVAL : -EHOSTUNREACH;
+	return 0;
 }
 
 /*
@@ -3348,8 +3404,13 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 			off = strlen(url);
 			len = 0;
 		}
-		pr_err(&ctx->lh, "Invalid --upstream-proxy value '%.*s%s%s'",
-		       (int)off, url, len ? "***" : "", url + off + len);
+		if (r == -EHOSTUNREACH)
+			pr_err(&ctx->lh, "--upstream-proxy host '%s' does not resolve",
+			       up->host);
+		else
+			pr_err(&ctx->lh, "Invalid --upstream-proxy value '%.*s%s%s'",
+			       (int)off, url, len ? "***" : "",
+			       url + off + len);
 		goto out_free;
 	}
 	if (ctx->cfg.upstream_auth_file) {
