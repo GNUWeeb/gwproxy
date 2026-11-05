@@ -1,4 +1,13 @@
 
+# The flags given to make, before anything below adds to them, for the
+# configure run that creates config.make. Once that exists, it records the
+# flags configure was given, overriding these, so that a rerun after
+# configure changes passes the same ones again.
+USER_CFLAGS := $(CFLAGS)
+USER_CXXFLAGS := $(CXXFLAGS)
+USER_LDFLAGS := $(LDFLAGS)
+USER_LIB_LDFLAGS := $(LIB_LDFLAGS)
+
 ifndef OPTIMIZE
 	OPTIMIZE = -O2
 endif
@@ -133,11 +142,12 @@ config.make: configure
 	else								\
 	  echo "$@ is out-of-date";					\
 	  echo "Running configure ...";					\
+	  sed -n "/.*Configured with/s/[^:]*: //p" "$@" |		\
 	  LDFLAGS="$(USER_LDFLAGS)"					\
 	      LIB_LDFLAGS="$(USER_LIB_LDFLAGS)"				\
 	      CFLAGS="$(USER_CFLAGS)" 					\
 	      CXXFLAGS="$(USER_CXXFLAGS)"				\
-	      sed -n "/.*Configured with/s/[^:]*: //p" "$@" | sh;	\
+	      sh;							\
 	fi;
 
 endif

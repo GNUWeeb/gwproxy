@@ -464,6 +464,11 @@ add_make_var "CFLAGS" "$(echo "${CFLAGS} ${USER_CFLAGS}" | awk '{$1=$1};1')";
 add_make_var "CXXFLAGS" "$(echo "${CXXFLAGS} ${USER_CXXFLAGS}" | awk '{$1=$1};1')";
 add_make_var "LDFLAGS" "$(echo "${LDFLAGS} ${USER_LDFLAGS}" | awk '{$1=$1};1')";
 add_make_var "LIB_LDFLAGS" "$(echo "${LIB_LDFLAGS} ${USER_LIB_LDFLAGS}" | awk '{$1=$1};1')";
+# What the caller gave, for the Makefile to pass again when it reruns us.
+add_make_var "USER_CFLAGS" "${USER_CFLAGS}";
+add_make_var "USER_CXXFLAGS" "${USER_CXXFLAGS}";
+add_make_var "USER_LDFLAGS" "${USER_LDFLAGS}";
+add_make_var "USER_LIB_LDFLAGS" "${USER_LIB_LDFLAGS}";
 printf "override O=%s\n" "${build_dir}" >> $config_make;
 ln -s "${config_make}" >> /dev/null 2>&1 || true;
 printf "\n";
