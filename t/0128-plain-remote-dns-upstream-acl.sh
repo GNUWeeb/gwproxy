@@ -68,12 +68,12 @@ run_case()
 	tag="[$loop/$scheme] $what"
 	aclopt=""
 	if [ "$rules" != - ]; then
-		printf '%s\n%b\n' "$NET" "$rules" >"$WORK/acl"
-		aclopt="--acl-file=$WORK/acl"
+		printf '%s\n%b\n' "$NET" "$rules" >"$W/acl"
+		aclopt="--acl-file=$W/acl"
 	fi
 	: >"$rlog"
 	pp="$(pick_port)"
-	glog="$WORK/gwp.log"
+	glog="$W/gwp.log"
 	"$GWPROXY" --bind="127.0.0.1:$pp" --target="$target" $aclopt \
 		--upstream-proxy="$scheme://127.0.0.1:$up" --event-loop="$loop" \
 		--nr-workers=1 --log-level=3 >"$glog" 2>&1 &
@@ -111,75 +111,86 @@ run_case()
 	[ "$seen" = "$i" ] || fail "$tag: upstream saw '$seen', want '$i'"
 }
 
-for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+# Everything below, for one event loop and one kind of upstream, given as
+# <loop>/<scheme>. The four run at once: one after the other they took most
+# of the time limit on a loaded host. Each keeps its files in a directory of
+# its own.
+combo()
+{
+	local loop="${1%/*}" scheme="${1#*/}" W="$WORK/${1%/*}.${1#*/}"
+	local kind rlog up up_pid t
 
-	for scheme in socks5h http; do
-		kind=socks5
-		[ "$scheme" = http ] && kind=http
-		rlog="$WORK/up.log"
-		: >"$rlog"
-		up="$(pick_port)"
-		python3 "$SERVERS_DIR/stub_upstream.py" "$kind" "$up" "$rlog" \
-			>"$WORK/up.err" 2>&1 &
-		up_pid=$!
-		_PIDS+=("$up_pid")
-		wait_listen "$up" "$up_pid" || fail "stub upstream did not listen"
+	mkdir -p "$W"
+	kind=socks5
+	[ "$scheme" = http ] && kind=http
+	rlog="$W/up.log"
+	: >"$rlog"
+	up="$(pick_port)"
+	python3 "$SERVERS_DIR/stub_upstream.py" "$kind" "$up" "$rlog" \
+		>"$W/up.err" 2>&1 &
+	up_pid=$!
+	_PIDS+=("$up_pid")
+	wait_listen "$up" "$up_pid" || fail "stub upstream did not listen"
 
-		for t in "$NAME" "$LIT"; do
-			run_case "accept, $t" "$t:80" "-P OUTPUT ACCEPT" "up $t 80"
-			run_case "policy reject, $t" "$t:80" "-P OUTPUT REJECT" denied
-			run_case "source reject, $t" "$t:80" \
-				"-P OUTPUT ACCEPT\n-A OUTPUT -s 127.0.0.0/8 -j REJECT" denied
-			run_case "DNAT, $t" "$t:80" \
-				"-P OUTPUT ACCEPT\n-A OUTPUT -j DNAT --to 198.51.100.9:99" \
-				"up 198.51.100.9 99"
-			run_case "BIND, $t" "$t:80" \
-				"-P OUTPUT ACCEPT\n-A OUTPUT -j BIND --to-source 127.0.0.77" \
-				"up $t 80 127.0.0.77"
-		done
-		run_case "IPv6 literal" "[2001:db8::1]:80" "-P OUTPUT ACCEPT" \
-			"up 2001:db8::1 80"
+	for t in "$NAME" "$LIT"; do
+		run_case "accept, $t" "$t:80" "-P OUTPUT ACCEPT" "up $t 80"
+		run_case "policy reject, $t" "$t:80" "-P OUTPUT REJECT" denied
+		run_case "source reject, $t" "$t:80" \
+			"-P OUTPUT ACCEPT\n-A OUTPUT -s 127.0.0.0/8 -j REJECT" denied
+		run_case "DNAT, $t" "$t:80" \
+			"-P OUTPUT ACCEPT\n-A OUTPUT -j DNAT --to 198.51.100.9:99" \
+			"up 198.51.100.9 99"
+		run_case "BIND, $t" "$t:80" \
+			"-P OUTPUT ACCEPT\n-A OUTPUT -j BIND --to-source 127.0.0.77" \
+			"up $t 80 127.0.0.77"
+	done
+	run_case "IPv6 literal" "[2001:db8::1]:80" "-P OUTPUT ACCEPT" \
+		"up 2001:db8::1 80"
 
-		# The rest depends neither on the upstream's protocol nor on the
-		# event loop: both loops ask the same function for the verdict.
-		if [ "$scheme" = http ] || [ "$loop" = io_uring ]; then
-			kill "$up_pid" 2>/dev/null
-			wait "$up_pid" 2>/dev/null
-			continue
-		fi
-
-		run_case "--dports reject" "$NAME:80" \
-			"-P OUTPUT ACCEPT\n-A OUTPUT --dports 80 -j REJECT" denied
-		run_case "other --dports" "$NAME:80" \
-			"-P OUTPUT ACCEPT\n-A OUTPUT --dports 81 -j REJECT" "up $NAME 80"
-		run_case "address-only DNAT, name" "$NAME:80" \
-			"-P OUTPUT ACCEPT\n-A OUTPUT -j DNAT --to 198.51.100.9" \
-			"up 198.51.100.9 80"
-
-		# What only one form of target can match.
-		run_case "-m domain" "$NAME:80" \
-			"-P OUTPUT ACCEPT\n-A OUTPUT -m domain --domain $NAME -j REJECT" denied
-		run_case "-m domain, trailing dot" "$NAME.:80" \
-			"-P OUTPUT ACCEPT\n-A OUTPUT -m domain --domain $NAME -j REJECT" denied
-		run_case "-m domain, rule with a trailing dot" "$NAME:80" \
-			"-P OUTPUT ACCEPT\n-A OUTPUT -m domain --domain $NAME. -j REJECT" denied
-		run_case "-d, no address to match" "$NAME:80" \
-			"-P OUTPUT ACCEPT\n-A OUTPUT -d 0.0.0.0/0 -j REJECT" "up $NAME 80"
-		run_case "-d, literal" "$LIT:80" \
-			"-P OUTPUT ACCEPT\n-A OUTPUT -d $LIT/32 -j REJECT" denied
-		run_case "-d, IPv6 literal" "[2001:db8::1]:80" \
-			"-P OUTPUT ACCEPT\n-A OUTPUT -d 2001:db8::1/128 -j REJECT" denied
-
-		# The built-in rules apply here as well.
-		run_case "default ACL, loopback literal" "127.0.0.1:80" - denied
-		run_case "default ACL, localhost" "localhost:80" - denied
-		run_case "default ACL, other name" "$NAME:80" - "up $NAME 80"
-
+	# The rest depends neither on the upstream's protocol nor on the
+	# event loop: both loops ask the same function for the verdict.
+	if [ "$scheme" = http ] || [ "$loop" = io_uring ]; then
 		kill "$up_pid" 2>/dev/null
 		wait "$up_pid" 2>/dev/null
-	done
-done
+		return 0
+	fi
+
+	run_case "--dports reject" "$NAME:80" \
+		"-P OUTPUT ACCEPT\n-A OUTPUT --dports 80 -j REJECT" denied
+	run_case "other --dports" "$NAME:80" \
+		"-P OUTPUT ACCEPT\n-A OUTPUT --dports 81 -j REJECT" "up $NAME 80"
+	run_case "address-only DNAT, name" "$NAME:80" \
+		"-P OUTPUT ACCEPT\n-A OUTPUT -j DNAT --to 198.51.100.9" \
+		"up 198.51.100.9 80"
+
+	# What only one form of target can match.
+	run_case "-m domain" "$NAME:80" \
+		"-P OUTPUT ACCEPT\n-A OUTPUT -m domain --domain $NAME -j REJECT" denied
+	run_case "-m domain, trailing dot" "$NAME.:80" \
+		"-P OUTPUT ACCEPT\n-A OUTPUT -m domain --domain $NAME -j REJECT" denied
+	run_case "-m domain, rule with a trailing dot" "$NAME:80" \
+		"-P OUTPUT ACCEPT\n-A OUTPUT -m domain --domain $NAME. -j REJECT" denied
+	run_case "-d, no address to match" "$NAME:80" \
+		"-P OUTPUT ACCEPT\n-A OUTPUT -d 0.0.0.0/0 -j REJECT" "up $NAME 80"
+	run_case "-d, literal" "$LIT:80" \
+		"-P OUTPUT ACCEPT\n-A OUTPUT -d $LIT/32 -j REJECT" denied
+	run_case "-d, IPv6 literal" "[2001:db8::1]:80" \
+		"-P OUTPUT ACCEPT\n-A OUTPUT -d 2001:db8::1/128 -j REJECT" denied
+
+	# The built-in rules apply here as well.
+	run_case "default ACL, loopback literal" "127.0.0.1:80" - denied
+	run_case "default ACL, localhost" "localhost:80" - denied
+	run_case "default ACL, other name" "$NAME:80" - "up $NAME 80"
+
+	kill "$up_pid" 2>/dev/null
+	wait "$up_pid" 2>/dev/null
+	return 0
+}
+
+combos="epoll/socks5h epoll/http"
+grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && \
+	combos="$combos io_uring/socks5h io_uring/http"
+gwp_parallel combo $combos
 
 # What cannot be a destination never gets as far as a connection.
 for bad in nocolon "$NAME:0" "$NAME:99999" ":80" "sp ace:80" "a..b:80"; do
