@@ -1018,6 +1018,7 @@ static char *rnd_rule(char *p, bool output, bool indexable)
 	static const uint32_t ikinds[] = { 0, 6, 7, 8 };
 	char cbuf[64], abuf[64];
 	const char *chain = output ? "OUTPUT" : "INPUT";
+	const char *act = rnd_action(abuf, output, indexable);
 	uint32_t kind;
 
 	if (indexable)
@@ -1034,7 +1035,9 @@ static char *rnd_rule(char *p, bool output, bool indexable)
 		p += sprintf(p, "! -s %s ", rnd_net());
 		break;
 	case 4:
-		p += sprintf(p, "-s %s -p %s ", rnd_net(), rnd(2) ? "tcp" : "udp");
+		/* -j UPSTREAM is TCP's only: a UDP one does not load. */
+		p += sprintf(p, "-s %s -p %s ", rnd_net(),
+			     rnd(2) || strstr(act, "UPSTREAM") ? "tcp" : "udp");
 		break;
 	case 5: {
 		uint32_t lo = rnd(3) * 1000;
@@ -1061,7 +1064,7 @@ static char *rnd_rule(char *p, bool output, bool indexable)
 				     rnd_doms[rnd(NELEM(rnd_doms))]);
 		break;
 	}
-	p += sprintf(p, "%s\n", rnd_action(abuf, output, indexable));
+	p += sprintf(p, "%s\n", act);
 	return p;
 }
 
@@ -2790,6 +2793,438 @@ static noinline void test_upstream_reload_readers(void)
 	free(path);
 }
 
+/*
+ * Pool servers made at load (struct gwp_acl_server_ops): a stand-in for the
+ * server objects gwproxy makes, counting how many are alive, so a test can
+ * tell that every one made is dropped again, and none too early.
+ */
+struct up_srv {
+	atomic_uint	ref;
+	char		url[128];
+};
+
+static atomic_int g_up_live;
+static int g_up_made;
+
+static int up_srv_make(void *arg, const char *url, void **out, char *why,
+		       size_t size)
+{
+	struct up_srv *s;
+
+	assert(arg == &g_up_live);
+	if (strstr(url, "unresolvable")) {
+		snprintf(why, size, "the host does not resolve");
+		return -EINVAL;
+	}
+	if (strstr(url, "nowhy"))
+		return -EAFNOSUPPORT;
+	s = calloc(1, sizeof(*s));
+	assert(s);
+	atomic_init(&s->ref, 1);
+	snprintf(s->url, sizeof(s->url), "%s", url);
+	atomic_fetch_add(&g_up_live, 1);
+	g_up_made++;
+	*out = s;
+	return 0;
+}
+
+static void up_srv_put(void *arg, void *srv)
+{
+	struct up_srv *s = srv;
+
+	assert(arg == &g_up_live);
+	assert(atomic_load(&s->ref) > 0);
+	if (atomic_fetch_sub(&s->ref, 1) != 1)
+		return;
+	memset(s->url, 'x', sizeof(s->url));
+	free(s);
+	assert(atomic_fetch_sub(&g_up_live, 1) > 0);
+}
+
+static const struct gwp_acl_server_ops up_srv_ops = {
+	.make	= up_srv_make,
+	.put	= up_srv_put,
+	.arg	= &g_up_live,
+};
+
+/* The server object @p's @i-th URL was made into, checked against it. */
+static struct up_srv *up_srv_of(const struct gwp_acl_pool *p, uint32_t i)
+{
+	struct up_srv *s = gwp_acl_pool_server(p, i);
+
+	assert(s && !strcmp(s->url, gwp_acl_pool_server_url(p, i)));
+	return s;
+}
+
+/*
+ * Every pool server is made when the set loads, and kept with its pool: a
+ * server a connection took a reference to outlives the pool, the reload that
+ * dropped it and the ACL. A server that cannot be made fails the load (or
+ * the reload, keeping the servers in force) with its file and line, and the
+ * servers made before it are dropped.
+ */
+static noinline void test_upstream_server_ops(void)
+{
+	char *dir = inc_dir(), *path, *said;
+	struct gwp_acl_req req;
+	struct up_srv *held;
+	struct gwp_acl *a;
+	int r;
+
+	g_up_made = 0;
+	path = inc_write(dir, "main.acl",
+			 "upstream p {\n"
+			 " server http://u:s3cret@10.0.0.1:3128;\n"
+			 " server http://10.0.0.2:3128;\n"
+			 "}\n"
+			 "upstream q {\n server socks5://10.0.0.3:1080;\n}\n"
+			 "-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_create_ops(&a, path, &up_srv_ops));
+	assert(g_up_made == 3 && atomic_load(&g_up_live) == 3);
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	assert(up_srv_of(req.upstream_pool, 0) != up_srv_of(req.upstream_pool, 1));
+	assert(!gwp_acl_pool_server(req.upstream_pool, 2));
+	/* What a connection does: keep the server, not the pool. */
+	held = up_srv_of(req.upstream_pool, 1);
+	atomic_fetch_add(&held->ref, 1);
+	gwp_acl_req_release(&req);
+
+	/* A reload makes the new set's servers and drops the old ones'. */
+	inc_put(dir, "main.acl",
+		"upstream p {\n server http://10.0.0.4:3128;\n}\n"
+		"-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_reload(a));
+	assert(g_up_made == 4 && atomic_load(&g_up_live) == 2);
+	assert(!strcmp(held->url, "http://10.0.0.2:3128"));
+
+	/* A server that cannot be made fails the reload; the rest go too. */
+	inc_put(dir, "main.acl",
+		"upstream p {\n"
+		" server http://10.0.0.5:3128;\n"
+		" server http://u:s3cret@unresolvable.invalid:3128;\n"
+		"}\n");
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, -EINVAL, said);
+	assert(strstr(said, "main.acl: line 3: upstream pool p server 2 (http://unresolvable.invalid:3128): the host does not resolve"));
+	assert(!strstr(said, "s3cret"));
+	free(said);
+	assert(g_up_made == 5 && atomic_load(&g_up_live) == 2);
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(!strcmp(up_srv_of(req.upstream_pool, 0)->url,
+		       "http://10.0.0.4:3128"));
+	gwp_acl_req_release(&req);
+
+	/* With no reason given, the errno says why. */
+	inc_put(dir, "main.acl", "upstream p {\n server http://nowhy:1;\n}\n");
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, -EINVAL, said);
+	assert(strstr(said, "main.acl: line 2: upstream pool p server 1 (http://nowhy:1): "));
+	assert(strstr(said, strerror(EAFNOSUPPORT)));
+	free(said);
+
+	/* The ACL goes; the server a connection holds stays. */
+	gwp_acl_destroy(a);
+	assert(atomic_load(&g_up_live) == 1);
+	assert(!strcmp(held->url, "http://10.0.0.2:3128"));
+	up_srv_put(&g_up_live, held);
+	assert(atomic_load(&g_up_live) == 0);
+
+	/* Without ops, a pool has its URLs and no server objects. */
+	inc_put(dir, "main.acl", "upstream p {\n server http://10.0.0.1:1;\n}\n"
+				 "-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(gwp_acl_pool_server_url(req.upstream_pool, 0));
+	assert(!gwp_acl_pool_server(req.upstream_pool, 0));
+	gwp_acl_req_release(&req);
+	gwp_acl_destroy(a);
+	assert(g_up_made == 5);
+
+	free(path);
+	inc_rmdir(dir);
+}
+
+/*
+ * gwp_acl_eval_upstream() for @user to @domain or the address @ip (one of
+ * them NULL), port 443: the pool name, "DIRECT" or "".
+ */
+static const char *up_pick(struct gwp_acl *a, const char *user,
+			   const char *domain, const char *ip)
+{
+	static char name[80];
+	struct gwp_sockaddr t;
+	struct gwp_acl_req req;
+	enum gwp_acl_upstream u;
+
+	memset(&req, 0, sizeof(req));
+	if (ip) {
+		t = sa4(ip, 443);
+		req.target = &t;
+	}
+	req.domain = domain;
+	req.user = user;
+	req.dport = 443;
+	req.proto = GWP_ACL_PROTO_TCP;
+	u = gwp_acl_eval_upstream(a, &req);
+	assert(u == req.upstream && !req.upstream_only);
+	if (u == GWP_ACL_UPSTREAM_POOL)
+		snprintf(name, sizeof(name), "%s",
+			 gwp_acl_pool_name(req.upstream_pool));
+	else
+		snprintf(name, sizeof(name), "%s",
+			 u == GWP_ACL_UPSTREAM_DIRECT ? "DIRECT" :
+			 u == GWP_ACL_UPSTREAM_UNSURE ? "UNSURE" : "");
+	if (u != GWP_ACL_UPSTREAM_POOL)
+		assert(!req.upstream_pool);
+	gwp_acl_req_release(&req);
+	return name;
+}
+
+/*
+ * The upstream is picked from what is known before the name is resolved:
+ * the user, a domain or a literal address. A -d rule matches the address
+ * only. The pick does not take a -m statistic turn from the evaluations
+ * that follow it, and with no -j UPSTREAM rule at all there is no pick.
+ */
+static noinline void test_upstream_pick(void)
+{
+	struct gwp_sockaddr t = sa4("192.0.2.1", 443);
+	struct gwp_acl *a = NULL;
+	int i;
+
+	assert(!gwp_acl_parse_str(&a,
+		"upstream a {\n server socks5h://10.0.0.1:1080;\n}\n"
+		"upstream b {\n server socks5://10.0.0.2:1080;\n}\n"
+		"-A OUTPUT -m user --user alice -j UPSTREAM --to a\n"
+		"-A OUTPUT -m domain --domain example.org -j UPSTREAM --to b\n"
+		"-A OUTPUT -d 198.51.100.0/24 -j UPSTREAM --to DIRECT\n"
+		"-A OUTPUT -d 203.0.113.0/24 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(!strcmp(up_pick(a, "alice", "example.net", NULL), "a"));
+	assert(!strcmp(up_pick(a, "alice", "example.org", NULL), "b"));
+	assert(!strcmp(up_pick(a, "bob", "example.net", NULL), ""));
+	assert(!strcmp(up_pick(a, NULL, NULL, "198.51.100.7"), "DIRECT"));
+	assert(!strcmp(up_pick(a, "alice", NULL, "198.51.100.7"), "DIRECT"));
+	/* A name is not an address, whatever it resolves to later. */
+	assert(!strcmp(up_pick(a, NULL, "198.51.100.7.nip.example", NULL), ""));
+	/* The pick's REJECT is not the request's: the pool stays. */
+	assert(!strcmp(up_pick(a, "alice", NULL, "203.0.113.1"), "a"));
+	gwp_acl_destroy(a);
+
+	/*
+	 * A default-deny set that lets targets through by -d: a name meets
+	 * no -d rule and the walk ends on the policy, yet the request keeps
+	 * its pool; the evaluations per address then say ACCEPT.
+	 */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"upstream a {\n server socks5://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m user --user alice -j UPSTREAM --to a\n"
+		"-A OUTPUT -d 192.0.2.0/24 -j ACCEPT\n"
+		"-P OUTPUT REJECT\n"));
+	assert(!strcmp(up_pick(a, "alice", "example.net", NULL), "a"));
+	assert(!strcmp(up_pick(a, "alice", NULL, "192.0.2.1"), "a"));
+	assert(!strcmp(up_pick(a, "bob", "example.net", NULL), ""));
+	gwp_acl_destroy(a);
+
+	/* An nth split of the upstream: the pick says what eval will. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"upstream a {\n server socks5h://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m statistic --mode nth --every 2 -j UPSTREAM --to a\n"
+		"-A OUTPUT -m statistic --mode nth --every 3 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	for (i = 0; i < 30; i++) {
+		struct gwp_acl_req req = {
+			.target = &t, .dport = 443, .proto = GWP_ACL_PROTO_TCP,
+		};
+		const char *want = i % 2 ? "" : "a";
+		enum gwp_acl_verdict v;
+
+		assert(!strcmp(up_pick(a, NULL, NULL, "192.0.2.1"), want));
+		assert(!strcmp(up_pick(a, NULL, NULL, "192.0.2.1"), want));
+		v = gwp_acl_eval_output(a, &req);
+		assert((v == GWP_ACL_REJECT) == (i % 3 == 0));
+		if (v == GWP_ACL_ACCEPT)
+			assert((req.upstream == GWP_ACL_UPSTREAM_POOL) ==
+			       !(i % 2));
+		gwp_acl_req_release(&req);
+	}
+	gwp_acl_destroy(a);
+
+	/* No -j UPSTREAM rule: nothing to pick, no statistic turn taken. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m statistic --mode nth --every 2 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	for (i = 0; i < 10; i++) {
+		assert(!strcmp(up_pick(a, NULL, NULL, "192.0.2.1"), ""));
+		assert(out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) ==
+		       (i % 2 ? GWP_ACL_ACCEPT : GWP_ACL_REJECT));
+	}
+	gwp_acl_destroy(a);
+	assert(!strcmp(up_pick(NULL, "alice", NULL, "192.0.2.1"), ""));
+}
+
+/* gwp_acl_eval_upstream() for @user with no target at all (UDP ASSOCIATE). */
+static const char *up_pick_nt(struct gwp_acl *a, const char *user)
+{
+	struct gwp_sockaddr c = sa4("198.51.100.9", 40000);
+	struct gwp_acl_req req;
+	enum gwp_acl_upstream u;
+	const char *name;
+
+	memset(&req, 0, sizeof(req));
+	req.client = &c;
+	req.sport = 40000;
+	req.user = user;
+	req.no_target = true;
+	req.proto = GWP_ACL_PROTO_TCP;
+	u = gwp_acl_eval_upstream(a, &req);
+	if (u == GWP_ACL_UPSTREAM_POOL)
+		name = gwp_acl_pool_name(req.upstream_pool);
+	else
+		name = u == GWP_ACL_UPSTREAM_DIRECT ? "DIRECT" :
+		       u == GWP_ACL_UPSTREAM_UNSURE ? "UNSURE" : "";
+	if (u != GWP_ACL_UPSTREAM_POOL)
+		assert(!req.upstream_pool);
+	gwp_acl_req_release(&req);
+	return name;
+}
+
+/*
+ * A pick with no target at all: no rule that tests the target matches, in
+ * either polarity, and a pool rule passed over only for that leaves the
+ * pick unsure, while a DIRECT one is just passed over. A request to an
+ * address keeps "! --domain" matching, as it has no name.
+ */
+static noinline void test_upstream_pick_no_target(void)
+{
+	struct gwp_acl *a = NULL;
+
+	assert(!gwp_acl_parse_str(&a,
+		"upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m user --user alice -m domain ! --domain secret.example -j UPSTREAM --to DIRECT\n"
+		"-A OUTPUT -m user --user bob -m domain --domain secret.example -j UPSTREAM --to s5\n"
+		"-A OUTPUT -m user --user carol ! -d 10.0.0.0/8 -j UPSTREAM --to DIRECT\n"
+		"-A OUTPUT -m user --user dave -j UPSTREAM --to s5\n"
+		"-A OUTPUT -m user --user erin --dports 80 -j UPSTREAM --to s5\n"
+		"-A OUTPUT -m user --user frank -s 192.0.2.0/24 -d 10.0.0.1 -j UPSTREAM --to s5\n"
+		"-A OUTPUT -m user --user gina -j UPSTREAM --to s5\n"
+		"-A OUTPUT -m user --user gina ! -d 10.0.0.0/8 -j UPSTREAM --to DIRECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(!strcmp(up_pick_nt(a, "alice"), ""));
+	assert(!strcmp(up_pick_nt(a, "bob"), "UNSURE"));
+	assert(!strcmp(up_pick_nt(a, "carol"), ""));
+	assert(!strcmp(up_pick_nt(a, "dave"), "s5"));
+	assert(!strcmp(up_pick_nt(a, "erin"), "UNSURE"));
+	/* Its other criteria fail: the rule says nothing about this one. */
+	assert(!strcmp(up_pick_nt(a, "frank"), ""));
+	assert(!strcmp(up_pick_nt(a, "gina"), "s5"));
+	assert(!strcmp(up_pick_nt(a, NULL), ""));
+
+	/* With a target, the same rules decide as ever. */
+	assert(!strcmp(up_pick(a, "alice", NULL, "192.0.2.1"), "DIRECT"));
+	assert(!strcmp(up_pick(a, "alice", "secret.example", NULL), ""));
+	assert(!strcmp(up_pick(a, "bob", "secret.example", NULL), "s5"));
+	assert(!strcmp(up_pick(a, "carol", NULL, "192.0.2.1"), "DIRECT"));
+	assert(!strcmp(up_pick(a, "erin", "example.org", NULL), ""));
+	gwp_acl_destroy(a);
+
+	/*
+	 * A run of pool rules long enough for the index, by name and by
+	 * address: with no target the index is not asked, the run is walked,
+	 * and its rules leave the pick unsure. A target still finds its rule.
+	 */
+	{
+		char text[4096], *p = text;
+		int i;
+
+		p += sprintf(p, "upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n");
+		for (i = 1; i <= 8; i++)
+			p += sprintf(p, "-A OUTPUT -m domain --domain h%d.example -j UPSTREAM --to s5 --accept\n", i);
+		a = NULL;
+		assert(!gwp_acl_parse_str(&a, text));
+		assert(gwp_acl_nr_indexed(a) == 8);
+		assert(!strcmp(up_pick_nt(a, "bob"), "UNSURE"));
+		assert(!strcmp(up_pick(a, "bob", "h5.example", NULL), "s5"));
+		assert(!strcmp(up_pick(a, "bob", "other.example", NULL), ""));
+		gwp_acl_destroy(a);
+
+		p = text;
+		p += sprintf(p, "upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n");
+		for (i = 1; i <= 8; i++)
+			p += sprintf(p, "-A OUTPUT -d 10.0.%d.0/24 -j UPSTREAM --to s5 --accept\n", i);
+		a = NULL;
+		assert(!gwp_acl_parse_str(&a, text));
+		assert(gwp_acl_nr_indexed(a) == 8);
+		assert(!strcmp(up_pick_nt(a, "bob"), "UNSURE"));
+		assert(!strcmp(up_pick(a, "bob", NULL, "10.0.3.7"), "s5"));
+		assert(!strcmp(up_pick(a, "bob", NULL, "10.9.3.7"), ""));
+		gwp_acl_destroy(a);
+	}
+
+	/* A statistic does not decide it: whether it matches is not known. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m statistic --mode nth --every 1000 --packet 999 --dports 80 -j UPSTREAM --to s5\n"));
+	assert(!strcmp(up_pick_nt(a, "bob"), "UNSURE"));
+	gwp_acl_destroy(a);
+}
+
+/* A -j UPSTREAM rule only UDP matches could never apply: refused. */
+static noinline void test_upstream_udp_refused(void)
+{
+	static const char pool[] = "upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n";
+	static const char *const rules[] = {
+		"-A OUTPUT -p udp -j UPSTREAM --to s5\n",
+		"-A OUTPUT ! -p tcp -m user --user bob -j UPSTREAM --to s5\n",
+		"-A OUTPUT -p udp -j UPSTREAM --to DIRECT --accept\n",
+	};
+	char text[512];
+	struct gwp_acl *a = NULL;
+	size_t i;
+
+	for (i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+		snprintf(text, sizeof(text), "%s%s", pool, rules[i]);
+		up_refused(text, -EINVAL, "line 4: -j UPSTREAM applies to TCP; UDP never goes through an upstream");
+	}
+	snprintf(text, sizeof(text), "%s%s%s", pool,
+		 "-A OUTPUT -p tcp -j UPSTREAM --to s5\n",
+		 "-A OUTPUT ! -p udp -j UPSTREAM --to DIRECT\n");
+	assert(!gwp_acl_parse_str(&a, text));
+	gwp_acl_destroy(a);
+}
+
+/*
+ * A regexp the pick cannot decide (the match limit) leaves it unsure: it
+ * may have missed a pool, so it must not fall back on the default.
+ */
+static noinline void test_upstream_pick_regexp_error(void)
+{
+#ifdef CONFIG_PCRE
+	struct gwp_acl *a = NULL;
+	char host[64];
+
+	memset(host, 'a', 30);
+	strcpy(host + 30, "!internal.example");
+	assert(!gwp_acl_parse_str(&a,
+		"upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m domain --domain-regexp (\\w+\\.?)+internal\\.example$ -j UPSTREAM --to s5\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(!strcmp(up_pick(a, NULL, host, NULL), "UNSURE"));
+	assert(!strcmp(up_pick(a, NULL, "a.internal.example", NULL), "s5"));
+	assert(!strcmp(up_pick(a, NULL, "other.org", NULL), ""));
+	gwp_acl_destroy(a);
+#endif
+}
+
 /* Every way the pool syntax and -j UPSTREAM can be wrong, one at a time. */
 static noinline void test_upstream_errors(void)
 {
@@ -3054,6 +3489,10 @@ static void run_tests(void)
 	test_upstream_pool_outlives_reload();
 	test_upstream_take_pool();
 	test_upstream_reload_readers();
+	test_upstream_server_ops();
+	test_upstream_pick_no_target();
+	test_upstream_pick_regexp_error();
+	test_upstream_udp_refused();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();
@@ -3075,6 +3514,7 @@ static void run_tests(void)
 		test_statistic_load_balance();
 		test_statistic_equal_every_is_uneven();
 		test_upstream_pools();
+		test_upstream_pick();
 	}
 	printf("All tests passed!\n");
 }

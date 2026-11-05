@@ -59,6 +59,12 @@ enum gwp_acl_upstream {
 	GWP_ACL_UPSTREAM_NONE	= 0,	/* no -j UPSTREAM rule matched */
 	GWP_ACL_UPSTREAM_DIRECT	= 1,	/* "--to DIRECT": no upstream at all */
 	GWP_ACL_UPSTREAM_POOL	= 2,	/* a pool: gwp_acl_req.upstream_pool */
+	/*
+	 * gwp_acl_eval_upstream() only: the choice cannot be told, and might
+	 * be a pool; the caller must refuse the request rather than send it
+	 * anywhere else. See there.
+	 */
+	GWP_ACL_UPSTREAM_UNSURE	= 3,
 };
 
 /* The pool's name, as written after "upstream". */
@@ -82,6 +88,14 @@ uint32_t gwp_acl_pool_nr_servers(const struct gwp_acl_pool *p);
  * form instead. NULL when @i is out of range.
  */
 const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i);
+
+/*
+ * The object made of the pool's @i-th server URL when the rule set loaded
+ * (see struct gwp_acl_server_ops), or NULL when @i is out of range or the
+ * ACL was created without ops. The pool holds a reference to it for as long
+ * as the pool lives; take your own to keep it longer.
+ */
+void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i);
 
 /* Take another reference to @p. */
 void gwp_acl_pool_get(struct gwp_acl_pool *p);
@@ -144,6 +158,34 @@ int gwp_acl_parse_bind_source(const char *s, struct gwp_sockaddr *out);
  * is warned about on stderr; no message shows the credentials.
  */
 int gwp_acl_create(struct gwp_acl **out, const char *path);
+
+/*
+ * What makes a pool server's object out of its URL, for a caller that wants
+ * every server checked and set up when the rule set loads, not when a
+ * connection first uses it (acl.c itself only checks the URL's shape).
+ *
+ * @make parses @url (it passed the shape check) into a new object with one
+ * reference, stored in *@srv, and returns 0; or returns a negative errno and
+ * may put the reason in @why (@size bytes), which then fails the load with
+ * the file and line of the server. Neither @why nor any message may show the
+ * URL's credentials. @put drops a reference @make handed out. Both get @arg,
+ * and are called from the thread that loads or reloads, or (@put) from
+ * whichever drops the last reference to a pool.
+ */
+struct gwp_acl_server_ops {
+	int	(*make)(void *arg, const char *url, void **srv, char *why,
+			size_t size);
+	void	(*put)(void *arg, void *srv);
+	void	*arg;
+};
+
+/*
+ * gwp_acl_create(), and every server of every pool of this load and of the
+ * reloads to come is made with @ops (NULL: none, as gwp_acl_create()). @ops
+ * must outlive the ACL and every pool reference taken from it.
+ */
+int gwp_acl_create_ops(struct gwp_acl **out, const char *path,
+		       const struct gwp_acl_server_ops *ops);
 
 /*
  * Parse an ACL from an in-memory NUL-terminated rule text (the built-in
@@ -220,6 +262,11 @@ static inline void gwp_acl_memo_reset(struct gwp_acl_memo *m)
  *   @dport   destination port, host byte order (OUTPUT).
  *   @proto   GWP_ACL_PROTO_TCP / _UDP.
  *   @memo    optional struct gwp_acl_memo (OUTPUT only), or NULL.
+ *   @no_target  the request has no target at all, not even a port (only
+ *            for gwp_acl_eval_upstream()): a rule that tests the target,
+ *            -d, --dports or -m domain in either polarity, cannot be
+ *            decided and never matches. Unlike a request whose target is
+ *            an address and so has no name, where "! --domain" matches.
  *
  * Outputs (set by gwp_acl_eval_output()):
  *   @dnat_applied  true if a -j DNAT rule matched; @dnat then holds the rewrite.
@@ -274,6 +321,11 @@ struct gwp_acl_req {
 	/* The rule's port, or 0; set only with @dnat_applied. */
 	uint16_t			dnat_port;
 	uint8_t				proto;	/* enum gwp_acl_proto */
+	/* Set by gwp_acl_eval_upstream() while it runs; leave it false. */
+	bool				upstream_only;
+	bool				no_target;
+	/* gwp_acl_eval_upstream()'s own: a pool rule could not be decided. */
+	bool				upstream_unsure;
 	uint8_t				upstream; /* enum gwp_acl_upstream */
 	bool				dnat_applied;
 	bool				mark_set;
@@ -286,6 +338,29 @@ struct gwp_acl_req {
  */
 enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 					 struct gwp_acl_req *req);
+
+/*
+ * Evaluate the OUTPUT chain for @req only to learn the upstream it chooses,
+ * as gwp_acl_eval_output() reports it in @req->upstream(_pool), which this
+ * returns too; the verdict and the other outputs are not to be used. The
+ * choice is that of the last -j UPSTREAM rule met before the walk ends,
+ * whether it ends on ACCEPT or REJECT: the verdict of a request that only
+ * has a name is not that of its addresses, since no -d rule matches it, so
+ * a REJECT here must not cost the request its pool.
+ *
+ * The choice is GWP_ACL_UPSTREAM_UNSURE, with no pool, when it cannot be
+ * told: a regexp the walk met could not be decided, or, with @no_target, a
+ * -j UPSTREAM rule to a pool was passed over only because it tests the
+ * target (all its other criteria hold), as it might send the request to
+ * that pool. A -j UPSTREAM --to DIRECT rule passed over that way is just
+ * ignored. The caller refuses an UNSURE request. It is meant to run once
+ * per connection before its real evaluations, which decide the verdict, so
+ * it leaves no trace on them: a -m statistic rule says what the next real
+ * evaluation would, without taking its turn. A ruleset without a
+ * -j UPSTREAM rule answers GWP_ACL_UPSTREAM_NONE without an evaluation.
+ */
+enum gwp_acl_upstream gwp_acl_eval_upstream(struct gwp_acl *acl,
+					    struct gwp_acl_req *req);
 
 /*
  * Drop what an OUTPUT evaluation left @req holding (its pool reference) and

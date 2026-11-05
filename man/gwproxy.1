@@ -346,6 +346,56 @@ follow the include lines: a file named by a new line is watched from that
 reload on, even while it is still missing (create it and the set reloads), and
 one whose line is gone no longer is.
 .IP \(bu 3
+.BI "upstream " name " {"
+\(em define an upstream pool, a set of upstream proxies that
+.B "\-j UPSTREAM"
+rules send connections through (see
+.BR "UPSTREAM CHAINING" ).
+The line stands alone, and so does the
+.B }
+that ends the block; each line between holds one directive ending in
+.BR ; :
+.BI "server " url ;
+adds a server, with a URL as
+.B \-\-upstream\-proxy
+takes it
+.RB ( socks5:// ", " socks5h:// " or " http:// ,
+optional
+.BR user:pass@ ,
+a name, an IPv4 address or a bracketed IPv6 one, an optional port), and
+.B least_conn;
+(at most once) sets the method; round\-robin is the default.
+.B https://
+servers are not supported in a pool yet. A pool has 1 to 64 servers, and all
+of them must resolve target names the same way:
+.B socks5://
+servers have gwproxy resolve them,
+.BR socks5h:// " and " http://
+servers resolve them themselves, and a pool mixing the two is refused. A
+.I name
+is 1 to 64 letters, digits,
+.BR _ ", " \- " and " . ,
+.B DIRECT
+is reserved, and a name is one pool across all the files of the set; a set
+has at most 1024 pools. Blocks do not nest, an include line may not stand in
+one, and a file may not end inside one. A pool may be defined after the rules
+that use it, or in another file of the set; a rule naming a pool that is not
+defined anywhere is an error. Every server is parsed and its host resolved
+when the set loads (and only then: a reload resolves it again), as
+.B \-\-upstream\-proxy
+is at startup: a host that is neither a name nor an address, a name that does
+not resolve, an address
+.B \-\-outgoing\-family
+forbids, or a
+.B \-\-target\-buf\-size
+below the 1280 bytes an upstream handshake needs fails the load like any
+malformed line. A file that holds a server URL with credentials is warned
+about (once per load, not an error) when its group or others may read it. No
+message shows the credentials: they name the pool and the server's number,
+counted from 1, and show its URL without the
+.B user:pass@
+part.
+.IP \(bu 3
 .BI "\-A " "chain [matches] " "\fB\-j\fR " target
 \(em append a rule. Matches, each negatable with a leading
 .BR ! :
@@ -374,9 +424,38 @@ the destination handed to an upstream proxy \(em including replacing a
 .B socks5h://
 hostname with the rewritten IP, or for a port\-only
 .B \-\-to :\fIport\fR
-keeping the hostname and changing its port \(em but not the UDP relay), or
+keeping the hostname and changing its port \(em but not the UDP relay),
 .B MARK
-.RB ( OUTPUT "-only) with " \-\-set\-mark " " \fInum\fR "."
+.RB ( OUTPUT "-only) with " \-\-set\-mark " " \fInum\fR ,
+.B BIND
+(below), or
+.B UPSTREAM
+.RB ( OUTPUT "-only) with " \-\-to " " \fIname\fR
+(or its alias
+.BR \-\-to\-proxy ),
+which sends the connection through the upstream pool
+.IR name ,
+or
+.BR "\-\-to DIRECT" ,
+which sends it to its target directly, past any
+.BR \-\-upstream\-proxy .
+Like
+.BR MARK " and " BIND ,
+.B UPSTREAM
+is a composable modifier: the last matching rule's choice wins, and
+.B \-\-accept
+makes a rule terminal. The choice is made once per connection, before its
+target's name is resolved (see
+.BR "UPSTREAM CHAINING" ),
+so a
+.B \-d
+in such a rule matches only a target the client gave as an address, never one
+it named; a load warns about such a rule. It applies to TCP only: UDP never
+goes through an upstream, so a rule with
+.B "\-p udp"
+or
+.B "! \-p tcp"
+could never take effect, and is a load error.
 .IP
 .B \-j MARK
 sets the fwmark
@@ -467,7 +546,7 @@ share a source port.
 .B \-\-accept
 .IP
 Valid only on
-.BR "\-j MARK" " and " "\-j BIND" ,
+.BR "\-j MARK" ", " "\-j BIND" " and " "\-j UPSTREAM" ,
 and takes no argument: apply the modifier and then stop traversing the chain,
 accepting the connection. It turns a composable modifier into a terminal action,
 so
@@ -929,8 +1008,11 @@ Default:
 .SS Upstream proxy chaining
 .TP
 .BR \-x ", " \-\-upstream\-proxy=\fIurl\fR
-Route every outgoing connection through a next\-hop proxy. The URL scheme
-selects the proxy type:
+Route every outgoing connection through a next\-hop proxy, but for those an ACL
+.B "\-j UPSTREAM"
+rule sends elsewhere (see
+.BR "UPSTREAM CHAINING" ).
+The URL scheme selects the proxy type:
 .BR socks5://[user:pass@]host:port ,
 a SOCKS5 proxy that resolves target hostnames locally;
 .BR socks5h://[user:pass@]host:port ,
@@ -1298,6 +1380,13 @@ that arrive while a reload runs give one more reload once it is over, not one
 each. The reload runs on a thread of its own, so the workers go on serving
 throughout.
 .PP
+An ACL reload rebuilds the upstream pools too (see
+.BR "UPSTREAM CHAINING" ):
+every pool server is parsed and its host resolved again, and a server that
+fails fails the reload, which keeps the rules and pools in force. New
+connections use the new pools; one already through a pool's server keeps that
+server until it ends.
+.PP
 The auth file must be a regular file. Unlike the ACL files, it is not checked
 for being one before it is opened: a FIFO put in its place makes a reload
 .RB ( SIGHUP ,
@@ -1439,6 +1528,124 @@ before the TCP FIN. A TLS client
 may chain through an
 .B https://
 upstream; each side has its own TLS session.
+.SS Upstream pools
+The ACL file
+.RB ( \-\-acl\-file )
+can send connections through other upstreams than
+.BR \-\-upstream\-proxy ,
+per user, client, port or target: an
+.BI "upstream " name " {"
+block defines a pool of upstream proxies, and an
+.B OUTPUT
+rule with
+.BI "\-j UPSTREAM \-\-to " name
+sends the connections it matches through it, or with
+.B "\-j UPSTREAM \-\-to DIRECT"
+to their targets directly. Of several matching
+.B \-j UPSTREAM
+rules the last one decides, unless one with
+.B \-\-accept
+ends the walk first; with none,
+.B \-\-upstream\-proxy
+applies, or no upstream at all. For example:
+.PP
+.RS
+.EX
+upstream office {
+    server socks5h://alice_up:secret@10.0.0.1:1080;
+}
+upstream web {
+    server http://10.0.0.3:3128;
+}
+\-A OUTPUT \-m user \-\-user alice \-j UPSTREAM \-\-to office
+\-A OUTPUT \-m user \-\-user bob \-j UPSTREAM \-\-to web
+\-A OUTPUT \-m domain \-\-domain intranet.example \-j UPSTREAM \-\-to DIRECT
+.EE
+.RE
+.PP
+The upstream is decided once per connection, before its target's name is
+resolved, from what is known then: the user, the client's address and port,
+and the target as the client gave it, a name or an address, and its port.
+So
+.B \-m domain
+matches a target given by name, and
+.B \-d
+only one given as an address (a name's addresses are not known yet). For a
+target given by name the decision passes over every rule with a
+.BR \-d ,
+terminal ones included: a
+.B "\-d ... \-j ACCEPT"
+above a
+.B \-j UPSTREAM
+rule does not stop a named target from picking that rule's pool, though it
+may accept the target's addresses afterwards. The decision is not the verdict
+either: it takes the choice of the last
+.B \-j UPSTREAM
+rule it meets, whether the walk then ends on an accept or a reject, so a
+default\-deny set that admits targets by
+.B \-d
+still sends them through their pool. A
+.B \-m statistic
+rule takes no turn in this decision, it tells what the connection's next
+evaluation will. A regexp that cannot be decided (one whose match runs into
+PCRE2's limits, which refuses the target in any evaluation)
+refuses the connection rather than leave it to the default. The
+.B OUTPUT
+evaluations that follow, once per resolved address and again when a connect is
+retried, decide the verdict,
+.BR DNAT ", " MARK " and " BIND
+as before, but never change the upstream.
+.PP
+The pool then decides how the name is resolved: a
+.B socks5://
+pool, like
+.B DIRECT
+and no upstream at all, has gwproxy resolve it and sends the server an
+address; a
+.BR socks5h:// " or " http://
+pool sends the server the name. Only the first server of a pool is used for
+now; the others, and the pool's method, are not.
+Plain
+.B \-\-target
+forwarding to a name sends that name to a pool that resolves names. A
+connection the ACL sends elsewhere goes to the address the name resolved to
+at startup; when
+.B \-\-upstream\-proxy
+itself resolves names remotely, the name is not resolved at startup, and such
+a connection is refused (and logged).
+.PP
+Each connection that a rule sends through a pool, or
+.BR DIRECT ,
+is logged at debug level, naming the pool and its server's number, counted
+from 1, and address, never its credentials. A pool server's address is
+resolved once, when the set loads; a reload resolves it again. A reload that
+changes the pools applies to new connections; one already through a pool's
+server keeps it until it ends.
+.PP
+UDP is never sent through an upstream, and the rules do not apply to the UDP
+relay's datagrams. A SOCKS5 UDP ASSOCIATE is decided like a connection, from
+the user and the client alone, as for a TCP connection. It has no target, so
+a rule that tests one
+.RB ( \-d ", " \-\-dports " or " "\-m domain" ,
+negated or not) is never taken for it, a terminal one such as
+.B "\-d ... \-j ACCEPT"
+included. A user the rules send through a pool is refused it (reply 0x07), and
+so is one that a pool rule
+.RB ( "\-p tcp" ,
+or with no protocol) would match but for its target tests, as the rule might
+send that user's traffic through the pool; a
+.B \-m statistic
+in such a rule counts as one that could match, and a later
+.B DIRECT
+rule that does match does not undo the refusal. A
+.B DIRECT
+rule passed over for its target tests is just passed over. Everyone else
+without a choice is refused it when
+.B \-\-upstream\-proxy
+is given, and a user the rules send
+.B DIRECT
+gets a direct UDP relay, even past
+.BR \-\-upstream\-proxy .
 .SH TARGET ADDRESS SELECTION
 A hostname target of a SOCKS5 or HTTP request usually resolves to several
 addresses, and gwproxy tries them as a list of candidates rather than

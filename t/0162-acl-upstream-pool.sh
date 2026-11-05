@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Upstream pools ("upstream NAME { server URL; }") and -j UPSTREAM rules in
-# the ACL file. They are parsed but not wired to connections yet, so this
-# checks what can be seen now: a set with pools, spread over an include,
-# loads and reloads and proxying goes on as before; a bad pool is refused at
-# startup, and on reload the rules in force stay; a file holding upstream
-# credentials that others can read is warned about, and no message shows a
-# password.
+# the ACL file, as files to load (t/0163 checks where they route): a set with
+# pools, spread over an include, loads and reloads and proxying goes on; a
+# bad pool is refused at startup, and on reload the rules in force stay; a
+# file holding upstream credentials that others can read is warned about,
+# and no message shows a password.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -90,8 +89,8 @@ grep -q 'mixed.acl: line 3: upstream pool mixed server 2 (socks5://127.0.0.1:2)'
 	"$WORK/mixed.log" || fail "a pool mixing DNS modes was not reported"
 
 # A good set: a pool in an included file, used from the top file before
-# it is defined, a pool in the top file, and DIRECT. Not wired yet, so
-# every request goes straight to the target as before.
+# it is defined, a pool in the top file, and DIRECT. The last match wins,
+# so the request goes straight to the target.
 printf -- '%s\n' 'upstream pool_b {' \
 	"	server http://user:$pass_word@127.0.0.1:3128;" \
 	'	least_conn;' '}' >"$d/pools.acl"
@@ -100,6 +99,7 @@ printf -- '%s\n' '-A OUTPUT -j UPSTREAM --to pool_a' \
 	"-A OUTPUT --dports $hp -j UPSTREAM --to-proxy pool_b" \
 	'-A OUTPUT --dports 9 -j UPSTREAM --to DIRECT --accept' \
 	'-A OUTPUT --dports 9 -j REJECT' \
+	"-A OUTPUT --dports $hp -j UPSTREAM --to DIRECT" \
 	'upstream pool_a {' '	server socks5h://127.0.0.1:1080;' '}' \
 	'-P OUTPUT ACCEPT' >"$d/main.acl"
 chmod 600 "$d/main.acl" "$d/pools.acl"
