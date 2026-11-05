@@ -2760,6 +2760,74 @@ static bool udp_reply_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	return true;
 }
 
+/*
+ * Decide, once per pair and before its target's name is resolved, which
+ * upstream @gcp goes through: the one an ACL -j UPSTREAM rule picks for
+ * what the client asked for -- the name @domain, the address @lit (either
+ * may be NULL) and port @port -- or else the default (--upstream-proxy, or
+ * none). With neither @domain nor @lit there is no target at all (a UDP
+ * ASSOCIATE), and a rule that tests one is not taken. Later calls change
+ * nothing. Returns 0, or -EACCES when the choice cannot be told and might
+ * be a pool (see gwp_acl_eval_upstream()), -EINVAL when the pool picked has
+ * no server to use: the pair must then not go anywhere.
+ */
+static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+			      const char *domain,
+			      const struct gwp_sockaddr *lit, uint16_t port)
+{
+	struct gwp_upstream *up;
+	struct gwp_acl_req req;
+	int r = 0;
+
+	if (gcp->flags & GWP_CONN_FLAG_UP_PICKED)
+		return 0;
+	gcp->flags |= GWP_CONN_FLAG_UP_PICKED;
+	if (!ctx->acl)
+		return 0;
+
+	acl_out_req(&req, &gcp->client_addr, lit, domain, gcp_req_user(gcp),
+		    GWP_ACL_PROTO_TCP);
+	if (!lit)
+		req.dport = port;
+	req.memo = NULL;
+	req.no_target = !domain && !lit;
+	switch (gwp_acl_eval_upstream(ctx->acl, &req)) {
+	case GWP_ACL_UPSTREAM_POOL:
+		/*
+		 * The pool's first server, until the pool's method (round-robin
+		 * or least_conn) picks one. Its pool holds it, so it is there;
+		 * the pair takes its own reference and drops the pool's.
+		 */
+		up = gwp_acl_pool_server(req.upstream_pool, 0);
+		if (unlikely(!up)) {
+			/* Never past the pool: refuse, not the default. */
+			pr_err(&ctx->lh, "BUG: upstream pool %s has no server object (idx=%u)",
+			       gwp_acl_pool_name(req.upstream_pool), gcp->idx);
+			r = -EINVAL;
+			break;
+		}
+		gwp_conn_set_upstream(gcp, up);
+		pr_dbg(&ctx->lh, "Upstream for idx=%u: pool %s server 1, %s (%s)",
+		       gcp->idx, gwp_acl_pool_name(req.upstream_pool),
+		       ip_to_str(&up->addr), up->host);
+		break;
+	case GWP_ACL_UPSTREAM_DIRECT:
+		gwp_conn_set_upstream(gcp, NULL);
+		pr_dbg(&ctx->lh, "Upstream for idx=%u: none (DIRECT)", gcp->idx);
+		break;
+	case GWP_ACL_UPSTREAM_UNSURE:
+		/* It may be a pool: neither the default nor DIRECT will do. */
+		pr_info(&ctx->lh, "Upstream for idx=%u cannot be decided by the ACL; refusing it",
+			gcp->idx);
+		r = -EACCES;
+		break;
+	case GWP_ACL_UPSTREAM_NONE:
+		break;
+	}
+	gwp_acl_req_release(&req);
+	return r;
+}
+
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 {
 	uint16_t dport = 0, dnat_port = 0;
@@ -2767,13 +2835,42 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 	enum gwp_acl_verdict v;
 
 	/*
-	 * Plain forwarding to a --target the upstream resolves: the request is
-	 * for that name. Set it each time, since a connect retried for want of
-	 * a descriptor must be judged afresh, not as an earlier DNAT left it.
+	 * Plain and transparent forwarding pick their upstream on the first
+	 * evaluation, the one for the target as configured or redirected:
+	 * a --target name as written, else the address.
+	 */
+	if (!ctx->cfg.as_socks5 && !ctx->cfg.as_http) {
+		int r;
+
+		if (ctx->target_name.ver)
+			r = conn_pick_upstream(ctx, gcp,
+					       ctx->target_name.domain.str,
+					       NULL, ntohs(ctx->target_name.port));
+		else
+			r = conn_pick_upstream(ctx, gcp, NULL, &gcp->target_addr,
+					       sa_port_h(&gcp->target_addr));
+		if (unlikely(r))
+			return false;
+	}
+
+	/*
+	 * Plain forwarding to a --target name: a pair whose upstream resolves
+	 * names asks it for that name, and it is what the ACL judges. Set it
+	 * each time, since a connect retried for want of a descriptor must be
+	 * judged afresh, not as an earlier DNAT left it. Any other pair goes
+	 * to the address the name resolved to at startup, which there is none
+	 * of when --upstream-proxy resolves names remotely.
 	 */
 	if (ctx->target_name.ver) {
-		gcp->up_dst = ctx->target_name;
-		gcp->req_domain = ctx->target_name.domain.str;
+		if (gcp->upstream && gcp->upstream->remote_dns) {
+			gcp->up_dst = ctx->target_name;
+			gcp->req_domain = ctx->target_name.domain.str;
+			memset(&gcp->target_addr, 0, sizeof(gcp->target_addr));
+		} else if (!gcp->target_addr.sa.sa_family) {
+			pr_warn(&ctx->lh, "--target %s was left for --upstream-proxy to resolve, so it has no address to go to without it (idx=%u)",
+				ctx->target_name.domain.str, gcp->idx);
+			return false;
+		}
 	}
 
 	/*
@@ -3638,13 +3735,18 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 		/*
 		 * With a remote-DNS upstream the proxy resolves the target, so
 		 * we must not resolve --target locally; keep a hostname to hand
-		 * to the proxy later.
+		 * to the proxy later. Otherwise resolve it, and still keep the
+		 * hostname, if it is one, for the pairs an ACL -j UPSTREAM rule
+		 * sends to a remote-DNS pool.
 		 */
 		if (ctx->upstream_pool.nr &&
-		    ctx->upstream_pool.srv[0]->remote_dns)
+		    ctx->upstream_pool.srv[0]->remote_dns) {
 			r = upstream_target_init(ctx);
-		else
+		} else {
 			r = convert_str_to_ssaddr(t, &ctx->target_addr, 0);
+			if (!r && upstream_target_init(ctx))
+				ctx->target_name.ver = 0;
+		}
 		if (r) {
 			pr_err(&ctx->lh, "Invalid target address '%s'", t);
 			goto out_free_log;
@@ -4730,12 +4832,26 @@ static int upstream_target_init(struct gwp_ctx *ctx)
 	return 0;
 }
 
+/*
+ * A SOCKS5 or HTTP request whose upstream could not be picked: refuse it as
+ * the ACL refuses a target (SOCKS5 0x02, HTTP 403). Returns -EBADMSG once
+ * the reply is queued, so it goes out before the teardown.
+ */
+static int pick_refused(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int r = gwp_acl_reject_reply(w, gcp);
+
+	return r == -EACCES ? -EBADMSG : r;
+}
+
 static int prepare_target_addr_domain(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp,
 				      char *host, uint16_t port)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_cfg *cfg = &ctx->cfg;
+	struct gwp_sockaddr sa;
+	bool is_ip;
 	size_t hl;
 	int r;
 
@@ -4759,21 +4875,30 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	gcp->req_domain = host;
 
 	/*
+	 * An address in disguise ("127.0.0.1", "::1", or a legacy form such
+	 * as "2130706433") is the target itself, to the ACL and to an
+	 * upstream alike.
+	 */
+	is_ip = req_host_ip(host, port, &sa);
+
+	/* The name decides the upstream, and the upstream how it resolves. */
+	r = conn_pick_upstream(ctx, gcp, host, is_ip ? &sa : NULL, port);
+	if (unlikely(r))
+		return pick_refused(w, gcp);
+
+	/*
 	 * socks5h://: don't resolve locally; hand the hostname to the upstream
 	 * proxy. up_dst carries the domain and we're ready to connect.
 	 */
 	if (gcp->upstream && gcp->upstream->remote_dns) {
-		struct gwp_sockaddr sa;
-
 		if (!port)
 			return -EINVAL;
 		/*
-		 * An address in disguise ("127.0.0.1", "::1", or a legacy form
-		 * such as "2130706433") is the target itself: take it as one,
-		 * so -d rules see it, and the upstream is asked for that
-		 * address rather than a name it would only parse back.
+		 * An address is taken as one, so -d rules see it, and the
+		 * upstream is asked for that address rather than a name it
+		 * would only parse back.
 		 */
-		if (req_host_ip(host, port, &sa)) {
+		if (is_ip) {
 			gwp_conn_set_single_candidate(gcp, &sa);
 			return 0;
 		}
@@ -4781,15 +4906,13 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	}
 
 	if (cfg->use_raw_dns) {
-		struct gwp_sockaddr sa;
-
 		/*
 		 * An address is the target, not a name to ask the server about:
 		 * the query would tell the server where the client is going, and
 		 * its answer would choose where the tunnel goes. The system
 		 * resolver parses these itself.
 		 */
-		if (req_host_ip(host, port, &sa)) {
+		if (is_ip) {
 			gwp_conn_set_single_candidate(gcp, &sa);
 			return 0;
 		}
@@ -4851,12 +4974,16 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ta->i4.sin_port = dst->port;
 		ta->i4.sin_family = AF_INET;
 		gwp_conn_set_single_candidate(gcp, ta);
+		if (conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port)))
+			return pick_refused(w, gcp);
 		return 0;
 	case GWP_SOCKS5_ATYP_IPV6:
 		memcpy(&ta->i6.sin6_addr, &dst->ip6, 16);
 		ta->i6.sin6_port = dst->port;
 		ta->i6.sin6_family = AF_INET6;
 		gwp_conn_set_single_candidate(gcp, ta);
+		if (conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port)))
+			return pick_refused(w, gcp);
 		return 0;
 	case GWP_SOCKS5_ATYP_DOMAIN:
 		return socks5_prepare_target_addr_domain(w, gcp);
@@ -5477,9 +5604,15 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * UDP ASSOCIATE is not chained through an upstream proxy: an HTTP
 	 * upstream cannot carry UDP at all, and SOCKS5 upstream UDP is not
 	 * implemented. Binding a local relay here would silently bypass the
-	 * configured chain, so refuse the command instead.
+	 * configured chain, so refuse the command instead. The chain is the
+	 * user's own when an ACL -j UPSTREAM rule picks one, from what is
+	 * known now (the user and the client, no target): a pool is refused
+	 * like --upstream-proxy, and so is a pool rule that only its target
+	 * tests could tell, DIRECT gets the relay even past it, and no choice
+	 * leaves the default to decide.
 	 */
-	if (gcp->upstream) {
+	r = conn_pick_upstream(ctx, gcp, NULL, NULL, 0);
+	if (r || gcp->upstream) {
 		rep = GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED;
 		goto reply;
 	}

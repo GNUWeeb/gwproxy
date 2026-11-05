@@ -458,6 +458,11 @@ enum {
 	 * uncount it (gwp_ctx_iplim_put()).
 	 */
 	GWP_CONN_FLAG_IPLIM		= (1ull << 5ull),
+	/*
+	 * The pair's upstream has been decided (conn_pick_upstream()):
+	 * no later OUTPUT evaluation may change it.
+	 */
+	GWP_CONN_FLAG_UP_PICKED		= (1ull << 6ull),
 };
 
 enum {
