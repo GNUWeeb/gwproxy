@@ -104,6 +104,11 @@ static int handle_raw_dns_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 					 GWP_MAX_CONN_CAND, &nr);
 	if (ret == -ESRCH)
 		return 1;
+	/* The lookup is over: its socket is done with; see ep_del(). */
+	if (ret != -EAGAIN) {
+		ep_del(w, gcp->gdp->fd);
+		gwp_dns_res_drop_query(gcp->gdp);
+	}
 	if (ret == -EAGAIN) {
 		/* Retry with the fallback record type. */
 		ret = send_dns_payload(gcp);

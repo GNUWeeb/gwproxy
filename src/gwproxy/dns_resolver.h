@@ -47,6 +47,10 @@ void gwp_dns_res_drop_query(struct gwp_dns_packet *gdp);
  * addresses, -EAGAIN when the next query is built and ready to send, -ESRCH
  * when the datagram does not answer the query in flight (ignore it), or
  * another negative error when the lookup failed.
+ *
+ * The socket stays open whatever the result: once the lookup is over (0 or
+ * an error other than -EAGAIN and -ESRCH), the caller takes it out of its
+ * event loop and then closes it with gwp_dns_res_drop_query().
  */
 int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 				struct gwp_dns_packet *gdp,
