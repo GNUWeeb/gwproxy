@@ -927,43 +927,43 @@ static void gwp_ctx_free_log(struct gwp_ctx *ctx)
  * only truncated once we hold its lock, so a second instance pointed at the
  * same file leaves the first one's PID alone. The lock is held, and the file
  * kept, for as long as the proxy runs; gwp_ctx_free_pid_file() removes it.
+ *
+ * Nothing here stops the proxy: a PID file that cannot be written (a symlink,
+ * one locked by another instance, a read-only directory) is warned about and
+ * the proxy runs without it, as the manual says. Hence no return value.
  */
 __cold
-static int gwp_ctx_init_pid_file(struct gwp_ctx *ctx)
+static void gwp_ctx_init_pid_file(struct gwp_ctx *ctx)
 {
 	const char *path = ctx->cfg.pid_file;
 	char buf[32];
-	int fd, n, r;
+	int fd, n;
 
 	fd = open(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644);
 	if (fd < 0) {
-		r = -errno;
-		pr_warn(&ctx->lh, "Failed to open PID file '%s': %s", path,
-			strerror(-r));
-		return r;
+		pr_warn(&ctx->lh, "Failed to open PID file '%s': %s; running without it",
+			path, strerror(errno));
+		return;
 	}
 
 	if (flock(fd, LOCK_EX | LOCK_NB)) {
-		r = -errno;
 		pr_warn(&ctx->lh, "PID file '%s' is locked by another process; not writing it",
 			path);
 		close(fd);
-		return r;
+		return;
 	}
 
 	n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
 	errno = 0;
 	if (ftruncate(fd, 0) || write(fd, buf, (size_t)n) != n) {
-		r = errno ? -errno : -EIO;
-		pr_warn(&ctx->lh, "Failed to write PID file '%s': %s", path,
-			strerror(-r));
+		pr_warn(&ctx->lh, "Failed to write PID file '%s': %s; running without it",
+			path, strerror(errno ? errno : EIO));
 		close(fd);
-		return r;
+		return;
 	}
 
 	pr_info(&ctx->lh, "Writing PID to '%s' (pid=%d)", path, (int)getpid());
 	ctx->pid_fd = fd;
-	return 0;
 }
 
 __cold

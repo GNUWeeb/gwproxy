@@ -193,7 +193,11 @@ Default:
 .TP
 .BR \-p ", " \-\-pid\-file=\fIfile\fR
 Write the process ID to
-.IR file .
+.IR file ,
+which is locked while the proxy runs and removed when it exits. A symlink is
+not followed. A file that cannot be written (a symlink, one locked by another
+instance, a directory that cannot be written to) is warned about, and the
+proxy runs without it.
 Not written by default.
 .SS Proxy mode selection
 .TP
