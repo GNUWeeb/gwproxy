@@ -50,14 +50,14 @@ Features
     ACL "-j BIND" rule.
   - Access-control lists (--acl-file): an iptables-style rule file with
     INPUT (client) and OUTPUT (target) chains, CIDR/domain/port matches and
-    ACCEPT/REJECT/DNAT actions, watched and hot-reloaded on change. The
-    MARK and BIND modifiers normally keep matching; "--accept" makes one
-    terminal, so a rule can set the mark or source bind and accept in a
-    single match rather than repeating the same condition twice. A
-    "-m statistic --mode nth --every N" match selects one connection in
-    every N, which combines with any other criterion and lets a set of
-    rules share traffic between them -- see gwproxy(1) for the descending
-    --every counts an even split needs. With an upstream proxy that
+    ACCEPT/REJECT/DNAT actions, reloaded on SIGHUP (or, with
+    --watch-files=1, on change). The MARK and BIND modifiers normally keep
+    matching; "--accept" makes one terminal, so a rule can set the mark or
+    source bind and accept in a single match rather than repeating the same
+    condition twice. A "-m statistic --mode nth --every N" match selects one
+    connection in every N, which combines with any other criterion and lets
+    a set of rules share traffic between them -- see gwproxy(1) for the
+    descending --every counts an even split needs. With an upstream proxy that
     resolves the name itself (socks5h:// and http://), -d rules only see
     targets given as IP literals, however they are spelled: what a name
     resolves to over there is beyond them, so filter such names with
@@ -176,7 +176,8 @@ The authentication file (--auth-file)
 holds one "username:password" entry per line. The same file is used for
 both SOCKS5 (RFC 1929) and HTTP CONNECT ("Basic", RFC 7617) auth; when it
 is set, clients of either protocol must present valid credentials. It is
-re-read automatically when the file changes.
+re-read on SIGHUP, together with the ACL file, or also whenever it changes
+with --watch-files=1.
 
 Transparent proxy mode takes each connection's original destination from
 SO_ORIGINAL_DST, so it must sit behind an iptables REDIRECT rule. gwproxy

@@ -3628,8 +3628,9 @@ static int fish_events(struct gwp_wrk *w)
 		return 0;
 	}
 
+	/* A signal, such as the SIGHUP that reloads the files: nothing amiss. */
 	if (r == -EINTR) {
-		pr_info(&w->ctx->lh, "io_uring_submit_and_wait() interrupted");
+		pr_dbg(&w->ctx->lh, "io_uring_submit_and_wait() interrupted");
 		return 0;
 	}
 

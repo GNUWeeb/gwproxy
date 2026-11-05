@@ -65,6 +65,7 @@ enum {
 	OPT_UPSTREAM_AUTH_FILE,
 	OPT_MAX_CONNS_PER_IP,
 	OPT_UPSTREAM_CA_FILE,
+	OPT_WATCH_FILES,
 };
 
 /*
@@ -86,6 +87,7 @@ static const struct option long_opts[] = {
 	{ "auth-file",		required_argument,	NULL,	'A' },
 	{ "acl-file",		required_argument,	NULL,	'a' },
 	{ "acl-allow-all",	no_argument,		NULL,	OPT_ACL_ALLOW_ALL },
+	{ "watch-files",	required_argument,	NULL,	OPT_WATCH_FILES },
 	{ "outgoing-family",	required_argument,	NULL,	OPT_OUTGOING_FAMILY },
 	{ "bind-ipv6-only",	required_argument,	NULL,	OPT_BIND_IPV6_ONLY },
 	{ "dns-cache-secs",	required_argument,	NULL,	'L' },
@@ -139,6 +141,7 @@ static const struct gwp_cfg default_opts = {
 	.protocol_timeout	= 10,
 	.auth_file		= NULL,
 	.acl_file		= NULL,
+	.watch_files		= false,
 	.dns_cache_secs		= 0,
 	.dns_cache_max_entries	= 65536,
 	.nr_workers		= 4,
@@ -202,6 +205,8 @@ static void show_help(const char *app)
 	printf("  -a, --acl-file=file             iptables-style ACL rule file for target/client filtering\n");
 	printf("                                  (default: a built-in ACL that rejects private/loopback target ranges)\n");
 	printf("      --acl-allow-all             Do not apply the built-in default ACL (allow all; ignored with --acl-file)\n");
+	printf("      --watch-files=0|1           Also reload the auth and ACL files when they change (default: %d)\n", default_opts.watch_files);
+	printf("                                  SIGHUP reloads them either way.\n");
 	printf("  -L, --dns-cache-secs=sec        Proxy DNS cache duration in seconds (default: %d)\n", default_opts.dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
 	printf("      --dns-cache-max-entries=nr  Max DNS cache entries; 0 = unlimited (default: %d)\n", default_opts.dns_cache_max_entries);
@@ -466,6 +471,10 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case OPT_ACL_ALLOW_ALL:
 			cfg->acl_allow_all = true;
+			break;
+		case OPT_WATCH_FILES:
+			if (opt_bool(c, optarg, &cfg->watch_files))
+				goto einval;
 			break;
 		case 'L':
 			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->dns_cache_secs))
@@ -1436,11 +1445,14 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 }
 
 /*
- * Hot reload of the auth and ACL files. The reload thread reads ctx->ino_fd
- * into a GWP_INO_BUF_SIZE buffer (room for a burst of records, so one read
- * usually drains it), gwp_reload_events() turns the records into the
- * GWP_RELOAD_* files they name, and gwp_ctx_reload_files() reloads each of
- * those once.
+ * Reload of the auth and ACL files. A SIGHUP reloads them all (see
+ * gwp_ctx_reload_hup()); with --watch-files=1, watching them also reloads a
+ * file when it changes.
+ *
+ * The watch: the reload thread reads ctx->ino_fd into a GWP_INO_BUF_SIZE
+ * buffer (room for a burst of records, so one read usually drains it),
+ * gwp_reload_events() turns the records into the GWP_RELOAD_* files they name,
+ * and gwp_ctx_reload_files() reloads each of those once.
  *
  * Inotify only reports changes made through the configured name in its
  * directory. A file can also change behind a symlink, by a swap of a directory
@@ -1799,9 +1811,9 @@ static void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 			gwp_reload_begin(ctx->acl_files[i].path,
 					 &ctx->acl_files[i].rf);
 		r = gwp_acl_reload(ctx->acl);
-		rs = gwp_acl_files_sync(ctx, true);
+		rs = gwp_acl_files_sync(ctx, ctx->ino_fd >= 0);
 		if (rs)
-			pr_warn(&ctx->lh, "Failed to update the ACL files watched for reload: %s",
+			pr_warn(&ctx->lh, "Failed to update the set of ACL files to reload: %s",
 				strerror(-rs));
 		/*
 		 * The set reloads as one, so each file carries its outcome;
@@ -1864,24 +1876,53 @@ static uint64_t gwp_reload_now_ms(void)
 }
 
 /*
+ * A SIGHUP: the operator says the files are ready, so every configured file is
+ * reloaded at once, with no wait for it to settle. Each failure is logged, even
+ * one the periodic check would retry quietly.
+ */
+static void gwp_ctx_reload_hup(struct gwp_ctx *ctx)
+{
+	size_t i;
+
+	if (!ctx->auth && !ctx->acl_watched) {
+		pr_info(&ctx->lh, "Received SIGHUP, but no auth or ACL file is configured; nothing to reload");
+		return;
+	}
+
+	pr_info(&ctx->lh, "Received SIGHUP, reloading the configured files");
+	ctx->auth_reload.retry = false;
+	for (i = 0; i < ctx->nr_acl_files; i++)
+		ctx->acl_files[i].rf.retry = false;
+	gwp_ctx_reload_files(ctx, GWP_RELOAD_AUTH | GWP_RELOAD_ACL);
+}
+
+/*
  * The reload thread. Reading, parsing and compiling a large auth or ACL file
  * takes milliseconds (tens with many regexes), and a worker doing it serves
  * none of its connections meanwhile, so the files are reloaded here instead.
  * The stores publish a new set under their own locks, so no worker waits for
  * more than that swap.
  *
- * The paths are checked every GWP_RELOAD_CHECK_MS. The first check, at once,
- * catches a change made since the startup load.
+ * A SIGHUP reloads every file. The eventfd is drained before the flag is
+ * taken, so the signals that arrive during a reload give one more reload after
+ * it, not one each.
+ *
+ * When the files are watched, the paths are also checked every
+ * GWP_RELOAD_CHECK_MS. The first check, at once, catches a change made since
+ * the startup load.
  */
 static void *gwp_reload_thread(void *arg)
 {
 	struct gwp_ctx *ctx = arg;
 	char buf[GWP_INO_BUF_SIZE]
 		__attribute__((aligned(__alignof__(struct inotify_event))));
-	struct pollfd pfd[2] = {
-		{ .fd = ctx->ino_fd, .events = POLLIN },
+	/* poll() skips a negative fd: ino_fd when nothing is watched. */
+	struct pollfd pfd[3] = {
 		{ .fd = ctx->reload_efd, .events = POLLIN },
+		{ .fd = ctx->hup_efd, .events = POLLIN },
+		{ .fd = ctx->ino_fd, .events = POLLIN },
 	};
+	bool watch = ctx->ino_fd >= 0;
 	uint64_t now, first = 0, due = 0, next_check = 0;
 	unsigned flags, pending = 0;
 	int r, timeout;
@@ -1890,20 +1931,48 @@ static void *gwp_reload_thread(void *arg)
 		uint64_t wake = pending && due < next_check ? due : next_check;
 
 		now = gwp_reload_now_ms();
-		timeout = wake > now ? (int)(wake - now) : 0;
+		if (!watch)
+			timeout = -1;
+		else
+			timeout = wake > now ? (int)(wake - now) : 0;
 
-		r = poll(pfd, 2, timeout);
+		r = poll(pfd, 3, timeout);
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;
 			r = -errno;
 			break;
 		}
-		if (pfd[1].revents)
+		if (pfd[0].revents)
 			return NULL;
 
+		if (pfd[1].revents) {
+			eventfd_t v;
+
+			/* Nonblocking; empty (EAGAIN) is fine too. */
+			(void)eventfd_read(ctx->hup_efd, &v);
+			if (atomic_exchange(&ctx->reload_hup, false)) {
+				/*
+				 * The reload covers every change made so far:
+				 * drop what the watch queued for them, or the
+				 * same edit is reloaded again right after.
+				 */
+				if (watch) {
+					flags = 0;
+					r = gwp_reload_drain(ctx, buf, &flags);
+					if (r < 0)
+						break;
+					pfd[2].revents = 0;
+				}
+				gwp_ctx_reload_hup(ctx);
+				pending = 0;
+			}
+		}
+		if (!watch)
+			continue;
+
 		flags = 0;
-		if (pfd[0].revents) {
+		if (pfd[2].revents) {
 			r = gwp_reload_drain(ctx, buf, &flags);
 			if (r < 0)
 				break;
@@ -1929,29 +1998,24 @@ static void *gwp_reload_thread(void *arg)
 		pending = 0;
 	}
 
-	pr_err(&ctx->lh, "Reload thread stopped, file changes are no longer picked up: %s",
+	pr_err(&ctx->lh, "Reload thread stopped, the files are no longer reloaded: %s",
 	       strerror(-r));
 	return NULL;
 }
 
 /*
- * One inotify instance watches the auth file and the files of the ACL (the
- * --acl-file and those it includes), so when they share a directory each
- * event is read once, not once per file. The reload thread polls it. Leaves
- * ino_fd at -1 and starts no thread when neither file is configured.
+ * With --watch-files=1, one inotify instance watches the auth file and the
+ * files of the ACL (the --acl-file and those it includes), so when they share a
+ * directory each event is read once, not once per file. Leaves ino_fd at -1
+ * when the files are not watched or neither is configured.
  */
-static int gwp_ctx_init_reload(struct gwp_ctx *ctx)
+static int gwp_ctx_init_watch(struct gwp_ctx *ctx)
 {
 	struct gwp_cfg *cfg = &ctx->cfg;
-	sigset_t all, old;
 	size_t i;
 	int r;
 
-	ctx->ino_fd = -1;
-	ctx->reload_efd = -1;
-	ctx->auth_wd = -1;
-	ctx->reload_running = false;
-	if (!ctx->auth && !ctx->acl_watched)
+	if (!cfg->watch_files || (!ctx->auth && !ctx->acl_watched))
 		return 0;
 
 	r = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -1988,6 +2052,71 @@ static int gwp_ctx_init_reload(struct gwp_ctx *ctx)
 			f->path, r);
 		f->wd = r;
 	}
+	return 0;
+
+out_err:
+	__sys_close(ctx->ino_fd);
+	ctx->ino_fd = -1;
+	ctx->auth_wd = -1;
+	for (i = 0; i < ctx->nr_acl_files; i++)
+		ctx->acl_files[i].wd = -1;
+	return r;
+}
+
+/*
+ * Stop the reload thread. A reload in progress finishes first, so the stores
+ * are not freed under it.
+ */
+static void gwp_ctx_free_reload(struct gwp_ctx *ctx)
+{
+	size_t i;
+
+	if (ctx->reload_running) {
+		eventfd_t one = 1;
+
+		if (eventfd_write(ctx->reload_efd, one))
+			pr_err(&ctx->lh, "Failed to signal the reload thread: %s",
+			       strerror(errno));
+		pthread_join(ctx->reload_thread, NULL);
+		ctx->reload_running = false;
+	}
+	if (ctx->reload_efd >= 0) {
+		__sys_close(ctx->reload_efd);
+		ctx->reload_efd = -1;
+	}
+	if (ctx->hup_efd >= 0) {
+		__sys_close(ctx->hup_efd);
+		ctx->hup_efd = -1;
+	}
+	if (ctx->ino_fd >= 0) {
+		__sys_close(ctx->ino_fd);
+		ctx->ino_fd = -1;
+	}
+	ctx->auth_wd = -1;
+	for (i = 0; i < ctx->nr_acl_files; i++)
+		ctx->acl_files[i].wd = -1;
+}
+
+/*
+ * Start the reload thread, with the file watch (see gwp_ctx_init_watch()) and
+ * the eventfds it polls. It runs even when no file is configured, so that a
+ * SIGHUP is answered with a log line rather than nothing.
+ */
+static int gwp_ctx_init_reload(struct gwp_ctx *ctx)
+{
+	sigset_t all, old;
+	int r;
+
+	ctx->ino_fd = -1;
+	ctx->reload_efd = -1;
+	ctx->hup_efd = -1;
+	ctx->auth_wd = -1;
+	ctx->reload_running = false;
+	atomic_store(&ctx->reload_hup, false);
+
+	r = gwp_ctx_init_watch(ctx);
+	if (r < 0)
+		return r;
 
 	r = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 	if (r < 0) {
@@ -1997,9 +2126,18 @@ static int gwp_ctx_init_reload(struct gwp_ctx *ctx)
 	}
 	ctx->reload_efd = r;
 
+	r = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (r < 0) {
+		r = -errno;
+		pr_err(&ctx->lh, "Failed to create SIGHUP eventfd: %s", strerror(-r));
+		goto out_err;
+	}
+	ctx->hup_efd = r;
+
 	/*
-	 * SIGINT and SIGTERM are for the workers to act on; the reload thread
-	 * starts with every signal blocked so they are never delivered here.
+	 * The handlers of SIGINT, SIGTERM and SIGHUP run on the other threads:
+	 * the reload thread starts with every signal blocked so they are never
+	 * delivered here (a SIGHUP only wakes it, see gwp_ctx_hup()).
 	 */
 	sigfillset(&all);
 	pthread_sigmask(SIG_SETMASK, &all, &old);
@@ -2015,48 +2153,15 @@ static int gwp_ctx_init_reload(struct gwp_ctx *ctx)
 	return 0;
 
 out_err:
-	if (ctx->reload_efd >= 0) {
-		__sys_close(ctx->reload_efd);
-		ctx->reload_efd = -1;
-	}
-	__sys_close(ctx->ino_fd);
-	ctx->ino_fd = -1;
-	ctx->auth_wd = -1;
-	for (i = 0; i < ctx->nr_acl_files; i++)
-		ctx->acl_files[i].wd = -1;
+	gwp_ctx_free_reload(ctx);
 	return r;
 }
 
 /*
- * Stop the reload thread. A reload in progress finishes first, so the stores
- * are not freed under it.
- */
-static void gwp_ctx_free_reload(struct gwp_ctx *ctx)
-{
-	if (ctx->reload_running) {
-		eventfd_t one = 1;
-
-		if (eventfd_write(ctx->reload_efd, one))
-			pr_err(&ctx->lh, "Failed to signal the reload thread: %s",
-			       strerror(errno));
-		pthread_join(ctx->reload_thread, NULL);
-		ctx->reload_running = false;
-	}
-	if (ctx->reload_efd >= 0) {
-		__sys_close(ctx->reload_efd);
-		ctx->reload_efd = -1;
-	}
-	if (ctx->ino_fd >= 0) {
-		__sys_close(ctx->ino_fd);
-		ctx->ino_fd = -1;
-	}
-}
-
-/*
  * Load the shared credential store from the auth file (if configured). The
- * store is shared by the SOCKS5 and HTTP CONNECT front-ends and hot-reloaded
- * through gwp_ctx_init_reload()'s watch. Leaves ctx->auth NULL when no auth
- * file is configured.
+ * store is shared by the SOCKS5 and HTTP CONNECT front-ends and reloaded by
+ * gwp_ctx_init_reload()'s thread. Leaves ctx->auth NULL when no auth file is
+ * configured.
  */
 static int gwp_ctx_init_auth(struct gwp_ctx *ctx)
 {
@@ -2173,11 +2278,11 @@ static const char gwp_acl_default_rules[] =
 	"-P OUTPUT ACCEPT\n";
 
 /*
- * Load the ACL rule file (--acl-file); gwp_ctx_init_reload() then watches it
- * and the files it includes, so it is hot-reloaded, like the auth store.
+ * Load the ACL rule file (--acl-file); gwp_ctx_init_reload()'s thread then
+ * reloads it and the files it includes, like the auth store.
  * Unlike auth (prot-only), the ACL is global to every proxy mode, so this is
  * initialised from gwp_ctx_init() regardless of SOCKS5/HTTP/transparent/plain
- * forwarding. With no file it applies the built-in default ACL (not watched),
+ * forwarding. With no file it applies the built-in default ACL (not reloaded),
  * unless --acl-allow-all leaves it disabled (NULL).
  */
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
@@ -5867,9 +5972,25 @@ static struct gwp_ctx *_Atomic g_ctx = NULL;
 static atomic_int g_nr_sig_handlers = 0;
 
 /*
+ * Ask the reload thread to reload the files (see gwp_reload_thread()). Called
+ * from the signal handler, so it only sets the flag and wakes the thread: an
+ * atomic store and a write(2) are async-signal-safe. A full eventfd counter
+ * (EAGAIN) still has the thread awake, so the result needs no check.
+ */
+__cold
+static void gwp_ctx_hup(struct gwp_ctx *ctx)
+{
+	uint64_t one = 1;
+
+	atomic_store(&ctx->reload_hup, true);
+	(void)__sys_write(ctx->hup_efd, &one, sizeof(one));
+}
+
+/*
  * Runs on whichever thread the signal lands on, possibly in the middle of a
- * worker's event loop, so gwp_ctx_stop() must stay async-signal-safe: set the
- * stop flag and wake the workers through their eventfds, nothing more.
+ * worker's event loop, so gwp_ctx_stop() and gwp_ctx_hup() must stay
+ * async-signal-safe: set a flag and wake a thread through its eventfd,
+ * nothing more.
  */
 __cold
 static void sig_handler(int sig)
@@ -5879,12 +6000,15 @@ static void sig_handler(int sig)
 
 	atomic_fetch_add(&g_nr_sig_handlers, 1);
 	ctx = atomic_load(&g_ctx);
-	if (ctx)
-		gwp_ctx_stop(ctx);
+	if (ctx) {
+		if (sig == SIGHUP)
+			gwp_ctx_hup(ctx);
+		else
+			gwp_ctx_stop(ctx);
+	}
 	atomic_fetch_sub(&g_nr_sig_handlers, 1);
 
 	errno = saved_errno;
-	(void)sig;
 }
 
 /*
@@ -5904,6 +6028,7 @@ static void sig_handler_detach_ctx(void)
 	sigemptyset(&set);
 	sigaddset(&set, SIGINT);
 	sigaddset(&set, SIGTERM);
+	sigaddset(&set, SIGHUP);
 	pthread_sigmask(SIG_BLOCK, &set, NULL);
 	atomic_store(&g_ctx, NULL);
 	while (atomic_load(&g_nr_sig_handlers))
@@ -5953,7 +6078,19 @@ int main(int argc, char *argv[])
 {
 	struct sigaction sa = { .sa_handler = SIG_IGN };
 	struct gwp_ctx ctx;
+	sigset_t hup;
 	int r;
+
+	/*
+	 * Until its handler is in place, a SIGHUP would kill the proxy, and
+	 * the startup can take a while (a large ACL, a log FIFO): keep it
+	 * pending instead, to be taken as a reload once the handler is in.
+	 * The threads started meanwhile inherit the block and keep it, so a
+	 * SIGHUP lands on this thread, worker 0, alone.
+	 */
+	sigemptyset(&hup);
+	sigaddset(&hup, SIGHUP);
+	pthread_sigmask(SIG_BLOCK, &hup, NULL);
 
 	memset(&ctx, 0, sizeof(ctx));
 	r = open_std_fds();
@@ -5983,11 +6120,20 @@ int main(int argc, char *argv[])
 	sa.sa_handler = &sig_handler;
 	r |= sigaction(SIGINT, &sa, NULL);
 	r |= sigaction(SIGTERM, &sa, NULL);
+	/*
+	 * A SIGHUP reloads the files and the proxy goes on, so let the system
+	 * calls it interrupts restart where they can; the workers' waits
+	 * (epoll_wait, io_uring_enter) never do and take the EINTR as a
+	 * spurious wakeup.
+	 */
+	sa.sa_flags = SA_RESTART;
+	r |= sigaction(SIGHUP, &sa, NULL);
 	if (r < 0) {
 		r = -errno;
 		fprintf(stderr, "Failed to set signal handlers: %s\n", strerror(-r));
 		goto out_free;
 	}
+	pthread_sigmask(SIG_UNBLOCK, &hup, NULL);
 
 	r = gwp_ctx_run(&ctx);
 out_free:

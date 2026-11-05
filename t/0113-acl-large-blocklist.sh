@@ -63,10 +63,7 @@ for loop in epoll io_uring; do
 
 	# The new list refuses 127.0.0.1 too.
 	write_acl "$WORK/big.acl" REJECT
-	for _ in $(seq 1 100); do
-		grep -q "Reloaded ACL file" "$WORK/gwp.$pp.log" && break
-		sleep 0.1
-	done
+	gwp_hup "$GWP_PID" "$WORK/gwp.$pp.log" 1
 	grep -q "Reloaded ACL file" "$WORK/gwp.$pp.log" \
 		|| fail "[$loop] ACL was not reloaded"
 	rep="$(probe "$pp" ipv4 127.0.0.1)"

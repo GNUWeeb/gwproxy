@@ -67,6 +67,7 @@ struct gwp_cfg {
 	const char	*auth_file;
 	const char	*acl_file;
 	bool		acl_allow_all;	/* skip the built-in default ACL */
+	bool		watch_files;	/* reload the files on change too */
 	int		dns_cache_secs;
 	int		dns_cache_max_entries;	/* cap; <=0 = unlimited */
 	int		nr_workers;
@@ -968,16 +969,20 @@ struct gwp_ctx {
 	int				pid_fd;
 	/*
 	 * One inotify instance watching the auth file and the ACL file (their
-	 * parent directories, see add_reload_watch()); -1 when neither is
-	 * configured. @reload_thread polls it and reloads the files, off the
-	 * workers; @reload_efd tells it to exit. @reload_running: the thread
-	 * was started and still needs a join. @auth_reload, @acl_files: the
-	 * state of each file's periodic check, the ACL's for each file of its
-	 * set (see gwp_acl_file()); owned by the thread once it runs.
-	 * @auth_wd: the watch on the auth file's directory, -1 when none.
+	 * parent directories, see add_reload_watch()); -1 when they are not
+	 * watched (--watch-files=0) or neither is configured. @reload_thread
+	 * polls it and reloads the files, off the workers; @reload_efd tells
+	 * it to exit. @hup_efd wakes it for a SIGHUP, which sets @reload_hup
+	 * (see gwp_ctx_hup()). @reload_running: the thread was started and
+	 * still needs a join. @auth_reload, @acl_files: the state of each
+	 * file's periodic check, the ACL's for each file of its set (see
+	 * gwp_acl_file()); owned by the thread once it runs. @auth_wd: the
+	 * watch on the auth file's directory, -1 when none.
 	 */
 	int				ino_fd;
 	int				reload_efd;
+	int				hup_efd;
+	_Atomic(bool)			reload_hup;
 	int				auth_wd;
 	pthread_t			reload_thread;
 	bool				reload_running;

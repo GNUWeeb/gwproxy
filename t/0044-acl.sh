@@ -356,14 +356,14 @@ for loop in epoll io_uring; do
 
 	kill "$usp" 2>/dev/null
 
-	# Hot reload survives an atomic replace (write-temp + rename-over, as
-	# editors and install(1) do): the watch is on the directory, so a
-	# renamed-in acl file is still picked up. A file/inode watch would go
-	# stale here and never reload.
+	# With --watch-files=1, a reload survives an atomic replace (write-temp
+	# + rename-over, as editors and install(1) do): the watch is on the
+	# directory, so a renamed-in acl file is still picked up. A file/inode
+	# watch would go stale here and never reload.
 	cp "$WORK/ok.acl" "$WORK/reload.acl"
 	rp="$(pick_port)"
 	gwp_start "127.0.0.1:$rp" --as-http=1 --event-loop="$loop" \
-		--acl-file="$WORK/reload.acl"
+		--watch-files=1 --acl-file="$WORK/reload.acl"
 	code="$(curl -s --max-time 20 -x "http://127.0.0.1:$rp" \
 		"http://127.0.0.1:$hp/payload.bin" -o /dev/null -w '%{http_code}')"
 	[ "$code" = 200 ] || fail "$loop pre-reload fetch got $code (want 200)"
