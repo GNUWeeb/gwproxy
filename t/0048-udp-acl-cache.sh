@@ -41,10 +41,7 @@ for loop in epoll io_uring; do
 	printf -- '%s\n' "-A OUTPUT -p udp --dports $e1 -j REJECT" \
 		'-P OUTPUT ACCEPT' >"$WORK/udp.new"
 	mv -f "$WORK/udp.new" "$WORK/udp.acl"
-	for _ in $(seq 1 100); do
-		grep -q "Reloaded ACL file" "$WORK/gwp.$pp.log" && break
-		sleep 0.1
-	done
+	gwp_hup "$GWP_PID" "$WORK/gwp.$pp.log" 1
 	grep -q "Reloaded ACL file" "$WORK/gwp.$pp.log" \
 		|| fail "[$loop] ACL was not reloaded"
 	touch "$WORK/go"

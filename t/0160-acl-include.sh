@@ -3,13 +3,14 @@
 #
 # "include PATH;" in the ACL file: the rules of an included file apply at the
 # include line, a relative path is taken from the including file's directory,
-# and a set with a broken or missing file is refused at startup. Every file of
-# the set is watched: editing an included file reloads the whole set, a failed
-# reload keeps the rules in force, a file added by a new include line is
-# watched from then on (even while it is still missing), and a file whose
-# include line is gone is not. A FIFO, included or put in place of the ACL
-# file, is refused rather than opened and waited on, which would hold up every
-# later reload and shutdown. Exercised on every available event loop.
+# and a set with a broken or missing file is refused at startup. With
+# --watch-files=1, every file of the set is watched: editing an included file
+# reloads the whole set, a failed reload keeps the rules in force, a file
+# added by a new include line is watched from then on (even while it is still
+# missing), and a file whose include line is gone is not. A FIFO, included or
+# put in place of the ACL file, is refused rather than opened and waited on,
+# which would hold up every later reload and shutdown. Exercised on every
+# available event loop.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -106,7 +107,7 @@ for loop in epoll io_uring; do
 	pp="$(pick_port)"
 	log="$WORK/gwp.$pp.log"
 	gwp_start "127.0.0.1:$pp" --as-http=1 --event-loop="$loop" \
-		--nr-workers=1 --acl-file="$d/main.acl"
+		--nr-workers=1 --watch-files=1 --acl-file="$d/main.acl"
 
 	# The included rule applies; the rest falls through to the policy.
 	c="$(code "$pp" 9)"
@@ -181,7 +182,7 @@ for loop in epoll io_uring; do
 	pp="$(pick_port)"
 	log="$WORK/gwp.$pp.log"
 	gwp_start "127.0.0.1:$pp" --as-http=1 --event-loop="$loop" \
-		--nr-workers=1 --acl-file="$d/main.acl"
+		--nr-workers=1 --watch-files=1 --acl-file="$d/main.acl"
 	mkfifo "$d/main.fifo"
 	mv -f "$d/main.fifo" "$d/main.acl"
 	wait_lines "$log" "$acl_bad" 1 || \

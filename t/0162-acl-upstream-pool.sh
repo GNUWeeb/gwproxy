@@ -117,6 +117,7 @@ n_ok="$(grep -c "$acl_ok" "$log")"
 printf -- '%s\n' 'upstream pool_b {' \
 	"	server http://user:$pass_word@127.0.0.1:3129;" '}' \
 	"-A OUTPUT --dports $hp -j REJECT" >"$d/pools.acl"
+gwp_hup "$GWP_PID" "$log" 1
 wait_code "$pp" "$hp" 403 || fail "an edit of the pool file was not reloaded"
 wait_lines "$log" "$acl_ok" $((n_ok + 1)) || fail "the reload was not logged"
 
@@ -126,6 +127,7 @@ chmod 644 "$d/pools.acl"
 printf -- '%s\n' "-A OUTPUT --dports $hp -j ACCEPT" '-P OUTPUT REJECT' \
 	'upstream pool_a {' '	server socks5h://127.0.0.1:1080;' '}' \
 	'include pools.acl;' >"$d/main.acl"
+gwp_hup "$GWP_PID" "$log" 1
 wait_code "$pp" "$hp" 200 || fail "an edit of the top file was not reloaded"
 wait_lines "$log" "$acl_ok" $((n_ok + 1)) || fail "the reload was not logged"
 grep -q 'pools.acl: warning: holds upstream credentials but is readable by group or others' \
@@ -137,6 +139,7 @@ grep -q 'main.acl: warning' "$log" && \
 n_bad="$(grep -c "$acl_bad" "$log")"
 printf -- '%s\n' 'upstream pool_b {' \
 	"	server https://user:$pass_word@127.0.0.1:3129;" '}' >"$d/pools.acl"
+gwp_hup "$GWP_PID" "$log" 1
 wait_lines "$log" "$acl_bad" $((n_bad + 1)) || \
 	fail "a pool with an https server did not fail the reload"
 grep -q 'pools.acl: line 2: upstream pool pool_b server 1 (https://127.0.0.1:3129): https:// is not supported in a pool yet' \
@@ -149,6 +152,7 @@ c="$(code "$pp" 9)"
 n_bad="$(grep -c "$acl_bad" "$log")"
 printf -- '%s\n' 'upstream pool_b {' '	server http://127.0.0.1:3129;' \
 	>"$d/pools.acl"
+gwp_hup "$GWP_PID" "$log" 1
 wait_lines "$log" "$acl_bad" $((n_bad + 1)) || \
 	fail "an unclosed pool did not fail the reload"
 grep -q 'pools.acl: line 1: upstream pool pool_b is not closed' "$log" || \

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# A burst of changes to --auth-file and --acl-file is reloaded once it has
-# settled, not once per change, and the reload reads the last version of each
-# file. Changes that never pause are still reloaded now and then rather than
-# waiting for a pause that never comes. Exercised on every available event
-# loop.
+# With --watch-files=1, a burst of changes to --auth-file and --acl-file is
+# reloaded once it has settled, not once per change, and the reload reads the
+# last version of each file. Changes that never pause are still reloaded now
+# and then rather than waiting for a pause that never comes. Exercised on
+# every available event loop.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -65,7 +65,8 @@ for loop in epoll io_uring; do
 	pp="$(pick_port)"
 	log="$WORK/gwp.$pp.log"
 	gwp_start "127.0.0.1:$pp" --as-socks5=1 --auth-file="$WORK/auth" \
-		--acl-file="$WORK/acl" --event-loop="$loop" --nr-workers=1
+		--acl-file="$WORK/acl" --event-loop="$loop" --nr-workers=1 \
+		--watch-files=1
 	fetch "$pp" u0 pw || fail "[$loop] initial credentials rejected"
 
 	# A burst: 20 versions of each file, about 10 ms apart, then one more

@@ -65,6 +65,7 @@ enum {
 	OPT_UPSTREAM_AUTH_FILE,
 	OPT_MAX_CONNS_PER_IP,
 	OPT_UPSTREAM_CA_FILE,
+	OPT_WATCH_FILES,
 };
 
 /*
@@ -86,6 +87,7 @@ static const struct option long_opts[] = {
 	{ "auth-file",		required_argument,	NULL,	'A' },
 	{ "acl-file",		required_argument,	NULL,	'a' },
 	{ "acl-allow-all",	no_argument,		NULL,	OPT_ACL_ALLOW_ALL },
+	{ "watch-files",	required_argument,	NULL,	OPT_WATCH_FILES },
 	{ "outgoing-family",	required_argument,	NULL,	OPT_OUTGOING_FAMILY },
 	{ "bind-ipv6-only",	required_argument,	NULL,	OPT_BIND_IPV6_ONLY },
 	{ "dns-cache-secs",	required_argument,	NULL,	'L' },
@@ -139,6 +141,7 @@ static const struct gwp_cfg default_opts = {
 	.protocol_timeout	= 10,
 	.auth_file		= NULL,
 	.acl_file		= NULL,
+	.watch_files		= false,
 	.dns_cache_secs		= 0,
 	.dns_cache_max_entries	= 65536,
 	.nr_workers		= 4,
@@ -202,6 +205,8 @@ static void show_help(const char *app)
 	printf("  -a, --acl-file=file             iptables-style ACL rule file for target/client filtering\n");
 	printf("                                  (default: a built-in ACL that rejects private/loopback target ranges)\n");
 	printf("      --acl-allow-all             Do not apply the built-in default ACL (allow all; ignored with --acl-file)\n");
+	printf("      --watch-files=0|1           Also reload the auth and ACL files when they change (default: %d)\n", default_opts.watch_files);
+	printf("                                  SIGHUP reloads them either way.\n");
 	printf("  -L, --dns-cache-secs=sec        Proxy DNS cache duration in seconds (default: %d)\n", default_opts.dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
 	printf("      --dns-cache-max-entries=nr  Max DNS cache entries; 0 = unlimited (default: %d)\n", default_opts.dns_cache_max_entries);
@@ -466,6 +471,10 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case OPT_ACL_ALLOW_ALL:
 			cfg->acl_allow_all = true;
+			break;
+		case OPT_WATCH_FILES:
+			if (opt_bool(c, optarg, &cfg->watch_files))
+				goto einval;
 			break;
 		case 'L':
 			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->dns_cache_secs))
@@ -1437,7 +1446,8 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 
 /*
  * Reload of the auth and ACL files. A SIGHUP reloads them all (see
- * gwp_ctx_reload_hup()); watching them reloads a file when it changes.
+ * gwp_ctx_reload_hup()); with --watch-files=1, watching them also reloads a
+ * file when it changes.
  *
  * The watch: the reload thread reads ctx->ino_fd into a GWP_INO_BUF_SIZE
  * buffer (room for a burst of records, so one read usually drains it),
@@ -1801,9 +1811,9 @@ static void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 			gwp_reload_begin(ctx->acl_files[i].path,
 					 &ctx->acl_files[i].rf);
 		r = gwp_acl_reload(ctx->acl);
-		rs = gwp_acl_files_sync(ctx, true);
+		rs = gwp_acl_files_sync(ctx, ctx->ino_fd >= 0);
 		if (rs)
-			pr_warn(&ctx->lh, "Failed to update the ACL files watched for reload: %s",
+			pr_warn(&ctx->lh, "Failed to update the set of ACL files to reload: %s",
 				strerror(-rs));
 		/*
 		 * The set reloads as one, so each file carries its outcome;
@@ -1994,10 +2004,10 @@ static void *gwp_reload_thread(void *arg)
 }
 
 /*
- * One inotify instance watches the auth file and the files of the ACL (the
- * --acl-file and those it includes), so when they share a directory each
- * event is read once, not once per file. Leaves ino_fd at -1 when neither file
- * is configured.
+ * With --watch-files=1, one inotify instance watches the auth file and the
+ * files of the ACL (the --acl-file and those it includes), so when they share a
+ * directory each event is read once, not once per file. Leaves ino_fd at -1
+ * when the files are not watched or neither is configured.
  */
 static int gwp_ctx_init_watch(struct gwp_ctx *ctx)
 {
@@ -2005,7 +2015,7 @@ static int gwp_ctx_init_watch(struct gwp_ctx *ctx)
 	size_t i;
 	int r;
 
-	if (!ctx->auth && !ctx->acl_watched)
+	if (!cfg->watch_files || (!ctx->auth && !ctx->acl_watched))
 		return 0;
 
 	r = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -2149,9 +2159,9 @@ out_err:
 
 /*
  * Load the shared credential store from the auth file (if configured). The
- * store is shared by the SOCKS5 and HTTP CONNECT front-ends and hot-reloaded
- * through gwp_ctx_init_reload()'s watch. Leaves ctx->auth NULL when no auth
- * file is configured.
+ * store is shared by the SOCKS5 and HTTP CONNECT front-ends and reloaded by
+ * gwp_ctx_init_reload()'s thread. Leaves ctx->auth NULL when no auth file is
+ * configured.
  */
 static int gwp_ctx_init_auth(struct gwp_ctx *ctx)
 {
@@ -2268,11 +2278,11 @@ static const char gwp_acl_default_rules[] =
 	"-P OUTPUT ACCEPT\n";
 
 /*
- * Load the ACL rule file (--acl-file); gwp_ctx_init_reload() then watches it
- * and the files it includes, so it is hot-reloaded, like the auth store.
+ * Load the ACL rule file (--acl-file); gwp_ctx_init_reload()'s thread then
+ * reloads it and the files it includes, like the auth store.
  * Unlike auth (prot-only), the ACL is global to every proxy mode, so this is
  * initialised from gwp_ctx_init() regardless of SOCKS5/HTTP/transparent/plain
- * forwarding. With no file it applies the built-in default ACL (not watched),
+ * forwarding. With no file it applies the built-in default ACL (not reloaded),
  * unless --acl-allow-all leaves it disabled (NULL).
  */
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
