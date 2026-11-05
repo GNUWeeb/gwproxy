@@ -13,8 +13,12 @@
 require python3
 
 # Every KeyUpdate frees memory: keep a sanitizer from holding on to it, which
-# would look like what this test is looking for.
-export ASAN_OPTIONS="quarantine_size_mb=1:thread_local_quarantine_size_kb=64:${ASAN_OPTIONS:-}"
+# would look like what this test is looking for. Nor may it move the frames of
+# functions to a stack of its own, to catch their use after a return: each
+# call takes the next frame there, so the stack's pages are touched one after
+# the other, 1 MiB of them for each frame size, and under load a scenario can
+# be measuring by the time that ends.
+export ASAN_OPTIONS="quarantine_size_mb=1:thread_local_quarantine_size_kb=64:detect_stack_use_after_return=0:${ASAN_OPTIONS:-}"
 
 require_opt --tls-cert
 require openssl
