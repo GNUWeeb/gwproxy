@@ -1265,7 +1265,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		gwp_conn_pair_drop_dns(w, gcp);
 		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
 		free(gcp->udp_peers);
-		gwp_conn_set_upstream(gcp, NULL);
+		gwp_conn_set_upstream(w->ctx, gcp, NULL);
 
 		/*
 		 * s5_conn and http_conn share a union, so the protocol object
@@ -2806,13 +2806,13 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			r = -EINVAL;
 			break;
 		}
-		gwp_conn_set_upstream(gcp, up);
+		gwp_conn_set_upstream(ctx, gcp, up);
 		pr_dbg(&ctx->lh, "Upstream for idx=%u: pool %s server 1, %s (%s)",
 		       gcp->idx, gwp_acl_pool_name(req.upstream_pool),
 		       ip_to_str(&up->addr), up->host);
 		break;
 	case GWP_ACL_UPSTREAM_DIRECT:
-		gwp_conn_set_upstream(gcp, NULL);
+		gwp_conn_set_upstream(ctx, gcp, NULL);
 		pr_dbg(&ctx->lh, "Upstream for idx=%u: none (DIRECT)", gcp->idx);
 		break;
 	case GWP_ACL_UPSTREAM_UNSURE:
@@ -3490,6 +3490,29 @@ static void upstream_free_tls(struct gwp_ctx __unused *ctx)
 #endif /* CONFIG_HTTPS */
 
 /*
+ * Give the server @up its entry in the shared state table, by identity: the
+ * URL's scheme, the address it resolved to and the user (struct
+ * gwp_up_key). The last step of making a server, once all of that is set.
+ */
+__cold
+static int upstream_attach_state(struct gwp_ctx *ctx, struct gwp_upstream *up)
+{
+	enum gwp_up_scheme scheme;
+	struct gwp_up_key key;
+
+	if (up->type == GWP_UPSTREAM_SOCKS5)
+		scheme = up->remote_dns ? GWP_UP_SCHEME_SOCKS5H :
+					  GWP_UP_SCHEME_SOCKS5;
+	else
+		scheme = up->use_tls ? GWP_UP_SCHEME_HTTPS : GWP_UP_SCHEME_HTTP;
+	gwp_up_key_init(&key, scheme, &up->addr, up->user,
+			up->has_auth ? up->ulen : 0);
+	up->state = gwp_up_state_get(ctx->up_tab, &key);
+	explicit_bzero(&key, sizeof(key));
+	return up->state ? 0 : -ENOMEM;
+}
+
+/*
  * --upstream-proxy and --upstream-proxy-auth-file: build the default upstream
  * pool, of the one server they name. The pool owns that server's first
  * reference; every connection through it takes one more.
@@ -3503,6 +3526,10 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 	size_t off, len;
 	int r;
 
+	/* Every server's, the ACL pools' too: made even without this one. */
+	ctx->up_tab = gwp_up_table_create();
+	if (!ctx->up_tab)
+		return -ENOMEM;
 	if (!url)
 		return 0;
 
@@ -3571,6 +3598,9 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 		ip_to_str(&up->addr),
 		up->remote_dns ? "remote" : "local");
 
+	r = upstream_attach_state(ctx, up);
+	if (r)
+		goto out_free;
 	atomic_init(&up->refcnt, 1);
 	pool->srv[0] = up;
 	pool->nr = 1;
@@ -3608,12 +3638,26 @@ static void gwp_ctx_free_upstream(struct gwp_ctx *ctx)
 		else
 			pr_dbg(&ctx->lh, "Upstream proxy %s: all connection references dropped",
 			       ip_to_str(&up->addr));
+		refs = gwp_up_state_open(up->state);
+		if (refs)
+			pr_err(&ctx->lh, "BUG: upstream proxy %s has %u open pairs at exit, want 0",
+			       ip_to_str(&up->addr), refs);
 		gwp_upstream_put(up);
 	}
 	free(pool->srv);
 	pool->srv = NULL;
 	pool->nr = 0;
 	upstream_free_tls(ctx);
+
+	/*
+	 * After the ACL's pools (gwp_ctx_free_acl()): every server is gone,
+	 * and each took its entry with it.
+	 */
+	refs = gwp_up_table_destroy(ctx->up_tab);
+	ctx->up_tab = NULL;
+	if (refs)
+		pr_err(&ctx->lh, "BUG: %u upstream server state entries left at exit, want 0",
+		       refs);
 }
 
 void gwp_upstream_put(struct gwp_upstream *up)
@@ -3623,6 +3667,7 @@ void gwp_upstream_put(struct gwp_upstream *up)
 	if (atomic_fetch_sub_explicit(&up->refcnt, 1, memory_order_acq_rel) != 1)
 		return;
 	live = up->live;
+	gwp_up_state_put(up->state);
 	explicit_bzero(up, sizeof(*up));
 	free(up);
 	if (live)
@@ -3672,6 +3717,13 @@ static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
 		return r;
 	}
 
+	r = upstream_attach_state(ctx, up);
+	if (r) {
+		snprintf(why, size, "out of memory");
+		explicit_bzero(up, sizeof(*up));
+		free(up);
+		return r;
+	}
 	atomic_init(&up->refcnt, 1);
 	up->live = &ctx->nr_acl_srv;
 	atomic_fetch_add_explicit(&ctx->nr_acl_srv, 1, memory_order_relaxed);
@@ -3684,13 +3736,36 @@ static void acl_srv_put(void __unused *arg, void *srv)
 	gwp_upstream_put(srv);
 }
 
-void gwp_conn_set_upstream(struct gwp_conn_pair *gcp, struct gwp_upstream *up)
+/*
+ * The one place a pair's upstream changes, so the open-pair count of each
+ * server identity (struct gwp_up_state) follows the pairs that hold one of
+ * its servers: a pair takes a slot with the server, when it is given it,
+ * not when it connects, and gives it back with the server, whichever way
+ * the pair stops using it -- replaced by an ACL pick, or freed (every
+ * teardown, failed or not, and worker shutdown end in a free).
+ */
+void gwp_conn_set_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+			   struct gwp_upstream *up)
 {
-	if (up)
+	struct gwp_upstream *old = gcp->upstream;
+	uint32_t n;
+
+	if (up) {
 		gwp_upstream_get(up);
-	if (gcp->upstream)
-		gwp_upstream_put(gcp->upstream);
+		gwp_up_state_take(up->state);
+	}
 	gcp->upstream = up;
+	if (!old)
+		return;
+
+	n = gwp_up_state_give(old->state);
+	if (unlikely(n == UINT32_MAX))
+		pr_err(&ctx->lh, "BUG: upstream %s had no open pair to give back (idx=%u)",
+		       ip_to_str(&old->addr), gcp->idx);
+	else
+		pr_dbg(&ctx->lh, "Upstream %s released by idx=%u, %u open",
+		       ip_to_str(&old->addr), gcp->idx, n);
+	gwp_upstream_put(old);
 }
 
 __cold
@@ -3954,7 +4029,7 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 	gcp->prot_type = GWP_PROT_TYPE_NONE;
 	/* Every connection goes through the default pool, when there is one. */
 	if (ctx->upstream_pool.nr)
-		gwp_conn_set_upstream(gcp, ctx->upstream_pool.srv[0]);
+		gwp_conn_set_upstream(ctx, gcp, ctx->upstream_pool.srv[0]);
 	return gcp;
 
 out_free_target_conn:
@@ -4034,7 +4109,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		__sys_close(gcp->udp_fd);
 	gwp_conn_close_attempts(gcp);
 	free(gcp->udp_peers);
-	gwp_conn_set_upstream(gcp, NULL);
+	gwp_conn_set_upstream(w->ctx, gcp, NULL);
 
 	gwp_conn_pair_drop_dns(w, gcp);
 
