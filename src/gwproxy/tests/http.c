@@ -189,6 +189,43 @@ static void test_forward_get(void)
 	PRTEST_OK();
 }
 
+/*
+ * A "Proxy" field, in any case and however often it comes, never reaches the
+ * origin, where CGI would make it HTTP_PROXY ("httpoxy"); fields around it
+ * and names that only start like it go on unchanged.
+ */
+static void test_forward_drops_proxy(void)
+{
+	static const char buf[] =
+		"GET http://example.com/cgi HTTP/1.1\r\n"
+		"X-Before: 1\r\n"
+		"Proxy: http://evil.example:3128/\r\n"
+		"Proxys: s\r\n"
+		"PROXY: http://evil.example:3129/\r\n"
+		"proxy: x\r\n"
+		"Proxy-Foo: f\r\n"
+		"Proxy_: u\r\n"
+		"X-After: 2\r\n"
+		"\r\n";
+	static const char want[] =
+		"GET /cgi HTTP/1.1\r\nHost: example.com\r\n"
+		"X-Before: 1\r\nProxys: s\r\nProxy-Foo: f\r\n"
+		"Proxy_: u\r\nX-After: 2\r\n"
+		"Connection: close\r\n\r\n";
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0;
+
+	assert(hc);
+	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	assert(req_len == sizeof(want) - 1);
+	assert(!memcmp(req, want, req_len));
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_forward_default_port(void)
 {
 	static const char buf[] =
@@ -1752,6 +1789,7 @@ int main(void)
 		test_connect_ipv4();
 		test_connect_ipv6();
 		test_forward_get();
+		test_forward_drops_proxy();
 		test_forward_default_port();
 		test_forward_authority_end();
 		test_forward_hop_by_hop();
