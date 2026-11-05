@@ -1142,7 +1142,10 @@ or chunked Transfer\-Encoding, is forwarded, and anything the client sends after
 it is discarded. A request gwproxy cannot delimit unambiguously (both framing
 headers, a Transfer\-Encoding other than "chunked", an invalid Content\-Length,
 or a Connection header naming Content\-Length, Transfer\-Encoding or Host) is
-answered with "400 Bad Request"; a malformed chunked body closes the connection.
+answered with "400 Bad Request". So is a malformed chunked body, including a
+chunk extension off the grammar of RFC 9112 Section 7.1.1 (an empty extension,
+an unterminated quoted string, whitespace before the line end), when it comes
+with the header; one that turns out malformed later closes the connection.
 A field value may hold bytes 0x80 to 0xff, which are passed on unchanged, and
 none of them makes a framing header acceptable; any other control byte than a
 tab in a value closes the connection without a reply.

@@ -442,7 +442,9 @@ static void test_req_framing(void)
 		"5\r\nhello\r\n"
 		"1A;ext=\"v\"\r\nabcdefghijklmnopqrstuvwxyz\r\n"
 		"0003 ;x\r\nabc\r\n"
-		"0\r\nX-Trailer: t\r\nX-T: v\r\n\r\n";
+		"2 ; a ; b = c\t;d=\"q \\\" ;\\\\\";e=\"\"\r\nde\r\n"
+		"1;\tn=\"obs\xa0\" ;m\r\nf\r\n"
+		"0;last=1\r\nX-Trailer: t\r\nX-T: v\r\n\r\n";
 	static const char *const bad_hdr[] = {
 		"POST http://h/ HTTP/1.1\r\nContent-Length: 1\r\n"
 		"Transfer-Encoding: chunked\r\n\r\n",
@@ -468,6 +470,33 @@ static void test_req_framing(void)
 		"100000005\r\nhello\r\n0\r\n\r\n",
 		"5 6\r\nhello\r\n0\r\n\r\n",	/* bare-space extension */
 		"5 \r\nhello\r\n0\r\n\r\n",
+		/* Chunk extensions off the RFC 9112 Section 7.1.1 grammar. */
+		"5;\r\nhello\r\n0\r\n\r\n",	/* empty extension */
+		"5;;a\r\nhello\r\n0\r\n\r\n",
+		"5;a;\r\nhello\r\n0\r\n\r\n",
+		"5; \r\nhello\r\n0\r\n\r\n",
+		"5;=b\r\nhello\r\n0\r\n\r\n",	/* no name */
+		"5;a=\r\nhello\r\n0\r\n\r\n",	/* no value */
+		"5;a= \r\nhello\r\n0\r\n\r\n",
+		"5;a==b\r\nhello\r\n0\r\n\r\n",
+		"5;a b\r\nhello\r\n0\r\n\r\n",	/* two names */
+		"5;a=b c\r\nhello\r\n0\r\n\r\n",	/* two values */
+		"5;a \r\nhello\r\n0\r\n\r\n",	/* BWS before CRLF */
+		"5;a=b \r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\" \r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\"c\r\nhello\r\n0\r\n\r\n",
+		"5;a(b)\r\nhello\r\n0\r\n\r\n",	/* not a token */
+		"5;a=b,c\r\nhello\r\n0\r\n\r\n",
+		"5;a=b\"c\"\r\nhello\r\n0\r\n\r\n",
+		"5;a\xa0\r\nhello\r\n0\r\n\r\n",
+		/* Unterminated quoted-string, as an origin may read it. */
+		"35;a=\"\r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\\\"\r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\\\r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\x01\"\r\nhello\r\n0\r\n\r\n",
+		"5;a=\"b\x7f\"\r\nhello\r\n0\r\n\r\n",
+		"5;a=\"\nb\"\r\nhello\r\n0\r\n\r\n",
+		"0;\r\n\r\n",			/* on the last chunk too */
 	};
 	char body[256];
 	size_t fwd, step, i;
