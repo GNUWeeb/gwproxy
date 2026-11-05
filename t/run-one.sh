@@ -148,6 +148,13 @@ watchdog=$!
 
 rc=0
 wait "$sid" || rc=$?
+
+# Cancel the watchdog. Its process group exists only once setsid(1) has called
+# setsid(), which on a loaded host can come after a short test has ended: the
+# group alone then names nothing, and the runner waits out the whole timeout
+# for the watchdog. Its PID reaches it before and after setsid(), and the group
+# then reaches the sleep it may have started, which can only exist after.
+kill -TERM "$watchdog" 2>/dev/null
 kill -TERM -"$watchdog" 2>/dev/null
 wait "$watchdog" 2>/dev/null
 
