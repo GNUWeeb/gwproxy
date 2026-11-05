@@ -1140,9 +1140,10 @@ request per connection.
 Only that one request reaches the origin: its body, delimited by Content\-Length
 or chunked Transfer\-Encoding, is forwarded, and anything the client sends after
 it is discarded. A request gwproxy cannot delimit unambiguously (both framing
-headers, a Transfer\-Encoding other than "chunked", an invalid Content\-Length,
-or a Connection header naming Content\-Length, Transfer\-Encoding or Host) is
-answered with "400 Bad Request". So is a malformed chunked body, including a
+headers, a Transfer\-Encoding other than "chunked", a Content\-Length that is
+not plain digits or exceeds 9223372036854775807, the largest signed 64\-bit
+integer, or a Connection header naming Content\-Length, Transfer\-Encoding or
+Host) is answered with "400 Bad Request". So is a malformed chunked body, including a
 chunk extension off the grammar of RFC 9112 Section 7.1.1 (an empty extension,
 an unterminated quoted string, whitespace before the line end), when it comes
 with the header; one that turns out malformed later closes the connection.

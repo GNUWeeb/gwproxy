@@ -515,11 +515,21 @@ static int set_req_framing(struct gwp_http_conn *hc)
 	if (cl) {
 		if (!cll)
 			return -EBADMSG;
+		/*
+		 * Digits only: no sign, no white space between them (around
+		 * them it is OWS, already trimmed), no list. And no more than
+		 * a signed 64-bit integer holds, which is what most origins
+		 * parse it into: past that one may wrap around and read a
+		 * short body where this proxy forwards a long one. A body of
+		 * many GiB is still well below.
+		 */
 		for (i = 0; i < cll; i++) {
+			uint64_t d = (uint64_t)(cl[i] - '0');
+
 			if (cl[i] < '0' || cl[i] > '9' ||
-			    len > (UINT64_MAX - 9) / 10)
+			    len > ((uint64_t)INT64_MAX - d) / 10)
 				return -EBADMSG;
-			len = len * 10 + (uint64_t)(cl[i] - '0');
+			len = len * 10 + d;
 		}
 	}
 

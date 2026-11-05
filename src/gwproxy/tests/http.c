@@ -454,6 +454,20 @@ static void test_req_framing(void)
 		"POST http://h/ HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
 		"POST http://h/ HTTP/1.1\r\n"
 		"Content-Length: 99999999999999999999\r\n\r\n",
+		/* More than a signed 64-bit integer holds. */
+		"POST http://h/ HTTP/1.1\r\n"
+		"Content-Length: 9223372036854775808\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\n"
+		"Content-Length: 9223372036854775810\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\n"
+		"Content-Length: 18446744073709551615\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\n"
+		"Content-Length: 18446744073709551616\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: +4\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 4 4\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 4\t4\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 4,4\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 0x4\r\n\r\n",
 	};
 	static const char *const bad_chunked[] = {
 		"5\nhello\r\n0\r\n\r\n",	/* bare LF */
@@ -511,6 +525,16 @@ static void test_req_framing(void)
 		assert(!req_body("POST http://h/ HTTP/1.1\r\n"
 				 "Content-Length: 5\r\n\r\n", body, step, &fwd));
 		assert(fwd == 5);
+
+		/* The largest Content-Length taken, leading zeros or not. */
+		assert(!req_body("POST http://h/ HTTP/1.1\r\nContent-Length: "
+				 "9223372036854775807\r\n\r\n", body, step,
+				 &fwd));
+		assert(fwd == strlen(body));
+		assert(!req_body("POST http://h/ HTTP/1.1\r\nContent-Length: "
+				 "  09223372036854775807 \r\n\r\n", body, step,
+				 &fwd));
+		assert(fwd == strlen(body));
 
 		/* No framing: no body; a pipelined request goes nowhere. */
 		assert(!req_body("GET http://h/ HTTP/1.1\r\n\r\n", next, step,
