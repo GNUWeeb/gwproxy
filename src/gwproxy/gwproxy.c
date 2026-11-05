@@ -238,8 +238,8 @@ static void show_help(const char *app)
 	printf("      --upstream-proxy-auth-file=file  Read the upstream proxy's user:pass from the first line of file\n");
 	printf("                                  instead of the URL, where other local users can see it\n");
 #ifdef CONFIG_HTTPS
-	printf("      --upstream-ca-file=file     PEM CA certificates to verify an https:// upstream proxy with\n");
-	printf("                                  (default: the system's trust store)\n");
+	printf("      --upstream-ca-file=file     PEM CA certificates to verify https:// upstream proxies with, the\n");
+	printf("                                  --upstream-proxy and ACL pool servers (default: the system's trust store)\n");
 #endif
 	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN or CAP_NET_RAW; 0 = off)\n");
 	printf("  -B, --bind-source=ip[:port]     Bind outgoing connections to this source address (default -j BIND --to-source)\n");
@@ -651,9 +651,13 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		goto einval;
 	}
 
-	/* The URL's scheme is checked once it is parsed (upstream_init_tls()). */
-	if (cfg->upstream_ca_file && !cfg->upstream_proxy) {
-		fprintf(stderr, ERR_WRAP "Error: --upstream-ca-file needs an https:// --upstream-proxy\n" ERR_WRAP);
+	/*
+	 * The URL's scheme is checked once it is parsed (upstream_init_tls());
+	 * an ACL file may name https:// pool servers.
+	 */
+	if (cfg->upstream_ca_file && !cfg->upstream_proxy &&
+	    !(cfg->acl_file && *cfg->acl_file)) {
+		fprintf(stderr, ERR_WRAP "Error: --upstream-ca-file needs an https:// --upstream-proxy or an --acl-file\n" ERR_WRAP);
 		goto einval;
 	}
 
@@ -3405,22 +3409,27 @@ static void gwp_ctx_free_tls(struct gwp_ctx *ctx)
 
 #ifdef CONFIG_HTTPS
 /*
- * An https:// upstream proxy: the client TLS context its connections use,
- * verifying the proxy's certificate against --upstream-ca-file, or else the
- * system's trust store. The proxy's name is tried on a connection here, so a
- * host OpenSSL cannot use (for SNI, say) fails now rather than every
- * connection.
+ * The client TLS context of every https:// upstream, the --upstream-proxy
+ * one and the servers of ACL upstream pools alike, verifying the proxy's
+ * certificate against --upstream-ca-file, or else the system's trust store:
+ * one trust store for all. @need says whether one is needed at all.
+ *
+ * With an ACL file it is always needed: any load, the first or a reload,
+ * may bring an https:// pool server. So it is made here, at startup,
+ * before the ACL first loads and before any worker runs, and freed only
+ * after the workers are gone (gwp_ctx_free_upstream()); every server object
+ * a worker can be handed thus finds it in place, with no lazy setup racing
+ * the workers. A set with no https:// server pays for one unused SSL_CTX.
  */
 __cold
-static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
+static int upstream_init_tls_ctx(struct gwp_ctx *ctx, bool need)
 {
 	const char *ca = ctx->cfg.upstream_ca_file;
-	struct gwp_ssl *s;
 	int r, fd;
 
-	if (!up->use_tls) {
+	if (!need) {
 		if (ca) {
-			pr_err(&ctx->lh, "--upstream-ca-file needs an https:// --upstream-proxy");
+			pr_err(&ctx->lh, "--upstream-ca-file needs an https:// --upstream-proxy or an --acl-file");
 			return -EINVAL;
 		}
 		return 0;
@@ -3451,15 +3460,91 @@ static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
 			       gwp_ssl_errstr());
 		return r;
 	}
+	return 0;
+}
+
+/*
+ * Try the host of the https:// upstream @up on a connection of the client
+ * context, so a host OpenSSL cannot use (for SNI, say) fails now rather than
+ * every connection.
+ */
+__cold
+static int upstream_check_tls_host(struct gwp_ctx *ctx, struct gwp_upstream *up)
+{
+	struct gwp_ssl *s;
+	int r;
 
 	s = gwp_ssl_client_new(ctx->up_ssl_ctx);
 	if (!s)
 		return -ENOMEM;
 	r = gwp_ssl_set_peer_name(s, up->host, up->host_is_ip);
 	gwp_ssl_free(s);
+	return r;
+}
+
+/* Whether ACL upstream pools may hold https:// servers: an ACL file. */
+static bool upstream_acl_may_tls(struct gwp_ctx *ctx)
+{
+	return ctx->cfg.acl_file && *ctx->cfg.acl_file;
+}
+
+/*
+ * The client TLS context with no --upstream-proxy: for the https:// servers
+ * an ACL file's pools may hold.
+ */
+__cold
+static int upstream_init_acl_tls(struct gwp_ctx *ctx)
+{
+	const char *ca = ctx->cfg.upstream_ca_file;
+	int r;
+
+	r = upstream_init_tls_ctx(ctx, upstream_acl_may_tls(ctx));
+	if (!r && ctx->up_ssl_ctx)
+		pr_dbg(&ctx->lh, "TLS to https:// upstream pool servers: verifying against %s",
+		       ca ? ca : "the system's trust store");
+	return r;
+}
+
+/*
+ * An https:// pool server @up, as its pool loads: the context is there
+ * (upstream_init_tls_ctx()), and its host must do as a TLS server name.
+ */
+__cold
+static int upstream_acl_srv_tls(struct gwp_ctx *ctx, struct gwp_upstream *up,
+				char *why, size_t size)
+{
+	int r;
+
+	if (!ctx->up_ssl_ctx) {
+		snprintf(why, size, "the upstream TLS context is not set up");
+		return -EINVAL;
+	}
+	r = upstream_check_tls_host(ctx, up);
+	if (r == -EINVAL)
+		snprintf(why, size, "host %s cannot be checked as a TLS server name",
+			 up->host);
+	return r;
+}
+
+/*
+ * The --upstream-proxy: its host, and the client TLS context, which an
+ * https:// one needs and an ACL file's pools may.
+ */
+__cold
+static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
+{
+	const char *ca = ctx->cfg.upstream_ca_file;
+	int r;
+
+	r = upstream_init_tls_ctx(ctx, up->use_tls || upstream_acl_may_tls(ctx));
+	if (r || !up->use_tls)
+		return r;
+
+	r = upstream_check_tls_host(ctx, up);
 	if (r) {
-		pr_err(&ctx->lh, "--upstream-proxy host '%s' cannot be checked as a TLS server name",
-		       up->host);
+		if (r == -EINVAL)
+			pr_err(&ctx->lh, "--upstream-proxy host '%s' cannot be checked as a TLS server name",
+			       up->host);
 		return r;
 	}
 
@@ -3487,6 +3572,19 @@ static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
 static void upstream_free_tls(struct gwp_ctx __unused *ctx)
 {
 }
+
+static int upstream_init_acl_tls(struct gwp_ctx __unused *ctx)
+{
+	return 0;
+}
+
+static int upstream_acl_srv_tls(struct gwp_ctx __unused *ctx,
+				struct gwp_upstream __unused *up, char *why,
+				size_t size)
+{
+	snprintf(why, size, "https:// needs gwproxy built with OpenSSL; use http:// or socks5h://");
+	return -ENOTSUP;
+}
 #endif /* CONFIG_HTTPS */
 
 /*
@@ -3504,7 +3602,7 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 	int r;
 
 	if (!url)
-		return 0;
+		return upstream_init_acl_tls(ctx);
 
 	up = calloc(1, sizeof(*up));
 	if (!up)
@@ -3653,10 +3751,6 @@ static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
 		snprintf(why, size, "host %s does not resolve", up->host);
 	} else if (r) {
 		snprintf(why, size, "the host is not a valid name or address");
-	} else if (up->use_tls) {
-		/* acl.c refuses these; the TLS context is not set up for them. */
-		snprintf(why, size, "https:// is not supported in a pool yet");
-		r = -ENOTSUP;
 	} else if (!gwp_ctx_outgoing_family_ok(ctx, &up->addr)) {
 		snprintf(why, size, "address %s is not allowed by --outgoing-family",
 			 ip_to_str(&up->addr));
@@ -3665,6 +3759,8 @@ static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
 		snprintf(why, size, "an upstream needs --target-buf-size of at least %d",
 			 GWP_UPSTREAM_MIN_TARGET_BUF);
 		r = -EINVAL;
+	} else if (up->use_tls) {
+		r = upstream_acl_srv_tls(ctx, up, why, size);
 	}
 	if (r) {
 		explicit_bzero(up, sizeof(*up));

@@ -137,13 +137,13 @@ grep -q 'main.acl: warning' "$log" && \
 
 # A bad pool on reload: refused, the rules in force stay.
 n_bad="$(grep -c "$acl_bad" "$log")"
-printf -- '%s\n' 'upstream pool_b {' \
+printf -- '%s\n' 'upstream pool_b {' '	server socks5://127.0.0.1:1080;' \
 	"	server https://user:$pass_word@127.0.0.1:3129;" '}' >"$d/pools.acl"
 gwp_hup "$GWP_PID" "$log" 1
 wait_lines "$log" "$acl_bad" $((n_bad + 1)) || \
-	fail "a pool with an https server did not fail the reload"
-grep -q 'pools.acl: line 2: upstream pool pool_b server 1 (https://127.0.0.1:3129): https:// is not supported in a pool yet' \
-	"$log" || fail "the https server was not reported"
+	fail "a pool mixing local and remote DNS did not fail the reload"
+grep -q 'pools.acl: line 3: upstream pool pool_b server 2 (https://127.0.0.1:3129): resolves names remotely, the servers before it locally' \
+	"$log" || fail "the mixed pool was not reported"
 c="$(code "$pp" "$hp")"
 [ "$c" = 200 ] || fail "a failed reload dropped the rules ($c)"
 c="$(code "$pp" 9)"

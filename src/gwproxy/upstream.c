@@ -357,7 +357,7 @@ int gwp_upstream_tls_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (unlikely(!s))
 		return -ENOMEM;
 
-	/* The name was tried at startup (gwp_ctx_init_upstream()). */
+	/* Tried when the server was made, at startup or as its pool loaded. */
 	if (unlikely(gwp_ssl_set_peer_name(s, up->host, up->host_is_ip))) {
 		gwp_ssl_free(s);
 		return -ENOMEM;
