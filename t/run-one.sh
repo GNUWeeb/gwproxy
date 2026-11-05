@@ -118,8 +118,13 @@ sid=$!
 # the scan runs between the deadline and the SIGTERM, and a fork per process on
 # the host (a few thousand on a busy one) took seconds, during which a test past
 # its deadline could still finish and pass.
+#
+# Its first line, written as the deadline passes, also tells the runner that
+# the test timed out: such a test fails whatever its exit status, as one that
+# catches SIGTERM and exits 0, or that ends while the scan runs, would pass.
 setsid bash -c "$(declare -f sess_pids sess_kill)"'
 	sleep "$1"
+	echo "timed out after $1 s" >"$3"
 	sess_pids "$2"
 	for p in "${PIDS[@]}"; do
 		d=/proc/$p
@@ -141,7 +146,7 @@ setsid bash -c "$(declare -f sess_pids sess_kill)"'
 			{ read -r wchan <"$t/wchan"; } 2>/dev/null
 			echo "  task ${t##*/} $comm state=${st%% *} wchan=$wchan"
 		done
-	done >"$3" 2>&1
+	done >>"$3" 2>&1
 	sess_kill "$2" 50
 ' watchdog "$TIMEOUT" "$sid" "$stuck" </dev/null >/dev/null 2>&1 &
 watchdog=$!
@@ -170,6 +175,7 @@ case "$kind:$rc" in
 integ:77) status=SKIP ;;
 *)	status=FAIL ;;
 esac
+[ ! -s "$stuck" ] || status=FAIL
 
 printf '%s %s %s\n' "$status" "$elapsed" "$name" >"$res"
 

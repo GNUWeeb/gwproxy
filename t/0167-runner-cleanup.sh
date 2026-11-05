@@ -7,6 +7,10 @@
 # timeout(1) moves its command into a process group of its own, so the test's
 # group alone does not reach it, and a process that ignores SIGTERM still has
 # to go.
+#
+# A test still running at its deadline fails, even if it then exits 0: when it
+# catches SIGTERM, or when it ends while the watchdog records what it was stuck
+# on.
 
 . "$(dirname "$0")/lib.sh"
 
@@ -36,6 +40,23 @@ left()
 }
 
 T_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Past its deadline: it must fail, whether it is still sleeping when the
+# deadline has been dealt with or catches the SIGTERM and exits 0.
+r="$(run late 1 'sleep 3')"
+diag "late: $r"
+case "$r" in
+FAIL\ *) ;;
+*) fail "a test that ran past its deadline did not fail: $r" ;;
+esac
+r="$(run late-term 1 'trap "exit 0" TERM
+sleep 30 &
+wait')"
+diag "late-term: $r"
+case "$r" in
+FAIL\ *) ;;
+*) fail "a test that exited 0 on SIGTERM at its deadline did not fail: $r" ;;
+esac
 
 # Stray processes under timeout(1), one of them deaf to SIGTERM, left by a test
 # that hangs (the watchdog reaps them) and by one that returns (the runner's
