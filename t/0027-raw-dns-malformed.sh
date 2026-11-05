@@ -76,13 +76,10 @@ for loop in epoll; do
 
 	for mode in good uncompressed-name cname-jump rdata-truncated \
 		    field-truncated tc-set question-label; do
-		dp="$(pick_port)"
 		rm -f "$WORK/nr_queries"
-		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$dp" \
-			"$WORK/nr_queries" 2>/dev/null &
-		dns_pid=$!
-		_PIDS+=("$dns_pid")
-		sleep 0.4
+		start_dns_responder "$mode" "$WORK/nr_queries"
+		dp="$DNS_PORT"
+		dns_pid="$DNS_PID"
 
 		p="$(pick_port)"
 		gwp_start "127.0.0.1:$p" --as-socks5=1 --raw-dns=1 \
@@ -127,11 +124,9 @@ for loop in epoll; do
 	# path used to treat the pending raw query as a getaddrinfo() entry
 	# and hand a field of the DNS packet to epoll_ctl() as a descriptor,
 	# so the query was never even sent.
-	dp="$(pick_port)"
-	python3 "$SERVERS_DIR/dns_malformed.py" good "$dp" 2>/dev/null &
-	dns_pid=$!
-	_PIDS+=("$dns_pid")
-	sleep 0.4
+	start_dns_responder good
+	dp="$DNS_PORT"
+	dns_pid="$DNS_PID"
 	p="$(pick_port)"
 	gwp_start "127.0.0.1:$p" --as-http=1 --raw-dns=1 \
 		--dns-server="127.0.0.1:$dp" --event-loop="$loop" --nr-workers=1

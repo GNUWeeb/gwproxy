@@ -431,6 +431,42 @@ time.sleep(3600)' >"$log" 2>&1 &
 	fail "could not reserve a closed port"
 }
 
+# start_dns_responder <mode> [<count-file> [<query-log>]]: start
+# t/servers/dns_malformed.py answering in <mode> on 127.0.0.1 and wait until
+# it has bound its port: it prints "ready" then. Sets DNS_PORT and DNS_PID.
+#
+# A fixed sleep before the proxy's first query is no wait at all on a loaded
+# host, and the query then goes to a port nothing has bound yet. pick_port()
+# reserves a TCP number; another test's UDP socket may hold it, in which case
+# the responder dies on bind and another number is tried.
+start_dns_responder()
+{
+	local mode="$1" log pid port i try
+
+	for try in 1 2 3 4 5; do
+		_DNS_N=$((${_DNS_N:-0} + 1))
+		log="$WORK/dns.$_DNS_N.log"
+		port="$(pick_port)"
+		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$port" \
+			"${@:2}" >"$log" 2>&1 &
+		pid=$!
+		_PIDS+=("$pid")
+		for i in $(seq 1 300); do
+			if grep -qx ready "$log"; then
+				DNS_PORT="$port"
+				DNS_PID="$pid"
+				return 0
+			fi
+			kill -0 "$pid" 2>/dev/null || break
+			sleep 0.05
+		done
+		kill "$pid" 2>/dev/null
+		wait "$pid" 2>/dev/null
+	done
+	sed 's/^/# dns: /' "$log" >&2
+	fail "the DNS responder ($mode) did not start"
+}
+
 # start_httpd <port> <docroot> [http_version]: start the dual-stack test HTTP
 # server serving <docroot>. It is reachable via 127.0.0.1, [::1] or localhost.
 # http_version is "1.0" (closes after each response) or "1.1" (keep-alive).

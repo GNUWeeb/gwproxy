@@ -20,11 +20,9 @@ make_payload "$WORK/payload.bin" 100
 start_httpd "$hp" "$WORK" "1.1"
 
 for mode in upper-name wrong-name wrong-type; do
-	dp="$(pick_port)"
-	python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$dp" 2>/dev/null &
-	dns_pid=$!
-	_PIDS+=("$dns_pid")
-	sleep 0.4
+	start_dns_responder "$mode"
+	dp="$DNS_PORT"
+	dns_pid="$DNS_PID"
 
 	p="$(pick_port)"
 	gwp_start "127.0.0.1:$p" --as-socks5=1 --raw-dns=1 \
