@@ -97,9 +97,14 @@ code="$(curl -s --max-time 20 -x "http://127.0.0.1:$ap" \
 	|| fail "--acl-allow-all did not permit the loopback target ($code, want 200)"
 kill "$GWP_PID" 2>/dev/null
 
-for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+# Everything below, on one event loop. The loops run at once: one after the
+# other they took most of the time limit on a loaded host. Each keeps its
+# files in a directory of its own.
+acl_loop()
+{
+	local loop="$1" W="$WORK/$1"
 
+	mkdir -p "$W"
 	# gwp_start succeeds only once gwproxy is listening, which a valid ACL
 	# reaches and a malformed one (rejected at startup) does not.
 	pp="$(pick_port)"
@@ -108,9 +113,9 @@ for loop in epoll io_uring; do
 
 	# An allowed target still proxies end-to-end.
 	curl -s --max-time 20 -x "socks5h://127.0.0.1:$pp" \
-		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/out.bin" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$W/out.bin" \
 		|| fail "$loop SOCKS5 CONNECT to an allowed target failed"
-	assert_files_equal "$WORK/payload.bin" "$WORK/out.bin" \
+	assert_files_equal "$WORK/payload.bin" "$W/out.bin" \
 		"$loop payload corrupted for an allowed target"
 
 	# A denied target: SOCKS5 replies REP 0x02 (not allowed by ruleset).
@@ -131,18 +136,18 @@ for loop in epoll io_uring; do
 	# (the dual-stack httpd is reachable both ways). Exercises the v6
 	# address match and a v6 listener on both loops.
 	printf -- '%s\n' '-A OUTPUT -d ::1/128 -j REJECT' \
-		'-P OUTPUT ACCEPT' >"$WORK/v6.acl"
+		'-P OUTPUT ACCEPT' >"$W/v6.acl"
 	v6p="$(pick_port)"
 	gwp_start "[::1]:$v6p" --as-socks5=1 --event-loop="$loop" \
-		--acl-file="$WORK/v6.acl"
+		--acl-file="$W/v6.acl"
 	if curl -s --max-time 10 -x "socks5h://[::1]:$v6p" \
 		"http://[::1]:$hp/payload.bin" -o /dev/null 2>/dev/null; then
 		fail "$loop IPv6 ACL rule did not block the ::1 target"
 	fi
 	curl -s --max-time 20 -x "socks5h://[::1]:$v6p" \
-		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/v6.out" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$W/v6.out" \
 		|| fail "$loop IPv6 listener wrongly blocked the IPv4 target"
-	assert_files_equal "$WORK/payload.bin" "$WORK/v6.out" \
+	assert_files_equal "$WORK/payload.bin" "$W/v6.out" \
 		"$loop IPv6 path corrupted the IPv4-target payload"
 	kill "$GWP_PID" 2>/dev/null
 
@@ -150,10 +155,10 @@ for loop in epoll io_uring; do
 	# domain is matched before resolution), while a literal-IP request
 	# (which carries no hostname) is allowed.
 	printf -- '%s\n' '-A OUTPUT -m domain --domain localhost -j REJECT' \
-		'-P OUTPUT ACCEPT' >"$WORK/domain.acl"
+		'-P OUTPUT ACCEPT' >"$W/domain.acl"
 	dp="$(pick_port)"
 	gwp_start "127.0.0.1:$dp" --as-socks5=1 --event-loop="$loop" \
-		--acl-file="$WORK/domain.acl"
+		--acl-file="$W/domain.acl"
 	if curl -s --max-time 10 -x "socks5h://127.0.0.1:$dp" \
 		"http://localhost:$hp/payload.bin" -o /dev/null 2>/dev/null; then
 		fail "$loop -m domain rule did not block the hostname request"
@@ -164,9 +169,9 @@ for loop in epoll io_uring; do
 	[ "$rep" = "REP=0x02" ] \
 		|| fail "$loop -m domain rule let 'localhost.' through ($rep)"
 	curl -s --max-time 20 -x "socks5://127.0.0.1:$dp" \
-		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/dom.out" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$W/dom.out" \
 		|| fail "$loop literal-IP request wrongly blocked by -m domain"
-	assert_files_equal "$WORK/payload.bin" "$WORK/dom.out" \
+	assert_files_equal "$WORK/payload.bin" "$W/dom.out" \
 		"$loop -m domain corrupted the literal-IP payload"
 	kill "$GWP_PID" 2>/dev/null
 
@@ -175,10 +180,10 @@ for loop in epoll io_uring; do
 	if grep -q CONFIG_PCRE "$ROOT/config.h" 2>/dev/null; then
 		printf -- '%s\n' \
 			'-A OUTPUT -m domain --domain-regexp ^localhost$ -j REJECT' \
-			'-P OUTPUT ACCEPT' >"$WORK/domre.acl"
+			'-P OUTPUT ACCEPT' >"$W/domre.acl"
 		rp="$(pick_port)"
 		gwp_start "127.0.0.1:$rp" --as-socks5=1 --event-loop="$loop" \
-			--acl-file="$WORK/domre.acl"
+			--acl-file="$W/domre.acl"
 		if curl -s --max-time 10 -x "socks5h://127.0.0.1:$rp" \
 			"http://localhost:$hp/payload.bin" -o /dev/null 2>/dev/null; then
 			fail "$loop --domain-regexp did not block the hostname"
@@ -188,9 +193,9 @@ for loop in epoll io_uring; do
 		[ "$rep" = "REP=0x02" ] \
 			|| fail "$loop --domain-regexp let 'localhost.' through ($rep)"
 		curl -s --max-time 20 -x "socks5://127.0.0.1:$rp" \
-			"http://127.0.0.1:$hp/payload.bin" -o "$WORK/domre.out" \
+			"http://127.0.0.1:$hp/payload.bin" -o "$W/domre.out" \
 			|| fail "$loop literal-IP wrongly blocked by --domain-regexp"
-		assert_files_equal "$WORK/payload.bin" "$WORK/domre.out" \
+		assert_files_equal "$WORK/payload.bin" "$W/domre.out" \
 			"$loop --domain-regexp corrupted the literal-IP payload"
 		kill "$GWP_PID" 2>/dev/null
 	fi
@@ -198,21 +203,21 @@ for loop in epoll io_uring; do
 	# -m user (OUTPUT-only): with an auth file, a rule keyed on the
 	# authenticated username blocks that user while another is served. The
 	# username is known only after the auth handshake.
-	printf -- '%s\n' 'user001:pw1' 'user002:pw2' >"$WORK/user.auth"
+	printf -- '%s\n' 'user001:pw1' 'user002:pw2' >"$W/user.auth"
 	printf -- '%s\n' '-A OUTPUT -m user --user user001 -j REJECT' \
-		'-P OUTPUT ACCEPT' >"$WORK/user.acl"
+		'-P OUTPUT ACCEPT' >"$W/user.acl"
 	uxp="$(pick_port)"
 	gwp_start "127.0.0.1:$uxp" --as-socks5=1 --as-http=1 \
-		--event-loop="$loop" --auth-file="$WORK/user.auth" \
-		--acl-file="$WORK/user.acl"
+		--event-loop="$loop" --auth-file="$W/user.auth" \
+		--acl-file="$W/user.acl"
 	if curl -s --max-time 10 -x "socks5h://user001:pw1@127.0.0.1:$uxp" \
 		"http://127.0.0.1:$hp/payload.bin" -o /dev/null 2>/dev/null; then
 		fail "$loop -m user did not block user001 (socks5)"
 	fi
 	curl -s --max-time 20 -x "socks5h://user002:pw2@127.0.0.1:$uxp" \
-		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/user.out" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$W/user.out" \
 		|| fail "$loop -m user wrongly blocked user002 (socks5)"
-	assert_files_equal "$WORK/payload.bin" "$WORK/user.out" \
+	assert_files_equal "$WORK/payload.bin" "$W/user.out" \
 		"$loop -m user corrupted user002's payload"
 	code="$(curl -s --max-time 20 -x "http://user001:pw1@127.0.0.1:$uxp" \
 		"http://127.0.0.1:$hp/payload.bin" -o /dev/null -w '%{http_code}')"
@@ -235,14 +240,14 @@ for loop in epoll io_uring; do
 	# peer-reporting server confirms the proxy connected from that source.
 	pa="$(pick_port)"
 	python3 "$SERVERS_DIR/peer_addr.py" 127.0.0.1 "$pa" \
-		>"$WORK/peer.log" 2>&1 &
+		>"$W/peer.log" 2>&1 &
 	_PIDS+=("$!")
 	wait_listen "$pa" "$!" || fail "$loop peer_addr server did not listen"
 	printf -- '%s\n' '-A OUTPUT -j BIND --to-source 127.0.0.2' \
-		'-P OUTPUT ACCEPT' >"$WORK/bind.acl"
+		'-P OUTPUT ACCEPT' >"$W/bind.acl"
 	bpp="$(pick_port)"
 	gwp_start "127.0.0.1:$bpp" --target="127.0.0.1:$pa" \
-		--event-loop="$loop" --acl-file="$WORK/bind.acl"
+		--event-loop="$loop" --acl-file="$W/bind.acl"
 	src="$(plain_peer_src "$bpp")"
 	[ "$src" = 127.0.0.2 ] \
 		|| fail "$loop BIND --to-source: server saw '$src' (want 127.0.0.2)"
@@ -254,13 +259,13 @@ for loop in epoll io_uring; do
 	# at the BIND -- and the source is still pinned, proving --accept ends
 	# the walk rather than skipping the modifier.
 	printf -- '%s\n' '-A OUTPUT -j BIND --to-source 127.0.0.2' \
-		'-A OUTPUT -j REJECT' '-P OUTPUT ACCEPT' >"$WORK/bind-noacc.acl"
+		'-A OUTPUT -j REJECT' '-P OUTPUT ACCEPT' >"$W/bind-noacc.acl"
 	printf -- '%s\n' '-A OUTPUT -j BIND --to-source 127.0.0.2 --accept' \
-		'-A OUTPUT -j REJECT' '-P OUTPUT ACCEPT' >"$WORK/bind-acc.acl"
+		'-A OUTPUT -j REJECT' '-P OUTPUT ACCEPT' >"$W/bind-acc.acl"
 
 	bnp="$(pick_port)"
 	gwp_start "127.0.0.1:$bnp" --target="127.0.0.1:$pa" \
-		--event-loop="$loop" --acl-file="$WORK/bind-noacc.acl"
+		--event-loop="$loop" --acl-file="$W/bind-noacc.acl"
 	src="$(plain_peer_src "$bnp")"
 	kill "$GWP_PID" 2>/dev/null
 	[ -z "$src" ] \
@@ -268,7 +273,7 @@ for loop in epoll io_uring; do
 
 	bap="$(pick_port)"
 	gwp_start "127.0.0.1:$bap" --target="127.0.0.1:$pa" \
-		--event-loop="$loop" --acl-file="$WORK/bind-acc.acl"
+		--event-loop="$loop" --acl-file="$W/bind-acc.acl"
 	src="$(plain_peer_src "$bap")"
 	kill "$GWP_PID" 2>/dev/null
 	[ "$src" = 127.0.0.2 ] \
@@ -278,14 +283,14 @@ for loop in epoll io_uring; do
 	# redirected to the real origin and succeeds.
 	printf -- '%s\n' \
 		"-A OUTPUT -d 127.0.0.1 --dports 8080 -j DNAT --to :$hp" \
-		'-P OUTPUT ACCEPT' >"$WORK/dnat.acl"
+		'-P OUTPUT ACCEPT' >"$W/dnat.acl"
 	np="$(pick_port)"
 	gwp_start "127.0.0.1:$np" --as-socks5=1 --event-loop="$loop" \
-		--acl-file="$WORK/dnat.acl"
+		--acl-file="$W/dnat.acl"
 	curl -s --max-time 20 -x "socks5://127.0.0.1:$np" \
-		"http://127.0.0.1:8080/payload.bin" -o "$WORK/dnat.out" \
+		"http://127.0.0.1:8080/payload.bin" -o "$W/dnat.out" \
 		|| fail "$loop DNAT-redirected CONNECT failed"
-	assert_files_equal "$WORK/payload.bin" "$WORK/dnat.out" \
+	assert_files_equal "$WORK/payload.bin" "$W/dnat.out" \
 		"$loop DNAT redirected to the wrong target"
 	kill "$GWP_PID" 2>/dev/null
 
@@ -293,11 +298,11 @@ for loop in epoll io_uring; do
 	# is redirected to the real origin.
 	fp="$(pick_port)"
 	gwp_start "127.0.0.1:$fp" --target="127.0.0.1:8080" --event-loop="$loop" \
-		--acl-file="$WORK/dnat.acl"
+		--acl-file="$W/dnat.acl"
 	curl -s --max-time 20 "http://127.0.0.1:$fp/payload.bin" \
-		-o "$WORK/dnat.plain.out" \
+		-o "$W/dnat.plain.out" \
 		|| fail "$loop plain DNAT-redirected forward failed"
-	assert_files_equal "$WORK/payload.bin" "$WORK/dnat.plain.out" \
+	assert_files_equal "$WORK/payload.bin" "$W/dnat.plain.out" \
 		"$loop plain DNAT redirected to the wrong target"
 	kill "$GWP_PID" 2>/dev/null
 
@@ -313,11 +318,11 @@ for loop in epoll io_uring; do
 	ufp="$(pick_port)"
 	gwp_start "127.0.0.1:$ufp" --as-socks5=1 --event-loop="$loop" \
 		--upstream-proxy="socks5://127.0.0.1:$uup" \
-		--acl-file="$WORK/dnat.acl"
+		--acl-file="$W/dnat.acl"
 	curl -s --max-time 20 -x "socks5://127.0.0.1:$ufp" \
-		"http://127.0.0.1:8080/payload.bin" -o "$WORK/updnat.out" \
+		"http://127.0.0.1:8080/payload.bin" -o "$W/updnat.out" \
 		|| fail "$loop socks5:// upstream DNAT failed"
-	assert_files_equal "$WORK/payload.bin" "$WORK/updnat.out" \
+	assert_files_equal "$WORK/payload.bin" "$W/updnat.out" \
 		"$loop socks5:// upstream DNAT redirected to the wrong target"
 	kill "$GWP_PID" 2>/dev/null
 
@@ -325,15 +330,15 @@ for loop in epoll io_uring; do
 	# to the origin IP, so the (unresolvable) name never reaches DNS.
 	printf -- '%s\n' \
 		"-A OUTPUT -m domain --domain blocked.invalid -j DNAT --to 127.0.0.1:$hp" \
-		'-P OUTPUT ACCEPT' >"$WORK/updnath.acl"
+		'-P OUTPUT ACCEPT' >"$W/updnath.acl"
 	ufp="$(pick_port)"
 	gwp_start "127.0.0.1:$ufp" --as-socks5=1 --event-loop="$loop" \
 		--upstream-proxy="socks5h://127.0.0.1:$uup" \
-		--acl-file="$WORK/updnath.acl"
+		--acl-file="$W/updnath.acl"
 	curl -s --max-time 20 -x "socks5h://127.0.0.1:$ufp" \
-		"http://blocked.invalid:9999/payload.bin" -o "$WORK/updnath.out" \
+		"http://blocked.invalid:9999/payload.bin" -o "$W/updnath.out" \
 		|| fail "$loop socks5h:// upstream DNAT failed"
-	assert_files_equal "$WORK/payload.bin" "$WORK/updnath.out" \
+	assert_files_equal "$WORK/payload.bin" "$W/updnath.out" \
 		"$loop socks5h:// upstream DNAT redirected to the wrong target"
 	kill "$GWP_PID" 2>/dev/null
 
@@ -342,15 +347,15 @@ for loop in epoll io_uring; do
 	# request to blocked.invalid:$hp reaches the origin on $hp.
 	printf -- '%s\n' \
 		'-A OUTPUT -m domain --domain blocked.invalid -j DNAT --to 127.0.0.1' \
-		'-P OUTPUT ACCEPT' >"$WORK/updnathp.acl"
+		'-P OUTPUT ACCEPT' >"$W/updnathp.acl"
 	ufp="$(pick_port)"
 	gwp_start "127.0.0.1:$ufp" --as-socks5=1 --event-loop="$loop" \
 		--upstream-proxy="socks5h://127.0.0.1:$uup" \
-		--acl-file="$WORK/updnathp.acl"
+		--acl-file="$W/updnathp.acl"
 	curl -s --max-time 20 -x "socks5h://127.0.0.1:$ufp" \
-		"http://blocked.invalid:$hp/payload.bin" -o "$WORK/updnathp.out" \
+		"http://blocked.invalid:$hp/payload.bin" -o "$W/updnathp.out" \
 		|| fail "$loop socks5h:// address-only DNAT lost the original port"
-	assert_files_equal "$WORK/payload.bin" "$WORK/updnathp.out" \
+	assert_files_equal "$WORK/payload.bin" "$W/updnathp.out" \
 		"$loop socks5h:// address-only DNAT redirected to the wrong target"
 	kill "$GWP_PID" 2>/dev/null
 
@@ -360,16 +365,16 @@ for loop in epoll io_uring; do
 	# + rename-over, as editors and install(1) do): the watch is on the
 	# directory, so a renamed-in acl file is still picked up. A file/inode
 	# watch would go stale here and never reload.
-	cp "$WORK/ok.acl" "$WORK/reload.acl"
+	cp "$WORK/ok.acl" "$W/reload.acl"
 	rp="$(pick_port)"
 	gwp_start "127.0.0.1:$rp" --as-http=1 --event-loop="$loop" \
-		--watch-files=1 --acl-file="$WORK/reload.acl"
+		--watch-files=1 --acl-file="$W/reload.acl"
 	code="$(curl -s --max-time 20 -x "http://127.0.0.1:$rp" \
 		"http://127.0.0.1:$hp/payload.bin" -o /dev/null -w '%{http_code}')"
 	[ "$code" = 200 ] || fail "$loop pre-reload fetch got $code (want 200)"
 	printf -- '%s\n' "-A OUTPUT --dports $hp -j REJECT" '-P OUTPUT ACCEPT' \
-		>"$WORK/reload.new"
-	mv -f "$WORK/reload.new" "$WORK/reload.acl"
+		>"$W/reload.new"
+	mv -f "$W/reload.new" "$W/reload.acl"
 	code=""
 	for _ in $(seq 1 50); do
 		code="$(curl -s --max-time 20 -x "http://127.0.0.1:$rp" \
@@ -396,10 +401,10 @@ for loop in epoll io_uring; do
 	# Plain --target forwarding connects at accept time and enforces the
 	# OUTPUT chain too: denied target -> dropped, allowed target -> served.
 	printf -- '%s\n' "-A OUTPUT --dports $hp -j REJECT" '-P OUTPUT ACCEPT' \
-		>"$WORK/plain-deny.acl"
+		>"$W/plain-deny.acl"
 	fp="$(pick_port)"
 	gwp_start "127.0.0.1:$fp" --target="127.0.0.1:$hp" --event-loop="$loop" \
-		--acl-file="$WORK/plain-deny.acl"
+		--acl-file="$W/plain-deny.acl"
 	if curl -s --max-time 10 "http://127.0.0.1:$fp/payload.bin" \
 		-o /dev/null 2>/dev/null; then
 		fail "$loop plain forward to a denied target was served"
@@ -410,19 +415,19 @@ for loop in epoll io_uring; do
 	gwp_start "127.0.0.1:$fp" --target="127.0.0.1:$hp" --event-loop="$loop" \
 		--acl-file="$WORK/ok.acl"
 	curl -s --max-time 20 "http://127.0.0.1:$fp/payload.bin" \
-		-o "$WORK/plain.out" \
+		-o "$W/plain.out" \
 		|| fail "$loop plain forward to an allowed target failed"
-	assert_files_equal "$WORK/payload.bin" "$WORK/plain.out" \
+	assert_files_equal "$WORK/payload.bin" "$W/plain.out" \
 		"$loop plain forward corrupted the payload"
 	kill "$GWP_PID" 2>/dev/null
 
 	# UDP relay OUTPUT: a datagram to a denied target is dropped, while an
 	# allowed target (ok.acl only denies TCP port 9) round-trips.
 	printf -- '%s\n' "-A OUTPUT -p udp --dports $ep -j REJECT" \
-		'-P OUTPUT ACCEPT' >"$WORK/udp-deny.acl"
+		'-P OUTPUT ACCEPT' >"$W/udp-deny.acl"
 	up="$(pick_port)"
 	gwp_start "127.0.0.1:$up" --as-socks5=1 --event-loop="$loop" \
-		--acl-file="$WORK/udp-deny.acl"
+		--acl-file="$W/udp-deny.acl"
 	if python3 "$SERVERS_DIR/socks5_udp_client.py" "$up" "$ep" 64 \
 		>/dev/null 2>&1; then
 		fail "$loop UDP datagram to a denied target was relayed"
@@ -439,10 +444,10 @@ for loop in epoll io_uring; do
 	# INPUT with -p udp: the UDP ASSOCIATE is refused, but TCP still works
 	# (the rule is protocol-specific).
 	printf -- '%s\n' '-A INPUT -s 127.0.0.1/32 -p udp -j REJECT' \
-		'-P INPUT ACCEPT' >"$WORK/udp-in-deny.acl"
+		'-P INPUT ACCEPT' >"$W/udp-in-deny.acl"
 	up="$(pick_port)"
 	gwp_start "127.0.0.1:$up" --as-socks5=1 --event-loop="$loop" \
-		--acl-file="$WORK/udp-in-deny.acl"
+		--acl-file="$W/udp-in-deny.acl"
 	if python3 "$SERVERS_DIR/socks5_udp_client.py" "$up" "$ep" 64 \
 		>/dev/null 2>&1; then
 		fail "$loop UDP ASSOCIATE from a udp-denied client succeeded"
@@ -461,10 +466,10 @@ for loop in epoll io_uring; do
 	# the count would not be one per connection.
 	printf -- '%s\n' \
 		'-A OUTPUT --dports 9 -m statistic --mode nth --every 2 -j REJECT' \
-		'-P OUTPUT ACCEPT' >"$WORK/nth.acl"
+		'-P OUTPUT ACCEPT' >"$W/nth.acl"
 	np="$(pick_port)"
 	gwp_start "127.0.0.1:$np" --as-socks5=1 --event-loop="$loop" \
-		--acl-file="$WORK/nth.acl"
+		--acl-file="$W/nth.acl"
 	rejected=0
 	for i in 1 2 3 4 5 6 7 8; do
 		rep="$(socks5_connect_rep "$np" 127.0.0.1 9)"
@@ -481,6 +486,11 @@ for loop in epoll io_uring; do
 			fail "$loop -m statistic leaked onto an unmatched port (REP $rep)"
 	done
 	kill "$GWP_PID" 2>/dev/null
-done
+	return 0
+}
+
+loops=epoll
+grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && loops="$loops io_uring"
+gwp_parallel acl_loop $loops
 
 pass

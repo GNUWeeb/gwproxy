@@ -54,17 +54,26 @@ gwp_sweep()
 		[ -n "$mypg" ] || return 0
 	fi
 
-	local pass pid exe n=0
+	# The group is checked first, with builtins only: a readlink, or any
+	# other fork, for each of the thousands of processes on a busy host
+	# took tens of seconds of every test's time limit. Only this test's
+	# few processes get as far as the readlink.
+	local pass d pid st f exe n=0
 	for pass in TERM KILL; do
-		for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-			exe="$(readlink "/proc/$pid/exe" 2>/dev/null)" || continue
+		for d in /proc/[0-9]*; do
+			pid="${d#/proc/}"
+			if [ -n "$mypg" ]; then
+				{ read -r st <"$d/stat"; } 2>/dev/null || continue
+				st="${st##*) }"
+				f=($st)
+				# Another test's process, or none of ours.
+				[ "${f[2]:-}" = "$mypg" ] || continue
+			fi
+			exe="$(readlink "$d/exe" 2>/dev/null)" || continue
 			case "$exe" in
 			"$bin"|"$bin (deleted)") ;;
 			*) continue ;;
 			esac
-			if [ -n "$mypg" ] && [ "$(_gwp_pgid_of "$pid")" != "$mypg" ]; then
-				continue	# another test's proxy
-			fi
 			kill "-$pass" "$pid" 2>/dev/null || continue
 			[ "$pass" = TERM ] && n=$((n + 1))
 		done
