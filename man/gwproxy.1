@@ -258,8 +258,8 @@ credentials. The file is reloaded on
 .BR SIGHUP ,
 and also on change with
 .BR \-\-watch\-files=1 .
-It must be a regular file: a FIFO in its place makes a reload wait for a
-writer, and shutdown with it (see
+It must be a regular file: anything else (a FIFO, a device) is refused at
+startup, and a reload that finds one keeps the current credentials (see
 .BR "RELOADING THE FILES" ).
 Without it, no authentication is required (see
 .BR "AUTHENTICATION" ).
@@ -1399,12 +1399,12 @@ connections use the new pools; one already through a pool's server keeps that
 server until it ends. The servers' health, an ejection included, carries over
 as their counts do.
 .PP
-The auth file must be a regular file. Unlike the ACL files, it is not checked
-for being one before it is opened: a FIFO put in its place makes a reload
+The auth file, like the ACL files, must be a regular file. A FIFO or a device
+put in its place is refused, not waited on: the reload
 .RB ( SIGHUP ,
-or a change seen by the watch) wait in
-.BR open (2)
-until something writes to it. Meanwhile no other reload runs, and a
+or a change seen by the watch) fails at once, says so, and keeps the current
+credentials in force. A reload of a very large file still takes as long as
+reading it, and meanwhile no other reload runs, and a
 .B SIGINT
 or
 .B SIGTERM
@@ -1902,8 +1902,7 @@ with whatever is still in its buffers or on its way discarded. There is no
 drain. A client in the middle of a transfer sees a normal end of stream after
 only part of the data, so a protocol that does not mark its own end cannot tell
 this from a complete transfer. The process exits once a reload in progress is
-over, which takes as long as a FIFO in place of the auth file keeps it waiting
-(see
+over (see
 .BR "RELOADING THE FILES" ).
 .TP
 .B SIGHUP
