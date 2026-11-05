@@ -2761,6 +2761,34 @@ static bool udp_reply_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 }
 
 /*
+ * Which of @pool's servers (from 0) the next pair goes to, by the pool's
+ * method: round-robin, the default, takes them in turn; least_conn the one
+ * with the fewest open pairs, ties in round-robin order. Both turn on the
+ * pool's cursor, shared by all workers, and least_conn reads the counts
+ * all workers keep (struct gwp_up_state), which carry across reloads.
+ * Workers picking at the same time may see the same counts and choose the
+ * same server; the next picks see the result, which is close enough.
+ */
+static uint32_t pool_pick_server(struct gwp_acl_pool *pool)
+{
+	uint32_t nr = gwp_acl_pool_nr_servers(pool), open[64], i;
+	bool lc = gwp_acl_pool_method(pool) == GWP_ACL_POOL_LEAST_CONN;
+	struct gwp_upstream *up;
+
+	if (nr <= 1)
+		return 0;
+	/* acl.c allows 64; past that, the first 64 are all it can pick. */
+	if (unlikely(nr > sizeof(open) / sizeof(open[0])))
+		nr = sizeof(open) / sizeof(open[0]);
+	for (i = 0; lc && i < nr; i++) {
+		up = gwp_acl_pool_server(pool, i);
+		/* None is a bug conn_pick_upstream() reports; never pick it. */
+		open[i] = up ? gwp_up_state_open(up->state) : UINT32_MAX;
+	}
+	return gwp_up_lb_pick(lc, gwp_acl_pool_next(pool), open, nr);
+}
+
+/*
  * Decide, once per pair and before its target's name is resolved, which
  * upstream @gcp goes through: the one an ACL -j UPSTREAM rule picks for
  * what the client asked for -- the name @domain, the address @lit (either
@@ -2777,6 +2805,7 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 {
 	struct gwp_upstream *up;
 	struct gwp_acl_req req;
+	uint32_t i;
 	int r = 0;
 
 	if (gcp->flags & GWP_CONN_FLAG_UP_PICKED)
@@ -2794,11 +2823,11 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	switch (gwp_acl_eval_upstream(ctx->acl, &req)) {
 	case GWP_ACL_UPSTREAM_POOL:
 		/*
-		 * The pool's first server, until the pool's method (round-robin
-		 * or least_conn) picks one. Its pool holds it, so it is there;
-		 * the pair takes its own reference and drops the pool's.
+		 * The pool holds its servers, so the one picked is there; the
+		 * pair takes its own reference, and the pool's goes with @req.
 		 */
-		up = gwp_acl_pool_server(req.upstream_pool, 0);
+		i = pool_pick_server(req.upstream_pool);
+		up = gwp_acl_pool_server(req.upstream_pool, i);
 		if (unlikely(!up)) {
 			/* Never past the pool: refuse, not the default. */
 			pr_err(&ctx->lh, "BUG: upstream pool %s has no server object (idx=%u)",
@@ -2807,9 +2836,10 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			break;
 		}
 		gwp_conn_set_upstream(ctx, gcp, up);
-		pr_dbg(&ctx->lh, "Upstream for idx=%u: pool %s server 1, %s (%s)",
-		       gcp->idx, gwp_acl_pool_name(req.upstream_pool),
-		       ip_to_str(&up->addr), up->host);
+		pr_dbg(&ctx->lh, "Upstream for idx=%u: pool %s server %u, %s (%s), %u open",
+		       gcp->idx, gwp_acl_pool_name(req.upstream_pool), i + 1,
+		       ip_to_str(&up->addr), up->host,
+		       gwp_up_state_open(up->state));
 		break;
 	case GWP_ACL_UPSTREAM_DIRECT:
 		gwp_conn_set_upstream(ctx, gcp, NULL);
