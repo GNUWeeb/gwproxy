@@ -59,19 +59,36 @@ pgid=$!
 # Before that it records what the test is stuck on: a test that hangs usually
 # prints nothing, and it is gone by the time anyone can look. From /proc alone,
 # as ps differs between the systems the tests run on.
+#
+# The scan runs between the deadline and the SIGTERM, so it reads every file
+# with bash builtins: a fork per process on the host (a few thousand on a busy
+# one) took seconds, during which a test past its deadline could still finish
+# and pass. Only the comm field may hold spaces or ')', so stat is split after
+# its last ") ".
 setsid bash -c '
 	sleep "$1"
 	for d in /proc/[0-9]*; do
-		st="$(sed "s/.*) //" "$d/stat" 2>/dev/null)" || continue
-		read -r _ _ _ sid _ <<<"$st"
-		[ "$sid" = "$2" ] || continue
-		echo "pid ${d#/proc/}: $(tr "\\0" " " <"$d/cmdline")"
-		grep -E "^(SigBlk|SigIgn|SigCgt):" "$d/status"
+		{ read -r st <"$d/stat"; } 2>/dev/null || continue
+		st=${st##*) }
+		f=($st)
+		[ "${f[3]}" = "$2" ] || continue
+		cmd=
+		while IFS= read -r -d "" a; do
+			cmd+="$a "
+		done 2>/dev/null <"$d/cmdline"
+		echo "pid ${d#/proc/}: $cmd"
+		while read -r l; do
+			case "$l" in
+			SigBlk:*|SigIgn:*|SigCgt:*) echo "$l" ;;
+			esac
+		done 2>/dev/null <"$d/status"
 		for t in "$d"/task/*; do
-			echo "  task ${t##*/} $(cat "$t/comm")" \
-				"state=$(sed "s/.*) //;s/ .*//" "$t/stat")" \
-				"wchan=$(cat "$t/wchan" 2>/dev/null)" \
-				"syscall=$(cat "$t/syscall" 2>/dev/null)"
+			comm= st= wchan=
+			{ read -r comm <"$t/comm"; } 2>/dev/null
+			{ read -r st <"$t/stat"; } 2>/dev/null
+			st=${st##*) }
+			{ read -r wchan <"$t/wchan"; } 2>/dev/null
+			echo "  task ${t##*/} $comm state=${st%% *} wchan=$wchan"
 		done
 	done >"$3" 2>&1
 	kill -TERM -"$2" 2>/dev/null
