@@ -2414,6 +2414,50 @@ static noinline void test_upstream_pools(void)
 }
 
 /*
+ * https:// servers load in a pool, alone or with the other remote-DNS
+ * schemes, kept as written; the pool resolves names remotely.
+ */
+static noinline void test_upstream_pool_https(void)
+{
+	static const char text[] =
+		"upstream tls {\n"
+		"	server https://u:s3cret@proxy.example:3129;\n"
+		"	server https://[2001:db8::2];\n"
+		"}\n"
+		"upstream mixed {\n"
+		"	server http://10.0.0.1:3128;\n"
+		"	server https://10.0.0.2:3129;\n"
+		"	server socks5h://10.0.0.3:1080;\n"
+		"}\n"
+		"-A OUTPUT -m user --user alice -j UPSTREAM --to tls\n"
+		"-A OUTPUT -m user --user bob -j UPSTREAM --to mixed\n";
+	struct gwp_acl_pool *p;
+	struct gwp_acl_req req;
+	struct gwp_acl *a;
+
+	assert(!gwp_acl_parse_str(&a, text));
+	assert(up_eval(a, "alice", &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	p = req.upstream_pool;
+	assert(!strcmp(gwp_acl_pool_name(p), "tls"));
+	assert(gwp_acl_pool_remote_dns(p));
+	assert(gwp_acl_pool_nr_servers(p) == 2);
+	assert(!strcmp(gwp_acl_pool_server_url(p, 0),
+		       "https://u:s3cret@proxy.example:3129"));
+	assert(!strcmp(gwp_acl_pool_server_url(p, 1), "https://[2001:db8::2]"));
+	gwp_acl_req_release(&req);
+
+	assert(up_eval(a, "bob", &req) == GWP_ACL_ACCEPT);
+	p = req.upstream_pool;
+	assert(!strcmp(gwp_acl_pool_name(p), "mixed"));
+	assert(gwp_acl_pool_remote_dns(p));
+	assert(gwp_acl_pool_nr_servers(p) == 3);
+	assert(!strcmp(gwp_acl_pool_server_url(p, 1), "https://10.0.0.2:3129"));
+	gwp_acl_req_release(&req);
+	gwp_acl_destroy(a);
+}
+
+/*
  * An UPSTREAM rule with --accept is answered by the run index when there
  * are enough such rules in a row; the result is the same. (Run once: its -d
  * draws a warning.)
@@ -3352,14 +3396,18 @@ static noinline void test_upstream_errors(void)
 	up_refused("upstream p {\n server http://h;x;\n}\n", -EINVAL,
 		   "unexpected characters after the host");
 
-	/* The DNS mode and the scheme pools do not take yet. */
+	/* One DNS mode a pool; https:// resolves remotely. */
 	up_refused("upstream p {\n server socks5h://h:1;\n"
 		   " server socks5://u:s3cret@h:1;\n}\n", -EINVAL,
 		   "line 3: upstream pool p server 2 (socks5://h:1): resolves names locally, the servers before it remotely");
 	up_refused("upstream p {\n server socks5://h:1;\n server http://h:1;\n}\n",
 		   -EINVAL, "resolves names remotely, the servers before it locally");
-	up_refused("upstream p {\n server https://u:s3cret@h:1;\n}\n", -EINVAL,
-		   "server 1 (https://h:1): https:// is not supported in a pool yet");
+	up_refused("upstream p {\n server socks5://h:1;\n"
+		   " server https://u:s3cret@h:1;\n}\n", -EINVAL,
+		   "line 3: upstream pool p server 2 (https://h:1): resolves names remotely, the servers before it locally");
+	up_refused("upstream p {\n server https://h:1;\n"
+		   " server socks5://h:1;\n}\n", -EINVAL,
+		   "server 2 (socks5://h:1): resolves names locally, the servers before it remotely");
 
 	/* The limits: 64 servers a pool, 1024 pools a set. */
 	text = malloc(1100 * 64);
@@ -3482,6 +3530,7 @@ static void run_tests(void)
 	test_include_errors();
 	test_include_reload();
 	test_upstream_errors();
+	test_upstream_pool_https();
 	test_upstream_index();
 	test_upstream_include();
 	test_upstream_creds_warning();

@@ -1175,21 +1175,21 @@ static bool host_char(char c)
  * or a bracketed IPv6 one; PORT 1 to 65535. The credentials are split as
  * gwp_parse_upstream() splits them (at the last '@'), with its limits. This
  * checks the shape only: nothing is resolved, and the URL is kept as
- * written for the full parse when a connection uses it. Sets *@remote_dns,
- * *@tls and *@creds, or *@why on error (-EINVAL). *@why never quotes the
- * URL, which may hold a password.
+ * written for the full parse when a connection uses it. Sets *@remote_dns
+ * and *@creds, or *@why on error (-EINVAL). *@why never quotes the URL,
+ * which may hold a password.
  */
-static int check_server_url(const char *url, bool *remote_dns, bool *tls,
-			    bool *creds, const char **why)
+static int check_server_url(const char *url, bool *remote_dns, bool *creds,
+			    const char **why)
 {
 	static const struct {
 		const char	*scheme;
-		bool		remote_dns, tls;
+		bool		remote_dns;
 	} schemes[] = {
-		{ "socks5://",	false,	false },
-		{ "socks5h://",	true,	false },
-		{ "http://",	true,	false },
-		{ "https://",	true,	true },
+		{ "socks5://",	false },
+		{ "socks5h://",	true },
+		{ "http://",	true },
+		{ "https://",	true },
 	};
 	const char *rest = NULL, *host, *at, *p;
 	size_t i;
@@ -1200,7 +1200,6 @@ static int check_server_url(const char *url, bool *remote_dns, bool *tls,
 		if (!strncmp(url, schemes[i].scheme, len)) {
 			rest = url + len;
 			*remote_dns = schemes[i].remote_dns;
-			*tls = schemes[i].tls;
 			break;
 		}
 	}
@@ -1328,7 +1327,7 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 {
 	struct gwp_acl_pool *p = ld->pool;
 	uint32_t idx = p->nr_servers + 1;
-	bool remote_dns, tls, creds;
+	bool remote_dns, creds;
 	const char *why;
 	char shown[160];
 	char **v, *dup;
@@ -1336,13 +1335,10 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 	if (p->nr_servers == ACL_POOL_MAX_SERVERS)
 		return load_err(ld, "upstream pool %s has more than %d servers",
 				p->name, ACL_POOL_MAX_SERVERS);
-	if (check_server_url(url, &remote_dns, &tls, &creds, &why))
+	if (check_server_url(url, &remote_dns, &creds, &why))
 		return load_err(ld, "upstream pool %s server %u: %s", p->name,
 				idx, why);
 	gwp_acl_url_redact(url, shown, sizeof(shown));
-	if (tls)
-		return load_err(ld, "upstream pool %s server %u (%s): https:// is not supported in a pool yet",
-				p->name, idx, shown);
 	if (p->nr_servers && remote_dns != p->remote_dns)
 		return load_err(ld, "upstream pool %s server %u (%s): resolves names %s, the servers before it %s; a pool cannot mix the two",
 				p->name, idx, shown,
