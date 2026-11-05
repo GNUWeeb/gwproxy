@@ -1603,8 +1603,7 @@ pool, like
 and no upstream at all, has gwproxy resolve it and sends the server an
 address; a
 .BR socks5h:// " or " http://
-pool sends the server the name. Only the first server of a pool is used for
-now; the others, and the pool's method, are not.
+pool sends the server the name.
 Plain
 .B \-\-target
 forwarding to a name sends that name to a pool that resolves names. A
@@ -1614,10 +1613,30 @@ at startup; when
 itself resolves names remotely, the name is not resolved at startup, and such
 a connection is refused (and logged).
 .PP
+A pool of several servers spreads its connections over them. By default it
+takes them in turn (round\-robin): each connection that picks the pool goes
+to the next server, in the order the block lists them, whichever worker
+serves it. With
+.BR least_conn ,
+a connection goes to the server with the fewest connections open through it
+at that moment, and among servers equally loaded to the next one in turn, so
+that they share the new connections. A connection counts against its server
+from the moment it is given it, before it connects, until it ends, however it
+ends: closed by either side, refused, failed to connect or in the handshake,
+or timed out. The counts belong to the server, not to the pool: a server,
+known by its scheme, the address it resolved to, its port and its user (not
+its password), counts the connections of every pool that lists it, and keeps
+its count across a reload, so connections opened before a reload still weigh
+on the choices made after it. A reload starts each pool's turn from its first
+server again. Workers choosing at the same moment may see the same counts and
+choose the same server; the choices after them see the result.
+.PP
 Each connection that a rule sends through a pool, or
 .BR DIRECT ,
 is logged at debug level, naming the pool and its server's number, counted
-from 1, and address, never its credentials. A pool server's address is
+from 1, how many connections that server then has open, and its address,
+never its credentials; so is each connection giving its server back, with
+the count left. A pool server's address is
 resolved once, when the set loads; a reload resolves it again. A reload that
 changes the pools applies to new connections; one already through a pool's
 server keeps it until it ends.
