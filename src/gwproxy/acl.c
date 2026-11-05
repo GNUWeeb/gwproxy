@@ -92,6 +92,12 @@ struct gwp_acl_pool {
 	uint32_t		nr_servers;
 	/* The server URLs as written, credentials included. */
 	char			**servers;
+	/*
+	 * What @ops made of each URL, NULL without @ops; the pool holds a
+	 * reference to each, dropped with @ops->put when it is freed.
+	 */
+	void			**srv;
+	const struct gwp_acl_server_ops *ops;
 	uint8_t			method;		/* enum gwp_acl_pool_method */
 	bool			remote_dns;
 	bool			have_method;	/* "least_conn;" seen */
@@ -273,6 +279,8 @@ struct gwp_acl_ruleset {
 struct gwp_acl {
 	_Atomic(struct gwp_acl_ruleset *) rs;
 	char			*path;
+	/* Makes the pool servers of every load; see gwp_acl_create_ops(). */
+	const struct gwp_acl_server_ops *ops;
 	/*
 	 * The files the last load or reload read or tried to read, @path
 	 * first; see gwp_acl_file(). Only the reloading thread touches them.
@@ -349,6 +357,7 @@ struct acl_file_key {
  *     opened it, or NULL.
  *   @refs: the -j UPSTREAM rules that name a pool, resolved once the whole
  *     set is read (see resolve_pools()).
+ *   @ops: what turns a pool server's URL into its object, or NULL.
  *   @creds: the file being parsed holds a server URL with credentials.
  *   @include_failed: the error parse_line() returned came from an include.
  *   @reported: the error parse_line() returned has been reported already.
@@ -372,6 +381,7 @@ struct acl_load {
 	unsigned		pool_line;
 	struct acl_pool_ref	*refs;
 	size_t			nr_refs;
+	const struct gwp_acl_server_ops *ops;
 	bool			creds;
 	bool			include_failed;
 	bool			reported;
@@ -1080,6 +1090,11 @@ const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i)
 	return i < p->nr_servers ? p->servers[i] : NULL;
 }
 
+void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i)
+{
+	return i < p->nr_servers && p->srv ? p->srv[i] : NULL;
+}
+
 void gwp_acl_pool_get(struct gwp_acl_pool *p)
 {
 	atomic_fetch_add_explicit(&p->ref, 1, memory_order_relaxed);
@@ -1096,8 +1111,11 @@ void gwp_acl_pool_put(struct gwp_acl_pool *p)
 	for (i = 0; i < p->nr_servers; i++) {
 		explicit_bzero(p->servers[i], strlen(p->servers[i]));
 		free(p->servers[i]);
+		if (p->srv && p->srv[i])
+			p->ops->put(p->ops->arg, p->srv[i]);
 	}
 	free(p->servers);
+	free(p->srv);
 	free(p);
 }
 
@@ -1333,9 +1351,34 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 	if (!v)
 		return -ENOMEM;
 	p->servers = v;
+	if (ld->ops) {
+		void **sv = realloc(p->srv, (p->nr_servers + 1) * sizeof(*sv));
+
+		if (!sv)
+			return -ENOMEM;
+		p->srv = sv;
+		p->ops = ld->ops;
+	}
 	dup = strdup(url);
 	if (!dup)
 		return -ENOMEM;
+	if (ld->ops) {
+		char err[160] = "";
+		void *srv = NULL;
+		int r;
+
+		r = ld->ops->make(ld->ops->arg, url, &srv, err, sizeof(err));
+		if (r) {
+			explicit_bzero(dup, strlen(dup));
+			free(dup);
+			if (r == -ENOMEM)
+				return r;
+			return load_err(ld, "upstream pool %s server %u (%s): %s",
+					p->name, idx, shown,
+					err[0] ? err : strerror(-r));
+		}
+		p->srv[p->nr_servers] = srv;
+	}
 	p->servers[p->nr_servers++] = dup;
 	p->remote_dns = remote_dns;
 	if (creds)
@@ -2969,6 +3012,12 @@ int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
 
 int gwp_acl_create(struct gwp_acl **out, const char *path)
 {
+	return gwp_acl_create_ops(out, path, NULL);
+}
+
+int gwp_acl_create_ops(struct gwp_acl **out, const char *path,
+		       const struct gwp_acl_server_ops *ops)
+{
 	struct gwp_acl_ruleset *rs;
 	struct gwp_acl *acl;
 	struct acl_load ld;
@@ -2984,6 +3033,7 @@ int gwp_acl_create(struct gwp_acl **out, const char *path)
 		return -ENOMEM;
 
 	load_init(&ld, rs);
+	ld.ops = ops;
 	r = load_finish(&ld, load_file(&ld, path));
 	if (!r) {
 		r = acl_alloc(&acl, rs);
@@ -2998,6 +3048,7 @@ int gwp_acl_create(struct gwp_acl **out, const char *path)
 
 	acl->files = ld.files;
 	acl->nr_files = ld.nr_files;
+	acl->ops = ops;
 	acl->path = strdup(path);
 	if (!acl->path) {
 		gwp_acl_destroy(acl);
@@ -3023,6 +3074,7 @@ int gwp_acl_reload(struct gwp_acl *acl)
 		return -ENOMEM;
 
 	load_init(&ld, rs);
+	ld.ops = acl->ops;
 	r = load_finish(&ld, load_file(&ld, acl->path));
 
 	/*

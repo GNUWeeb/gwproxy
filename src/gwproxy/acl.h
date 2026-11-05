@@ -83,6 +83,14 @@ uint32_t gwp_acl_pool_nr_servers(const struct gwp_acl_pool *p);
  */
 const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i);
 
+/*
+ * The object made of the pool's @i-th server URL when the rule set loaded
+ * (see struct gwp_acl_server_ops), or NULL when @i is out of range or the
+ * ACL was created without ops. The pool holds a reference to it for as long
+ * as the pool lives; take your own to keep it longer.
+ */
+void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i);
+
 /* Take another reference to @p. */
 void gwp_acl_pool_get(struct gwp_acl_pool *p);
 
@@ -144,6 +152,34 @@ int gwp_acl_parse_bind_source(const char *s, struct gwp_sockaddr *out);
  * is warned about on stderr; no message shows the credentials.
  */
 int gwp_acl_create(struct gwp_acl **out, const char *path);
+
+/*
+ * What makes a pool server's object out of its URL, for a caller that wants
+ * every server checked and set up when the rule set loads, not when a
+ * connection first uses it (acl.c itself only checks the URL's shape).
+ *
+ * @make parses @url (it passed the shape check) into a new object with one
+ * reference, stored in *@srv, and returns 0; or returns a negative errno and
+ * may put the reason in @why (@size bytes), which then fails the load with
+ * the file and line of the server. Neither @why nor any message may show the
+ * URL's credentials. @put drops a reference @make handed out. Both get @arg,
+ * and are called from the thread that loads or reloads, or (@put) from
+ * whichever drops the last reference to a pool.
+ */
+struct gwp_acl_server_ops {
+	int	(*make)(void *arg, const char *url, void **srv, char *why,
+			size_t size);
+	void	(*put)(void *arg, void *srv);
+	void	*arg;
+};
+
+/*
+ * gwp_acl_create(), and every server of every pool of this load and of the
+ * reloads to come is made with @ops (NULL: none, as gwp_acl_create()). @ops
+ * must outlive the ACL and every pool reference taken from it.
+ */
+int gwp_acl_create_ops(struct gwp_acl **out, const char *path,
+		       const struct gwp_acl_server_ops *ops);
 
 /*
  * Parse an ACL from an in-memory NUL-terminated rule text (the built-in

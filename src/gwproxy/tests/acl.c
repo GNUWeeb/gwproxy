@@ -2790,6 +2790,162 @@ static noinline void test_upstream_reload_readers(void)
 	free(path);
 }
 
+/*
+ * Pool servers made at load (struct gwp_acl_server_ops): a stand-in for the
+ * server objects gwproxy makes, counting how many are alive, so a test can
+ * tell that every one made is dropped again, and none too early.
+ */
+struct up_srv {
+	atomic_uint	ref;
+	char		url[128];
+};
+
+static atomic_int g_up_live;
+static int g_up_made;
+
+static int up_srv_make(void *arg, const char *url, void **out, char *why,
+		       size_t size)
+{
+	struct up_srv *s;
+
+	assert(arg == &g_up_live);
+	if (strstr(url, "unresolvable")) {
+		snprintf(why, size, "the host does not resolve");
+		return -EINVAL;
+	}
+	if (strstr(url, "nowhy"))
+		return -EAFNOSUPPORT;
+	s = calloc(1, sizeof(*s));
+	assert(s);
+	atomic_init(&s->ref, 1);
+	snprintf(s->url, sizeof(s->url), "%s", url);
+	atomic_fetch_add(&g_up_live, 1);
+	g_up_made++;
+	*out = s;
+	return 0;
+}
+
+static void up_srv_put(void *arg, void *srv)
+{
+	struct up_srv *s = srv;
+
+	assert(arg == &g_up_live);
+	assert(atomic_load(&s->ref) > 0);
+	if (atomic_fetch_sub(&s->ref, 1) != 1)
+		return;
+	memset(s->url, 'x', sizeof(s->url));
+	free(s);
+	assert(atomic_fetch_sub(&g_up_live, 1) > 0);
+}
+
+static const struct gwp_acl_server_ops up_srv_ops = {
+	.make	= up_srv_make,
+	.put	= up_srv_put,
+	.arg	= &g_up_live,
+};
+
+/* The server object @p's @i-th URL was made into, checked against it. */
+static struct up_srv *up_srv_of(const struct gwp_acl_pool *p, uint32_t i)
+{
+	struct up_srv *s = gwp_acl_pool_server(p, i);
+
+	assert(s && !strcmp(s->url, gwp_acl_pool_server_url(p, i)));
+	return s;
+}
+
+/*
+ * Every pool server is made when the set loads, and kept with its pool: a
+ * server a connection took a reference to outlives the pool, the reload that
+ * dropped it and the ACL. A server that cannot be made fails the load (or
+ * the reload, keeping the servers in force) with its file and line, and the
+ * servers made before it are dropped.
+ */
+static noinline void test_upstream_server_ops(void)
+{
+	char *dir = inc_dir(), *path, *said;
+	struct gwp_acl_req req;
+	struct up_srv *held;
+	struct gwp_acl *a;
+	int r;
+
+	g_up_made = 0;
+	path = inc_write(dir, "main.acl",
+			 "upstream p {\n"
+			 " server http://u:s3cret@10.0.0.1:3128;\n"
+			 " server http://10.0.0.2:3128;\n"
+			 "}\n"
+			 "upstream q {\n server socks5://10.0.0.3:1080;\n}\n"
+			 "-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_create_ops(&a, path, &up_srv_ops));
+	assert(g_up_made == 3 && atomic_load(&g_up_live) == 3);
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	assert(up_srv_of(req.upstream_pool, 0) != up_srv_of(req.upstream_pool, 1));
+	assert(!gwp_acl_pool_server(req.upstream_pool, 2));
+	/* What a connection does: keep the server, not the pool. */
+	held = up_srv_of(req.upstream_pool, 1);
+	atomic_fetch_add(&held->ref, 1);
+	gwp_acl_req_release(&req);
+
+	/* A reload makes the new set's servers and drops the old ones'. */
+	inc_put(dir, "main.acl",
+		"upstream p {\n server http://10.0.0.4:3128;\n}\n"
+		"-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_reload(a));
+	assert(g_up_made == 4 && atomic_load(&g_up_live) == 2);
+	assert(!strcmp(held->url, "http://10.0.0.2:3128"));
+
+	/* A server that cannot be made fails the reload; the rest go too. */
+	inc_put(dir, "main.acl",
+		"upstream p {\n"
+		" server http://10.0.0.5:3128;\n"
+		" server http://u:s3cret@unresolvable.invalid:3128;\n"
+		"}\n");
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, -EINVAL, said);
+	assert(strstr(said, "main.acl: line 3: upstream pool p server 2 (http://unresolvable.invalid:3128): the host does not resolve"));
+	assert(!strstr(said, "s3cret"));
+	free(said);
+	assert(g_up_made == 5 && atomic_load(&g_up_live) == 2);
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(!strcmp(up_srv_of(req.upstream_pool, 0)->url,
+		       "http://10.0.0.4:3128"));
+	gwp_acl_req_release(&req);
+
+	/* With no reason given, the errno says why. */
+	inc_put(dir, "main.acl", "upstream p {\n server http://nowhy:1;\n}\n");
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, -EINVAL, said);
+	assert(strstr(said, "main.acl: line 2: upstream pool p server 1 (http://nowhy:1): "));
+	assert(strstr(said, strerror(EAFNOSUPPORT)));
+	free(said);
+
+	/* The ACL goes; the server a connection holds stays. */
+	gwp_acl_destroy(a);
+	assert(atomic_load(&g_up_live) == 1);
+	assert(!strcmp(held->url, "http://10.0.0.2:3128"));
+	up_srv_put(&g_up_live, held);
+	assert(atomic_load(&g_up_live) == 0);
+
+	/* Without ops, a pool has its URLs and no server objects. */
+	inc_put(dir, "main.acl", "upstream p {\n server http://10.0.0.1:1;\n}\n"
+				 "-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(gwp_acl_pool_server_url(req.upstream_pool, 0));
+	assert(!gwp_acl_pool_server(req.upstream_pool, 0));
+	gwp_acl_req_release(&req);
+	gwp_acl_destroy(a);
+	assert(g_up_made == 5);
+
+	free(path);
+	inc_rmdir(dir);
+}
+
 /* Every way the pool syntax and -j UPSTREAM can be wrong, one at a time. */
 static noinline void test_upstream_errors(void)
 {
@@ -3054,6 +3210,7 @@ static void run_tests(void)
 	test_upstream_pool_outlives_reload();
 	test_upstream_take_pool();
 	test_upstream_reload_readers();
+	test_upstream_server_ops();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();
