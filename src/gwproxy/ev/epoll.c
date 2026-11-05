@@ -634,8 +634,12 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		if (target_fd != -EMFILE && target_fd != -ENFILE) {
 			pr_err(&ctx->lh, "Failed to create target socket: %s",
 				strerror(-target_fd));
-			/* A connect refused at once, say. */
-			gwp_conn_upstream_failed(w, gcp, target_fd);
+			/*
+			 * A connect refused at once, say: with nothing set up
+			 * yet, its retry is just this again.
+			 */
+			if (gwp_conn_upstream_failed(w, gcp, target_fd, true))
+				return start_new_target(w, gcp);
 		}
 		return target_fd;
 	}
@@ -1531,6 +1535,81 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
  */
 
 /*
+ * Plain and transparent forwarding's retry: a new target socket to the
+ * pair's new upstream, registered as start_new_target() does, but with the
+ * client already registered. Like any connect it ends in
+ * handle_ev_target_conn_result() or handle_ev_target_conn_err().
+ */
+static int redial_plain(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_sockaddr *ca;
+	struct epoll_event ev;
+	int fd;
+
+	fd = gwp_conn_dial_addr(w->ctx, gcp, &ca);
+	if (unlikely(fd))
+		return fd;
+
+	fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt,
+				    &gcp->is_target_alive, true);
+	if (fd < 0) {
+		/* Counted; the one retry is spent. */
+		gwp_conn_upstream_failed(w, gcp, fd, false);
+		return fd;
+	}
+	gcp->target.fd = fd;
+	/* The handshake runs from the connect result, as for the first. */
+	gcp->is_target_alive = false;
+	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
+	ev.events = gcp->target.ep_mask;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
+	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+/*
+ * gwp_conn_upstream_failed() has moved the pair to another server of its
+ * pool after the attempt on the old one failed with @err. Close that
+ * attempt's socket, put the pair back as it was before it dialled, and
+ * dial the new server: through the attempt path for the SOCKS5 and HTTP
+ * front-ends, a direct socket for plain forwarding, as the first dial
+ * went. Nothing of the client's has been sent (it waits in client.buf
+ * until the tunnel is up), so nothing is replayed or lost. The connect
+ * timer is left running: the retry has what is left of the pair's connect
+ * timeout, no more. Returns 0 once the new attempt is under way, else the
+ * error that ends the pair, with the client answered as for any failure.
+ */
+static int upstream_redial(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   int err)
+{
+	int r;
+
+	if (gcp->target.fd >= 0) {
+		/* Closing it takes it out of the epoll set too. */
+		__sys_close(gcp->target.fd);
+		gcp->target.fd = -1;
+		gcp->target.ep_mask = 0;
+		r = credit_fd_closed(w, 1);
+		if (unlikely(r))
+			return r;
+	}
+
+	switch (gcp->prot_type) {
+	case GWP_PROT_TYPE_SOCKS5:
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_SOCKS5_CONNECT);
+		break;
+	case GWP_PROT_TYPE_HTTP:
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_HTTP_CONNECT);
+		break;
+	default:
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_FORWARDING);
+		return redial_plain(w, gcp);
+	}
+
+	gcp->next_cand = 0;
+	return connect_next_candidate(w, gcp, err);
+}
+
+/*
  * Describe the upstream destination for logging. With socks5h:// the real
  * destination is a hostname (target_addr is unset), so show up_dst instead.
  */
@@ -1544,7 +1623,8 @@ static int upstream_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int r;
 
-	gwp_conn_upstream_failed(w, gcp, err);
+	if (gwp_conn_upstream_failed(w, gcp, err, true))
+		return upstream_redial(w, gcp, err);
 	r = gwp_upstream_fail_reply(w, gcp, err);
 
 	if (r > 0) {
@@ -2347,12 +2427,22 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r;
 
 	/*
+	 * No target socket, so this event is for one that is gone: a retry
+	 * (upstream_redial()) started from a client event closed it after
+	 * epoll had reported it in the same batch. EV_BIT_TARGET is only
+	 * ever registered for target.fd.
+	 */
+	if (unlikely(gcp->target.fd < 0))
+		return 0;
+
+	/*
 	 * Held before the upstream handshake, the target is watched only for
 	 * a hangup: the upstream went away before it was spoken to.
 	 */
 	if (unlikely(upstream_start_held(gcp))) {
 		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_HUP, 0);
-		gwp_conn_upstream_failed(w, gcp, -ECONNRESET);
+		if (gwp_conn_upstream_failed(w, gcp, -ECONNRESET, true))
+			return upstream_redial(w, gcp, -ECONNRESET);
 		return -ECONNRESET;
 	}
 
@@ -2362,7 +2452,8 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			if (gwp_in_upstream_hs(gcp))
 				return upstream_fail(w, gcp, r);
 			/* Plain forwarding's connect to its upstream. */
-			gwp_conn_upstream_failed(w, gcp, r);
+			if (gwp_conn_upstream_failed(w, gcp, r, true))
+				return upstream_redial(w, gcp, r);
 			return r;
 		}
 
@@ -2560,7 +2651,8 @@ static int handle_conn_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		if (!gwp_in_dns_lookup(gcp)) {
 			gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TIMEOUT,
 					      gwp_upstream_timeout_val(gcp));
-			gwp_conn_upstream_failed(w, gcp, -ETIMEDOUT);
+			/* No time left to retry in. */
+			gwp_conn_upstream_failed(w, gcp, -ETIMEDOUT, false);
 		}
 		if (gwp_in_upstream_hs(gcp))
 			gcp->target.len = 0;
@@ -2781,7 +2873,11 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 exhausted:
 	pr_dbg(&w->ctx->lh, "No target address left to try (idx=%u): %s",
 		gcp->idx, strerror(-err));
-	gwp_conn_upstream_failed(w, gcp, err);
+	/* No socket left to close: the retry walks the candidates again. */
+	if (gwp_conn_upstream_failed(w, gcp, err, true)) {
+		gcp->next_cand = 0;
+		return connect_next_candidate(w, gcp, err);
+	}
 
 	if (!gwp_conn_fail_reply(w, gcp, err) && gcp->target.len) {
 		ssize_t sr = __do_send(&gcp->target, &gcp->client);

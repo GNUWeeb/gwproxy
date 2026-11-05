@@ -2088,6 +2088,48 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 /*
+ * gwp_conn_upstream_failed() has moved the pair to another server of its
+ * pool after the attempt on the old one failed with @err, with nothing in
+ * flight on the old socket. Close it, put the pair back as it was before
+ * it dialled (an https:// upstream's engine and scratch go too), and dial
+ * the new server through the candidate walk, as the first dial went.
+ * Nothing of the client's has been sent: it waits in its socket, or in
+ * client.buf, until the tunnel is up, so nothing is replayed or lost. The
+ * connect timer and the client watch stay armed: the retry has what is
+ * left of the pair's connect timeout, no more. Returns 0 once the new
+ * attempt is under way, else the error that ends the pair, with the client
+ * answered as for any failure.
+ */
+static int upstream_iou_redial(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			       int err)
+{
+	if (gcp->target.fd >= 0) {
+		prep_close(w, gcp->target.fd);
+		gcp->target.fd = -1;
+	}
+
+	switch (gcp->prot_type) {
+	case GWP_PROT_TYPE_SOCKS5:
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_SOCKS5_CONNECT);
+		break;
+	case GWP_PROT_TYPE_HTTP:
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_HTTP_CONNECT);
+		break;
+	default:
+		/* Plain forwarding connects from the state it was made in. */
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_INIT);
+		break;
+	}
+#ifdef CONFIG_HTTPS
+	free(gcp->up_tls_io);
+	gcp->up_tls_io = NULL;
+#endif
+
+	gcp->next_cand = 0;
+	return connect_next_candidate(w, gcp, err);
+}
+
+/*
  * A handshake with the upstream proxy failed. Tell the downstream client in
  * whatever protocol it speaks and return @err so the caller tears the pair
  * down; the reply's send goes out ahead of the teardown's cancels.
@@ -2095,7 +2137,12 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 static int upstream_iou_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			     int err)
 {
-	gwp_conn_upstream_failed(w, gcp, err);
+	/*
+	 * The old socket can go only with nothing in flight on it: a
+	 * completion for it would be taken for the new attempt's.
+	 */
+	if (gwp_conn_upstream_failed(w, gcp, err, !gcp->nr_ops_target))
+		return upstream_iou_redial(w, gcp, err);
 	if (gwp_upstream_fail_reply(w, gcp, err) > 0)
 		prep_send_client(w, gcp);
 	return err;
@@ -2115,6 +2162,10 @@ static int upstream_tls_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (hs == GWP_SSL_ERROR) {
 		gwp_upstream_tls_fail(w, gcp);
+		/* A retry goes first: the alert's send would hold the socket. */
+		if (gwp_conn_upstream_failed(w, gcp, -EPROTO,
+					     !gcp->nr_ops_target))
+			return upstream_iou_redial(w, gcp, -EPROTO);
 		/*
 		 * The alert tells the proxy why. Like the client's reply, its
 		 * send goes out ahead of the teardown's cancels.
@@ -2582,7 +2633,8 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				gwp_upstream_note_end(gcp,
 						      GWP_UPSTREAM_END_TIMEOUT,
 						      gwp_upstream_timeout_val(gcp));
-				gwp_conn_upstream_failed(w, gcp, r);
+				/* No time left to retry in. */
+				gwp_conn_upstream_failed(w, gcp, r, false);
 			}
 
 			if (gwp_in_upstream_hs(gcp)) {
@@ -3025,7 +3077,11 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 exhausted:
 	pr_dbg(&w->ctx->lh, "No target address left to try (idx=%u): %s",
 		gcp->idx, strerror(-err));
-	gwp_conn_upstream_failed(w, gcp, err);
+	/* No socket left to close: the retry walks the candidates again. */
+	if (gwp_conn_upstream_failed(w, gcp, err, true)) {
+		gcp->next_cand = 0;
+		return connect_next_candidate(w, gcp, err);
+	}
 
 	/*
 	 * Report the failure instead of just hanging up, so the client learns

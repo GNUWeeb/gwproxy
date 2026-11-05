@@ -356,6 +356,32 @@ static int http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return GWP_UPSTREAM_IO_SEND;
 }
 
+void gwp_upstream_hs_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   int state)
+{
+	if (gwp_in_upstream_hs(gcp))
+		gcp->target.len = 0;
+	gwp_conn_buf_compact(&gcp->target);
+	/*
+	 * The whole buffer again, as before the handshake: build_connect()
+	 * and http_start() held the client's reply room back, and
+	 * gwp_upstream_splice_reply() may or may not have given it back
+	 * before it failed, so set it rather than add to it.
+	 */
+	gcp->target.cap = (uint32_t)w->ctx->cfg.target_buf_size;
+	gcp->target.rd_eof = false;
+	gcp->target.wr_shut = false;
+#ifdef CONFIG_HTTPS
+	if (gcp->target.tls) {
+		gwp_ssl_free(gcp->target.tls);
+		gcp->target.tls = NULL;
+	}
+#endif
+	gcp->up_tx = false;
+	gcp->up_scan = 0;
+	gcp->conn_state = state;
+}
+
 int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	if (gcp->upstream->type == GWP_UPSTREAM_HTTP)

@@ -12,7 +12,9 @@
 # their slots back when they close. Every way a pair ends gives its slot
 # back, once: the client closing, the target refused by the upstream, the
 # upstream refusing or answering garbage, the upstream refusing the TCP
-# connection, and the idle timeout; afterwards every count is back to 0,
+# connection (both retried on the other server, so the pair gives back two
+# slots, one per server), and the idle timeout; afterwards every count is
+# back to 0,
 # which the next picks show, and gwproxy finds every reference given back
 # at exit. Counts are read from the debug log: a pick says how many pairs
 # its server then has open, a release how many it has left. On every
@@ -144,12 +146,14 @@ wait_rel()
 	fail "$1: the pair did not give its server back"
 }
 
-# through <tag> <user:pass> <pool> <url> <ok|fail>: one connection by that
-# user, which must pick <pool> and end (one release) before this returns;
-# the transfer must work (ok) or not (fail). Leaves the pick in PICK_*.
+# through <tag> <user:pass> <pool> <url> <ok|fail> [releases]: one
+# connection by that user, which must pick <pool> and end (one release, or
+# <releases>: a connection retried on another server gives back both)
+# before this returns; the transfer must work (ok) or not (fail). Leaves
+# the pick in PICK_*.
 through()
 {
-	local np nr ec=0
+	local np nr ec=0 nrel_want="${6:-1}"
 
 	np="$(npick "$3")"
 	nr="$(nrel)"
@@ -165,7 +169,7 @@ through()
 	fi
 	[ "$(npick "$3")" -eq $((np + 1)) ] || \
 		fail "$1: the connection did not pick pool $3"
-	wait_rel "$1" $((nr + 1))
+	wait_rel "$1" $((nr + nrel_want))
 	last_pick "$3"
 }
 
@@ -311,18 +315,23 @@ for loop in epoll io_uring; do
 		fail "[$loop] target refused: :$PICK_PORT kept a pair"
 
 	# An upstream that refuses, one that is not there, one that answers
-	# garbage: round-robin over the two servers of the bad pool.
+	# garbage: round-robin over the two servers of the bad pool. The
+	# refusal is the target's (REP 0x05), not retried; the other two are
+	# the upstream's own, retried once on the other server, which fails
+	# too, and the pair gives both servers back.
 	echo refuse >"$WORK/fault"
 	through "[$loop upstream refuse]" carol:pc bad "$url" fail
 	[ "$PICK_PORT" = "$rf" ] && [ "$(last_rel "$rf")" = 0 ] || \
 		fail "[$loop] upstream refuse: :$PICK_PORT kept a pair"
-	through "[$loop upstream dead]" carol:pc bad "$url" fail
-	[ "$PICK_PORT" = "$rdead" ] && [ "$(last_rel "$rdead")" = 0 ] || \
-		fail "[$loop] upstream dead: :$PICK_PORT kept a pair"
+	through "[$loop upstream dead]" carol:pc bad "$url" fail 2
+	[ "$PICK_PORT" = "$rdead" ] && [ "$(last_rel "$rdead")" = 0 ] &&
+	[ "$(last_rel "$rf")" = 0 ] || \
+		fail "[$loop] upstream dead: a server kept a pair"
 	echo bad_ver >"$WORK/fault"
-	through "[$loop upstream garbage]" carol:pc bad "$url" fail
-	[ "$PICK_PORT" = "$rf" ] && [ "$(last_rel "$rf")" = 0 ] || \
-		fail "[$loop] upstream garbage: :$PICK_PORT kept a pair"
+	through "[$loop upstream garbage]" carol:pc bad "$url" fail 2
+	[ "$PICK_PORT" = "$rf" ] && [ "$(last_rel "$rf")" = 0 ] &&
+	[ "$(last_rel "$rdead")" = 0 ] || \
+		fail "[$loop] upstream garbage: a server kept a pair"
 
 	# Every count is 0 again: equal servers take new pairs in turn.
 	seen=""

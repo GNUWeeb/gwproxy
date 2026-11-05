@@ -3980,9 +3980,42 @@ static enum gwp_upstream_end upstream_end_of(struct gwp_conn_pair *gcp,
 	return GWP_UPSTREAM_END_CONNECT;
 }
 
-enum gwp_upstream_fail_class
-gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			 int err)
+/*
+ * The one retry of @gcp, whose attempt through the @gcp->up_srv-th server
+ * of its pool failed: move it to the next server in service, if there is
+ * one. Returns whether it did.
+ */
+static bool upstream_retry(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream *old = gcp->upstream, *up;
+	char d_old[320];
+	uint32_t i;
+
+	gcp->flags |= GWP_CONN_FLAG_UP_RETRIED;
+	i = pool_pick_server(w->ctx, gcp->up_pool, gcp->up_srv);
+	up = gwp_acl_pool_server(gcp->up_pool, i);
+	if (!up) {
+		pr_dbg(&w->ctx->lh, "Upstream %s failed (idx=%u); no other server in service to retry on",
+		       up_desc(gcp->up_pool, gcp->up_srv, old, d_old,
+			       sizeof(d_old)), gcp->idx);
+		return false;
+	}
+
+	up_desc(gcp->up_pool, gcp->up_srv, old, d_old, sizeof(d_old));
+	gwp_conn_set_upstream(w->ctx, gcp, up);
+	gcp->up_srv = (uint8_t)i;
+	/* A new attempt: its failure is its own. */
+	gcp->flags &= ~GWP_CONN_FLAG_UP_FAILED;
+	gcp->up_end = 0;
+	gcp->up_val = 0;
+	pr_dbg(&w->ctx->lh, "Upstream retry for idx=%u: %s failed, trying server %u (%s), %u open",
+	       gcp->idx, d_old, i + 1, ip_to_str(&up->addr),
+	       gwp_up_state_open(up->state));
+	return true;
+}
+
+bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      int err, bool may_retry)
 {
 	enum gwp_upstream_fail_class cls;
 	enum gwp_upstream_end end;
@@ -3991,7 +4024,7 @@ gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	char why[64];
 
 	if (!up || gcp->is_target_alive || (gcp->flags & GWP_CONN_FLAG_UP_FAILED))
-		return GWP_UPSTREAM_FAIL_NEUTRAL;
+		return false;
 	gcp->flags |= GWP_CONN_FLAG_UP_FAILED;
 
 	if (gcp->up_end) {
@@ -4001,6 +4034,14 @@ gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		end = upstream_end_of(gcp, err);
 		val = (unsigned int)(err < 0 ? -err : err);
 	}
+	/*
+	 * A retry runs on what the first attempt left of the connect
+	 * timeout, which may be next to nothing: running out of it says
+	 * little about the second server, so it does not count.
+	 */
+	if (end == GWP_UPSTREAM_END_TIMEOUT &&
+	    (gcp->flags & GWP_CONN_FLAG_UP_RETRIED))
+		val = 1;
 	cls = gwp_upstream_fail_classify(end, (int)val);
 
 	switch (end) {
@@ -4039,7 +4080,12 @@ gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				GWP_UP_EJECT_MS / 1000, GWP_UP_EJECT_FAILS,
 				GWP_UP_EJECT_WINDOW_MS / 1000);
 	}
-	return cls;
+
+	if (cls != GWP_UPSTREAM_FAIL_UPSTREAM || !may_retry || !gcp->up_pool ||
+	    (gcp->flags & (GWP_CONN_FLAG_UP_RETRIED | GWP_CONN_FLAG_IS_DYING |
+			   GWP_CONN_FLAG_IS_CANCEL)))
+		return false;
+	return upstream_retry(w, gcp);
 }
 
 void gwp_conn_upstream_up(struct gwp_conn_pair *gcp)
