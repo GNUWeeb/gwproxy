@@ -3405,20 +3405,18 @@ static void gwp_ctx_free_tls(struct gwp_ctx *ctx)
 
 #ifdef CONFIG_HTTPS
 /*
- * An https:// upstream proxy: the client TLS context its connections use,
- * verifying the proxy's certificate against --upstream-ca-file, or else the
- * system's trust store. The proxy's name is tried on a connection here, so a
- * host OpenSSL cannot use (for SNI, say) fails now rather than every
- * connection.
+ * The client TLS context of every https:// upstream, the --upstream-proxy
+ * one and the servers of ACL upstream pools alike, verifying the proxy's
+ * certificate against --upstream-ca-file, or else the system's trust store:
+ * one trust store for all. @need says whether one is needed at all.
  */
 __cold
-static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
+static int upstream_init_tls_ctx(struct gwp_ctx *ctx, bool need)
 {
 	const char *ca = ctx->cfg.upstream_ca_file;
-	struct gwp_ssl *s;
 	int r, fd;
 
-	if (!up->use_tls) {
+	if (!need) {
 		if (ca) {
 			pr_err(&ctx->lh, "--upstream-ca-file needs an https:// --upstream-proxy");
 			return -EINVAL;
@@ -3451,15 +3449,44 @@ static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
 			       gwp_ssl_errstr());
 		return r;
 	}
+	return 0;
+}
+
+/*
+ * Try the host of the https:// upstream @up on a connection of the client
+ * context, so a host OpenSSL cannot use (for SNI, say) fails now rather than
+ * every connection.
+ */
+__cold
+static int upstream_check_tls_host(struct gwp_ctx *ctx, struct gwp_upstream *up)
+{
+	struct gwp_ssl *s;
+	int r;
 
 	s = gwp_ssl_client_new(ctx->up_ssl_ctx);
 	if (!s)
 		return -ENOMEM;
 	r = gwp_ssl_set_peer_name(s, up->host, up->host_is_ip);
 	gwp_ssl_free(s);
+	return r;
+}
+
+/* An https:// --upstream-proxy: its client TLS context, and its host. */
+__cold
+static int upstream_init_tls(struct gwp_ctx *ctx, struct gwp_upstream *up)
+{
+	const char *ca = ctx->cfg.upstream_ca_file;
+	int r;
+
+	r = upstream_init_tls_ctx(ctx, up->use_tls);
+	if (r || !up->use_tls)
+		return r;
+
+	r = upstream_check_tls_host(ctx, up);
 	if (r) {
-		pr_err(&ctx->lh, "--upstream-proxy host '%s' cannot be checked as a TLS server name",
-		       up->host);
+		if (r == -EINVAL)
+			pr_err(&ctx->lh, "--upstream-proxy host '%s' cannot be checked as a TLS server name",
+			       up->host);
 		return r;
 	}
 
