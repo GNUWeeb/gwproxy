@@ -61,12 +61,22 @@ static void test_connect(void)
 	}
 }
 
+/*
+ * Out of time waiting for the CONNECT's reply: the destination may be the
+ * one that does not answer, so it does not count.
+ */
+static void test_timeout_reply(void)
+{
+	CHECK(TIMEOUT, 1, N);
+}
+
 /* The ends that always count, whatever @val holds. */
 static void test_always_upstream(void)
 {
 	CHECK(TLS, 0, U);
 	CHECK(MALFORMED, 0, U);
 	CHECK(HUP, 0, U);
+	/* Out of time before the CONNECT was out: the upstream's. */
 	CHECK(TIMEOUT, 0, U);
 
 	/* No acceptable method, or one we never offered. */
@@ -187,6 +197,7 @@ int main(void)
 {
 	test_connect();
 	test_always_upstream();
+	test_timeout_reply();
 	test_s5_auth();
 	test_s5_rep();
 	test_http();

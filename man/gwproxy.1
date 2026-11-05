@@ -1396,7 +1396,8 @@ An ACL reload rebuilds the upstream pools too (see
 every pool server is parsed and its host resolved again, and a server that
 fails fails the reload, which keeps the rules and pools in force. New
 connections use the new pools; one already through a pool's server keeps that
-server until it ends.
+server until it ends. The servers' health, an ejection included, carries over
+as their counts do.
 .PP
 The auth file must be a regular file. Unlike the ACL files, it is not checked
 for being one before it is opened: a FIFO put in its place makes a reload
@@ -1515,8 +1516,10 @@ not count), and is sent as the TLS server
 name (SNI); an IP address literal must be among its IP addresses, and is not
 sent as SNI. TLS 1.2 is the oldest version accepted. A handshake that fails,
 or a certificate that is refused, fails the connection as any other upstream
-failure does (SOCKS5 reply 0x01, HTTP 502 to the client) and is logged with
-the reason, for example
+failure does (SOCKS5 reply 0x01, HTTP 502 to the client, after a pool's retry
+on another server; see
+.BR "Upstream pools" )
+and is logged with the reason, for example
 .IR "certificate verify failed: hostname mismatch" .
 .PP
 The end of the upstream's stream reaches the client as a normal end of stream
@@ -1658,6 +1661,71 @@ its count across a reload, so connections opened before a reload still weigh
 on the choices made after it. A reload starts each pool's turn from its first
 server again. Workers choosing at the same moment may see the same counts and
 choose the same server; the choices after them see the result.
+.PP
+A pool also keeps track of its servers' health, from the connections they
+carry (passively: gwproxy sends no probes of its own). A failure counts
+against a server only when it is the server's own: its TCP connection
+refused, reset or timed out, its TLS handshake failing (a refused
+certificate included), a SOCKS5 server that accepts none of the offered
+authentication methods, refuses the credentials or answers reply 0x07 or
+0x08, an HTTP server that answers 407, a reply that does not parse, the
+server hanging up, or the connect timeout running out before gwproxy has
+sent its CONNECT request (during the TCP connect, the TLS handshake or the
+SOCKS5 method and authentication exchange). A failure the server reports for
+the target (SOCKS5 replies 0x03 to 0x06, HTTP 502 and 504) reaches the client
+as it is and never counts, and neither do ambiguous refusals (SOCKS5 replies
+0x01 and 0x02, HTTP 403, 500, 503 and any other status), the timeout running
+out while the server is waiting for the target to answer the CONNECT (a
+target that never answers holds a healthy server up), nor local trouble such
+as running out of descriptors. Three failures
+that count, within 30 seconds, eject the server for 5 minutes: no pool picks
+it meanwhile, and round\-robin and
+.B least_conn
+alike spread its share over the servers left. As with the counts, the health
+is the server's, not the pool's: failures through one pool eject the server
+from every pool that lists it. When every server of a pool is ejected, the
+pool takes the one whose ejection ends soonest; a pool of one server, and
+.BR \-\-upstream\-proxy ,
+keep using theirs, so for them an ejection shows only in the log. A server
+that fails while ejected is not ejected for longer; once its 5 minutes are
+over it is picked again, and if it failed in its last 30 seconds out, its
+next failure ejects it again at once. A connection that gets through does not
+undo the failures before it: they count until they are 30 seconds old. These
+numbers are fixed.
+.PP
+A connection that a pool's server fails in one of the ways that count is
+tried again, once, on another server of the same pool that is not ejected:
+the next one in the block's order, or with
+.B least_conn
+the least loaded one. This is safe because nothing the client sends is
+passed on before the tunnel through the upstream is up, so the retry repeats
+nothing and loses nothing. It has what is left of the connection's
+.BR \-\-connect\-timeout ,
+no more: a connection that ran out of time is not retried, and when the retry
+runs out of it, that does not count against its server. With no other
+server to take, or once its retry has failed too, the client gets the reply
+it would have had without one: SOCKS5 reply 0x05 for a refused connection and
+0x01 for a failed handshake, or HTTP 502. A failure that does not count is not
+retried, and neither is a connection through
+.BR \-\-upstream\-proxy .
+.PP
+A reload keeps what is known of each server that the new pools still list,
+ejection included, as it keeps the counts. A server that the reload takes out
+of every pool is remembered only while connections opened before it still use
+that server; once they are gone it is forgotten, and a later reload that
+lists it again starts it afresh.
+.PP
+An ejection is logged at warning level, once however many pools list the
+server, as
+.IR "Upstream pool NAME server N (ADDRESS) ejected for 300 s after 3 failures in 30 s" ,
+naming the pool of the connection whose failure ejected it (or
+.I default upstream (ADDRESS)
+for
+.BR \-\-upstream\-proxy ),
+and the server's return at info level, when a connection first finds the 5
+minutes over. At debug level each failure is logged with whether it counted,
+each retry with both servers, and each connection that had to take an ejected
+server.
 .PP
 Each connection that a rule sends through a pool, or
 .BR DIRECT ,

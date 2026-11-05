@@ -16,6 +16,7 @@
 #include <gwproxy/dns.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/iplimit.h>
+#include <gwproxy/upstream.h>
 #include <gwproxy/upstream_lb.h>
 #include <gwproxy/log.h>
 #include <assert.h>
@@ -470,6 +471,23 @@ enum {
 	 * no later OUTPUT evaluation may change it.
 	 */
 	GWP_CONN_FLAG_UP_PICKED		= (1ull << 6ull),
+	/*
+	 * The attempt through the pair's upstream has failed and been
+	 * classified (gwp_conn_upstream_failed()): another way the same
+	 * failure surfaces must not count it again.
+	 */
+	GWP_CONN_FLAG_UP_FAILED		= (1ull << 7ull),
+	/*
+	 * The client has been given its failure reply (gwp_conn_fail_reply()),
+	 * so a failure that surfaces again on its way out gives no second
+	 * one (gwp_upstream_fail_reply()).
+	 */
+	GWP_CONN_FLAG_FAIL_REPLIED	= (1ull << 9ull),
+	/*
+	 * The pair has had its one retry on another server of its pool
+	 * (gwp_conn_upstream_failed()).
+	 */
+	GWP_CONN_FLAG_UP_RETRIED	= (1ull << 8ull),
 };
 
 enum {
@@ -583,6 +601,14 @@ struct gwp_conn_pair {
 	 * gwp_conn_set_upstream().
 	 */
 	struct gwp_upstream	*upstream;
+	/*
+	 * The ACL pool @upstream was picked from, with a reference, NULL for
+	 * the default (--upstream-proxy) or none; held only until the tunnel
+	 * is up (gwp_conn_upstream_up()), for the logs and the retry that
+	 * may need another of its servers. @up_srv is @upstream's place in
+	 * it.
+	 */
+	struct gwp_acl_pool	*up_pool;
 
 	/*
 	 * The hostname the client asked for, when it used a domain target
@@ -687,6 +713,16 @@ struct gwp_conn_pair {
 	 * searched from its start again on every read.
 	 */
 	uint32_t		up_scan;
+
+	/*
+	 * How the attempt through the upstream failed, when the place that
+	 * saw it knows better than the errno it returns: an enum
+	 * gwp_upstream_end plus one, 0 when none was noted, and its value
+	 * (gwp_upstream_note_end()).
+	 */
+	uint16_t		up_val;
+	uint8_t			up_end;
+	uint8_t			up_srv;
 
 	/* One-byte scalars last, so they pack instead of each opening a hole. */
 	bool			is_target_alive;
@@ -1040,6 +1076,46 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 /* Make @gcp chain through @up (NULL: go direct), dropping what it had. */
 void gwp_conn_set_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			   struct gwp_upstream *up);
+
+/*
+ * Say how the attempt through @gcp's upstream failed (@end, with @val as
+ * enum gwp_upstream_end documents), where that is known better than from
+ * the errno the failure returns. The first note stands.
+ */
+static inline void gwp_upstream_note_end(struct gwp_conn_pair *gcp,
+					 enum gwp_upstream_end end, int val)
+{
+	if (gcp->up_end)
+		return;
+	gcp->up_end = (uint8_t)end + 1;
+	gcp->up_val = (uint16_t)(val < 0 ? 0 : val > 0xffff ? 0xffff : val);
+}
+
+/*
+ * The attempt through @gcp's upstream failed with @err, before the tunnel
+ * was up: a connect, the TLS or proxy handshake, or the time they had.
+ * Every way such an attempt fails, on both event loops, ends here, and
+ * the first call per attempt classifies it (gwp_upstream_fail_classify(),
+ * from the noted end, else from @err), logs it and, for the upstream's
+ * own failures, counts it against the server's health; later calls for
+ * the same attempt do nothing.
+ *
+ * Then, when @may_retry (the caller can dial again at once) and the
+ * failure was the upstream's own, the pair gets its one retry: if its
+ * pool has another server in service, the pair is moved to it
+ * (gwp_conn_set_upstream()) and true is returned, for the caller to undo
+ * the old attempt (gwp_upstream_hs_reset()) and dial the new server. No
+ * client data has reached a target yet, as the tunnel is not up. false
+ * otherwise: the failure stands, and the client gets its usual answer.
+ */
+bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      int err, bool may_retry);
+
+/*
+ * The tunnel through @gcp's upstream is up: what was kept for a failure
+ * (the pool reference) goes.
+ */
+void gwp_conn_upstream_up(struct gwp_conn_pair *gcp);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
@@ -1175,6 +1251,15 @@ bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
 			const struct gwp_sockaddr *dst, bool connected);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
 
+/* Monotonic milliseconds, at the coarse clock's resolution (a few ms). */
+static inline uint64_t gwp_now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC_COARSE, &t);
+	return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
 /* Monotonic seconds, at the coarse clock's resolution (a few ms). */
 static inline uint32_t gwp_now_sec(void)
 {
@@ -1210,6 +1295,27 @@ static inline bool gwp_in_upstream_hs(const struct gwp_conn_pair *gcp)
 
 	return cs >= CONN_STATE_UPSTREAM_S5_MIN &&
 	       cs <= CONN_STATE_UPSTREAM_HTTP_MAX;
+}
+
+/*
+ * The value of a GWP_UPSTREAM_END_TIMEOUT for @gcp's attempt (see enum
+ * gwp_upstream_end): 0 while the upstream owes us its part, the connect or
+ * the handshake up to our CONNECT request; 1 once that request is out and
+ * its reply is awaited, or while the handshake waits on our own client
+ * (its reply still being flushed), neither the upstream's fault.
+ */
+static inline int gwp_upstream_timeout_val(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	if (cs == CONN_STATE_UPSTREAM_S5_CONNECT ||
+	    cs == CONN_STATE_UPSTREAM_HTTP_CONNECT)
+		return !gcp->up_tx;
+	if (gwp_in_upstream_hs(gcp))
+		return 0;
+	/* Connected, but held for the client (upstream_start_held()). */
+	return gcp->upstream && gcp->target.fd >= 0 &&
+	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
 }
 
 /*
@@ -1341,6 +1447,17 @@ enum gwp_upstream_io {
  * or a negative errno.
  */
 int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * gwp_conn_upstream_failed() moved @gcp to another server: undo what the
+ * attempt on the old one left, so the pair is as it was before it dialled,
+ * in @state (the loop's state for a pair whose connect is under way). The
+ * handshake's bytes in gcp->target go, and the room it held back returns;
+ * what is there before the handshake starts (the rest of a reply to the
+ * client) stays. The old target socket is the caller's to close.
+ */
+void gwp_upstream_hs_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   int state);
 
 /*
  * Fresh proxy bytes were appended to gcp->target.buf: parse the current
