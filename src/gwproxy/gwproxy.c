@@ -6617,7 +6617,17 @@ static void *gwp_ctx_thread_entry(void *arg)
 
 	ctx->stop = true;
 	gwp_ctx_signal_all_workers(ctx);
-	pr_info(&ctx->lh, "Worker %u stopped", w->idx);
+	/*
+	 * An error here stops the whole proxy and becomes its exit status
+	 * (see main()). Many of the paths that return one log nothing of
+	 * their own, so say here, once per worker, which worker stopped and
+	 * why.
+	 */
+	if (r < 0)
+		pr_err(&ctx->lh, "Worker %u stopped on an error, stopping the proxy: %s",
+		       w->idx, strerror(-r));
+	else
+		pr_info(&ctx->lh, "Worker %u stopped", w->idx);
 	return (void *)(intptr_t)r;
 }
 

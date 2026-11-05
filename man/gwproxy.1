@@ -1924,7 +1924,11 @@ Ignored, so a peer closing a connection cannot terminate the process.
 exits
 .B 0
 on a clean shutdown and non\-zero if the configuration is invalid or a fatal
-runtime error occurs.
+runtime error occurs. The non\-zero status is an
+.BR errno (3)
+value, such as 22
+.RB ( EINVAL )
+for an invalid option, and the log says what failed.
 .SH FILES
 .TP
 .I auth\-file
