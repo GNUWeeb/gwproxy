@@ -254,6 +254,12 @@ static int set_target(struct gwp_http_conn *hc, const char *a, size_t len,
  * so the origin still needs them to frame it. Expect is absent too, so a
  * "100-continue" expectation is forwarded to the origin (RFC 9110 Section
  * 10.1.1). "Proxy-Connection" is non-standard but sent by some clients.
+ *
+ * "Proxy" is no hop-by-hop field and no standard field at all, but it goes
+ * the same way: a CGI-style origin turns it into HTTP_PROXY, which many HTTP
+ * libraries take for the proxy of their own outgoing requests ("httpoxy"), so
+ * the client could send the origin's requests wherever it likes. Nothing
+ * legitimate needs it at the origin.
  */
 static bool is_hop_by_hop(const char *k, size_t klen)
 {
@@ -265,6 +271,7 @@ static bool is_hop_by_hop(const char *k, size_t klen)
 		HBH("Connection"), HBH("Proxy-Connection"), HBH("Keep-Alive"),
 		HBH("TE"), HBH("Trailer"), HBH("Upgrade"),
 		HBH("Proxy-Authorization"), HBH("Proxy-Authenticate"),
+		HBH("Proxy"),
 	};
 #undef HBH
 	size_t i;
@@ -484,7 +491,8 @@ too_big:
  * name is an ordinary field here and goes on to the origin, where a CGI-style
  * server maps '-' and '_' to the same variable and may read it as the real
  * one: a second Content-Length the proxy never saw, or a hop-by-hop field it
- * believes it dropped.
+ * believes it dropped. "Proxy", dropped too, holds no '-' and so has no such
+ * alias: no other name reaches CGI as HTTP_PROXY.
  */
 static bool is_underscore_alias(const char *k, size_t klen)
 {

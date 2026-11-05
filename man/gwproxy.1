@@ -1292,6 +1292,13 @@ with "400 Bad Request": an origin that maps "_" and "\-" to the same name, as CG
 does, could read it as the field itself. Other names with underscores are
 forwarded unchanged.
 .PP
+A "Proxy" field, in any case, is dropped from a forwarding request as well,
+though it is no hop\-by\-hop field: an origin that runs CGI programs would hand
+it to them as HTTP_PROXY, which many HTTP libraries take for the proxy of their
+own outgoing requests ("httpoxy"), so the client could pick where the origin's
+requests go. No other name reaches CGI as HTTP_PROXY, so it has no alias to
+refuse.
+.PP
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
 does not send another request on the connection, and the connection is closed
@@ -1521,6 +1528,22 @@ on another server; see
 .BR "Upstream pools" )
 and is logged with the reason, for example
 .IR "certificate verify failed: hostname mismatch" .
+.PP
+An upstream that turns the CONNECT down is answered to an HTTP client with
+"502 Bad Gateway", whatever its reason. A SOCKS5 client gets reply 0x05
+(connection refused) only when the upstream says the target could not be
+reached: a
+.B socks5://
+or
+.B socks5h://
+upstream's failed reply, or a 502 or 504 from an
+.B http://
+or
+.B https://
+one. A 407, which says the upstream refused gwproxy's credentials, and any
+other status (403, 500, 503, ...) say nothing about the target and get reply
+0x01 (general failure), as does a SOCKS5 upstream that refuses the
+credentials.
 .PP
 The end of the upstream's stream reaches the client as a normal end of stream
 only if it is one, as for a TLS client in the other direction (see

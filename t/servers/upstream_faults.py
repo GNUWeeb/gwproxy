@@ -28,6 +28,7 @@
 #   rst_connect      reset the connection instead of answering the CONNECT
 #   auth_required    answer the CONNECT with 407
 #   bad_gateway      answer the CONNECT with 502
+#   status_NNN       answer the CONNECT with status NNN (status_504, say)
 #
 # Usage: upstream_faults.py <socks5|http> <bind_port> <fault_file>
 import socket, struct, sys, threading
@@ -86,6 +87,9 @@ def http(c, fault):
                   b'Content-Length: 0\r\n\r\n')
     elif fault == 'bad_gateway':
         c.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n')
+    elif fault.startswith('status_'):
+        c.sendall(b'HTTP/1.1 %s Status\r\nContent-Length: 0\r\n\r\n' %
+                  fault[7:].encode())
 
 
 def serve(c, fault):
