@@ -498,6 +498,8 @@ def strand_round(port, pid):
     # the origin is short of by then is what the proxy took and sat on.
     stuck = True
     seen = -1
+    start = time.monotonic()
+    rd, sink0, sent0 = 0, sink.count, sent
     deadline = time.monotonic() + 100
     moved = time.monotonic()
     err = None
@@ -509,12 +511,19 @@ def strand_round(port, pid):
         if now > deadline or (not stuck and now - moved > STRAND_STALL):
             err = "tunnel did not resume: origin got %d of %d bytes" % (
                 sink.count, sent)
+            err += ("\n  %s after %.1f s of reading, %.1f s since the origin"
+                    " last got data; client read %d bytes; at the start of"
+                    " reading the origin had %d of %d; proxy pid %d" % (
+                        "deadline" if now > deadline else "stall",
+                        now - start, now - moved, rd, sink0, sent0, pid))
             err += "\n" + stall_state(pid, c, sink, sent, stuck)
             break
         try:
-            if not c.s.recv(random.choice((256, 512, 1024, 4096))):
+            d = c.s.recv(random.choice((256, 512, 1024, 4096)))
+            if not d:
                 err = "proxy hung up"
                 break
+            rd += len(d)
         except BlockingIOError:
             pass
         time.sleep(random.choice((0, 0.0002, 0.001)))
@@ -527,10 +536,10 @@ def strand_round(port, pid):
 
 
 def strand(port, pid):
-    for _ in range(STRAND_ROUNDS):
+    for i in range(STRAND_ROUNDS):
         err = strand_round(port, pid)
         if err:
-            return err
+            return "round %d of %d: %s" % (i + 1, STRAND_ROUNDS, err)
     return None
 
 
