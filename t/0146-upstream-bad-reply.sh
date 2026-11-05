@@ -4,10 +4,12 @@
 # However a handshake with the upstream proxy goes wrong, a client with a
 # request outstanding must be told, not just hung up on: a malformed reply, a
 # hangup or a reset get a SOCKS5 client REP 0x01 and an HTTP client a 502, as
-# a refused CONNECT gets REP 0x05 and a 502. A plain forwarding client has no
-# reply to wait for, and must get no bytes at all. Every case ends at once
-# rather than at a timeout. The log names whose fault each failure is: a
-# refused CONNECT the destination's, garbage the upstream's, a 403 nobody's.
+# a SOCKS5 upstream's refused CONNECT gets REP 0x05 and a 502. An HTTP
+# upstream's 403 says nothing about the destination, so it gets REP 0x01 too
+# (t/0174 has the other statuses). A plain forwarding client has no reply to
+# wait for, and must get no bytes at all. Every case ends at once rather than
+# at a timeout. The log names whose fault each failure is: a refused CONNECT
+# the destination's, garbage the upstream's, a 403 nobody's.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -126,9 +128,7 @@ for loop in epoll io_uring; do
 		--nr-workers=1 --upstream-proxy="http://127.0.0.1:$http_up"
 	for front in socks5 http; do
 		while read -r f got; do
-			rep=01
-			[ "$f" = refuse ] && rep=05
-			check "[$loop] $front, http upstream, $f" "$front" "$rep" "$got"
+			check "[$loop] $front, http upstream, $f" "$front" 01 "$got"
 		done < <(probe "$pp" "$front" refuse bad_reply bad_status close_connect \
 			       partial_close rst_connect)
 	done

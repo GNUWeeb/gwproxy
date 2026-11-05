@@ -1529,6 +1529,22 @@ on another server; see
 and is logged with the reason, for example
 .IR "certificate verify failed: hostname mismatch" .
 .PP
+An upstream that turns the CONNECT down is answered to an HTTP client with
+"502 Bad Gateway", whatever its reason. A SOCKS5 client gets reply 0x05
+(connection refused) only when the upstream says the target could not be
+reached: a
+.B socks5://
+or
+.B socks5h://
+upstream's failed reply, or a 502 or 504 from an
+.B http://
+or
+.B https://
+one. A 407, which says the upstream refused gwproxy's credentials, and any
+other status (403, 500, 503, ...) say nothing about the target and get reply
+0x01 (general failure), as does a SOCKS5 upstream that refuses the
+credentials.
+.PP
 The end of the upstream's stream reaches the client as a normal end of stream
 only if it is one, as for a TLS client in the other direction (see
 .BR "TLS TERMINATION" ).

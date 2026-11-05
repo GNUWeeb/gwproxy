@@ -240,7 +240,17 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			status, fail_class(GWP_UPSTREAM_END_HTTP, status),
 			gcp->idx, gwp_upstream_dst_str(gcp));
 		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_HTTP, status);
-		return -ECONNREFUSED;
+		/*
+		 * Only a 502 or 504 says the destination could not be
+		 * reached: that is the refused CONNECT a SOCKS5 client hears
+		 * as REP 0x05. A 407 turned our credentials down, and a 403,
+		 * 500, 503 or any other status says nothing about the
+		 * destination: a failure of the chain, REP 0x01.
+		 */
+		if (gwp_upstream_http_class(status) ==
+		    GWP_UPSTREAM_FAIL_DESTINATION)
+			return -ECONNREFUSED;
+		return -EPROTO;
 	}
 	r = gwp_upstream_splice_reply(w, gcp, consumed);
 	return r ? r : GWP_UPSTREAM_IO_DONE;
@@ -263,11 +273,11 @@ int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	gwp_conn_buf_compact(&gcp->target);
 
 	/*
-	 * Only a refused CONNECT says something about the destination. An
-	 * upstream that turned down our credentials, or answered something
-	 * we cannot use, or hung up, is a failure of the proxy chain: REP
-	 * 0x01, not the 0x02 "not allowed by ruleset" that -EACCES would map
-	 * to.
+	 * Only a refused CONNECT (SOCKS5 REP non-zero, HTTP 502 or 504) says
+	 * something about the destination. An upstream that turned down our
+	 * credentials (SOCKS5 auth, HTTP 407), or answered something we
+	 * cannot use, or hung up, is a failure of the proxy chain: REP 0x01,
+	 * not the 0x02 "not allowed by ruleset" that -EACCES would map to.
 	 */
 	if (err != -ECONNREFUSED)
 		err = -EPROTO;
