@@ -475,6 +475,44 @@ static void tmr_disarm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	gwp_tmr_disarm(&w->tmrs, gcp, kind);
 }
 
+/*
+ * --connect-timeout=0 sets no limit on the connect, nor on the upstream
+ * handshake that follows it, as a client that is still there can end the wait
+ * whenever it likes. A client that half-closes meanwhile cannot, short of a
+ * reset: it has made its request and waits for the answer, and its FIN is held
+ * until the target is up (__forward_progress()), so a target or an upstream
+ * proxy that never answers would hold the pair for ever. From that FIN on,
+ * --protocol-timeout bounds the rest of the wait, the bound that the handshake
+ * and the lookup before it ran under.
+ *
+ * Is @gcp in that wait, with nothing bounding it yet? The timer is free then,
+ * as nothing else runs on it during the connect at --connect-timeout=0; while
+ * it runs, for the connect timeout or for this bound, it is left alone.
+ */
+static bool fin_unbounded(struct gwp_wrk *w, const struct gwp_conn_pair *gcp)
+{
+	return !gcp->is_target_alive && w->ctx->cfg.connect_timeout <= 0 &&
+	       w->ctx->cfg.protocol_timeout > 0 && !gwp_in_dns_lookup(gcp) &&
+	       !gcp->tmr_pos[GWP_TMR_CONN];
+}
+
+/*
+ * The client has half-closed (@fin): it was read as the end of its stream, or
+ * reported as EPOLLRDHUP while unread data parks its fd (see adj_epl_in()).
+ */
+static int bound_fin_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			     bool fin)
+{
+	int sec = w->ctx->cfg.protocol_timeout;
+
+	if (!fin || !fin_unbounded(w, gcp))
+		return 0;
+
+	pr_dbg(&w->ctx->lh, "Client half-closed during the connect, bounding it to %d s (idx=%u)",
+	       sec, gcp->idx);
+	return tmr_arm(w, gcp, GWP_TMR_CONN, sec * 1000ull);
+}
+
 __hot
 static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -1167,7 +1205,7 @@ static bool client_rx_held(struct gwp_conn_pair *gcp)
 	return conn_rx_held(gcp, &gcp->client);
 }
 
-static bool adj_epl_in(struct gwp_conn *src, bool hold)
+static bool adj_epl_in(struct gwp_conn *src, bool hold, bool fin)
 {
 	uint32_t desired;
 
@@ -1191,13 +1229,17 @@ static bool adj_epl_in(struct gwp_conn *src, bool hold)
 	 * together with the data still to be read. An EPOLLOUT armed on the
 	 * same fd is not lost by this: every EPOLLOUT event leads to a send,
 	 * and a socket that is still full wakes us again when it drains.
+	 *
+	 * @fin keeps EPOLLRDHUP on a parked fd, edge-triggered, so that a FIN
+	 * behind the unread data is reported once: a client that half-closes
+	 * during the connect is then bounded all the same (bound_fin_connect()).
 	 */
 	if (src->rd_eof)
 		desired = 0;
 	else if (!hold && src->cap - src->len)
 		desired = EPOLLIN | EPOLLRDHUP;
 	else
-		desired = EPOLLET;
+		desired = EPOLLET | (fin ? EPOLLRDHUP : 0);
 
 	if ((src->ep_mask & (EPOLLIN | EPOLLRDHUP | EPOLLET)) != desired) {
 		src->ep_mask &= ~(EPOLLIN | EPOLLRDHUP | EPOLLET);
@@ -1223,7 +1265,8 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r;
 
 	client_need_ctl |= adj_epl_out(&gcp->target, &gcp->client);
-	client_need_ctl |= adj_epl_in(&gcp->client, client_rx_held(gcp));
+	client_need_ctl |= adj_epl_in(&gcp->client, client_rx_held(gcp),
+				      fin_unbounded(w, gcp));
 
 	/*
 	 * Until the target is connected, its registration belongs to the
@@ -1237,7 +1280,8 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (gcp->is_target_alive) {
 		target_need_ctl |= adj_epl_out(&gcp->client, &gcp->target);
 		target_need_ctl |= adj_epl_in(&gcp->target,
-					      conn_rx_held(gcp, &gcp->target));
+					      conn_rx_held(gcp, &gcp->target),
+					      false);
 	}
 
 	if (client_need_ctl) {
@@ -2577,7 +2621,13 @@ static int handle_ev_client_upstream_hs(struct gwp_wrk *w,
 	if ((ev->events & EPOLLHUP) && gcp->client.rd_eof)
 		return -ECONNRESET;
 
-	if (!adj_epl_in(&gcp->client, client_rx_held(gcp)))
+	r = bound_fin_connect(w, gcp, gcp->client.rd_eof ||
+				      (ev->events & EPOLLRDHUP));
+	if (unlikely(r))
+		return r;
+
+	if (!adj_epl_in(&gcp->client, client_rx_held(gcp),
+			fin_unbounded(w, gcp)))
 		return 0;
 
 	cev.events = gcp->client.ep_mask;
@@ -2642,6 +2692,13 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		r = do_splice(w, gcp, &gcp->client, &gcp->target, true,
 			      gcp->is_target_alive);
 		if (r)
+			return r;
+	}
+
+	if (unlikely(!gcp->is_target_alive)) {
+		r = bound_fin_connect(w, gcp, gcp->client.rd_eof ||
+					      (ev->events & EPOLLRDHUP));
+		if (unlikely(r))
 			return r;
 	}
 
@@ -2987,6 +3044,27 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gcp->conn_state = CONN_STATE_SOCKS5_CONNECT;
 	else if (CONN_STATE_HTTP_MIN <= r && r <= CONN_STATE_HTTP_MAX)
 		gcp->conn_state = CONN_STATE_HTTP_CONNECT;
+
+	/*
+	 * A FIN that came with the request, or during the lookup. One still
+	 * behind unread data is reported once the parked client fd watches
+	 * for it (adj_epl_in()).
+	 */
+	r = bound_fin_connect(w, gcp, gcp->client.rd_eof);
+	if (unlikely(r))
+		return r;
+	if ((gcp->client.ep_mask & EPOLLET) &&
+	    adj_epl_in(&gcp->client, client_rx_held(gcp),
+		       fin_unbounded(w, gcp))) {
+		struct epoll_event cev;
+
+		cev.events = gcp->client.ep_mask;
+		cev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd,
+				    &cev);
+		if (unlikely(r))
+			return r;
+	}
 
 	log_conn_pair_created(w, gcp);
 	return 0;
@@ -3601,7 +3679,8 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * __adjust_epl_mask() takes it back once the target is up and the
 	 * buffer drains.
 	 */
-	if (adj_epl_in(&gcp->client, client_rx_held(gcp))) {
+	if (adj_epl_in(&gcp->client, client_rx_held(gcp),
+		       fin_unbounded(w, gcp))) {
 		struct epoll_event cev;
 
 		cev.events = gcp->client.ep_mask;

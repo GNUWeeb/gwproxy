@@ -488,6 +488,12 @@ enum {
 	 * (gwp_conn_upstream_failed()).
 	 */
 	GWP_CONN_FLAG_UP_RETRIED	= (1ull << 8ull),
+	/*
+	 * io_uring: the client half-closed during the connect at
+	 * --connect-timeout=0, and --protocol-timeout now bounds the rest of
+	 * it (handle_ev_client_watch()).
+	 */
+	GWP_CONN_FLAG_FIN_BOUND		= (1ull << 10ull),
 };
 
 enum {

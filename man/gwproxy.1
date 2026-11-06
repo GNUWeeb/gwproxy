@@ -142,7 +142,10 @@ listener, from 1 to 1024. Default:
 Seconds allowed for a client to complete the SOCKS5/HTTP (and, if enabled, TLS)
 handshake before the connection is dropped. This includes the lookup of the
 target's name; a client whose request is waiting for one when the time runs out
-gets a SOCKS5 reply 0x06 or an HTTP 504 first. Default:
+gets a SOCKS5 reply 0x06 or an HTTP 504 first. With
+.B \-\-connect\-timeout=0
+it also bounds the connect of a client that half\-closes its connection while
+the connect is in progress (see there). Default:
 .BR 10 .
 .TP
 .BR \-c ", " \-\-connect\-timeout=\fIsec\fR
@@ -155,8 +158,14 @@ for the same name (see
 never answers after its SYN retries, but an upstream proxy that accepts and then
 says nothing is waited for as long as the client stays. A client that resets its
 connection ends the wait at once, though with io_uring on a kernel older than
-5.13 only when the connect ends. One that has sent a FIN counts as staying, as
-it may only have finished sending and be waiting for the answer.
+5.13 only when the connect ends. One that has sent a FIN may only have finished
+sending and be waiting for the answer, so its FIN is passed on once the target
+is up; but as it can no longer end the wait itself,
+.B \-\-protocol\-timeout
+bounds the rest of the connect from that FIN on (the upstream proxy handshake
+included), and the client gets a SOCKS5 reply 0x06 or an HTTP 504 when it runs
+out. With io_uring on a kernel older than 5.13 the FIN goes unnoticed and the
+wait stays unbounded.
 Default:
 .BR 5 .
 .TP

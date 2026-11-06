@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
+# Two things about descriptors and time while a connection is being set up.
+#
+# A client may send its request and close its write side before the target is
+# connected; the proxy holds the FIN and passes it on once the target is up,
+# as the client may only have finished sending (t/0100). With
+# --connect-timeout=0 nothing then bounded the wait: a target that never
+# answered held the pair until the kernel gave up on the SYN, and a silent
+# upstream proxy held it for ever. Once the client has half-closed during the
+# connect, --protocol-timeout bounds it instead. Checked on both event loops
+# through SOCKS5, HTTP CONNECT, plain forwarding and an upstream proxy that
+# never answers; a client that keeps its write side open still waits without
+# a limit, and a half-closed client of a slow but working target still gets
+# its answer.
+#
 # A raw DNS query's socket closed at the end of its lookup was not credited
 # to the accept throttle, which only counted it when the pair went away
 # before the lookup ended. With accept stopped for want of descriptors, the
@@ -12,11 +26,122 @@
 . "$(dirname "$0")/lib.sh"
 require python3
 
-grep -q CONFIG_NEW_DNS_RESOLVER "$ROOT/config.h" 2>/dev/null || \
-	skip "gwproxy built without the raw DNS resolver"
+# A target whose accept queue is full: every SYN goes unanswered.
+BH_PORT=""
+python3 "$SERVERS_DIR/blackhole_listener.py" >"$WORK/bh.port" 2>&1 &
+_PIDS+=("$!")
+for _ in $(seq 1 100); do
+	BH_PORT="$(head -n 1 "$WORK/bh.port" 2>/dev/null)"
+	[ -n "$BH_PORT" ] && break
+	sleep 0.05
+done
+[ -n "$BH_PORT" ] || fail "the black-hole target did not start"
+
+# An upstream proxy that accepts and then never says a word.
+SILENT_PORT=""
+python3 -c '
+import socket, threading
+def hold(c):
+    while c.recv(4096):
+        pass
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(64)
+print(s.getsockname()[1], flush=True)
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=hold, args=(c,), daemon=True).start()' \
+	>"$WORK/silent.port" 2>&1 &
+_PIDS+=("$!")
+for _ in $(seq 1 100); do
+	SILENT_PORT="$(head -n 1 "$WORK/silent.port" 2>/dev/null)"
+	[ -n "$SILENT_PORT" ] && break
+	sleep 0.05
+done
+[ -n "$SILENT_PORT" ] || fail "the silent upstream did not start"
+
+BOUND=2
+
+# fin_bound <loop> <name> <client args>... -- <proxy args>...
+fin_bound()
+{
+	local loop="$1" name="$2" pp got log
+	local -a cargs=()
+
+	shift 2
+	while [ "$1" != -- ]; do
+		cargs+=("$1")
+		shift
+	done
+	shift
+	pp="$(pick_port)"
+	gwp_start "127.0.0.1:$pp" --event-loop="$loop" --nr-workers=1 \
+		--connect-timeout=0 --protocol-timeout="$BOUND" "$@"
+	log="$WORK/gwp.$pp.log"
+	got="$(timeout 120 python3 "$SERVERS_DIR/fin_during_connect.py" \
+		"${cargs[0]}" "$pp" "${cargs[@]:1}" "$BOUND")"
+	case "$got" in
+	OK*) diag "[$loop] $name: $got" ;;
+	*) fail "[$loop] $name: $got" ;;
+	esac
+	grep -q "Connection timeout!" "$log" || \
+		fail "[$loop] $name: no connection timeout logged"
+	kill "$GWP_PID" 2>/dev/null
+	wait "$GWP_PID" 2>/dev/null
+}
+
+run_loop()
+{
+	local loop="$1" pp tp d got
+
+	fin_bound "$loop" "SOCKS5" socks5 "$BH_PORT" -- --as-socks5=1
+	fin_bound "$loop" "HTTP CONNECT" http "$BH_PORT" -- --as-http=1
+	fin_bound "$loop" "plain forwarding" plain -- \
+		--target="127.0.0.1:$BH_PORT"
+	fin_bound "$loop" "silent upstream" plain -- \
+		--target="127.0.0.1:$BH_PORT" \
+		--upstream-proxy="socks5://127.0.0.1:$SILENT_PORT"
+
+	# A target that answers late, but within the bound: the half-closed
+	# client still gets the answer to its request.
+	pp="$(pick_port)"
+	gwp_start "127.0.0.1:$pp" --as-socks5=1 --event-loop="$loop" \
+		--nr-workers=1 --connect-timeout=0 --protocol-timeout=30
+	for d in data nodata; do
+		got="$(timeout 60 python3 "$SERVERS_DIR/connect_eof.py" socks5 "$pp" "$d")"
+		[ "$got" = OK ] || fail "[$loop] slow target, SOCKS5, $d: $got"
+	done
+	kill "$GWP_PID" 2>/dev/null
+	wait "$GWP_PID" 2>/dev/null
+
+	pp="$(pick_port)"
+	tp="$(pick_port)"
+	gwp_start "127.0.0.1:$pp" --target="127.0.0.1:$tp" \
+		--event-loop="$loop" --nr-workers=1 --connect-timeout=0 \
+		--protocol-timeout=30
+	got="$(timeout 60 python3 "$SERVERS_DIR/connect_eof.py" plain "$pp" "$tp" data)"
+	[ "$got" = OK ] || fail "[$loop] slow target, plain forwarding: $got"
+	kill "$GWP_PID" 2>/dev/null
+	wait "$GWP_PID" 2>/dev/null
+}
+
+loops=(epoll)
+if grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null; then
+	loops+=(io_uring)
+else
+	diag "gwproxy built without io_uring; skipping that loop"
+fi
+gwp_parallel run_loop "${loops[@]}"
+
+# ------------------------------------------------- raw DNS and accept ----
+if ! grep -q CONFIG_NEW_DNS_RESOLVER "$ROOT/config.h" 2>/dev/null; then
+	diag "gwproxy built without the raw DNS resolver; skipping that part"
+	pass
+fi
 soft="$(ulimit -Sn)"
 if [ "$soft" != unlimited ] && [ "$soft" -lt 256 ]; then
-	skip "harness fd limit ($soft) too low"
+	diag "harness fd limit ($soft) too low; skipping the raw DNS part"
+	pass
 fi
 
 names="$WORK/dns.names"

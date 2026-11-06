@@ -2560,14 +2560,36 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
  * The client's socket during the connect or the upstream handshake. A reset ends
  * the pair. A FIN alone may come from a client that only finished sending and
  * waits for the answer, so like the epoll loop this holds on to it.
+ *
+ * At --connect-timeout=0 nothing bounds that wait, and a half-closed client
+ * cannot end it short of a reset, so a target or an upstream proxy that never
+ * answers would hold the pair for ever. From the FIN on, --protocol-timeout
+ * bounds the rest of it, as on epoll (bound_fin_connect()). No other timer runs
+ * then: do_prep_connect() has queued the removal of the protocol timer ahead
+ * of this poll, and the removal matches the first timer it finds, so it cannot
+ * take this one. The target coming up removes it like the connect timer.
  */
-static int handle_ev_client_watch(struct gwp_conn_pair *gcp, int res)
+static int handle_ev_client_watch(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				  int res)
 {
+	int sec = w->ctx->cfg.protocol_timeout;
+
 	/* Removed or refused, or the target came up as the poll fired. */
 	if (res <= 0 || gcp->is_target_alive)
 		return 0;
 
-	return (res & (POLLERR | POLLHUP)) ? -ECONNRESET : 0;
+	if (res & (POLLERR | POLLHUP))
+		return -ECONNRESET;
+
+	if ((res & POLLRDHUP) && w->ctx->cfg.connect_timeout <= 0 && sec > 0 &&
+	    !(gcp->flags & GWP_CONN_FLAG_FIN_BOUND)) {
+		gcp->flags |= GWP_CONN_FLAG_FIN_BOUND;
+		pr_dbg(&w->ctx->lh, "Client half-closed during the connect, bounding it to %d s (idx=%u)",
+		       sec, gcp->idx);
+		prep_timer_target(w, gcp, sec);
+	}
+
+	return 0;
 }
 
 static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -3467,7 +3489,7 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	if (ev_bit == EV_BIT_IOU_CLIENT_WATCH && (cqe->flags & IORING_CQE_F_MORE)) {
 		gcp = udata;
 		if (!(gcp->flags & GWP_CONN_FLAG_IS_CANCEL) &&
-		    handle_ev_client_watch(gcp, cqe->res))
+		    handle_ev_client_watch(w, gcp, cqe->res))
 			shutdown_gcp(w, gcp);
 		return 0;
 	}
@@ -3594,7 +3616,7 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		break;
 	case EV_BIT_IOU_CLIENT_WATCH:
 		pr_dbg(&ctx->lh, "Handling client watch event: %d", cqe->res);
-		r = handle_ev_client_watch(udata, cqe->res);
+		r = handle_ev_client_watch(w, udata, cqe->res);
 		break;
 	case EV_BIT_IOU_CLIENT_WATCH_DEL:
 		pr_dbg(&ctx->lh, "Handling client watch removal: %d", cqe->res);
