@@ -84,6 +84,7 @@ static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst);
+static int drop_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /*
  * One datagram from the query's socket. Returns 1 when the lookup is still
@@ -104,10 +105,11 @@ static int handle_raw_dns_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 					 GWP_MAX_CONN_CAND, &nr);
 	if (ret == -ESRCH)
 		return 1;
-	/* The lookup is over: its socket is done with; see ep_del(). */
+	/* The lookup is over: its socket is done with. */
 	if (ret != -EAGAIN) {
-		ep_del(w, gcp->gdp->fd);
-		gwp_dns_res_drop_query(gcp->gdp);
+		r = drop_raw_dns_query(w, gcp);
+		if (unlikely(r))
+			return r;
 	}
 	if (ret == -EAGAIN) {
 		/* Retry with the fallback record type. */
@@ -418,6 +420,24 @@ static int credit_fd_closed(struct gwp_wrk *w, int n)
 	return rearm_accept(w, x);
 }
 
+#ifdef CONFIG_NEW_DNS_RESOLVER
+/*
+ * Close a raw DNS query's socket, out of the epoll set first (see ep_del()),
+ * and credit it to the accept throttle like any other descriptor of the pair.
+ * Whichever comes first closes it, the end of the lookup or the pair's
+ * teardown; the other finds it gone, so it is credited once.
+ */
+static int drop_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	if (!w->ctx->cfg.use_raw_dns || !gcp->gdp || gcp->gdp->fd < 0)
+		return 0;
+
+	ep_del(w, gcp->gdp->fd);
+	gwp_dns_res_drop_query(gcp->gdp);
+	return credit_fd_closed(w, 1);
+}
+#endif
+
 static uint64_t now_ms(void)
 {
 	struct timespec t;
@@ -545,12 +565,9 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * Close the query's socket now, so no reply for this pair is read
 	 * later in the batch, and count it towards the accept throttle.
 	 */
-	if (w->ctx->cfg.use_raw_dns && gcp->gdp && gcp->gdp->fd >= 0) {
-		int r;
+	{
+		int r = drop_raw_dns_query(w, gcp);
 
-		ep_del(w, gcp->gdp->fd);
-		gwp_dns_res_drop_query(gcp->gdp);
-		r = credit_fd_closed(w, 1);
 		if (unlikely(r))
 			return r;
 	}
