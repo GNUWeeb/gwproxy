@@ -6437,9 +6437,14 @@ static int http_fwd_target_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * into, so that what is held back, what is still queued for the
 	 * client (an interim response) and the next read can never add up to
 	 * more than the rewritten header and the body behind it can occupy.
+	 *
+	 * Filling that room exactly is fine: a run of interim responses that
+	 * comes in one full read leaves no room, and the loop then reads no
+	 * more until the client has taken some of them. Only more than that
+	 * is too much, which a header that grew in the rewrite can be.
 	 */
 	pending = gwp_http_fwd_res_pending(hc);
-	if (t->len + pending + HTTP_FWD_RES_SLACK >= cap)
+	if (t->len + pending + HTTP_FWD_RES_SLACK > cap)
 		return http_fwd_res_fail(w, gcp, from, -E2BIG);
 	t->cap = cap - HTTP_FWD_RES_SLACK - (uint32_t)pending;
 	return 0;
