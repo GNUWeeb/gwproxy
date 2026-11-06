@@ -118,37 +118,37 @@ gwp_kill_priv()
 		bin=$GWP_KP_BIN
 		root=$GWP_KP_ROOT
 
-		ppid_of() {
-			local st
-			st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
-			st=${st##*) }
-			set -- $st
-			printf "%s" "$2"
-		}
-
-		# descends <pid> <ancestor>: true when <ancestor> is <pid> or is
-		# reached by walking up. The bound stops a pid-reuse cycle from
+		# descends <pid>: true when <pid> is $root or is reached from it
+		# by walking up. Builtins only, as in gwp_sweep(): this runs for
+		# every process on the host, and a fork for each of them took
+		# seconds on a busy one. The bound stops a pid-reuse cycle from
 		# spinning forever.
 		descends() {
-			local p="$1" want="$2" n=0
+			local p="$1" n=0 st f
 			while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] \
 			      && [ "$n" -lt 64 ]; do
-				[ "$p" = "$want" ] && return 0
-				p=$(ppid_of "$p") || return 1
+				[ "$p" = "$root" ] && return 0
+				{ read -r st <"/proc/$p/stat"; } 2>/dev/null || return 1
+				st=${st##*) }
+				f=($st)
+				p=${f[1]:-}
 				n=$((n + 1))
 			done
 			return 1
 		}
 
+		# The ancestry is checked first: only the few processes under
+		# <pid> get as far as the readlink.
 		for pass in TERM KILL; do
 			hit=0
-			for p in $(ls /proc 2>/dev/null | grep -E "^[0-9]+$"); do
-				exe=$(readlink "/proc/$p/exe" 2>/dev/null) || continue
+			for d in /proc/[0-9]*; do
+				p=${d#/proc/}
+				descends "$p" || continue
+				exe=$(readlink "$d/exe" 2>/dev/null) || continue
 				case "$exe" in
 				"$bin"|"$bin (deleted)") ;;
 				*) continue ;;
 				esac
-				descends "$p" "$root" || continue
 				kill "-$pass" "$p" 2>/dev/null && hit=1
 			done
 			[ "$hit" = 1 ] || break

@@ -62,6 +62,7 @@ SHUT_UPDATES = 128 << 10
 SHUT_SETTLE = 32 << 10
 SHUT_GROWTH = 1 << 20
 SHUT_STALL = 30         # the origin got nothing for this long: it is stuck
+RESUME_STALL = 30       # nothing moved for this long: the tunnel is stuck
 BURST_SNDBUF = 256 << 10  # one read gets the engine past its limit with less
 BURST_RUN = 20          # OpenSSL allows 32 KeyUpdates without data in between
 STRAND_ROUNDS = 3       # it depends on timing: this makes it show nearly always
@@ -128,6 +129,26 @@ def check_growth(pid, before, limit, count, what):
     if grew > limit:
         raise RuntimeError("proxy memory grew by %d MiB after %d %s" % (
             grew >> 20, count, what))
+
+
+class Progress:
+    """Tells a wait that is getting somewhere, however slowly, from one that
+    is stuck. A proxy starved of CPU can need minutes for what takes it a
+    second on an idle host, so a fixed deadline fails it for being slow: give
+    up only once nothing has moved for RESUME_STALL seconds."""
+
+    def __init__(self):
+        self.seen = None
+        self.moved = time.monotonic()
+
+    def stuck(self, *state):
+        """@state: what the wait watches, such as the bytes the origin and
+        the client got so far. Whether it has not changed for too long."""
+        now = time.monotonic()
+        if state != self.seen:
+            self.seen, self.moved = state, now
+            return False
+        return now - self.moved > RESUME_STALL
 
 
 class Client:
@@ -314,15 +335,20 @@ def noread(port, pid):
 
     # Read again, and all must get going. This has no use for what it reads,
     # and SSL_read() would not get to the socket with a KeyUpdate of ours
-    # stuck on its way out, so take it raw and finish that write.
-    deadline = time.monotonic() + 60
+    # stuck on its way out, so take it raw and finish that write. Whatever
+    # moves, on either side, is progress.
+    prog = Progress()
+    got = 0
     while n != 1 or sink.count < sent + 1:
-        if time.monotonic() > deadline:
-            return "tunnel did not resume: origin got %d of %d bytes" % (
-                sink.count, sent + 1)
+        if prog.stuck(sink.count, got, n):
+            return ("tunnel did not resume: origin got %d of %d bytes, "
+                    "nothing moved for %d s" % (sink.count, sent + 1,
+                                                RESUME_STALL))
         try:
-            if not c.s.recv(65536):
+            d = c.s.recv(65536)
+            if not d:
                 return "proxy hung up"
+            got += len(d)
         except BlockingIOError:
             select.select([c.s], [], [], 0.1)
         if n != 1:
@@ -349,13 +375,18 @@ def udp(port, pid):
     n = flood_unread(c, pid)[1]
 
     # Read again, and the proxy must take what the client still has to send.
-    deadline = time.monotonic() + 90
+    # Answers coming in are progress: the proxy has to send them all first.
+    prog = Progress()
+    got = 0
     while n != 1:
-        if time.monotonic() > deadline:
-            return "association did not resume"
+        if prog.stuck(got):
+            return ("association did not resume: got %d bytes, nothing "
+                    "moved for %d s" % (got, RESUME_STALL))
         try:
-            if not c.s.recv(65536):
+            d = c.s.recv(65536)
+            if not d:
                 return "proxy hung up"
+            got += len(d)
         except BlockingIOError:
             select.select([c.s], [], [], 0.1)
         n = LIB.SSL_write(c.ssl, b"x", 1)
@@ -400,15 +431,19 @@ def burst(port, pid):
     check_growth(pid, before, MAX_GROWTH, pushed, "messages")
 
     # As in noread: take it raw, and finish the message that got stuck.
-    deadline = time.monotonic() + 60
+    prog = Progress()
+    got = 0
     stuck = True
     while stuck or sink.count < sent:
-        if time.monotonic() > deadline:
-            return "tunnel did not resume: origin got %d of %d bytes" % (
-                sink.count, sent)
+        if prog.stuck(sink.count, got, stuck):
+            return ("tunnel did not resume: origin got %d of %d bytes, "
+                    "nothing moved for %d s" % (sink.count, sent,
+                                                RESUME_STALL))
         try:
-            if not c.s.recv(65536):
+            d = c.s.recv(65536)
+            if not d:
                 return "proxy hung up"
+            got += len(d)
         except BlockingIOError:
             select.select([c.s], [], [], 0.1)
         if stuck and push(is_data):

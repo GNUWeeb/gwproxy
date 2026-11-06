@@ -365,3 +365,5 @@ for loop in epoll io_uring; do
 	stop_front "$front"
 	exit_clean "[$loop idle]"
 done
+
+pass
