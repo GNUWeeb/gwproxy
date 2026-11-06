@@ -438,14 +438,15 @@ time.sleep(3600)' >"$log" 2>&1 &
 # A fixed sleep before the proxy's first query is no wait at all on a loaded
 # host, and the query then goes to a port nothing has bound yet. pick_port()
 # reserves a TCP number; another test's UDP socket may hold it, in which case
-# the responder dies on bind and another number is tried.
+# the responder dies on bind and another number is tried. The log is named
+# after the shell too: the parts of gwp_parallel() count from the same number.
 start_dns_responder()
 {
 	local mode="$1" log pid port i try
 
 	for try in 1 2 3 4 5; do
 		_DNS_N=$((${_DNS_N:-0} + 1))
-		log="$WORK/dns.$_DNS_N.log"
+		log="$WORK/dns.$BASHPID.$_DNS_N.log"
 		port="$(pick_port)"
 		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$port" \
 			"${@:2}" >"$log" 2>&1 &
