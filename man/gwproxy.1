@@ -193,7 +193,11 @@ Default:
 .TP
 .BR \-p ", " \-\-pid\-file=\fIfile\fR
 Write the process ID to
-.IR file .
+.IR file ,
+which is locked while the proxy runs and removed when it exits. A symlink is
+not followed. A file that cannot be written (a symlink, one locked by another
+instance, a directory that cannot be written to) is warned about, and the
+proxy runs without it.
 Not written by default.
 .SS Proxy mode selection
 .TP
@@ -254,9 +258,28 @@ File of
 .B username:password
 credentials, one per line, shared by SOCKS5 (RFC 1929) and HTTP "Basic" (RFC
 7617) authentication. When set, clients of either protocol must present valid
-credentials. The file is watched and hot\-reloaded on change. Without it, no
-authentication is required (see
+credentials. The file is reloaded on
+.BR SIGHUP ,
+and also on change with
+.BR \-\-watch\-files=1 .
+It must be a regular file: anything else (a FIFO, a device) is refused at
+startup, and a reload that finds one keeps the current credentials (see
+.BR "RELOADING THE FILES" ).
+Without it, no authentication is required (see
 .BR "AUTHENTICATION" ).
+.TP
+.BR \-\-watch\-files=\fI0|1\fR
+Also reload
+.B \-\-auth\-file
+and the
+.B \-\-acl\-file
+set by themselves when they change, in addition to
+.B SIGHUP
+(default: 0). With 0, the files are read at startup and then only when
+.B SIGHUP
+asks for it: nothing watches them, so editing a file has no effect until the
+signal. See
+.BR "RELOADING THE FILES" .
 .SS Access control
 .TP
 .BR \-a ", " \-\-acl\-file=\fIfile\fR
@@ -264,10 +287,18 @@ Load an iptables\-style access\-control list that filters incoming clients
 .RB ( INPUT " chain)"
 and outgoing targets
 .RB ( OUTPUT " chain)."
-The file is watched and hot\-reloaded on change, and a malformed file is
-rejected (at startup, or by keeping the previous rules on reload); so is an
-empty file, one with a NUL byte, and one that changes while it is read. A file
-that is rewritten in place can still be reloaded half written; replace it
+The file is reloaded on
+.BR SIGHUP ,
+and also on change with
+.B \-\-watch\-files=1
+(see
+.BR "RELOADING THE FILES" ).
+A malformed file is rejected (at startup, or by keeping the previous rules on
+reload); so is an empty file, one with a NUL byte, one that changes while it is
+read, and anything that is not a regular file (a FIFO is refused, not waited
+on). Under
+.BR \-\-watch\-files=1 ,
+a file that is rewritten in place can still be reloaded half written; replace it
 atomically instead: write the new rules to a temporary file in the same
 directory and rename it over the old one. When
 .B \-\-acl\-file
@@ -287,6 +318,88 @@ is part of that word. The directives are:
 .BI "\-P " "chain target"
 \(em set a chain's default policy
 .RB ( ACCEPT " or " REJECT ).
+.IP \(bu 3
+.BI "include " path ;
+\(em read the rules of another file in place of this line, so first\-match
+order is the order of the lines as read top to bottom through every file. A
+relative
+.I path
+is taken from the directory of the file that holds the line, an absolute one as
+given; it is one word (no quoting, no globs), and the
+.B ;
+is required (it may also stand apart as the last word). An included file may
+include others, up to 8 levels below the
+.B \-\-acl\-file
+(a chain of 9 files), one load reads at most 64 files (the
+.B \-\-acl\-file
+and every include counted, a file included twice twice), and none may include
+itself, directly or through others. Every file of the set, the
+.B \-\-acl\-file
+included, must be a regular file (a FIFO or a device is refused rather than
+waited on) and is held to the same checks (not empty, no NUL byte, not changed
+while read, no malformed line), and
+the set loads whole or not at all: any failure refuses it at startup, or keeps
+the previous rules on reload.
+.B SIGHUP
+reloads the whole set. With
+.BR \-\-watch\-files=1 ,
+every file of the set is watched like the
+.B \-\-acl\-file
+itself, and a change to any of them reloads the whole set. The watched files
+follow the include lines: a file named by a new line is watched from that
+reload on, even while it is still missing (create it and the set reloads), and
+one whose line is gone no longer is.
+.IP \(bu 3
+.BI "upstream " name " {"
+\(em define an upstream pool, a set of upstream proxies that
+.B "\-j UPSTREAM"
+rules send connections through (see
+.BR "UPSTREAM CHAINING" ).
+The line stands alone, and so does the
+.B }
+that ends the block; each line between holds one directive ending in
+.BR ; :
+.BI "server " url ;
+adds a server, with a URL as
+.B \-\-upstream\-proxy
+takes it
+.RB ( socks5:// ", " socks5h:// ", " http:// " or " https:// ,
+optional
+.BR user:pass@ ,
+a name, an IPv4 address or a bracketed IPv6 one, an optional port), and
+.B least_conn;
+(at most once) sets the method; round\-robin is the default.
+.B https://
+servers need a build with OpenSSL support; without it they fail the load.
+A pool has 1 to 64 servers, and all of them must resolve target names the
+same way:
+.B socks5://
+servers have gwproxy resolve them,
+.BR socks5h:// ", " http:// " and " https://
+servers resolve them themselves, and a pool mixing the two is refused. A
+.I name
+is 1 to 64 letters, digits,
+.BR _ ", " \- " and " . ,
+.B DIRECT
+is reserved, and a name is one pool across all the files of the set; a set
+has at most 1024 pools. Blocks do not nest, an include line may not stand in
+one, and a file may not end inside one. A pool may be defined after the rules
+that use it, or in another file of the set; a rule naming a pool that is not
+defined anywhere is an error. Every server is parsed and its host resolved
+when the set loads (and only then: a reload resolves it again), as
+.B \-\-upstream\-proxy
+is at startup: a host that is neither a name nor an address, a name that does
+not resolve, an address
+.B \-\-outgoing\-family
+forbids, or a
+.B \-\-target\-buf\-size
+below the 1280 bytes an upstream handshake needs fails the load like any
+malformed line. A file that holds a server URL with credentials is warned
+about (once per load, not an error) when its group or others may read it. No
+message shows the credentials: they name the pool and the server's number,
+counted from 1, and show its URL without the
+.B user:pass@
+part.
 .IP \(bu 3
 .BI "\-A " "chain [matches] " "\fB\-j\fR " target
 \(em append a rule. Matches, each negatable with a leading
@@ -316,9 +429,38 @@ the destination handed to an upstream proxy \(em including replacing a
 .B socks5h://
 hostname with the rewritten IP, or for a port\-only
 .B \-\-to :\fIport\fR
-keeping the hostname and changing its port \(em but not the UDP relay), or
+keeping the hostname and changing its port \(em but not the UDP relay),
 .B MARK
-.RB ( OUTPUT "-only) with " \-\-set\-mark " " \fInum\fR "."
+.RB ( OUTPUT "-only) with " \-\-set\-mark " " \fInum\fR ,
+.B BIND
+(below), or
+.B UPSTREAM
+.RB ( OUTPUT "-only) with " \-\-to " " \fIname\fR
+(or its alias
+.BR \-\-to\-proxy ),
+which sends the connection through the upstream pool
+.IR name ,
+or
+.BR "\-\-to DIRECT" ,
+which sends it to its target directly, past any
+.BR \-\-upstream\-proxy .
+Like
+.BR MARK " and " BIND ,
+.B UPSTREAM
+is a composable modifier: the last matching rule's choice wins, and
+.B \-\-accept
+makes a rule terminal. The choice is made once per connection, before its
+target's name is resolved (see
+.BR "UPSTREAM CHAINING" ),
+so a
+.B \-d
+in such a rule matches only a target the client gave as an address, never one
+it named; a load warns about such a rule. It applies to TCP only: UDP never
+goes through an upstream, so a rule with
+.B "\-p udp"
+or
+.B "! \-p tcp"
+could never take effect, and is a load error.
 .IP
 .B \-j MARK
 sets the fwmark
@@ -409,7 +551,7 @@ share a source port.
 .B \-\-accept
 .IP
 Valid only on
-.BR "\-j MARK" " and " "\-j BIND" ,
+.BR "\-j MARK" ", " "\-j BIND" " and " "\-j UPSTREAM" ,
 and takes no argument: apply the modifier and then stop traversing the chain,
 accepting the connection. It turns a composable modifier into a terminal action,
 so
@@ -871,18 +1013,26 @@ Default:
 .SS Upstream proxy chaining
 .TP
 .BR \-x ", " \-\-upstream\-proxy=\fIurl\fR
-Route every outgoing connection through a next\-hop proxy. The URL scheme
-selects the proxy type:
+Route every outgoing connection through a next\-hop proxy, but for those an ACL
+.B "\-j UPSTREAM"
+rule sends elsewhere (see
+.BR "UPSTREAM CHAINING" ).
+The URL scheme selects the proxy type:
 .BR socks5://[user:pass@]host:port ,
 a SOCKS5 proxy that resolves target hostnames locally;
 .BR socks5h://[user:pass@]host:port ,
-a SOCKS5 proxy that resolves them itself; or
+a SOCKS5 proxy that resolves them itself;
 .BR http://[user:pass@]host:port ,
-an HTTP proxy reached with an HTTP CONNECT request. Optional
+an HTTP proxy reached with an HTTP CONNECT request; or
+.BR https://[user:pass@]host:port ,
+the same over TLS, which needs a build with OpenSSL support (see
+.B UPSTREAM CHAINING
+for what is verified). The host may be a name or an IP address literal, an
+IPv6 one in brackets. Optional
 .B user:pass
 supplies username/password authentication to the upstream (RFC\ 1929 for
-SOCKS5, HTTP Basic for HTTP). The port defaults to 1080 for SOCKS5 and 8080
-for HTTP.
+SOCKS5, HTTP Basic for HTTP and HTTPS). The port defaults to 1080 for SOCKS5
+and 8080 for HTTP and HTTPS.
 gwproxy overwrites the password in its command line with
 .B ***
 as soon as it has read it, but other local users can still catch it there in
@@ -907,6 +1057,27 @@ password may contain any character except a line break, including
 and
 .BR : .
 The URL must not carry credentials of its own when this option is given.
+.TP
+.BR \-\-upstream\-ca\-file=\fIfile\fR
+Verify the certificates of
+.B https://
+upstream proxies against the CA certificates in
+.I file
+(PEM, one or more) instead of the system's default trust store: of an
+.B https://
+.B \-\-upstream\-proxy
+and of the
+.B https://
+servers of the ACL file's upstream pools alike, one trust store for all.
+Needs an
+.B https://
+.B \-\-upstream\-proxy
+or an
+.BR \-\-acl\-file ;
+it is read once, at startup, and a file that cannot be read or holds no
+certificate is an error then, even when no pool has an
+.B https://
+server yet. Only in builds with OpenSSL support.
 .SS Networking
 .TP
 .BR \-M ", " \-\-mark=\fInr\fR
@@ -934,8 +1105,9 @@ address, a bare IPv6 address, or a bracketed
 .RI [ v6 ]
 when a
 .I port
-follows. Omit the port (the default) for an ephemeral source port, chosen per
-destination at
+follows. The port is written in decimal digits only, 0 to 65535; anything else
+is refused at startup. Omit the port (the default) for an ephemeral source
+port, chosen per destination at
 .BR connect (2);
 pinning a fixed one limits that source to a single connection at a time and
 defeats multi\-address racing, as described under
@@ -1096,9 +1268,13 @@ request per connection.
 Only that one request reaches the origin: its body, delimited by Content\-Length
 or chunked Transfer\-Encoding, is forwarded, and anything the client sends after
 it is discarded. A request gwproxy cannot delimit unambiguously (both framing
-headers, a Transfer\-Encoding other than "chunked", an invalid Content\-Length,
-or a Connection header naming Content\-Length, Transfer\-Encoding or Host) is
-answered with "400 Bad Request"; a malformed chunked body closes the connection.
+headers, a Transfer\-Encoding other than "chunked", a Content\-Length that is
+not plain digits or exceeds 9223372036854775807, the largest signed 64\-bit
+integer, or a Connection header naming Content\-Length, Transfer\-Encoding or
+Host) is answered with "400 Bad Request". So is a malformed chunked body, including a
+chunk extension off the grammar of RFC 9112 Section 7.1.1 (an empty extension,
+an unterminated quoted string, whitespace before the line end), when it comes
+with the header; one that turns out malformed later closes the connection.
 A field value may hold bytes 0x80 to 0xff, which are passed on unchanged, and
 none of them makes a framing header acceptable; any other control byte than a
 tab in a value closes the connection without a reply.
@@ -1112,6 +1288,21 @@ Cache\-Control, have their repeated lines joined with ", "; any other repeated
 field, such as X\-Forwarded\-For, keeps its separate lines, in their order. As
 with every field, each line reaches the origin spelled "Name: value", and a
 hop\-by\-hop field or one that Connection names is dropped.
+.PP
+A forwarding request with a field name that reads, in any case and with each
+"_" taken for "\-", as Content\-Length, Transfer\-Encoding, Host or a hop\-by\-hop
+field (Connection, Proxy\-Connection, Keep\-Alive, TE, Trailer, Upgrade,
+Proxy\-Authorization, Proxy\-Authenticate), such as Content_Length, is answered
+with "400 Bad Request": an origin that maps "_" and "\-" to the same name, as CGI
+does, could read it as the field itself. Other names with underscores are
+forwarded unchanged.
+.PP
+A "Proxy" field, in any case, is dropped from a forwarding request as well,
+though it is no hop\-by\-hop field: an origin that runs CGI programs would hand
+it to them as HTTP_PROXY, which many HTTP libraries take for the proxy of their
+own outgoing requests ("httpoxy"), so the client could pick where the origin's
+requests go. No other name reaches CGI as HTTP_PROXY, so it has no alias to
+refuse.
 .PP
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
@@ -1188,12 +1379,60 @@ holds one
 .B username:password
 entry per line. The same store backs SOCKS5 (RFC 1929) and HTTP "Basic" (RFC
 7617) authentication; whenever it is configured, clients of either protocol
-must authenticate. gwproxy watches the file and reloads it automatically when it
-changes, so credentials can be updated without a restart. A file written through
-the configured name in its directory is reloaded as soon as the writer closes it,
-and a file renamed to that name at once. Any other change to the file the path
-leads to (behind a symlink, a Kubernetes secret mount, a swapped directory, unlink
-and link, or a change of its mode or owner) is seen by a
+must authenticate. Credentials can be updated without a restart: edit the file
+and send gwproxy a
+.B SIGHUP
+(see
+.BR "RELOADING THE FILES" ).
+.SH RELOADING THE FILES
+.B SIGHUP
+reloads
+.B \-\-auth\-file
+and the
+.B \-\-acl\-file
+with every file it includes, all at once and with no further wait: sending it
+says the files are ready. Each file that fails to load (missing, unreadable,
+malformed) is logged with the reason and keeps its current contents in force,
+while the other one is still reloaded; each outcome is logged
+.RB ( "Reloaded ACL file" ,
+.BR "Failed to reload authentication file" ,
+\&...). A
+.B SIGHUP
+with neither file configured is logged as having nothing to reload. Signals
+that arrive while a reload runs give one more reload once it is over, not one
+each. The reload runs on a thread of its own, so the workers go on serving
+throughout.
+.PP
+An ACL reload rebuilds the upstream pools too (see
+.BR "UPSTREAM CHAINING" ):
+every pool server is parsed and its host resolved again, and a server that
+fails fails the reload, which keeps the rules and pools in force. New
+connections use the new pools; one already through a pool's server keeps that
+server until it ends. The servers' health, an ejection included, carries over
+as their counts do.
+.PP
+The auth file, like the ACL files, must be a regular file. A FIFO or a device
+put in its place is refused, not waited on: the reload
+.RB ( SIGHUP ,
+or a change seen by the watch) fails at once, says so, and keeps the current
+credentials in force. A reload of a very large file still takes as long as
+reading it, and meanwhile no other reload runs, and a
+.B SIGINT
+or
+.B SIGTERM
+stops the workers but the process does not exit until that reload is over.
+.PP
+By default nothing else reloads the files: editing one has no effect until the
+next
+.BR SIGHUP .
+With
+.BR \-\-watch\-files=1 ,
+gwproxy also watches them and reloads a file by itself when it changes. A file
+written through the configured name in its directory is reloaded as soon as the
+writer closes it, and a file renamed to that name at once. Any other change to
+the file the path leads to (behind a symlink, a Kubernetes secret mount, a
+swapped directory, unlink and link, or a change of its mode or owner) is seen by
+a
 .BR stat (2)
 of the path every second, and is reloaded once the file has not changed for 5
 seconds, so a revoked credential stops working about 6 seconds later. That wait
@@ -1204,10 +1443,9 @@ truncated file then refuses every client, and a partial
 can allow what the finished one rejects. Replace these files atomically (write a
 temporary file in the same directory and rename it over the old one) if that
 matters. A file that disappears or cannot be read is logged once and the current
-credentials stay in force until it comes back, and a reload that fails for want
-of descriptors or memory is retried every second; the same goes for
-.BR \-\-acl\-file .
-A FIFO or device found this way is logged once and not read.
+contents stay in force until it comes back, and a reload that fails for want of
+descriptors or memory is retried every second. A FIFO or device found this way
+is logged once and not read.
 .SH TRANSPARENT PROXY
 .RB ( \-\-as\-transparent=1 )
 Transparent mode takes each connection's original destination from the
@@ -1246,9 +1484,7 @@ defers name resolution to the upstream proxy. An
 .B http://
 upstream is reached with an HTTP CONNECT request, which likewise resolves the
 host at the proxy. Credentials embedded in the URL authenticate to the upstream.
-An
-.B https://
-upstream (TLS to the proxy) is not supported yet. In transparent mode the
+In transparent mode the
 upstream, of any type, is asked for the connection's original destination
 address.
 .PP
@@ -1271,6 +1507,288 @@ unless a
 to an address replaces it. A
 .B \-\-target
 that is not a valid hostname or address with a port is refused at startup.
+.PP
+An
+.B https://
+upstream is an HTTP proxy reached over TLS: the HTTP CONNECT request, its
+credentials and the tunnel behind it all go through the TLS session, on
+both event loops. Nothing is sent to the proxy before the TLS handshake has
+completed and its certificate has been verified. The certificate chain must
+lead to a CA in the system's default trust store (OpenSSL's, which honours
+the
+.B SSL_CERT_FILE
+and
+.B SSL_CERT_DIR
+environment variables) or, with
+.BR \-\-upstream\-ca\-file ,
+to one in that file, and the certificate must be valid at the time. It must
+also be the URL's host's: a name must be among the certificate's DNS names
+(a wildcard covers one whole label at most; the subject's common name does
+not count), and is sent as the TLS server
+name (SNI); an IP address literal must be among its IP addresses, and is not
+sent as SNI. TLS 1.2 is the oldest version accepted. A handshake that fails,
+or a certificate that is refused, fails the connection as any other upstream
+failure does (SOCKS5 reply 0x01, HTTP 502 to the client, after a pool's retry
+on another server; see
+.BR "Upstream pools" )
+and is logged with the reason, for example
+.IR "certificate verify failed: hostname mismatch" .
+.PP
+An upstream that turns the CONNECT down is answered to an HTTP client with
+"502 Bad Gateway", whatever its reason. A SOCKS5 client gets reply 0x05
+(connection refused) only when the upstream says the target could not be
+reached: a
+.B socks5://
+or
+.B socks5h://
+upstream's failed reply, or a 502 or 504 from an
+.B http://
+or
+.B https://
+one. A 407, which says the upstream refused gwproxy's credentials, and any
+other status (403, 500, 503, ...) say nothing about the target and get reply
+0x01 (general failure), as does a SOCKS5 upstream that refuses the
+credentials.
+.PP
+The end of the upstream's stream reaches the client as a normal end of stream
+only if it is one, as for a TLS client in the other direction (see
+.BR "TLS TERMINATION" ).
+Once the tunnel through an
+.B https://
+upstream is up, the client's connection is reset (TCP RST) rather than closed
+whenever the pair goes down before the client's side was shut after a whole
+stream: when the upstream's stream is cut (a record that fails to verify, a
+fatal alert, a reset, a stream that stops in the middle of a record), and
+equally on any other teardown, including
+.B \-\-idle\-timeout
+and gwproxy shutting down. A tunnel that fails before it is up, and a 502
+gwproxy sends in place of an unusable response to a forwarded request, end
+with a normal close. When the client is done sending, the upstream is sent a
+.B close_notify
+before the TCP FIN. A TLS client
+.RB ( \-\-tls\-cert )
+may chain through an
+.B https://
+upstream; each side has its own TLS session.
+.SS Upstream pools
+The ACL file
+.RB ( \-\-acl\-file )
+can send connections through other upstreams than
+.BR \-\-upstream\-proxy ,
+per user, client, port or target: an
+.BI "upstream " name " {"
+block defines a pool of upstream proxies, and an
+.B OUTPUT
+rule with
+.BI "\-j UPSTREAM \-\-to " name
+sends the connections it matches through it, or with
+.B "\-j UPSTREAM \-\-to DIRECT"
+to their targets directly. Of several matching
+.B \-j UPSTREAM
+rules the last one decides, unless one with
+.B \-\-accept
+ends the walk first; with none,
+.B \-\-upstream\-proxy
+applies, or no upstream at all. For example:
+.PP
+.RS
+.EX
+upstream office {
+    server socks5h://alice_up:secret@10.0.0.1:1080;
+}
+upstream web {
+    server http://10.0.0.3:3128;
+}
+\-A OUTPUT \-m user \-\-user alice \-j UPSTREAM \-\-to office
+\-A OUTPUT \-m user \-\-user bob \-j UPSTREAM \-\-to web
+\-A OUTPUT \-m domain \-\-domain intranet.example \-j UPSTREAM \-\-to DIRECT
+.EE
+.RE
+.PP
+A pool's
+.B https://
+servers are verified as an
+.B https://
+.B \-\-upstream\-proxy
+is (see above), against the same trust store, the system's or
+.BR \-\-upstream\-ca\-file ,
+each against its own host, which is sent as SNI when it is a name. A pool
+may mix
+.B https://
+servers with
+.BR http:// " and " socks5h://
+ones. An
+.B https://
+server may come in with a reload into a proxy that had none, and one whose
+host cannot be used as a TLS server name fails the load like any bad server.
+.PP
+The upstream is decided once per connection, before its target's name is
+resolved, from what is known then: the user, the client's address and port,
+and the target as the client gave it, a name or an address, and its port.
+So
+.B \-m domain
+matches a target given by name, and
+.B \-d
+only one given as an address (a name's addresses are not known yet). For a
+target given by name the decision passes over every rule with a
+.BR \-d ,
+terminal ones included: a
+.B "\-d ... \-j ACCEPT"
+above a
+.B \-j UPSTREAM
+rule does not stop a named target from picking that rule's pool, though it
+may accept the target's addresses afterwards. The decision is not the verdict
+either: it takes the choice of the last
+.B \-j UPSTREAM
+rule it meets, whether the walk then ends on an accept or a reject, so a
+default\-deny set that admits targets by
+.B \-d
+still sends them through their pool. A
+.B \-m statistic
+rule takes no turn in this decision, it tells what the connection's next
+evaluation will. A regexp that cannot be decided (one whose match runs into
+PCRE2's limits, which refuses the target in any evaluation)
+refuses the connection rather than leave it to the default. The
+.B OUTPUT
+evaluations that follow, once per resolved address and again when a connect is
+retried, decide the verdict,
+.BR DNAT ", " MARK " and " BIND
+as before, but never change the upstream.
+.PP
+The pool then decides how the name is resolved: a
+.B socks5://
+pool, like
+.B DIRECT
+and no upstream at all, has gwproxy resolve it and sends the server an
+address; a
+.BR socks5h:// ", " http:// " or " https://
+pool sends the server the name.
+Plain
+.B \-\-target
+forwarding to a name sends that name to a pool that resolves names. A
+connection the ACL sends elsewhere goes to the address the name resolved to
+at startup; when
+.B \-\-upstream\-proxy
+itself resolves names remotely, the name is not resolved at startup, and such
+a connection is refused (and logged).
+.PP
+A pool of several servers spreads its connections over them. By default it
+takes them in turn (round\-robin): each connection that picks the pool goes
+to the next server, in the order the block lists them, whichever worker
+serves it. With
+.BR least_conn ,
+a connection goes to the server with the fewest connections open through it
+at that moment, and among servers equally loaded to the next one in turn, so
+that they share the new connections. A connection counts against its server
+from the moment it is given it, before it connects, until it ends, however it
+ends: closed by either side, refused, failed to connect or in the handshake,
+or timed out. The counts belong to the server, not to the pool: a server,
+known by its scheme, the address it resolved to, its port and its user (not
+its password), counts the connections of every pool that lists it, and keeps
+its count across a reload, so connections opened before a reload still weigh
+on the choices made after it. A reload starts each pool's turn from its first
+server again. Workers choosing at the same moment may see the same counts and
+choose the same server; the choices after them see the result.
+.PP
+A pool also keeps track of its servers' health, from the connections they
+carry (passively: gwproxy sends no probes of its own). A failure counts
+against a server only when it is the server's own: its TCP connection
+refused, reset or timed out, its TLS handshake failing (a refused
+certificate included), a SOCKS5 server that accepts none of the offered
+authentication methods, refuses the credentials or answers reply 0x07 or
+0x08, an HTTP server that answers 407, a reply that does not parse, the
+server hanging up, or the connect timeout running out before gwproxy has
+sent its CONNECT request (during the TCP connect, the TLS handshake or the
+SOCKS5 method and authentication exchange). A failure the server reports for
+the target (SOCKS5 replies 0x03 to 0x06, HTTP 502 and 504) reaches the client
+as it is and never counts, and neither do ambiguous refusals (SOCKS5 replies
+0x01 and 0x02, HTTP 403, 500, 503 and any other status), the timeout running
+out while the server is waiting for the target to answer the CONNECT (a
+target that never answers holds a healthy server up), nor local trouble such
+as running out of descriptors. Three failures
+that count, within 30 seconds, eject the server for 5 minutes: no pool picks
+it meanwhile, and round\-robin and
+.B least_conn
+alike spread its share over the servers left. As with the counts, the health
+is the server's, not the pool's: failures through one pool eject the server
+from every pool that lists it. When every server of a pool is ejected, the
+pool takes the one whose ejection ends soonest; a pool of one server, and
+.BR \-\-upstream\-proxy ,
+keep using theirs, so for them an ejection shows only in the log. A server
+that fails while ejected is not ejected for longer; once its 5 minutes are
+over it is picked again, and if it failed in its last 30 seconds out, its
+next failure ejects it again at once. A connection that gets through does not
+undo the failures before it: they count until they are 30 seconds old. These
+numbers are fixed.
+.PP
+A connection that a pool's server fails in one of the ways that count is
+tried again, once, on another server of the same pool that is not ejected:
+the next one in the block's order, or with
+.B least_conn
+the least loaded one. This is safe because nothing the client sends is
+passed on before the tunnel through the upstream is up, so the retry repeats
+nothing and loses nothing. It has what is left of the connection's
+.BR \-\-connect\-timeout ,
+no more: a connection that ran out of time is not retried, and when the retry
+runs out of it, that does not count against its server. With no other
+server to take, or once its retry has failed too, the client gets the reply
+it would have had without one: SOCKS5 reply 0x05 for a refused connection and
+0x01 for a failed handshake, or HTTP 502. A failure that does not count is not
+retried, and neither is a connection through
+.BR \-\-upstream\-proxy .
+.PP
+A reload keeps what is known of each server that the new pools still list,
+ejection included, as it keeps the counts. A server that the reload takes out
+of every pool is remembered only while connections opened before it still use
+that server; once they are gone it is forgotten, and a later reload that
+lists it again starts it afresh.
+.PP
+An ejection is logged at warning level, once however many pools list the
+server, as
+.IR "Upstream pool NAME server N (ADDRESS) ejected for 300 s after 3 failures in 30 s" ,
+naming the pool of the connection whose failure ejected it (or
+.I default upstream (ADDRESS)
+for
+.BR \-\-upstream\-proxy ),
+and the server's return at info level, when a connection first finds the 5
+minutes over. At debug level each failure is logged with whether it counted,
+each retry with both servers, and each connection that had to take an ejected
+server.
+.PP
+Each connection that a rule sends through a pool, or
+.BR DIRECT ,
+is logged at debug level, naming the pool and its server's number, counted
+from 1, how many connections that server then has open, and its address,
+never its credentials; so is each connection giving its server back, with
+the count left. A pool server's address is
+resolved once, when the set loads; a reload resolves it again. A reload that
+changes the pools applies to new connections; one already through a pool's
+server keeps it until it ends.
+.PP
+UDP is never sent through an upstream, and the rules do not apply to the UDP
+relay's datagrams. A SOCKS5 UDP ASSOCIATE is decided like a connection, from
+the user and the client alone, as for a TCP connection. It has no target, so
+a rule that tests one
+.RB ( \-d ", " \-\-dports " or " "\-m domain" ,
+negated or not) is never taken for it, a terminal one such as
+.B "\-d ... \-j ACCEPT"
+included. A user the rules send through a pool is refused it (reply 0x07), and
+so is one that a pool rule
+.RB ( "\-p tcp" ,
+or with no protocol) would match but for its target tests, as the rule might
+send that user's traffic through the pool; a
+.B \-m statistic
+in such a rule counts as one that could match, and a later
+.B DIRECT
+rule that does match does not undo the refusal. A
+.B DIRECT
+rule passed over for its target tests is just passed over. Everyone else
+without a choice is refused it when
+.B \-\-upstream\-proxy
+is given, and a user the rules send
+.B DIRECT
+gets a direct UDP relay, even past
+.BR \-\-upstream\-proxy .
 .SH TARGET ADDRESS SELECTION
 A hostname target of a SOCKS5 or HTTP request usually resolves to several
 addresses, and gwproxy tries them as a list of candidates rather than
@@ -1411,7 +1929,25 @@ Stop at once: workers leave their event loops and every connection is closed,
 with whatever is still in its buffers or on its way discarded. There is no
 drain. A client in the middle of a transfer sees a normal end of stream after
 only part of the data, so a protocol that does not mark its own end cannot tell
-this from a complete transfer.
+this from a complete transfer. The process exits once a reload in progress is
+over (see
+.BR "RELOADING THE FILES" ).
+Early in the startup, while it loads its files, the signal ends the process
+at once. From when it starts its threads and opens its listeners until its
+handler is in place, the signal is held instead, and then stops the proxy as
+above, with exit status 0.
+.TP
+.B SIGHUP
+Reload
+.B \-\-auth\-file
+and the
+.B \-\-acl\-file
+set (see
+.BR "RELOADING THE FILES" ).
+The proxy goes on running whatever the outcome, and with neither file
+configured the signal is only logged: a stray
+.B SIGHUP
+(a closed terminal, say) does not terminate the process.
 .TP
 .B SIGPIPE
 Ignored, so a peer closing a connection cannot terminate the process.
@@ -1420,7 +1956,11 @@ Ignored, so a peer closing a connection cannot terminate the process.
 exits
 .B 0
 on a clean shutdown and non\-zero if the configuration is invalid or a fatal
-runtime error occurs.
+runtime error occurs. The non\-zero status is an
+.BR errno (3)
+value, such as 22
+.RB ( EINVAL )
+for an invalid option, and the log says what failed.
 .SH FILES
 .TP
 .I auth\-file
@@ -1478,6 +2018,15 @@ Chain every outgoing connection through an upstream proxy (SOCKS5 or HTTP):
 .EX
 gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \\
     \-\-upstream\-proxy=socks5h://user:pass@1.2.3.4:1080
+.EE
+.RE
+.PP
+The same through an HTTPS proxy, whose certificate a private CA issued:
+.RS 4
+.EX
+gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \\
+    \-\-upstream\-proxy=https://user:pass@proxy.example.net:3129 \\
+    \-\-upstream\-ca\-file=/etc/gwproxy/proxy\-ca.pem
 .EE
 .RE
 .PP

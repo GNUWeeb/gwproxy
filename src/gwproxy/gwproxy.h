@@ -16,6 +16,8 @@
 #include <gwproxy/dns.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/iplimit.h>
+#include <gwproxy/upstream.h>
+#include <gwproxy/upstream_lb.h>
 #include <gwproxy/log.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -67,6 +69,7 @@ struct gwp_cfg {
 	const char	*auth_file;
 	const char	*acl_file;
 	bool		acl_allow_all;	/* skip the built-in default ACL */
+	bool		watch_files;	/* reload the files on change too */
 	int		dns_cache_secs;
 	int		dns_cache_max_entries;	/* cap; <=0 = unlimited */
 	int		nr_workers;
@@ -113,6 +116,8 @@ struct gwp_cfg {
 	bool		as_transparent;
 	const char	*tls_cert;
 	const char	*tls_key;
+	/* CA certificates to verify an https:// upstream proxy with. */
+	const char	*upstream_ca_file;
 };
 
 struct gwp_ctx;
@@ -123,26 +128,65 @@ enum {
 };
 
 /*
- * Parsed form of the --upstream-proxy option. When @enabled, every outgoing
- * connection is routed through this upstream proxy instead of being connected
- * to directly. The URL scheme picks @type (socks5[h]:// vs http[s]://) and, for
- * HTTP, whether the hop to the proxy is TLS (@use_tls, https://). Populated once
- * at startup and shared read-only by all workers.
+ * One upstream proxy server, parsed from a URL such as --upstream-proxy's. A
+ * connection that chains through it holds a reference (gwp_conn_pair::upstream)
+ * and dials it instead of its target. The URL scheme picks @type (socks5[h]://
+ * vs http[s]://) and, for HTTP, whether the hop to the proxy is TLS (@use_tls,
+ * https://). Read-only once set up and shared by all workers; @refcnt keeps it
+ * alive for as long as a pool or a connection still uses it, so a pool can go
+ * away (an ACL reload) while connections through its servers carry on. Freed
+ * by the gwp_upstream_put() that drops the last reference.
  */
 struct gwp_upstream {
-	bool			enabled;
+	_Atomic(uint32_t)	refcnt;
 	uint8_t			type;		/* GWP_UPSTREAM_SOCKS5 / HTTP */
 	bool			remote_dns;	/* socks5h:// (proxy resolves) */
 	bool			use_tls;	/* https:// (TLS to the proxy) */
 	bool			has_auth;
+	/* @host is an IP literal, not a DNS name (gwp_upstream_url_host()). */
+	bool			host_is_ip;
 	uint8_t			ulen;
 	uint8_t			plen;
 	struct gwp_sockaddr	addr;		/* proxy endpoint */
+	/*
+	 * The host as the URL wrote it, which @addr was resolved from: the
+	 * name an https:// upstream's certificate is checked against.
+	 */
+	char			host[256];
 	char			user[256];
 	char			pass[256];
+	/*
+	 * Counts the live servers of the ACL's pools (gwp_ctx::nr_acl_srv),
+	 * one less once this one is freed; NULL for --upstream-proxy's.
+	 */
+	_Atomic(uint32_t)	*live;
+	/*
+	 * What all servers of this one's identity share (gwp_ctx::up_tab),
+	 * held until this one is freed: among others, how many pairs use
+	 * it now, one for each pair whose gwp_conn_pair::upstream it is.
+	 */
+	struct gwp_up_state	*state;
 };
 
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up);
+
+/*
+ * A set of upstream servers to pick from. --upstream-proxy makes the default
+ * pool (gwp_ctx::upstream_pool), of one server; @nr is 0 when there is none,
+ * and connections then go direct. The pool holds a reference to each server.
+ */
+struct gwp_upstream_pool {
+	uint32_t		nr;
+	struct gwp_upstream	**srv;
+};
+
+static inline struct gwp_upstream *gwp_upstream_get(struct gwp_upstream *up)
+{
+	atomic_fetch_add_explicit(&up->refcnt, 1, memory_order_relaxed);
+	return up;
+}
+
+void gwp_upstream_put(struct gwp_upstream *up);
 
 /*
  * How many of a name's addresses one connection may try. The resolver can hand
@@ -324,6 +368,12 @@ enum {
 	 */
 	CONN_STATE_UPSTREAM_HTTP_MIN	= 300,
 	CONN_STATE_UPSTREAM_HTTP_CONNECT = 301,	/* await "HTTP/1.x 2xx"      */
+	/*
+	 * https:// only: the TLS handshake with the proxy, before the CONNECT.
+	 * The event loops drive it themselves (gwp_upstream_tls_start()); it
+	 * sends nothing of ours and leaves gcp->target's buffer alone.
+	 */
+	CONN_STATE_UPSTREAM_TLS_HS	= 302,
 	CONN_STATE_UPSTREAM_HTTP_MAX	= 399,
 
 	CONN_STATE_HTTP_MIN		= 400,
@@ -380,11 +430,11 @@ struct gwp_conn {
 	bool		wr_shut;
 
 	/*
-	 * TLS state for this endpoint (HTTPS proxy). NULL for a plaintext
-	 * endpoint; only the client side is ever TLS in this cut. Once set and
-	 * the handshake has completed, __do_recv()/__do_send() transparently
-	 * decrypt/encrypt through it. Owned here and released in
-	 * gwp_free_conn_pair().
+	 * TLS state for this endpoint, NULL for a plaintext one: the client's
+	 * when it connected with TLS (--tls-cert), the target's when it is an
+	 * https:// upstream proxy. Once set and the handshake has completed,
+	 * __do_recv()/__do_send() transparently decrypt/encrypt through it.
+	 * Owned here and released in gwp_free_conn_pair().
 	 */
 	struct gwp_ssl	*tls;
 };
@@ -416,6 +466,28 @@ enum {
 	 * uncount it (gwp_ctx_iplim_put()).
 	 */
 	GWP_CONN_FLAG_IPLIM		= (1ull << 5ull),
+	/*
+	 * The pair's upstream has been decided (conn_pick_upstream()):
+	 * no later OUTPUT evaluation may change it.
+	 */
+	GWP_CONN_FLAG_UP_PICKED		= (1ull << 6ull),
+	/*
+	 * The attempt through the pair's upstream has failed and been
+	 * classified (gwp_conn_upstream_failed()): another way the same
+	 * failure surfaces must not count it again.
+	 */
+	GWP_CONN_FLAG_UP_FAILED		= (1ull << 7ull),
+	/*
+	 * The client has been given its failure reply (gwp_conn_fail_reply()),
+	 * so a failure that surfaces again on its way out gives no second
+	 * one (gwp_upstream_fail_reply()).
+	 */
+	GWP_CONN_FLAG_FAIL_REPLIED	= (1ull << 9ull),
+	/*
+	 * The pair has had its one retry on another server of its pool
+	 * (gwp_conn_upstream_failed()).
+	 */
+	GWP_CONN_FLAG_UP_RETRIED	= (1ull << 8ull),
 };
 
 enum {
@@ -498,6 +570,8 @@ struct gwp_conn_pair {
 	 * handshake starts, freed in gwp_free_conn_pair().
 	 */
 	struct gwp_iou_tls		*tls_io;
+	/* The same for the target, when it is an https:// upstream proxy. */
+	struct gwp_iou_tls		*up_tls_io;
 #endif
 #endif
 
@@ -520,6 +594,21 @@ struct gwp_conn_pair {
 	struct gwp_udp_peers	*udp_peers;
 	/* The next pair on the epoll loop's list of pairs to free (@dead). */
 	struct gwp_conn_pair	*next_dead;
+	/*
+	 * The upstream proxy this pair chains through, NULL to connect
+	 * direct. Holds a reference, and a slot of its open-pair count,
+	 * both dropped when the pair is freed; set it only with
+	 * gwp_conn_set_upstream().
+	 */
+	struct gwp_upstream	*upstream;
+	/*
+	 * The ACL pool @upstream was picked from, with a reference, NULL for
+	 * the default (--upstream-proxy) or none; held only until the tunnel
+	 * is up (gwp_conn_upstream_up()), for the logs and the retry that
+	 * may need another of its servers. @up_srv is @upstream's place in
+	 * it.
+	 */
+	struct gwp_acl_pool	*up_pool;
 
 	/*
 	 * The hostname the client asked for, when it used a domain target
@@ -603,7 +692,7 @@ struct gwp_conn_pair {
 
 	/*
 	 * Destination requested from the upstream SOCKS5 proxy. Only used
-	 * when ctx->upstream.enabled. For socks5:// this is filled from
+	 * when @upstream is set. For socks5:// this is filled from
 	 * target_addr (an IP); for socks5h:// it carries the hostname.
 	 *
 	 * This is the single largest member (262 bytes, mostly the 256-byte
@@ -624,6 +713,16 @@ struct gwp_conn_pair {
 	 * searched from its start again on every read.
 	 */
 	uint32_t		up_scan;
+
+	/*
+	 * How the attempt through the upstream failed, when the place that
+	 * saw it knows better than the errno it returns: an enum
+	 * gwp_upstream_end plus one, 0 when none was noted, and its value
+	 * (gwp_upstream_note_end()).
+	 */
+	uint16_t		up_val;
+	uint8_t			up_end;
+	uint8_t			up_srv;
 
 	/* One-byte scalars last, so they pack instead of each opening a hole. */
 	bool			is_target_alive;
@@ -874,6 +973,17 @@ struct gwp_reload_file {
 	bool			retry;
 };
 
+/*
+ * One file of the ACL rule set (the --acl-file or a file it includes), as the
+ * reload thread watches it. @wd: the inotify watch on its directory, -1 when
+ * there is none (the periodic check still covers it).
+ */
+struct gwp_reload_acl_file {
+	char			*path;
+	int			wd;
+	struct gwp_reload_file	rf;
+};
+
 struct gwp_ctx {
 	/*
 	 * Set from the signal handler and from any worker that exits, read by
@@ -895,8 +1005,16 @@ struct gwp_ctx {
 	struct gwp_socks5_ctx		*socks5;
 	struct gwp_auth			*auth;
 	struct gwp_ssl_ctx		*ssl_ctx;
+	/* The client side of TLS to an https:// upstream proxy, else NULL. */
+	struct gwp_ssl_ctx		*up_ssl_ctx;
 	struct gwp_dns_ctx		*dns;
-	struct gwp_upstream		upstream;
+	/* --upstream-proxy; see struct gwp_upstream_pool. */
+	struct gwp_upstream_pool	upstream_pool;
+	/*
+	 * The shared state of every upstream server, the default one and
+	 * the ACL pools', by identity (struct gwp_up_table).
+	 */
+	struct gwp_up_table		*up_tab;
 	/*
 	 * Parsed --bind-source/--bind-iface: the source pin applied to every
 	 * outgoing connection that no ACL -j BIND rule claimed. Built once at
@@ -910,24 +1028,38 @@ struct gwp_ctx {
 	int				pid_fd;
 	/*
 	 * One inotify instance watching the auth file and the ACL file (their
-	 * parent directories, see add_reload_watch()); -1 when neither is
-	 * configured. @reload_thread polls it and reloads the files, off the
-	 * workers; @reload_efd tells it to exit. @reload_running: the thread
-	 * was started and still needs a join. @auth_reload, @acl_reload: the
-	 * state of each file's periodic check; owned by the thread once it
-	 * runs.
+	 * parent directories, see add_reload_watch()); -1 when they are not
+	 * watched (--watch-files=0) or neither is configured. @reload_thread
+	 * polls it and reloads the files, off the workers; @reload_efd tells
+	 * it to exit. @hup_efd wakes it for a SIGHUP, which sets @reload_hup
+	 * (see gwp_ctx_hup()). @reload_running: the thread was started and
+	 * still needs a join. @auth_reload, @acl_files: the state of each
+	 * file's periodic check, the ACL's for each file of its set (see
+	 * gwp_acl_file()); owned by the thread once it runs. @auth_wd: the
+	 * watch on the auth file's directory, -1 when none.
 	 */
 	int				ino_fd;
 	int				reload_efd;
+	int				hup_efd;
+	_Atomic(bool)			reload_hup;
+	int				auth_wd;
 	pthread_t			reload_thread;
 	bool				reload_running;
 	struct gwp_reload_file		auth_reload;
-	struct gwp_reload_file		acl_reload;
+	struct gwp_reload_acl_file	*acl_files;
+	size_t				nr_acl_files;
 	/* ACL rule store. Global to all proxy modes, unlike @auth which is
 	 * prot-only. @acl_watched: loaded from --acl-file (so reloadable),
 	 * not the built-in default rules. */
 	struct gwp_acl			*acl;
 	bool				acl_watched;
+	/*
+	 * Make the servers of the ACL's upstream pools when a load reads
+	 * them (struct gwp_acl_server_ops). @nr_acl_srv counts those still
+	 * alive: held by a pool, or by a connection after its pool is gone.
+	 */
+	struct gwp_acl_server_ops	acl_srv_ops;
+	_Atomic(uint32_t)		nr_acl_srv;
 	/* Client connections per address, for --max-conns-per-ip; NULL when
 	 * there is no cap, so the accept path costs nothing then. */
 	struct gwp_iplim		*iplim;
@@ -941,6 +1073,49 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w);
 bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+/* Make @gcp chain through @up (NULL: go direct), dropping what it had. */
+void gwp_conn_set_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+			   struct gwp_upstream *up);
+
+/*
+ * Say how the attempt through @gcp's upstream failed (@end, with @val as
+ * enum gwp_upstream_end documents), where that is known better than from
+ * the errno the failure returns. The first note stands.
+ */
+static inline void gwp_upstream_note_end(struct gwp_conn_pair *gcp,
+					 enum gwp_upstream_end end, int val)
+{
+	if (gcp->up_end)
+		return;
+	gcp->up_end = (uint8_t)end + 1;
+	gcp->up_val = (uint16_t)(val < 0 ? 0 : val > 0xffff ? 0xffff : val);
+}
+
+/*
+ * The attempt through @gcp's upstream failed with @err, before the tunnel
+ * was up: a connect, the TLS or proxy handshake, or the time they had.
+ * Every way such an attempt fails, on both event loops, ends here, and
+ * the first call per attempt classifies it (gwp_upstream_fail_classify(),
+ * from the noted end, else from @err), logs it and, for the upstream's
+ * own failures, counts it against the server's health; later calls for
+ * the same attempt do nothing.
+ *
+ * Then, when @may_retry (the caller can dial again at once) and the
+ * failure was the upstream's own, the pair gets its one retry: if its
+ * pool has another server in service, the pair is moved to it
+ * (gwp_conn_set_upstream()) and true is returned, for the caller to undo
+ * the old attempt (gwp_upstream_hs_reset()) and dial the new server. No
+ * client data has reached a target yet, as the tunnel is not up. false
+ * otherwise: the failure stands, and the client gets its usual answer.
+ */
+bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      int err, bool may_retry);
+
+/*
+ * The tunnel through @gcp's upstream is up: what was kept for a failure
+ * (the pool reference) goes.
+ */
+void gwp_conn_upstream_up(struct gwp_conn_pair *gcp);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
@@ -1076,6 +1251,15 @@ bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
 			const struct gwp_sockaddr *dst, bool connected);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
 
+/* Monotonic milliseconds, at the coarse clock's resolution (a few ms). */
+static inline uint64_t gwp_now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC_COARSE, &t);
+	return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
 /* Monotonic seconds, at the coarse clock's resolution (a few ms). */
 static inline uint32_t gwp_now_sec(void)
 {
@@ -1111,6 +1295,27 @@ static inline bool gwp_in_upstream_hs(const struct gwp_conn_pair *gcp)
 
 	return cs >= CONN_STATE_UPSTREAM_S5_MIN &&
 	       cs <= CONN_STATE_UPSTREAM_HTTP_MAX;
+}
+
+/*
+ * The value of a GWP_UPSTREAM_END_TIMEOUT for @gcp's attempt (see enum
+ * gwp_upstream_end): 0 while the upstream owes us its part, the connect or
+ * the handshake up to our CONNECT request; 1 once that request is out and
+ * its reply is awaited, or while the handshake waits on our own client
+ * (its reply still being flushed), neither the upstream's fault.
+ */
+static inline int gwp_upstream_timeout_val(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	if (cs == CONN_STATE_UPSTREAM_S5_CONNECT ||
+	    cs == CONN_STATE_UPSTREAM_HTTP_CONNECT)
+		return !gcp->up_tx;
+	if (gwp_in_upstream_hs(gcp))
+		return 0;
+	/* Connected, but held for the client (upstream_start_held()). */
+	return gcp->upstream && gcp->target.fd >= 0 &&
+	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
 }
 
 /*
@@ -1244,6 +1449,17 @@ enum gwp_upstream_io {
 int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /*
+ * gwp_conn_upstream_failed() moved @gcp to another server: undo what the
+ * attempt on the old one left, so the pair is as it was before it dialled,
+ * in @state (the loop's state for a pair whose connect is under way). The
+ * handshake's bytes in gcp->target go, and the room it held back returns;
+ * what is there before the handshake starts (the rest of a reply to the
+ * client) stays. The old target socket is the caller's to close.
+ */
+void gwp_upstream_hs_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   int state);
+
+/*
  * Fresh proxy bytes were appended to gcp->target.buf: parse the current
  * handshake state and either build the next request (GWP_UPSTREAM_IO_SEND), ask
  * for more (GWP_UPSTREAM_IO_RECV), or on final success splice the downstream
@@ -1263,6 +1479,28 @@ int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
  */
 int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    int err);
+
+#ifdef CONFIG_HTTPS
+/*
+ * Connected to an https:// upstream proxy: set up the target's TLS engine, in
+ * client role and naming the proxy as its URL does, and enter
+ * CONN_STATE_UPSTREAM_TLS_HS. The event loop then drives the handshake and
+ * calls gwp_upstream_hs_start() only once it has completed, with the proxy's
+ * certificate verified. Returns 0 or a negative errno.
+ */
+int gwp_upstream_tls_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/* The TLS handshake with the upstream proxy failed: log why. */
+void gwp_upstream_tls_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * The https:// upstream's stream has ended, and the end was a cut rather than
+ * one to pass on to the client (gwp_ssl_rx_cut()). An end the proxy made
+ * itself, when the HTTP forwarding filter answered 502 in place of an unusable
+ * response, is not one: the 502 is complete, whatever the engine still holds.
+ */
+bool gwp_upstream_tls_cut(struct gwp_conn_pair *gcp);
+#endif
 
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);

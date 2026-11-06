@@ -7,6 +7,8 @@
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
+/* Before common.h: musl's struct stat has a field named __unused. */
+#include <sys/stat.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/common.h>
 #include <arpa/inet.h>
@@ -20,6 +22,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <limits.h>
 
 static struct gwp_sockaddr sa4(const char *ip, uint16_t port)
 {
@@ -704,6 +707,11 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT -j ACCEPT --to-iface eth0\n",	    /* --to-iface w/o BIND */
 		"-A INPUT -j BIND --to-iface eth0\n",		    /* BIND in INPUT */
 		"-A OUTPUT -j BIND --to-source notanip\n",	    /* bad source */
+		"-A OUTPUT -j BIND --to-source 10.0.0.1:80x\n",   /* port junk */
+		"-A OUTPUT -j BIND --to-source 10.0.0.1:65536\n", /* port range */
+		"-A OUTPUT -j BIND --to-source 10.0.0.1:+80\n",   /* port sign */
+		"-A OUTPUT -j BIND --to-source [::1]:-18446744073709551535\n", /* 81 */
+		"-A OUTPUT -j BIND --to-source 10.0.0.1:\n",	    /* empty port */
 		"-A OUTPUT -j BIND --to-source 1.1.1.1 --to-source 2.2.2.2\n", /* dup src */
 		"-A OUTPUT -j BIND --to-iface toolonginterfacename0\n", /* iface >= 16 */
 		"-A OUTPUT -j ACCEPT --accept\n",		    /* --accept on ACCEPT */
@@ -995,13 +1003,14 @@ static const char *rnd_action(char *buf, bool output, bool terminal)
 	static const char *const out_acts[] = {
 		"-j ACCEPT", "-j REJECT", "-j DNAT --to 127.0.0.1:81",
 		"-j DNAT --to :82", "-j MARK --set-mark 5 --accept",
-		"-j BIND --to-source 127.0.0.2 --accept", "-j MARK --set-mark 6",
-		"-j BIND --to-iface lo",
+		"-j BIND --to-source 127.0.0.2 --accept",
+		"-j UPSTREAM --to DIRECT --accept", "-j MARK --set-mark 6",
+		"-j BIND --to-iface lo", "-j UPSTREAM --to DIRECT",
 	};
 
 	if (!output)
 		return rnd(2) ? "-j ACCEPT" : "-j REJECT";
-	strcpy(buf, out_acts[rnd(terminal || rnd(4) ? 6 : NELEM(out_acts))]);
+	strcpy(buf, out_acts[rnd(terminal || rnd(4) ? 7 : NELEM(out_acts))]);
 	return buf;
 }
 
@@ -1014,6 +1023,7 @@ static char *rnd_rule(char *p, bool output, bool indexable)
 	static const uint32_t ikinds[] = { 0, 6, 7, 8 };
 	char cbuf[64], abuf[64];
 	const char *chain = output ? "OUTPUT" : "INPUT";
+	const char *act = rnd_action(abuf, output, indexable);
 	uint32_t kind;
 
 	if (indexable)
@@ -1030,7 +1040,9 @@ static char *rnd_rule(char *p, bool output, bool indexable)
 		p += sprintf(p, "! -s %s ", rnd_net());
 		break;
 	case 4:
-		p += sprintf(p, "-s %s -p %s ", rnd_net(), rnd(2) ? "tcp" : "udp");
+		/* -j UPSTREAM is TCP's only: a UDP one does not load. */
+		p += sprintf(p, "-s %s -p %s ", rnd_net(),
+			     rnd(2) || strstr(act, "UPSTREAM") ? "tcp" : "udp");
 		break;
 	case 5: {
 		uint32_t lo = rnd(3) * 1000;
@@ -1057,7 +1069,7 @@ static char *rnd_rule(char *p, bool output, bool indexable)
 				     rnd_doms[rnd(NELEM(rnd_doms))]);
 		break;
 	}
-	p += sprintf(p, "%s\n", rnd_action(abuf, output, indexable));
+	p += sprintf(p, "%s\n", act);
 	return p;
 }
 
@@ -1078,7 +1090,8 @@ static bool same_result(const struct gwp_acl_req *x, enum gwp_acl_verdict vx,
 			const struct gwp_acl_req *y, enum gwp_acl_verdict vy)
 {
 	if (vx != vy || x->dnat_applied != y->dnat_applied ||
-	    x->mark_set != y->mark_set || x->bind.set != y->bind.set)
+	    x->mark_set != y->mark_set || x->bind.set != y->bind.set ||
+	    x->upstream != y->upstream)
 		return false;
 	if (x->dnat_applied && memcmp(&x->dnat, &y->dnat, sizeof(x->dnat)))
 		return false;
@@ -1090,10 +1103,31 @@ static bool same_result(const struct gwp_acl_req *x, enum gwp_acl_verdict vx,
 }
 
 /*
+ * gwp_acl_parse_str() with its warnings dropped: a random -j UPSTREAM rule
+ * with a -d draws one each time.
+ */
+static int parse_quiet(struct gwp_acl **a, const char *text)
+{
+	int saved, null, r;
+
+	fflush(stderr);
+	saved = dup(STDERR_FILENO);
+	null = open("/dev/null", O_WRONLY);
+	assert(saved >= 0 && null >= 0);
+	assert(dup2(null, STDERR_FILENO) == STDERR_FILENO);
+	close(null);
+	r = gwp_acl_parse_str(a, text);
+	fflush(stderr);
+	assert(dup2(saved, STDERR_FILENO) == STDERR_FILENO);
+	close(saved);
+	return r;
+}
+
+/*
  * Random rule files, each evaluated twice: as written, where long runs
  * are indexed, and with a never-matching two-criterion rule after every
  * rule, which leaves no run to index. Every request must get the same
- * verdict and the same DNAT/MARK/BIND result from both.
+ * verdict and the same DNAT/MARK/BIND/UPSTREAM result from both.
  */
 static noinline void test_index_matches_linear(void)
 {
@@ -1135,8 +1169,8 @@ static noinline void test_index_matches_linear(void)
 				     "-A OUTPUT -d 0.0.0.0/32 --dports 1 -j REJECT\n" :
 				     "-A INPUT -s 0.0.0.0/32 --sports 1 -j REJECT\n");
 		}
-		assert(!gwp_acl_parse_str(&a, txt));
-		assert(!gwp_acl_parse_str(&b, ref));
+		assert(!parse_quiet(&a, txt));
+		assert(!parse_quiet(&b, ref));
 		assert(gwp_acl_nr_indexed(b) == 0);
 
 		for (k = 0; k < 200; k++) {
@@ -1799,6 +1833,1654 @@ static void test_file_nul(void)
 	free(path);
 }
 
+/*
+ * A FIFO in place of the rule file, at creation or on reload, is refused at
+ * once: opening it for reading would otherwise wait for a writer that may
+ * never come, and hold up every later reload and shutdown with it.
+ */
+static void test_file_fifo(void)
+{
+	struct gwp_sockaddr t = sa4("93.184.216.34", 80);
+	char *path, *fifo;
+	struct gwp_acl *a;
+
+	path = write_tmp_rules("-P OUTPUT REJECT\n");
+	assert(asprintf(&fifo, "%s.fifo", path) > 0);
+	assert(!mkfifo(fifo, 0600));
+	assert(gwp_acl_create(&a, fifo) == -EINVAL);
+
+	assert(!gwp_acl_create(&a, path));
+	assert(!rename(fifo, path));
+	assert(gwp_acl_reload(a) == -EINVAL);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(fifo);
+	free(path);
+}
+
+/*
+ * ------------------------------------------------------------------------
+ * include
+ * ------------------------------------------------------------------------
+ */
+
+/* A new empty directory for one include test; malloc'd path. */
+static char *inc_dir(void)
+{
+	const char *tmp = getenv("TMPDIR");
+	char *dir;
+
+	if (!tmp || !*tmp)
+		tmp = "/tmp";
+	assert(asprintf(&dir, "%s/gwp-acl-inc.XXXXXX", tmp) > 0);
+	assert(mkdtemp(dir));
+	return dir;
+}
+
+/* Write @text to @dir/@name (truncating it); returns the malloc'd path. */
+static char *inc_write(const char *dir, const char *name, const char *text)
+{
+	size_t len = strlen(text);
+	char *path;
+	int fd;
+
+	assert(asprintf(&path, "%s/%s", dir, name) > 0);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	assert(fd >= 0);
+	assert(write(fd, text, len) == (ssize_t)len);
+	close(fd);
+	return path;
+}
+
+static void inc_put(const char *dir, const char *name, const char *text)
+{
+	free(inc_write(dir, name, text));
+}
+
+/* Remove @dir and everything in it (one level of subdirectories). */
+static void inc_rmdir(char *dir)
+{
+	char *cmd;
+
+	assert(asprintf(&cmd, "rm -rf -- '%s'", dir) > 0);
+	assert(!system(cmd));
+	free(cmd);
+	free(dir);
+}
+
+/* @acl's watched files are @dir/<each of @names>, in that order. */
+static void inc_files(struct gwp_acl *acl, const char *dir,
+		      const char *const *names, size_t nr)
+{
+	char path[PATH_MAX];
+	size_t i;
+
+	for (i = 0; i < nr; i++) {
+		snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+		assert(gwp_acl_file(acl, i));
+		assert(!strcmp(gwp_acl_file(acl, i), path));
+	}
+	assert(!gwp_acl_file(acl, nr));
+}
+
+static enum gwp_acl_verdict inc_out(struct gwp_acl *a, const char *ip)
+{
+	struct gwp_sockaddr t = sa4(ip, 80);
+
+	return out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP);
+}
+
+/*
+ * The rules of an included file go in at the include line, so first-match
+ * order is the order read top to bottom across the files. A relative path
+ * is taken from the including file's directory, at every level; an absolute
+ * one as given. A file included twice, but not inside itself, is no cycle.
+ */
+static noinline void test_include_order(void)
+{
+	static const char *const names[] = {
+		"main.acl", "sub/a.acl", "sub/b.acl", "sub/c.acl", "abs.acl",
+	};
+	char *dir = inc_dir(), *sub, *main_path, *abs_path, *text;
+	char cwd[PATH_MAX];
+	struct gwp_acl *a;
+
+	assert(asprintf(&sub, "%s/sub", dir) > 0);
+	assert(!mkdir(sub, 0700));
+	abs_path = inc_write(dir, "abs.acl",
+			     "-A OUTPUT -d 203.0.113.1 -j REJECT\n");
+	assert(asprintf(&text,
+		"-A OUTPUT -d 192.0.2.1 -j ACCEPT\n"
+		"include sub/a.acl;\n"
+		"-A OUTPUT -d 192.0.2.0/24 -j ACCEPT\n"
+		"include %s ; # an absolute path\n"
+		"-A OUTPUT -d 198.51.100.0/24 -j REJECT\n"
+		"#include sub/missing.acl;\n"
+		"-P OUTPUT ACCEPT\n", abs_path) > 0);
+	main_path = inc_write(dir, "main.acl", text);
+	free(text);
+	inc_put(sub, "a.acl",
+		"-A OUTPUT -d 192.0.2.0/25 -j REJECT\n"
+		"include b.acl;\n"
+		"include c.acl;\n");
+	inc_put(sub, "b.acl",
+		"-A OUTPUT -d 192.0.2.128/25 -j REJECT\n"
+		"include c.acl;\n");
+	inc_put(sub, "c.acl", "-A OUTPUT -d 203.0.113.2 -j REJECT\n");
+
+	assert(!gwp_acl_create(&a, main_path));
+	/* Before the include, from it, from its include, after it. */
+	assert(inc_out(a, "192.0.2.1") == GWP_ACL_ACCEPT);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.200") == GWP_ACL_REJECT);
+	assert(inc_out(a, "198.51.100.7") == GWP_ACL_REJECT);
+	assert(inc_out(a, "203.0.113.1") == GWP_ACL_REJECT);
+	assert(inc_out(a, "203.0.113.2") == GWP_ACL_REJECT);
+	assert(inc_out(a, "203.0.113.3") == GWP_ACL_ACCEPT);
+	/* abs.acl is listed by the path it was included by. */
+	inc_files(a, dir, names, 5);
+	gwp_acl_destroy(a);
+
+	/* A top file named without a directory includes from the cwd. */
+	assert(getcwd(cwd, sizeof(cwd)));
+	assert(!chdir(dir));
+	assert(!gwp_acl_create(&a, "main.acl"));
+	assert(!strcmp(gwp_acl_file(a, 0), "main.acl"));
+	assert(!strcmp(gwp_acl_file(a, 1), "sub/a.acl"));
+	assert(!strcmp(gwp_acl_file(a, 2), "sub/b.acl"));
+	assert(inc_out(a, "192.0.2.200") == GWP_ACL_REJECT);
+	assert(!chdir(cwd));
+	gwp_acl_destroy(a);
+
+	free(abs_path);
+	free(main_path);
+	free(sub);
+	inc_rmdir(dir);
+}
+
+/* @text as main.acl in @dir must fail to load with @err. */
+static void inc_refused(const char *dir, const char *text, int err)
+{
+	struct gwp_acl *a = NULL;
+	char *path = inc_write(dir, "main.acl", text);
+
+	assert(gwp_acl_create(&a, path) == err);
+	assert(!a);
+	free(path);
+}
+
+/*
+ * Every way an include can go wrong refuses the whole load: a bad include
+ * line, a missing or unreadable file, an empty one or one with a NUL byte, a
+ * bad rule in an included file, a cycle (by any name), or nesting too deep.
+ */
+static noinline void test_include_errors(void)
+{
+	static const char nul[] = "-P OUTPUT REJECT\n\0\n";
+	char *dir = inc_dir(), *path, name[32], text[64];
+	struct gwp_acl *a = NULL;
+	int fd, i;
+
+	inc_put(dir, "ok.acl", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
+
+	/* The syntax: one path, then a ';', which may stand alone. */
+	inc_refused(dir, "include ok.acl\n", -EINVAL);
+	inc_refused(dir, "include\n", -EINVAL);
+	inc_refused(dir, "include ;\n", -EINVAL);
+	inc_refused(dir, "include ;;\n", -EINVAL);
+	inc_refused(dir, "include ok.acl;;\n", -EINVAL);
+	inc_refused(dir, "include ok.acl; ;\n", -EINVAL);
+	inc_refused(dir, "include ok.acl other.acl;\n", -EINVAL);
+	inc_refused(dir, "include ok.acl ok.acl ;\n", -EINVAL);
+	inc_refused(dir, "include ok.acl # no ;\n", -EINVAL);
+	inc_refused(dir, "-A OUTPUT -j ACCEPT include ok.acl;\n", -EINVAL);
+	path = inc_write(dir, "main.acl", "include ok.acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	gwp_acl_destroy(a);
+	free(path);
+
+	/* No directory to take a path from: refused in text. */
+	assert(gwp_acl_parse_str(&a, "include /dev/null;\n") == -EINVAL);
+
+	inc_refused(dir, "include missing.acl;\n", -ENOENT);
+	inc_refused(dir, "include .;\n", -EINVAL);
+	inc_refused(dir, "include /dev/null;\n", -EINVAL);
+
+	/*
+	 * A FIFO, included or as the top file, is refused at once: opening it
+	 * for reading would otherwise wait for a writer that never comes.
+	 */
+	assert(asprintf(&path, "%s/pipe.acl", dir) > 0);
+	assert(!mkfifo(path, 0600));
+	inc_refused(dir, "include pipe.acl;\n", -EINVAL);
+	assert(gwp_acl_create(&a, path) == -EINVAL);
+	free(path);
+
+	inc_put(dir, "empty.acl", "");
+	inc_refused(dir, "include empty.acl;\n", -ENODATA);
+	path = inc_write(dir, "nul.acl", "");
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, nul, sizeof(nul) - 1) == (ssize_t)sizeof(nul) - 1);
+	close(fd);
+	free(path);
+	inc_refused(dir, "include nul.acl;\n", -EINVAL);
+
+	inc_put(dir, "bad.acl", "-A OUTPUT -j BOGUS\n");
+	inc_refused(dir, "-P OUTPUT REJECT\ninclude bad.acl;\n", -EINVAL);
+
+	/* Cycles: directly, through another file, through another name. */
+	inc_refused(dir, "include main.acl;\n", -ELOOP);
+	inc_refused(dir, "include ./main.acl;\n", -ELOOP);
+	inc_put(dir, "back.acl", "include main.acl;\n");
+	inc_refused(dir, "include back.acl;\n", -ELOOP);
+	inc_put(dir, "self.acl", "include link.acl;\n");
+	assert(asprintf(&path, "%s/link.acl", dir) > 0);
+	assert(!symlink("self.acl", path));
+	free(path);
+	inc_refused(dir, "include self.acl;\n", -ELOOP);
+
+	/*
+	 * Depth: dN.acl includes d(N+1).acl and d7.acl includes leaf.acl. From
+	 * main.acl (level 0) through d1.acl, leaf.acl is at level 8 and loads;
+	 * through d0.acl it is at level 9, one too deep.
+	 */
+	for (i = 0; i < 7; i++) {
+		snprintf(name, sizeof(name), "d%d.acl", i);
+		snprintf(text, sizeof(text), "include d%d.acl;\n", i + 1);
+		inc_put(dir, name, text);
+	}
+	inc_put(dir, "d7.acl", "include leaf.acl;\n");
+	inc_put(dir, "leaf.acl", "-A OUTPUT -d 192.0.2.8 -j REJECT\n");
+	path = inc_write(dir, "main.acl", "include d0.acl;\n");
+	assert(gwp_acl_create(&a, path) == -ELOOP);
+	free(path);
+	path = inc_write(dir, "main.acl", "include d1.acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(inc_out(a, "192.0.2.8") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	free(path);
+
+	/*
+	 * At most 64 reads of a file per load, the top file and each repeat
+	 * counted: 63 includes load, 64 do not. And a diamond that would
+	 * read 2^8 files is stopped by the same cap, not by the depth one.
+	 */
+	{
+		char big[64 * 16 + 1];
+		char *p = big;
+
+		for (i = 0; i < 63; i++)
+			p += sprintf(p, "include ok.acl;\n");
+		path = inc_write(dir, "main.acl", big);
+		assert(!gwp_acl_create(&a, path));
+		assert(inc_out(a, "192.0.2.1") == GWP_ACL_REJECT);
+		gwp_acl_destroy(a);
+		free(path);
+		p += sprintf(p, "include ok.acl;\n");
+		inc_refused(dir, big, -E2BIG);
+	}
+	for (i = 0; i < 8; i++) {
+		snprintf(name, sizeof(name), "w%d.acl", i);
+		snprintf(text, sizeof(text), "include w%d.acl;\ninclude w%d.acl;\n",
+			 i + 1, i + 1);
+		inc_put(dir, name, text);
+	}
+	inc_put(dir, "w8.acl", "-A OUTPUT -d 192.0.2.8 -j REJECT\n");
+	inc_refused(dir, "include w1.acl;\n", -E2BIG);
+
+	inc_rmdir(dir);
+}
+
+/*
+ * A change to an included file is picked up by a reload of the whole set,
+ * a broken one keeps the old rules, and the files to watch follow the
+ * includes: every file the last attempt met, even one that was missing.
+ */
+static noinline void test_include_reload(void)
+{
+	static const char *const two[] = { "main.acl", "a.acl" };
+	static const char *const three[] = { "main.acl", "a.acl", "new.acl" };
+	static const char *const one[] = { "main.acl" };
+	char *dir = inc_dir(), *main_path, *a_path;
+	struct stat st, st_main, st_a;
+	struct gwp_acl *a;
+
+	main_path = inc_write(dir, "main.acl",
+			      "include a.acl;\n-P OUTPUT ACCEPT\n");
+	inc_put(dir, "a.acl", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
+	assert(!stat(main_path, &st_main));
+	assert(asprintf(&a_path, "%s/a.acl", dir) > 0);
+	assert(!stat(a_path, &st_a));
+	assert(!gwp_acl_create(&a, main_path));
+	assert(inc_out(a, "192.0.2.1") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_ACCEPT);
+	inc_files(a, dir, two, 2);
+
+	/*
+	 * Each file's identity is the one it had when it was read, and stays
+	 * so after it changes: the reload watch compares against it, so a
+	 * change made right after the read is still seen as one.
+	 */
+	assert(!gwp_acl_file_stat(a, 0, &st));
+	assert(st.st_ino == st_main.st_ino && st.st_size == st_main.st_size);
+	assert(!gwp_acl_file_stat(a, 1, &st));
+	assert(st.st_ino == st_a.st_ino && st.st_size == st_a.st_size);
+	inc_put(dir, "a.acl", "-A OUTPUT -d 192.0.2.1 -j REJECT # longer\n");
+	assert(!gwp_acl_file_stat(a, 1, &st));
+	assert(st.st_size == st_a.st_size);
+	assert(gwp_acl_file_stat(a, 2, &st) == -ENOENT);
+
+	inc_put(dir, "a.acl", "-A OUTPUT -d 192.0.2.2 -j REJECT\n");
+	assert(!gwp_acl_reload(a));
+	assert(inc_out(a, "192.0.2.1") == GWP_ACL_ACCEPT);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+
+	/* A broken included file: the old rules stay. */
+	inc_put(dir, "a.acl", "-A OUTPUT -j BOGUS\n");
+	assert(gwp_acl_reload(a) == -EINVAL);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+	inc_files(a, dir, two, 2);
+	inc_put(dir, "a.acl", "-A OUTPUT -d 192.0.2.3 -j REJECT\n");
+
+	/* An include of a file not there yet: it is watched all the same. */
+	inc_put(dir, "main.acl",
+		"include a.acl;\ninclude new.acl;\n-P OUTPUT ACCEPT\n");
+	assert(gwp_acl_reload(a) == -ENOENT);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+	inc_files(a, dir, three, 3);
+	assert(gwp_acl_file_stat(a, 2, &st) == -ENOENT);
+	inc_put(dir, "new.acl", "-A OUTPUT -d 192.0.2.4 -j REJECT\n");
+	assert(!gwp_acl_reload(a));
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_ACCEPT);
+	assert(inc_out(a, "192.0.2.3") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.4") == GWP_ACL_REJECT);
+	inc_files(a, dir, three, 3);
+
+	/* Includes dropped: so are their files. */
+	inc_put(dir, "main.acl", "-P OUTPUT REJECT\n");
+	assert(!gwp_acl_reload(a));
+	assert(inc_out(a, "192.0.2.5") == GWP_ACL_REJECT);
+	inc_files(a, dir, one, 1);
+
+	gwp_acl_destroy(a);
+	free(a_path);
+	free(main_path);
+	inc_rmdir(dir);
+}
+
+/*
+ * ------------------------------------------------------------------------
+ * Upstream pools and -j UPSTREAM
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * What the code under test writes to stderr between up_capture() and
+ * up_captured(), which returns it (malloc'd), so a test can check what a
+ * load said: the file and line of an error, and that no password is in it.
+ */
+static int g_saved_stderr = -1;
+static FILE *g_capture;
+
+static void up_capture(void)
+{
+	fflush(stderr);
+	g_capture = tmpfile();
+	assert(g_capture);
+	g_saved_stderr = dup(STDERR_FILENO);
+	assert(g_saved_stderr >= 0);
+	assert(dup2(fileno(g_capture), STDERR_FILENO) == STDERR_FILENO);
+}
+
+static char *up_captured(void)
+{
+	long len;
+	char *buf;
+
+	fflush(stderr);
+	assert(dup2(g_saved_stderr, STDERR_FILENO) == STDERR_FILENO);
+	close(g_saved_stderr);
+	g_saved_stderr = -1;
+	len = ftell(g_capture);
+	assert(len >= 0);
+	buf = calloc(1, (size_t)len + 1);
+	assert(buf);
+	rewind(g_capture);
+	assert(fread(buf, 1, (size_t)len, g_capture) == (size_t)len);
+	fclose(g_capture);
+	return buf;
+}
+
+/* A captured call returned @r, wanted @want: show what it said if not. */
+static void up_check(int r, int want, const char *said)
+{
+	if (r == want)
+		return;
+	fprintf(stderr, "returned %d, not %d; it said:\n%s", r, want, said);
+	assert(0);
+}
+
+/*
+ * @text must fail to parse with @err, and the message must contain @msg (and
+ * never the password "s3cret" a URL in the text may carry).
+ */
+static void up_refused(const char *text, int err, const char *msg)
+{
+	struct gwp_acl *a = NULL;
+	char *said;
+	int r;
+
+	up_capture();
+	r = gwp_acl_parse_str(&a, text);
+	said = up_captured();
+	if (r != err || !strstr(said, msg) || strstr(said, "s3cret")) {
+		fprintf(stderr, "unexpected result %d for:\n%s---\n%s", r,
+			text, said);
+		assert(0);
+	}
+	assert(!a);
+	free(said);
+}
+
+/* Evaluate OUTPUT for user @user to 192.0.2.1:80; fills *@req. */
+static enum gwp_acl_verdict up_eval(struct gwp_acl *a, const char *user,
+				    struct gwp_acl_req *req)
+{
+	static struct gwp_sockaddr t;
+
+	t = sa4("192.0.2.1", 80);
+	memset(req, 0, sizeof(*req));
+	req->target = &t;
+	req->user = user;
+	req->dport = 80;
+	req->proto = GWP_ACL_PROTO_TCP;
+	return gwp_acl_eval_output(a, req);
+}
+
+/* The pool name OUTPUT chose for @user, "DIRECT", or "" for none. */
+static const char *up_choice(struct gwp_acl *a, const char *user)
+{
+	static char name[80];
+	struct gwp_acl_req req;
+
+	assert(up_eval(a, user, &req) == GWP_ACL_ACCEPT);
+	switch (req.upstream) {
+	case GWP_ACL_UPSTREAM_NONE:
+		assert(!req.upstream_pool);
+		strcpy(name, "");
+		break;
+	case GWP_ACL_UPSTREAM_DIRECT:
+		assert(!req.upstream_pool);
+		strcpy(name, "DIRECT");
+		break;
+	default:
+		assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+		assert(req.upstream_pool);
+		snprintf(name, sizeof(name), "%s",
+			 gwp_acl_pool_name(req.upstream_pool));
+		break;
+	}
+	gwp_acl_req_release(&req);
+	assert(!req.upstream_pool && req.upstream == GWP_ACL_UPSTREAM_NONE);
+	gwp_acl_req_release(&req);
+	return name;
+}
+
+/* "upstream NAME {", N servers, "}", appended at @p; returns the new end. */
+static char *up_pool_text(char *p, const char *name, unsigned nr)
+{
+	unsigned i;
+
+	p += sprintf(p, "upstream %s {\n", name);
+	for (i = 0; i < nr; i++)
+		p += sprintf(p, "\tserver socks5h://10.0.%u.%u:1080;\n",
+			     i / 250, i % 250 + 1);
+	p += sprintf(p, "}\n");
+	return p;
+}
+
+/*
+ * A pool's contents as parsed, and what the eval hands out: the pool the
+ * last matching rule names, DIRECT, or nothing, with --accept ending the
+ * walk, and a pool defined after the rule that names it.
+ */
+static noinline void test_upstream_pools(void)
+{
+	static const char text[] =
+		"-A OUTPUT -m user --user alice -j UPSTREAM --to pool_a\n"
+		"-A OUTPUT -m user --user bob -j UPSTREAM --to-proxy pool-b.2\n"
+		"-A OUTPUT -m user --user bob -j UPSTREAM --to pool_a\n"
+		"-A OUTPUT -m user --user carol -j UPSTREAM --to pool_a\n"
+		"-A OUTPUT -m user --user carol -j UPSTREAM --to DIRECT\n"
+		"-A OUTPUT -m user --user dave -j UPSTREAM --to pool-b.2 --accept\n"
+		"-A OUTPUT -m user --user dave -j UPSTREAM --to pool_a\n"
+		"-A OUTPUT -m user --user dave -j REJECT\n"
+		"-A OUTPUT -m user --user erin -j UPSTREAM --to pool_a\n"
+		"-A OUTPUT -m user --user erin -j REJECT\n"
+		"-A OUTPUT -m user --user frank -j MARK --set-mark 7\n"
+		"-A OUTPUT -m user --user frank -j UPSTREAM --to pool_a\n"
+		"-A OUTPUT -m user --user frank -j BIND --to-iface lo\n"
+		"upstream pool_a {\n"
+		"	server socks5h://10.0.0.1:7777;\n"
+		"    server http://user:s3cret@10.0.0.3:9999 ;  # a comment\n"
+		"	server http://[2001:db8::1]:8080;\n"
+		"	server http://proxy.example;\n"
+		"}\n"
+		"upstream pool-b.2 {\n"
+		"	least_conn ;\n"
+		"	server socks5://u@[::1]:1;\n"
+		"}\n"
+		"-P OUTPUT ACCEPT\n";
+	struct gwp_acl_pool *p;
+	struct gwp_acl_req req;
+	struct gwp_acl *a;
+
+	assert(!gwp_acl_parse_str(&a, text));
+	assert(!strcmp(up_choice(a, "alice"), "pool_a"));
+	assert(!strcmp(up_choice(a, "bob"), "pool_a"));	/* last wins */
+	assert(!strcmp(up_choice(a, "carol"), "DIRECT"));
+	assert(!strcmp(up_choice(a, "dave"), "pool-b.2"));	/* --accept */
+	assert(!strcmp(up_choice(a, "zed"), ""));		/* no rule */
+
+	/* A refused request gets no pool. */
+	assert(up_eval(a, "erin", &req) == GWP_ACL_REJECT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_NONE && !req.upstream_pool);
+
+	/* Composes with MARK and BIND. */
+	assert(up_eval(a, "frank", &req) == GWP_ACL_ACCEPT);
+	assert(req.mark_set && req.mark == 7 && req.bind.set);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	p = req.upstream_pool;
+	assert(!strcmp(gwp_acl_pool_name(p), "pool_a"));
+	assert(gwp_acl_pool_method(p) == GWP_ACL_POOL_ROUND_ROBIN);
+	assert(gwp_acl_pool_remote_dns(p));
+	assert(gwp_acl_pool_nr_servers(p) == 4);
+	assert(!strcmp(gwp_acl_pool_server_url(p, 0),
+		       "socks5h://10.0.0.1:7777"));
+	assert(!strcmp(gwp_acl_pool_server_url(p, 1),
+		       "http://user:s3cret@10.0.0.3:9999"));
+	assert(!strcmp(gwp_acl_pool_server_url(p, 2),
+		       "http://[2001:db8::1]:8080"));
+	assert(!strcmp(gwp_acl_pool_server_url(p, 3), "http://proxy.example"));
+	assert(!gwp_acl_pool_server_url(p, 4));
+	/* The cursor counts picks, for every holder of the pool alike. */
+	assert(gwp_acl_pool_next(p) == 0);
+	assert(gwp_acl_pool_next(p) == 1);
+	gwp_acl_req_release(&req);
+	assert(up_eval(a, "frank", &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream_pool == p);
+	assert(gwp_acl_pool_next(req.upstream_pool) == 2);
+	gwp_acl_req_release(&req);
+
+	assert(up_eval(a, "dave", &req) == GWP_ACL_ACCEPT);
+	p = req.upstream_pool;
+	assert(gwp_acl_pool_method(p) == GWP_ACL_POOL_LEAST_CONN);
+	assert(!gwp_acl_pool_remote_dns(p));
+	assert(gwp_acl_pool_nr_servers(p) == 1);
+	assert(!strcmp(gwp_acl_pool_server_url(p, 0), "socks5://u@[::1]:1"));
+	gwp_acl_req_release(&req);
+	gwp_acl_destroy(a);
+}
+
+/*
+ * https:// servers load in a pool, alone or with the other remote-DNS
+ * schemes, kept as written; the pool resolves names remotely.
+ */
+static noinline void test_upstream_pool_https(void)
+{
+	static const char text[] =
+		"upstream tls {\n"
+		"	server https://u:s3cret@proxy.example:3129;\n"
+		"	server https://[2001:db8::2];\n"
+		"}\n"
+		"upstream mixed {\n"
+		"	server http://10.0.0.1:3128;\n"
+		"	server https://10.0.0.2:3129;\n"
+		"	server socks5h://10.0.0.3:1080;\n"
+		"}\n"
+		"-A OUTPUT -m user --user alice -j UPSTREAM --to tls\n"
+		"-A OUTPUT -m user --user bob -j UPSTREAM --to mixed\n";
+	struct gwp_acl_pool *p;
+	struct gwp_acl_req req;
+	struct gwp_acl *a;
+
+	assert(!gwp_acl_parse_str(&a, text));
+	assert(up_eval(a, "alice", &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	p = req.upstream_pool;
+	assert(!strcmp(gwp_acl_pool_name(p), "tls"));
+	assert(gwp_acl_pool_remote_dns(p));
+	assert(gwp_acl_pool_nr_servers(p) == 2);
+	assert(!strcmp(gwp_acl_pool_server_url(p, 0),
+		       "https://u:s3cret@proxy.example:3129"));
+	assert(!strcmp(gwp_acl_pool_server_url(p, 1), "https://[2001:db8::2]"));
+	gwp_acl_req_release(&req);
+
+	assert(up_eval(a, "bob", &req) == GWP_ACL_ACCEPT);
+	p = req.upstream_pool;
+	assert(!strcmp(gwp_acl_pool_name(p), "mixed"));
+	assert(gwp_acl_pool_remote_dns(p));
+	assert(gwp_acl_pool_nr_servers(p) == 3);
+	assert(!strcmp(gwp_acl_pool_server_url(p, 1), "https://10.0.0.2:3129"));
+	gwp_acl_req_release(&req);
+	gwp_acl_destroy(a);
+}
+
+/*
+ * An UPSTREAM rule with --accept is answered by the run index when there
+ * are enough such rules in a row; the result is the same. (Run once: its -d
+ * draws a warning.)
+ */
+static noinline void test_upstream_index(void)
+{
+	struct gwp_acl *a;
+
+	assert(!gwp_acl_parse_str(&a,
+		"upstream p { \n server socks5://10.0.0.1:1;\n}\n"
+		"-A OUTPUT -d 198.51.100.1 -j REJECT\n"
+		"-A OUTPUT -d 198.51.100.2 -j REJECT\n"
+		"-A OUTPUT -d 198.51.100.3 -j REJECT\n"
+		"-A OUTPUT -d 198.51.100.4 -j REJECT\n"
+		"-A OUTPUT -d 198.51.100.5 -j REJECT\n"
+		"-A OUTPUT -d 198.51.100.6 -j REJECT\n"
+		"-A OUTPUT -d 198.51.100.7 -j REJECT\n"
+		"-A OUTPUT -d 192.0.2.1 -j UPSTREAM --to p --accept\n"
+		"-A OUTPUT -j REJECT\n"));
+	assert(gwp_acl_nr_indexed(a) == 8);
+	assert(!strcmp(up_choice(a, NULL), "p"));
+	gwp_acl_destroy(a);
+}
+
+/*
+ * The pool an evaluation handed out stays valid after the ruleset that
+ * defined it is gone: a reload, and then the ACL itself. Under the
+ * sanitizers a use after free shows here.
+ */
+static noinline void test_upstream_pool_outlives_reload(void)
+{
+	char *dir = inc_dir(), *path;
+	struct gwp_acl_req req;
+	struct gwp_acl *a;
+
+	path = inc_write(dir, "main.acl",
+			 "upstream old {\n server http://10.0.0.1:3128;\n}\n"
+			 "-A OUTPUT -j UPSTREAM --to old\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+
+	inc_put(dir, "main.acl",
+		"upstream new {\n server http://10.0.0.2:3128;\n}\n"
+		"-A OUTPUT -j UPSTREAM --to new\n");
+	assert(!gwp_acl_reload(a));
+	assert(!strcmp(up_choice(a, NULL), "new"));
+	/* The old ruleset is freed; its pool is not. */
+	assert(!strcmp(gwp_acl_pool_name(req.upstream_pool), "old"));
+	assert(!strcmp(gwp_acl_pool_server_url(req.upstream_pool, 0),
+		       "http://10.0.0.1:3128"));
+
+	/* A failed reload keeps the pools in force. */
+	inc_put(dir, "main.acl",
+		"upstream new {\n server http://10.0.0.2:3128;\n"
+		"-A OUTPUT -j UPSTREAM --to new\n");
+	assert(gwp_acl_reload(a) == -EINVAL);
+	assert(!strcmp(up_choice(a, NULL), "new"));
+
+	gwp_acl_destroy(a);
+	assert(!strcmp(gwp_acl_pool_name(req.upstream_pool), "old"));
+	gwp_acl_req_release(&req);
+	free(path);
+	inc_rmdir(dir);
+}
+
+/*
+ * Pools and rules spread over the files of a set: a pool defined in an
+ * included file, used before and after the include, and one used in an
+ * included file but defined in the top one. A name is one pool in the whole
+ * set, and a block must end in the file that opened it.
+ */
+static noinline void test_upstream_include(void)
+{
+	char *dir = inc_dir(), *path, *said;
+	struct gwp_acl *a = NULL;
+	int r;
+
+	inc_put(dir, "pools.acl",
+		"upstream inc {\n server socks5h://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m user --user b -j UPSTREAM --to top\n");
+	path = inc_write(dir, "main.acl",
+			 "-A OUTPUT -m user --user a -j UPSTREAM --to inc\n"
+			 "include pools.acl;\n"
+			 "-A OUTPUT -m user --user c -j UPSTREAM --to inc\n"
+			 "upstream top {\n server http://10.0.0.2:1;\n}\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(!strcmp(up_choice(a, "a"), "inc"));
+	assert(!strcmp(up_choice(a, "b"), "top"));
+	assert(!strcmp(up_choice(a, "c"), "inc"));
+	gwp_acl_destroy(a);
+	a = NULL;
+
+	/* The same name in two files of the set. */
+	inc_put(dir, "main.acl",
+		"upstream inc {\n server http://10.0.0.2:1;\n}\n"
+		"include pools.acl;\n");
+	up_capture();
+	r = gwp_acl_create(&a, path);
+	said = up_captured();
+	up_check(r, -EINVAL, said);
+	assert(strstr(said, "pools.acl: line 1: upstream pool inc is defined twice"));
+	assert(strstr(said, "main.acl: line 4: failed to include a file"));
+	free(said);
+
+	/* An undefined pool is named with the file and line that use it. */
+	inc_put(dir, "main.acl", "include pools.acl;\n");
+	up_capture();
+	r = gwp_acl_create(&a, path);
+	said = up_captured();
+	up_check(r, -EINVAL, said);
+	assert(strstr(said, "pools.acl: line 4: upstream pool top is not defined"));
+	free(said);
+
+	/* A block may not span an include, nor run past its file's end. */
+	inc_put(dir, "open.acl", "upstream o {\n server http://10.0.0.2:1;\n");
+	inc_put(dir, "main.acl",
+		"include open.acl;\n}\n-A OUTPUT -j UPSTREAM --to o\n");
+	up_capture();
+	r = gwp_acl_create(&a, path);
+	said = up_captured();
+	up_check(r, -EINVAL, said);
+	assert(strstr(said, "open.acl: line 1: upstream pool o is not closed"));
+	free(said);
+	inc_put(dir, "main.acl",
+		"upstream o {\n server http://10.0.0.2:1;\n"
+		"include pools.acl;\n}\n");
+	up_capture();
+	r = gwp_acl_create(&a, path);
+	said = up_captured();
+	up_check(r, -EINVAL, said);
+	assert(strstr(said, "main.acl: line 3: include is not allowed inside an upstream block"));
+	free(said);
+	assert(!a);
+
+	free(path);
+	inc_rmdir(dir);
+}
+
+/*
+ * A file that holds a password in a server URL is reported when others may
+ * read it, once per load, and never with the password.
+ */
+static noinline void test_upstream_creds_warning(void)
+{
+	static const char warn[] = "readable by group or others";
+	char *dir = inc_dir(), *path, *inc_path, *said, *p;
+	struct gwp_acl *a;
+	int r;
+
+	inc_path = inc_write(dir, "creds.acl",
+			     "upstream c {\n server http://u:s3cret@10.0.0.1:1;\n}\n");
+	path = inc_write(dir, "main.acl",
+			 "include creds.acl;\n-A OUTPUT -j UPSTREAM --to c\n"
+			 "include none.acl;\n");
+	inc_put(dir, "none.acl", "upstream n {\n server http://10.0.0.1:1;\n}\n");
+
+	/* 0600 everywhere: nothing to say. */
+	up_capture();
+	r = gwp_acl_create(&a, path);
+	said = up_captured();
+	up_check(r, 0, said);
+	assert(!strstr(said, warn));
+	free(said);
+
+	/* Readable by others: warned once per load, reload included. */
+	assert(!chmod(inc_path, 0644));
+	assert(!chmod(path, 0640));
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, 0, said);
+	p = strstr(said, warn);
+	assert(p && !strstr(p + 1, warn));
+	assert(strstr(said, "creds.acl: warning: holds upstream credentials"));
+	assert(!strstr(said, "main.acl: warning"));
+	assert(!strstr(said, "s3cret"));
+	free(said);
+
+	/*
+	 * A file without credentials: never. (A file with them cannot be
+	 * included twice: its pools would be defined twice.)
+	 */
+	assert(!chmod(path, 0644));
+	assert(!chmod(dir, 0755));
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, 0, said);
+	assert(!strstr(said, "none.acl"));
+	free(said);
+
+	/* Group-readable alone counts too. */
+	assert(!chmod(inc_path, 0640));
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, 0, said);
+	assert(strstr(said, warn));
+	free(said);
+
+	gwp_acl_destroy(a);
+	free(inc_path);
+	free(path);
+	inc_rmdir(dir);
+}
+
+/* The URL a message may show: the credentials, and only they, left out. */
+static noinline void test_upstream_url_redact(void)
+{
+	static const struct {
+		const char *in, *out;
+	} cases[] = {
+		{ "http://user:s3cret@10.0.0.1:80", "http://10.0.0.1:80" },
+		{ "socks5h://user@host:1", "socks5h://host:1" },
+		{ "socks5://u:p@ss@[::1]:9", "socks5://[::1]:9" },
+		{ "https://a:b://c@h", "https://h" },
+		{ "http://10.0.0.1", "http://10.0.0.1" },
+		{ "bogus:s3cret@h", "h" },
+		{ "", "" },
+		/* Malformed: nothing up to the last '@' but a scheme stays. */
+		{ "u:s3cret@h://x", "h://x" },
+		{ "u:s3cret@h", "h" },
+		{ "http://u:s3cret@", "http://" },
+		{ "@", "" },
+		{ "u:s3cret://h@x", "x" },
+		{ "u:s3cret@x://y@z", "z" },
+		{ "://u:s3cret@h", "://h" },
+		{ "a b://u:s3cret@h", "h" },
+		{ "http:/u:s3cret@h", "h" },
+		{ "http://h:1", "http://h:1" },
+	};
+	char buf[64];
+	size_t i;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		assert(!gwp_acl_url_redact(cases[i].in, buf, sizeof(buf)));
+		assert(!strcmp(buf, cases[i].out));
+	}
+	/* Too long: cut short, still without the credentials. */
+	assert(gwp_acl_url_redact("http://u:s3cret@abcdefgh:1", buf, 10) ==
+	       -ENAMETOOLONG);
+	assert(!strcmp(buf, "http://ab"));
+	assert(gwp_acl_url_redact("http://h", NULL, 0) == -ENAMETOOLONG);
+}
+
+/*
+ * The pool reference moves out of a request: the request then holds none,
+ * so releasing it (or a copy made afterwards) drops nothing more, and the
+ * choice itself is still there to read.
+ */
+static noinline void test_upstream_take_pool(void)
+{
+	struct gwp_acl_req req, copy;
+	struct gwp_acl_pool *p;
+	struct gwp_acl *a;
+
+	assert(!gwp_acl_parse_str(&a,
+		"upstream t {\n server http://10.0.0.1:1;\n}\n"
+		"-A OUTPUT -j UPSTREAM --to t\n"));
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	p = gwp_acl_req_take_pool(&req);
+	assert(p && !req.upstream_pool);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	copy = req;
+	gwp_acl_req_release(&req);
+	gwp_acl_req_release(&copy);
+	assert(!gwp_acl_req_take_pool(&req));
+	/* The ACL goes; the reference taken over keeps the pool. */
+	gwp_acl_destroy(a);
+	assert(!strcmp(gwp_acl_pool_name(p), "t"));
+	gwp_acl_pool_put(p);
+}
+
+/*
+ * Readers keep evaluating OUTPUT and holding on to the pools they are handed,
+ * a few at a time, while the main thread reloads the set with a new pool each
+ * time. Every pool a reader holds must still be whole, however many reloads
+ * ago its ruleset went; the sanitizers catch a pool freed too early, or
+ * never.
+ */
+#define UP_READERS	4
+#define UP_HELD		8
+
+struct up_reader {
+	struct gwp_acl	*acl;
+	atomic_bool	*stop;
+	unsigned long	nr_pools;
+};
+
+/* Pool "gN" has one server, http://10.0.0.1:N. */
+static void up_check_pool(const struct gwp_acl_pool *p)
+{
+	const char *name = gwp_acl_pool_name(p), *url;
+	char want[64];
+
+	assert(name[0] == 'g');
+	assert(gwp_acl_pool_nr_servers(p) == 1);
+	url = gwp_acl_pool_server_url(p, 0);
+	snprintf(want, sizeof(want), "http://10.0.0.1:%s", name + 1);
+	assert(!strcmp(url, want));
+}
+
+static void *up_reader_fn(void *arg)
+{
+	struct up_reader *ur = arg;
+	struct gwp_acl_pool *held[UP_HELD] = { NULL };
+	struct gwp_sockaddr t = sa4("192.0.2.1", 80);
+	unsigned n = 0, i;
+
+	while (!atomic_load_explicit(ur->stop, memory_order_relaxed)) {
+		struct gwp_acl_req req = {
+			.target = &t, .dport = 80, .proto = GWP_ACL_PROTO_TCP,
+		};
+
+		assert(gwp_acl_eval_output(ur->acl, &req) == GWP_ACL_ACCEPT);
+		assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+		up_check_pool(req.upstream_pool);
+		gwp_acl_pool_put(held[n % UP_HELD]);
+		held[n % UP_HELD] = gwp_acl_req_take_pool(&req);
+		n++;
+		for (i = 0; i < UP_HELD; i++)
+			if (held[i])
+				up_check_pool(held[i]);
+	}
+	for (i = 0; i < UP_HELD; i++)
+		gwp_acl_pool_put(held[i]);
+	ur->nr_pools = n;
+	return NULL;
+}
+
+static void up_write_gen(const char *path, unsigned gen)
+{
+	char text[160];
+	int fd, len;
+
+	len = snprintf(text, sizeof(text),
+		       "upstream g%u {\n server http://10.0.0.1:%u;\n}\n"
+		       "-A OUTPUT -j UPSTREAM --to g%u\n", gen, gen, gen);
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, text, (size_t)len) == len);
+	close(fd);
+}
+
+static noinline void test_upstream_reload_readers(void)
+{
+	struct up_reader ur[UP_READERS];
+	pthread_t thr[UP_READERS];
+	atomic_bool stop = false;
+	struct gwp_acl *a;
+	unsigned gen;
+	char *path;
+	size_t i;
+
+	path = write_tmp_rules("# empty for now\n");
+	up_write_gen(path, 1);
+	assert(!gwp_acl_create(&a, path));
+	for (i = 0; i < UP_READERS; i++) {
+		ur[i].acl = a;
+		ur[i].stop = &stop;
+		ur[i].nr_pools = 0;
+		assert(!pthread_create(&thr[i], NULL, up_reader_fn, &ur[i]));
+	}
+	for (gen = 2; gen <= 300; gen++) {
+		up_write_gen(path, gen);
+		assert(!gwp_acl_reload(a));
+	}
+	atomic_store(&stop, true);
+	for (i = 0; i < UP_READERS; i++) {
+		pthread_join(thr[i], NULL);
+		assert(ur[i].nr_pools > 0);
+	}
+	assert(!strcmp(up_choice(a, NULL), "g300"));
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(path);
+}
+
+/*
+ * Pool servers made at load (struct gwp_acl_server_ops): a stand-in for the
+ * server objects gwproxy makes, counting how many are alive, so a test can
+ * tell that every one made is dropped again, and none too early.
+ */
+struct up_srv {
+	atomic_uint	ref;
+	char		url[128];
+};
+
+static atomic_int g_up_live;
+static int g_up_made;
+
+static int up_srv_make(void *arg, const char *url, void **out, char *why,
+		       size_t size)
+{
+	struct up_srv *s;
+
+	assert(arg == &g_up_live);
+	if (strstr(url, "unresolvable")) {
+		snprintf(why, size, "the host does not resolve");
+		return -EINVAL;
+	}
+	if (strstr(url, "nowhy"))
+		return -EAFNOSUPPORT;
+	s = calloc(1, sizeof(*s));
+	assert(s);
+	atomic_init(&s->ref, 1);
+	snprintf(s->url, sizeof(s->url), "%s", url);
+	atomic_fetch_add(&g_up_live, 1);
+	g_up_made++;
+	*out = s;
+	return 0;
+}
+
+static void up_srv_put(void *arg, void *srv)
+{
+	struct up_srv *s = srv;
+
+	assert(arg == &g_up_live);
+	assert(atomic_load(&s->ref) > 0);
+	if (atomic_fetch_sub(&s->ref, 1) != 1)
+		return;
+	memset(s->url, 'x', sizeof(s->url));
+	free(s);
+	assert(atomic_fetch_sub(&g_up_live, 1) > 0);
+}
+
+static const struct gwp_acl_server_ops up_srv_ops = {
+	.make	= up_srv_make,
+	.put	= up_srv_put,
+	.arg	= &g_up_live,
+};
+
+/* The server object @p's @i-th URL was made into, checked against it. */
+static struct up_srv *up_srv_of(const struct gwp_acl_pool *p, uint32_t i)
+{
+	struct up_srv *s = gwp_acl_pool_server(p, i);
+
+	assert(s && !strcmp(s->url, gwp_acl_pool_server_url(p, i)));
+	return s;
+}
+
+/*
+ * Every pool server is made when the set loads, and kept with its pool: a
+ * server a connection took a reference to outlives the pool, the reload that
+ * dropped it and the ACL. A server that cannot be made fails the load (or
+ * the reload, keeping the servers in force) with its file and line, and the
+ * servers made before it are dropped.
+ */
+static noinline void test_upstream_server_ops(void)
+{
+	char *dir = inc_dir(), *path, *said;
+	struct gwp_acl_req req;
+	struct up_srv *held;
+	struct gwp_acl *a;
+	int r;
+
+	g_up_made = 0;
+	path = inc_write(dir, "main.acl",
+			 "upstream p {\n"
+			 " server http://u:s3cret@10.0.0.1:3128;\n"
+			 " server http://10.0.0.2:3128;\n"
+			 "}\n"
+			 "upstream q {\n server socks5://10.0.0.3:1080;\n}\n"
+			 "-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_create_ops(&a, path, &up_srv_ops));
+	assert(g_up_made == 3 && atomic_load(&g_up_live) == 3);
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	assert(up_srv_of(req.upstream_pool, 0) != up_srv_of(req.upstream_pool, 1));
+	assert(!gwp_acl_pool_server(req.upstream_pool, 2));
+	/* What a connection does: keep the server, not the pool. */
+	held = up_srv_of(req.upstream_pool, 1);
+	atomic_fetch_add(&held->ref, 1);
+	gwp_acl_req_release(&req);
+
+	/* A reload makes the new set's servers and drops the old ones'. */
+	inc_put(dir, "main.acl",
+		"upstream p {\n server http://10.0.0.4:3128;\n}\n"
+		"-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_reload(a));
+	assert(g_up_made == 4 && atomic_load(&g_up_live) == 2);
+	assert(!strcmp(held->url, "http://10.0.0.2:3128"));
+
+	/* A server that cannot be made fails the reload; the rest go too. */
+	inc_put(dir, "main.acl",
+		"upstream p {\n"
+		" server http://10.0.0.5:3128;\n"
+		" server http://u:s3cret@unresolvable.invalid:3128;\n"
+		"}\n");
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, -EINVAL, said);
+	assert(strstr(said, "main.acl: line 3: upstream pool p server 2 (http://unresolvable.invalid:3128): the host does not resolve"));
+	assert(!strstr(said, "s3cret"));
+	free(said);
+	assert(g_up_made == 5 && atomic_load(&g_up_live) == 2);
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(!strcmp(up_srv_of(req.upstream_pool, 0)->url,
+		       "http://10.0.0.4:3128"));
+	gwp_acl_req_release(&req);
+
+	/* With no reason given, the errno says why. */
+	inc_put(dir, "main.acl", "upstream p {\n server http://nowhy:1;\n}\n");
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, -EINVAL, said);
+	assert(strstr(said, "main.acl: line 2: upstream pool p server 1 (http://nowhy:1): "));
+	assert(strstr(said, strerror(EAFNOSUPPORT)));
+	free(said);
+
+	/* The ACL goes; the server a connection holds stays. */
+	gwp_acl_destroy(a);
+	assert(atomic_load(&g_up_live) == 1);
+	assert(!strcmp(held->url, "http://10.0.0.2:3128"));
+	up_srv_put(&g_up_live, held);
+	assert(atomic_load(&g_up_live) == 0);
+
+	/* Without ops, a pool has its URLs and no server objects. */
+	inc_put(dir, "main.acl", "upstream p {\n server http://10.0.0.1:1;\n}\n"
+				 "-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(gwp_acl_pool_server_url(req.upstream_pool, 0));
+	assert(!gwp_acl_pool_server(req.upstream_pool, 0));
+	gwp_acl_req_release(&req);
+	gwp_acl_destroy(a);
+	assert(g_up_made == 5);
+
+	free(path);
+	inc_rmdir(dir);
+}
+
+/*
+ * gwp_acl_eval_upstream() for @user to @domain or the address @ip (one of
+ * them NULL), port 443: the pool name, "DIRECT" or "".
+ */
+static const char *up_pick(struct gwp_acl *a, const char *user,
+			   const char *domain, const char *ip)
+{
+	static char name[80];
+	struct gwp_sockaddr t;
+	struct gwp_acl_req req;
+	enum gwp_acl_upstream u;
+
+	memset(&req, 0, sizeof(req));
+	if (ip) {
+		t = sa4(ip, 443);
+		req.target = &t;
+	}
+	req.domain = domain;
+	req.user = user;
+	req.dport = 443;
+	req.proto = GWP_ACL_PROTO_TCP;
+	u = gwp_acl_eval_upstream(a, &req);
+	assert(u == req.upstream && !req.upstream_only);
+	if (u == GWP_ACL_UPSTREAM_POOL)
+		snprintf(name, sizeof(name), "%s",
+			 gwp_acl_pool_name(req.upstream_pool));
+	else
+		snprintf(name, sizeof(name), "%s",
+			 u == GWP_ACL_UPSTREAM_DIRECT ? "DIRECT" :
+			 u == GWP_ACL_UPSTREAM_UNSURE ? "UNSURE" : "");
+	if (u != GWP_ACL_UPSTREAM_POOL)
+		assert(!req.upstream_pool);
+	gwp_acl_req_release(&req);
+	return name;
+}
+
+/*
+ * The upstream is picked from what is known before the name is resolved:
+ * the user, a domain or a literal address. A -d rule matches the address
+ * only. The pick does not take a -m statistic turn from the evaluations
+ * that follow it, and with no -j UPSTREAM rule at all there is no pick.
+ */
+static noinline void test_upstream_pick(void)
+{
+	struct gwp_sockaddr t = sa4("192.0.2.1", 443);
+	struct gwp_acl *a = NULL;
+	int i;
+
+	assert(!gwp_acl_parse_str(&a,
+		"upstream a {\n server socks5h://10.0.0.1:1080;\n}\n"
+		"upstream b {\n server socks5://10.0.0.2:1080;\n}\n"
+		"-A OUTPUT -m user --user alice -j UPSTREAM --to a\n"
+		"-A OUTPUT -m domain --domain example.org -j UPSTREAM --to b\n"
+		"-A OUTPUT -d 198.51.100.0/24 -j UPSTREAM --to DIRECT\n"
+		"-A OUTPUT -d 203.0.113.0/24 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(!strcmp(up_pick(a, "alice", "example.net", NULL), "a"));
+	assert(!strcmp(up_pick(a, "alice", "example.org", NULL), "b"));
+	assert(!strcmp(up_pick(a, "bob", "example.net", NULL), ""));
+	assert(!strcmp(up_pick(a, NULL, NULL, "198.51.100.7"), "DIRECT"));
+	assert(!strcmp(up_pick(a, "alice", NULL, "198.51.100.7"), "DIRECT"));
+	/* A name is not an address, whatever it resolves to later. */
+	assert(!strcmp(up_pick(a, NULL, "198.51.100.7.nip.example", NULL), ""));
+	/* The pick's REJECT is not the request's: the pool stays. */
+	assert(!strcmp(up_pick(a, "alice", NULL, "203.0.113.1"), "a"));
+	gwp_acl_destroy(a);
+
+	/*
+	 * A default-deny set that lets targets through by -d: a name meets
+	 * no -d rule and the walk ends on the policy, yet the request keeps
+	 * its pool; the evaluations per address then say ACCEPT.
+	 */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"upstream a {\n server socks5://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m user --user alice -j UPSTREAM --to a\n"
+		"-A OUTPUT -d 192.0.2.0/24 -j ACCEPT\n"
+		"-P OUTPUT REJECT\n"));
+	assert(!strcmp(up_pick(a, "alice", "example.net", NULL), "a"));
+	assert(!strcmp(up_pick(a, "alice", NULL, "192.0.2.1"), "a"));
+	assert(!strcmp(up_pick(a, "bob", "example.net", NULL), ""));
+	gwp_acl_destroy(a);
+
+	/* An nth split of the upstream: the pick says what eval will. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"upstream a {\n server socks5h://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m statistic --mode nth --every 2 -j UPSTREAM --to a\n"
+		"-A OUTPUT -m statistic --mode nth --every 3 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	for (i = 0; i < 30; i++) {
+		struct gwp_acl_req req = {
+			.target = &t, .dport = 443, .proto = GWP_ACL_PROTO_TCP,
+		};
+		const char *want = i % 2 ? "" : "a";
+		enum gwp_acl_verdict v;
+
+		assert(!strcmp(up_pick(a, NULL, NULL, "192.0.2.1"), want));
+		assert(!strcmp(up_pick(a, NULL, NULL, "192.0.2.1"), want));
+		v = gwp_acl_eval_output(a, &req);
+		assert((v == GWP_ACL_REJECT) == (i % 3 == 0));
+		if (v == GWP_ACL_ACCEPT)
+			assert((req.upstream == GWP_ACL_UPSTREAM_POOL) ==
+			       !(i % 2));
+		gwp_acl_req_release(&req);
+	}
+	gwp_acl_destroy(a);
+
+	/* No -j UPSTREAM rule: nothing to pick, no statistic turn taken. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m statistic --mode nth --every 2 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	for (i = 0; i < 10; i++) {
+		assert(!strcmp(up_pick(a, NULL, NULL, "192.0.2.1"), ""));
+		assert(out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) ==
+		       (i % 2 ? GWP_ACL_ACCEPT : GWP_ACL_REJECT));
+	}
+	gwp_acl_destroy(a);
+	assert(!strcmp(up_pick(NULL, "alice", NULL, "192.0.2.1"), ""));
+}
+
+/* gwp_acl_eval_upstream() for @user with no target at all (UDP ASSOCIATE). */
+static const char *up_pick_nt(struct gwp_acl *a, const char *user)
+{
+	struct gwp_sockaddr c = sa4("198.51.100.9", 40000);
+	struct gwp_acl_req req;
+	enum gwp_acl_upstream u;
+	const char *name;
+
+	memset(&req, 0, sizeof(req));
+	req.client = &c;
+	req.sport = 40000;
+	req.user = user;
+	req.no_target = true;
+	req.proto = GWP_ACL_PROTO_TCP;
+	u = gwp_acl_eval_upstream(a, &req);
+	if (u == GWP_ACL_UPSTREAM_POOL)
+		name = gwp_acl_pool_name(req.upstream_pool);
+	else
+		name = u == GWP_ACL_UPSTREAM_DIRECT ? "DIRECT" :
+		       u == GWP_ACL_UPSTREAM_UNSURE ? "UNSURE" : "";
+	if (u != GWP_ACL_UPSTREAM_POOL)
+		assert(!req.upstream_pool);
+	gwp_acl_req_release(&req);
+	return name;
+}
+
+/*
+ * A pick with no target at all: no rule that tests the target matches, in
+ * either polarity, and a pool rule passed over only for that leaves the
+ * pick unsure, while a DIRECT one is just passed over. A request to an
+ * address keeps "! --domain" matching, as it has no name.
+ */
+static noinline void test_upstream_pick_no_target(void)
+{
+	struct gwp_acl *a = NULL;
+
+	assert(!gwp_acl_parse_str(&a,
+		"upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m user --user alice -m domain ! --domain secret.example -j UPSTREAM --to DIRECT\n"
+		"-A OUTPUT -m user --user bob -m domain --domain secret.example -j UPSTREAM --to s5\n"
+		"-A OUTPUT -m user --user carol ! -d 10.0.0.0/8 -j UPSTREAM --to DIRECT\n"
+		"-A OUTPUT -m user --user dave -j UPSTREAM --to s5\n"
+		"-A OUTPUT -m user --user erin --dports 80 -j UPSTREAM --to s5\n"
+		"-A OUTPUT -m user --user frank -s 192.0.2.0/24 -d 10.0.0.1 -j UPSTREAM --to s5\n"
+		"-A OUTPUT -m user --user gina -j UPSTREAM --to s5\n"
+		"-A OUTPUT -m user --user gina ! -d 10.0.0.0/8 -j UPSTREAM --to DIRECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(!strcmp(up_pick_nt(a, "alice"), ""));
+	assert(!strcmp(up_pick_nt(a, "bob"), "UNSURE"));
+	assert(!strcmp(up_pick_nt(a, "carol"), ""));
+	assert(!strcmp(up_pick_nt(a, "dave"), "s5"));
+	assert(!strcmp(up_pick_nt(a, "erin"), "UNSURE"));
+	/* Its other criteria fail: the rule says nothing about this one. */
+	assert(!strcmp(up_pick_nt(a, "frank"), ""));
+	assert(!strcmp(up_pick_nt(a, "gina"), "s5"));
+	assert(!strcmp(up_pick_nt(a, NULL), ""));
+
+	/* With a target, the same rules decide as ever. */
+	assert(!strcmp(up_pick(a, "alice", NULL, "192.0.2.1"), "DIRECT"));
+	assert(!strcmp(up_pick(a, "alice", "secret.example", NULL), ""));
+	assert(!strcmp(up_pick(a, "bob", "secret.example", NULL), "s5"));
+	assert(!strcmp(up_pick(a, "carol", NULL, "192.0.2.1"), "DIRECT"));
+	assert(!strcmp(up_pick(a, "erin", "example.org", NULL), ""));
+	gwp_acl_destroy(a);
+
+	/*
+	 * A run of pool rules long enough for the index, by name and by
+	 * address: with no target the index is not asked, the run is walked,
+	 * and its rules leave the pick unsure. A target still finds its rule.
+	 */
+	{
+		char text[4096], *p = text;
+		int i;
+
+		p += sprintf(p, "upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n");
+		for (i = 1; i <= 8; i++)
+			p += sprintf(p, "-A OUTPUT -m domain --domain h%d.example -j UPSTREAM --to s5 --accept\n", i);
+		a = NULL;
+		assert(!gwp_acl_parse_str(&a, text));
+		assert(gwp_acl_nr_indexed(a) == 8);
+		assert(!strcmp(up_pick_nt(a, "bob"), "UNSURE"));
+		assert(!strcmp(up_pick(a, "bob", "h5.example", NULL), "s5"));
+		assert(!strcmp(up_pick(a, "bob", "other.example", NULL), ""));
+		gwp_acl_destroy(a);
+
+		p = text;
+		p += sprintf(p, "upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n");
+		for (i = 1; i <= 8; i++)
+			p += sprintf(p, "-A OUTPUT -d 10.0.%d.0/24 -j UPSTREAM --to s5 --accept\n", i);
+		a = NULL;
+		assert(!gwp_acl_parse_str(&a, text));
+		assert(gwp_acl_nr_indexed(a) == 8);
+		assert(!strcmp(up_pick_nt(a, "bob"), "UNSURE"));
+		assert(!strcmp(up_pick(a, "bob", NULL, "10.0.3.7"), "s5"));
+		assert(!strcmp(up_pick(a, "bob", NULL, "10.9.3.7"), ""));
+		gwp_acl_destroy(a);
+	}
+
+	/* A statistic does not decide it: whether it matches is not known. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m statistic --mode nth --every 1000 --packet 999 --dports 80 -j UPSTREAM --to s5\n"));
+	assert(!strcmp(up_pick_nt(a, "bob"), "UNSURE"));
+	gwp_acl_destroy(a);
+}
+
+/* A -j UPSTREAM rule only UDP matches could never apply: refused. */
+static noinline void test_upstream_udp_refused(void)
+{
+	static const char pool[] = "upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n";
+	static const char *const rules[] = {
+		"-A OUTPUT -p udp -j UPSTREAM --to s5\n",
+		"-A OUTPUT ! -p tcp -m user --user bob -j UPSTREAM --to s5\n",
+		"-A OUTPUT -p udp -j UPSTREAM --to DIRECT --accept\n",
+	};
+	char text[512];
+	struct gwp_acl *a = NULL;
+	size_t i;
+
+	for (i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+		snprintf(text, sizeof(text), "%s%s", pool, rules[i]);
+		up_refused(text, -EINVAL, "line 4: -j UPSTREAM applies to TCP; UDP never goes through an upstream");
+	}
+	snprintf(text, sizeof(text), "%s%s%s", pool,
+		 "-A OUTPUT -p tcp -j UPSTREAM --to s5\n",
+		 "-A OUTPUT ! -p udp -j UPSTREAM --to DIRECT\n");
+	assert(!gwp_acl_parse_str(&a, text));
+	gwp_acl_destroy(a);
+}
+
+/*
+ * A regexp the pick cannot decide (the match limit) leaves it unsure: it
+ * may have missed a pool, so it must not fall back on the default.
+ */
+static noinline void test_upstream_pick_regexp_error(void)
+{
+#ifdef CONFIG_PCRE
+	struct gwp_acl *a = NULL;
+	char host[64];
+
+	memset(host, 'a', 30);
+	strcpy(host + 30, "!internal.example");
+	assert(!gwp_acl_parse_str(&a,
+		"upstream s5 {\n server socks5://10.0.0.1:1080;\n}\n"
+		"-A OUTPUT -m domain --domain-regexp (\\w+\\.?)+internal\\.example$ -j UPSTREAM --to s5\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(!strcmp(up_pick(a, NULL, host, NULL), "UNSURE"));
+	assert(!strcmp(up_pick(a, NULL, "a.internal.example", NULL), "s5"));
+	assert(!strcmp(up_pick(a, NULL, "other.org", NULL), ""));
+	gwp_acl_destroy(a);
+#endif
+}
+
+/* Every way the pool syntax and -j UPSTREAM can be wrong, one at a time. */
+static noinline void test_upstream_errors(void)
+{
+	static const char srv[] = " server http://10.0.0.1:1;\n";
+	char name[80], *text, *p;
+	struct gwp_acl *a;
+	int i;
+
+	/* The block's opening line. */
+	up_refused("upstream p\n", -EINVAL, "line 1: expected \"upstream NAME {\"");
+	up_refused("upstream p{\n}\n", -EINVAL, "expected \"upstream NAME {\"");
+	up_refused("upstream p { server http://h;\n}\n", -EINVAL,
+		   "expected \"upstream NAME {\"");
+	up_refused("upstream {\n}\n", -EINVAL, "expected \"upstream NAME {\"");
+
+	/* The name. */
+	up_refused("upstream p/q {\n server http://h;\n}\n", -EINVAL,
+		   "bad upstream pool name");
+	memset(name, 'n', 65);
+	name[65] = '\0';
+	assert(asprintf(&text, "upstream %s {\n%s}\n", name, srv) > 0);
+	up_refused(text, -EINVAL, "bad upstream pool name");
+	free(text);
+	name[64] = '\0';
+	assert(asprintf(&text, "upstream %s {\n%s}\n"
+			"-A OUTPUT -j UPSTREAM --to %s\n", name, srv, name) > 0);
+	assert(!gwp_acl_parse_str(&a, text));
+	assert(!strcmp(up_choice(a, NULL), name));
+	gwp_acl_destroy(a);
+	free(text);
+	up_refused("upstream DIRECT {\n server http://h;\n}\n", -EINVAL,
+		   "the upstream pool name DIRECT is reserved");
+	up_refused("upstream p {\n server http://h;\n}\n"
+		   "upstream p {\n server http://h;\n}\n", -EINVAL,
+		   "line 4: upstream pool p is defined twice");
+
+	/* The block's contents and end. */
+	up_refused("upstream p {\n}\n", -EINVAL,
+		   "line 2: upstream pool p has no server");
+	up_refused("upstream p {\n server http://h;\n} x\n", -EINVAL,
+		   "\"}\" must stand alone on its line");
+	up_refused("upstream p {\n server http://h;\n least_conn;\n"
+		   " least_conn;\n}\n", -EINVAL,
+		   "line 4: least_conn given twice");
+	up_refused("upstream p {\n server http://h;\n least_conn x;\n}\n",
+		   -EINVAL, "expected \"least_conn;\"");
+	up_refused("upstream p {\n server http://h\n}\n", -EINVAL,
+		   "line 2: missing ';' at the end of the directive");
+	up_refused("upstream p {\n least_conn\n}\n", -EINVAL,
+		   "missing ';' at the end of the directive");
+	up_refused("upstream p {\n server;\n}\n", -EINVAL,
+		   "expected \"server URL;\"");
+	up_refused("upstream p {\n server http://a; server http://b;\n}\n",
+		   -EINVAL, "expected \"server URL;\"");
+	up_refused("upstream p {\n weight 3;\n}\n", -EINVAL,
+		   "unknown directive in upstream pool p");
+	/* A URL without "server": refused without being quoted. */
+	up_refused("upstream p {\n http://u:s3cret@h;\n}\n", -EINVAL,
+		   "unknown directive in upstream pool p");
+	up_refused("upstream p {\n -A OUTPUT -j ACCEPT\n}\n", -EINVAL,
+		   "unknown directive in upstream pool p");
+	up_refused("upstream p {\n server http://h;\n upstream q {\n}\n}\n",
+		   -EINVAL, "line 3: upstream blocks do not nest");
+	up_refused("upstream p {\n server http://h;\n include x.acl;\n}\n",
+		   -EINVAL, "include is not allowed inside an upstream block");
+	up_refused("upstream p {\n server http://h;\n", -EINVAL,
+		   "line 1: upstream pool p is not closed");
+
+	/* The server URLs; no message quotes the password. */
+	up_refused("upstream p {\n server ftp://u:s3cret@h:1;\n}\n", -EINVAL,
+		   "pool p server 1: the scheme must be");
+	up_refused("upstream p {\n server SOCKS5://h:1;\n}\n", -EINVAL,
+		   "the scheme must be");
+	up_refused("upstream p {\n server http://u:s3cret@;\n}\n", -EINVAL,
+		   "the host is empty or malformed");
+	up_refused("upstream p {\n server http://;\n}\n", -EINVAL,
+		   "the host is empty or malformed");
+	up_refused("upstream p {\n server http://:s3cret@h:1;\n}\n", -EINVAL,
+		   "the user name is empty");
+	memset(name, 'u', 64);
+	name[64] = '\0';
+	assert(asprintf(&text,
+			"upstream p {\n server http://%s%s%s%s:s3cret@h:1;\n}\n",
+			name, name, name, name) > 0);
+	up_refused(text, -EINVAL, "longer than 255 bytes");
+	free(text);
+	assert(asprintf(&text,
+			"upstream p {\n server http://u:s3cret%s%s%s%s@h:1;\n}\n",
+			name, name, name, name) > 0);
+	up_refused(text, -EINVAL, "longer than 255 bytes");
+	free(text);
+	text = malloc(700);
+	assert(text);
+	p = text + sprintf(text, "upstream p {\n server http://");
+	memset(p, 'h', 520);
+	strcpy(p + 520, ":1;\n}\n");
+	up_refused(text, -EINVAL, "the URL is too long");
+	free(text);
+	up_refused("upstream p {\n server http://u:s3cret@h:0;\n}\n", -EINVAL,
+		   "the port must be a number from 1 to 65535");
+	up_refused("upstream p {\n server http://h:65536;\n}\n", -EINVAL,
+		   "the port must be a number from 1 to 65535");
+	up_refused("upstream p {\n server http://h:99999999999999999999;\n}\n",
+		   -EINVAL, "the port must be a number from 1 to 65535");
+	up_refused("upstream p {\n server http://h:;\n}\n", -EINVAL,
+		   "the port must be a number from 1 to 65535");
+	up_refused("upstream p {\n server http://h:8x;\n}\n", -EINVAL,
+		   "the port must be a number from 1 to 65535");
+	up_refused("upstream p {\n server http://h:+80;\n}\n", -EINVAL,
+		   "the port must be a number from 1 to 65535");
+	up_refused("upstream p {\n server http://[::1;\n}\n", -EINVAL,
+		   "the IPv6 address is malformed");
+	up_refused("upstream p {\n server http://[]:1;\n}\n", -EINVAL,
+		   "the IPv6 address is malformed");
+	up_refused("upstream p {\n server http://[10.0.0.1]:1;\n}\n", -EINVAL,
+		   "the IPv6 address is malformed");
+	up_refused("upstream p {\n server http://[::1]x;\n}\n", -EINVAL,
+		   "unexpected characters after the host");
+	up_refused("upstream p {\n server http://::1;\n}\n", -EINVAL,
+		   "the host is empty or malformed");
+	up_refused("upstream p {\n server http://h:1/;\n}\n", -EINVAL,
+		   "the port must be");
+	up_refused("upstream p {\n server http://h/x;\n}\n", -EINVAL,
+		   "unexpected characters after the host");
+	up_refused("upstream p {\n server http://h;x;\n}\n", -EINVAL,
+		   "unexpected characters after the host");
+
+	/* One DNS mode a pool; https:// resolves remotely. */
+	up_refused("upstream p {\n server socks5h://h:1;\n"
+		   " server socks5://u:s3cret@h:1;\n}\n", -EINVAL,
+		   "line 3: upstream pool p server 2 (socks5://h:1): resolves names locally, the servers before it remotely");
+	up_refused("upstream p {\n server socks5://h:1;\n server http://h:1;\n}\n",
+		   -EINVAL, "resolves names remotely, the servers before it locally");
+	up_refused("upstream p {\n server socks5://h:1;\n"
+		   " server https://u:s3cret@h:1;\n}\n", -EINVAL,
+		   "line 3: upstream pool p server 2 (https://h:1): resolves names remotely, the servers before it locally");
+	up_refused("upstream p {\n server https://h:1;\n"
+		   " server socks5://h:1;\n}\n", -EINVAL,
+		   "server 2 (socks5://h:1): resolves names locally, the servers before it remotely");
+
+	/* The limits: 64 servers a pool, 1024 pools a set. */
+	text = malloc(1100 * 64);
+	assert(text);
+	up_pool_text(text, "p", 64);
+	assert(!gwp_acl_parse_str(&a, text));
+	gwp_acl_destroy(a);
+	up_pool_text(text, "p", 65);
+	up_refused(text, -EINVAL, "line 66: upstream pool p has more than 64 servers");
+	for (p = text, i = 0; i < 1024; i++) {
+		snprintf(name, sizeof(name), "p%d", i);
+		p = up_pool_text(p, name, 1);
+	}
+	p += sprintf(p, "-A OUTPUT -j UPSTREAM --to p1023\n");
+	assert(!gwp_acl_parse_str(&a, text));
+	assert(!strcmp(up_choice(a, NULL), "p1023"));
+	gwp_acl_destroy(a);
+	up_pool_text(p, "p1024", 1);
+	up_refused(text, -EINVAL, "more than 1024 upstream pools");
+	free(text);
+
+	/* The rules. */
+	up_refused("upstream p {\n server http://h;\n}\n"
+		   "-A INPUT -j UPSTREAM --to p\n", -EINVAL,
+		   "line 4: -j UPSTREAM is only valid in the OUTPUT chain");
+	up_refused("-A OUTPUT -j UPSTREAM\n", -EINVAL,
+		   "-j UPSTREAM needs --to NAME");
+	up_refused("-A OUTPUT -j UPSTREAM --to-destination DIRECT\n", -EINVAL,
+		   "-j UPSTREAM needs --to NAME");
+	up_refused("-A OUTPUT -j UPSTREAM --to p/q\n", -EINVAL,
+		   "-j UPSTREAM: bad upstream pool name");
+	up_refused("-A OUTPUT -j UPSTREAM --to\n", -EINVAL, "parse error on line 1");
+	up_refused("-A OUTPUT -j UPSTREAM --to DIRECT --to-proxy DIRECT\n",
+		   -EINVAL, "parse error on line 1");
+	up_refused("-A OUTPUT -j UPSTREAM --to DIRECT --set-mark 1\n", -EINVAL,
+		   "parse error on line 1");
+	up_refused("-A OUTPUT -j UPSTREAM --to-iface lo --to DIRECT\n", -EINVAL,
+		   "parse error on line 1");
+	up_refused("-A OUTPUT ! -j UPSTREAM --to DIRECT\n", -EINVAL,
+		   "parse error on line 1");
+	up_refused("-A OUTPUT -j UPSTREAM ! --to DIRECT\n", -EINVAL,
+		   "parse error on line 1");
+	up_refused("-A OUTPUT -d 10.0.0.1 -j DNAT --to-proxy 10.0.0.2\n",
+		   -EINVAL, "parse error on line 1");
+	up_refused("-A OUTPUT -j UPSTREAM --to nope\n-P OUTPUT ACCEPT\n",
+		   -EINVAL, "line 1: upstream pool nope is not defined");
+	up_refused("upstream nope {\n server http://h;\n}\n"
+		   "-A OUTPUT -j UPSTREAM --to Nope\n", -EINVAL,
+		   "line 4: upstream pool Nope is not defined");
+
+	/* -d in an UPSTREAM rule only warns. */
+	up_capture();
+	i = gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 10.0.0.0/8 -j UPSTREAM --to DIRECT\n");
+	text = up_captured();
+	up_check(i, 0, text);
+	assert(strstr(text, "line 1: warning: -d in a -j UPSTREAM rule"));
+	free(text);
+	gwp_acl_destroy(a);
+}
+
 #ifdef CONFIG_PCRE
 /* Linked with --wrap, so a test can fail the context's allocation. */
 void *__real_pcre2_match_context_create_8(void *gcontext);
@@ -1855,6 +3537,23 @@ static void run_tests(void)
 	test_generation();
 	test_empty_chain_policy();
 	test_file_nul();
+	test_file_fifo();
+	test_include_order();
+	test_include_errors();
+	test_include_reload();
+	test_upstream_errors();
+	test_upstream_pool_https();
+	test_upstream_index();
+	test_upstream_include();
+	test_upstream_creds_warning();
+	test_upstream_url_redact();
+	test_upstream_pool_outlives_reload();
+	test_upstream_take_pool();
+	test_upstream_reload_readers();
+	test_upstream_server_ops();
+	test_upstream_pick_no_target();
+	test_upstream_pick_regexp_error();
+	test_upstream_udp_refused();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();
@@ -1875,6 +3574,8 @@ static void run_tests(void)
 		test_statistic_counts_only_matches();
 		test_statistic_load_balance();
 		test_statistic_equal_every_is_uneven();
+		test_upstream_pools();
+		test_upstream_pick();
 	}
 	printf("All tests passed!\n");
 }

@@ -9,6 +9,10 @@
 
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
+#include <gwproxy/upstream.h>
+#ifdef CONFIG_HTTPS
+#include <gwproxy/ssl.h>
+#endif
 
 /*
  * Upstream proxy chaining: the SOCKS5/HTTP CONNECT handshake this proxy speaks
@@ -28,6 +32,12 @@
  * IPv6 bound address. An HTTP client's is 19 bytes.
  */
 #define UPSTREAM_CLIENT_REPLY_MAX	22
+
+/* The class of a handshake failure, as its log line names it. */
+static const char *fail_class(enum gwp_upstream_end end, int val)
+{
+	return gwp_upstream_fail_class_str(gwp_upstream_fail_classify(end, val));
+}
 
 /*
  * While the reply to a CONNECT is awaited, target.cap leaves this much of the
@@ -94,9 +104,9 @@ int gwp_upstream_splice_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 }
 
 /* Build the SOCKS5 user/pass auth request; advance to the AUTH-reply state. */
-static int build_userpass(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int build_userpass(struct gwp_conn_pair *gcp)
 {
-	struct gwp_upstream *up = &w->ctx->upstream;
+	struct gwp_upstream *up = gcp->upstream;
 	size_t len = gcp->target.cap;
 	int r;
 
@@ -150,13 +160,14 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			r = build_connect(gcp);
 			return r ? r : GWP_UPSTREAM_IO_SEND;
 		}
-		if (method == 0x02 && ctx->upstream.has_auth) {
-			r = build_userpass(w, gcp);
+		if (method == 0x02 && gcp->upstream->has_auth) {
+			r = build_userpass(gcp);
 			return r ? r : GWP_UPSTREAM_IO_SEND;
 		}
 
-		pr_err(&ctx->lh, "Upstream SOCKS5 proxy selected no acceptable auth method (0x%02x)",
-			method);
+		pr_err(&ctx->lh, "Upstream SOCKS5 proxy selected no acceptable auth method (0x%02x, class=%s)",
+			method, fail_class(GWP_UPSTREAM_END_S5_METHOD, method));
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_S5_METHOD, method);
 		return -EACCES;
 	}
 	case CONN_STATE_UPSTREAM_S5_AUTH: {
@@ -168,8 +179,11 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 		gwp_conn_buf_advance(&gcp->target, 2);
 		if (status != 0x00) {
-			pr_err(&ctx->lh, "Upstream SOCKS5 authentication failed (idx=%u)",
+			pr_err(&ctx->lh, "Upstream SOCKS5 authentication failed (status=0x%02x, class=%s, idx=%u)",
+				status, fail_class(GWP_UPSTREAM_END_S5_AUTH, status),
 				gcp->idx);
+			gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_S5_AUTH,
+					      status);
 			return -EACCES;
 		}
 		r = build_connect(gcp);
@@ -184,8 +198,10 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return r == -EAGAIN ? GWP_UPSTREAM_IO_RECV : r;
 
 		if (rep != GWP_SOCKS5_REP_SUCCESS) {
-			pr_err(&ctx->lh, "Upstream SOCKS5 CONNECT failed (rep=0x%02x, idx=%u, dst=%s)",
-				rep, gcp->idx, gwp_upstream_dst_str(gcp));
+			pr_err(&ctx->lh, "Upstream SOCKS5 CONNECT failed (rep=0x%02x, class=%s, idx=%u, dst=%s)",
+				rep, fail_class(GWP_UPSTREAM_END_S5_REP, rep),
+				gcp->idx, gwp_upstream_dst_str(gcp));
+			gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_S5_REP, rep);
 			return -ECONNREFUSED;
 		}
 		r = gwp_upstream_splice_reply(w, gcp, consumed);
@@ -210,17 +226,31 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * holds the client until the connect timeout, so fail it now.
 	 */
 	if (r == -EAGAIN && gcp->target.len >= gcp->target.cap) {
-		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT reply header too large (idx=%u, dst=%s)",
-			gcp->idx, gwp_upstream_dst_str(gcp));
+		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT reply header too large (class=%s, idx=%u, dst=%s)",
+			fail_class(GWP_UPSTREAM_END_MALFORMED, 0), gcp->idx,
+			gwp_upstream_dst_str(gcp));
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_MALFORMED, 0);
 		return -EMSGSIZE;
 	}
 	if (r)
 		return r == -EAGAIN ? GWP_UPSTREAM_IO_RECV : r;
 
 	if (status < 200 || status >= 300) {
-		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT failed (status=%d, idx=%u, dst=%s)",
-			status, gcp->idx, gwp_upstream_dst_str(gcp));
-		return -ECONNREFUSED;
+		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT failed (status=%d, class=%s, idx=%u, dst=%s)",
+			status, fail_class(GWP_UPSTREAM_END_HTTP, status),
+			gcp->idx, gwp_upstream_dst_str(gcp));
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_HTTP, status);
+		/*
+		 * Only a 502 or 504 says the destination could not be
+		 * reached: that is the refused CONNECT a SOCKS5 client hears
+		 * as REP 0x05. A 407 turned our credentials down, and a 403,
+		 * 500, 503 or any other status says nothing about the
+		 * destination: a failure of the chain, REP 0x01.
+		 */
+		if (gwp_upstream_http_class(status) ==
+		    GWP_UPSTREAM_FAIL_DESTINATION)
+			return -ECONNREFUSED;
+		return -EPROTO;
 	}
 	r = gwp_upstream_splice_reply(w, gcp, consumed);
 	return r ? r : GWP_UPSTREAM_IO_DONE;
@@ -231,15 +261,23 @@ int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int r;
 
+	/*
+	 * Answered already: the failure came back up through a second
+	 * caller (upstream_start() inside the TLS step, say). What is left
+	 * of that answer is still to be sent; nothing is added.
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
+		return 0;
+
 	gcp->target.len = 0;
 	gwp_conn_buf_compact(&gcp->target);
 
 	/*
-	 * Only a refused CONNECT says something about the destination. An
-	 * upstream that turned down our credentials, or answered something
-	 * we cannot use, or hung up, is a failure of the proxy chain: REP
-	 * 0x01, not the 0x02 "not allowed by ruleset" that -EACCES would map
-	 * to.
+	 * Only a refused CONNECT (SOCKS5 REP non-zero, HTTP 502 or 504) says
+	 * something about the destination. An upstream that turned down our
+	 * credentials (SOCKS5 auth, HTTP 407), or answered something we
+	 * cannot use, or hung up, is a failure of the proxy chain: REP 0x01,
+	 * not the 0x02 "not allowed by ruleset" that -EACCES would map to.
 	 */
 	if (err != -ECONNREFUSED)
 		err = -EPROTO;
@@ -258,9 +296,12 @@ int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	else
 		r = s5_parse(w, gcp);
 
-	if (r == -EINVAL)
-		pr_err(&w->ctx->lh, "Upstream proxy sent a malformed reply (idx=%u, dst=%s)",
-			gcp->idx, gwp_upstream_dst_str(gcp));
+	if (r == -EINVAL) {
+		pr_err(&w->ctx->lh, "Upstream proxy sent a malformed reply (class=%s, idx=%u, dst=%s)",
+			fail_class(GWP_UPSTREAM_END_MALFORMED, 0), gcp->idx,
+			gwp_upstream_dst_str(gcp));
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_MALFORMED, 0);
+	}
 	return r;
 }
 
@@ -277,7 +318,7 @@ static int s5_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return r;
 	}
 
-	r = gwp_socks5_cli_build_greeting(ctx->upstream.has_auth,
+	r = gwp_socks5_cli_build_greeting(gcp->upstream->has_auth,
 					  gcp->target.buf, &len);
 	if (unlikely(r))
 		return r;
@@ -292,7 +333,7 @@ static int s5_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 static int http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_upstream *up = &w->ctx->upstream;
+	struct gwp_upstream *up = gcp->upstream;
 	char authority[300];
 	size_t len = 0;
 	int r;
@@ -325,9 +366,81 @@ static int http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return GWP_UPSTREAM_IO_SEND;
 }
 
+void gwp_upstream_hs_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   int state)
+{
+	if (gwp_in_upstream_hs(gcp))
+		gcp->target.len = 0;
+	gwp_conn_buf_compact(&gcp->target);
+	/*
+	 * The whole buffer again, as before the handshake: build_connect()
+	 * and http_start() held the client's reply room back, and
+	 * gwp_upstream_splice_reply() may or may not have given it back
+	 * before it failed, so set it rather than add to it.
+	 */
+	gcp->target.cap = (uint32_t)w->ctx->cfg.target_buf_size;
+	gcp->target.rd_eof = false;
+	gcp->target.wr_shut = false;
+#ifdef CONFIG_HTTPS
+	if (gcp->target.tls) {
+		gwp_ssl_free(gcp->target.tls);
+		gcp->target.tls = NULL;
+	}
+#endif
+	gcp->up_tx = false;
+	gcp->up_scan = 0;
+	gcp->conn_state = state;
+}
+
 int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	if (w->ctx->upstream.type == GWP_UPSTREAM_HTTP)
+	if (gcp->upstream->type == GWP_UPSTREAM_HTTP)
 		return http_start(w, gcp);
 	return s5_start(w, gcp);
 }
+
+#ifdef CONFIG_HTTPS
+int gwp_upstream_tls_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream *up = gcp->upstream;
+	struct gwp_ssl *s;
+
+	s = gwp_ssl_client_new(w->ctx->up_ssl_ctx);
+	if (unlikely(!s))
+		return -ENOMEM;
+
+	/* Tried when the server was made, at startup or as its pool loaded. */
+	if (unlikely(gwp_ssl_set_peer_name(s, up->host, up->host_is_ip))) {
+		gwp_ssl_free(s);
+		return -ENOMEM;
+	}
+
+	gcp->target.tls = s;
+	gcp->conn_state = CONN_STATE_UPSTREAM_TLS_HS;
+	pr_dbg(&w->ctx->lh, "Upstream TLS handshake started (idx=%u, host=%s)",
+		gcp->idx, up->host);
+	return 0;
+}
+
+void gwp_upstream_tls_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream *up = gcp->upstream;
+	const char *why = gwp_ssl_verify_errstr(gcp->target.tls);
+
+	pr_err(&w->ctx->lh, "Upstream TLS handshake failed (class=%s, idx=%u, host=%s, up=%s): %s%s",
+		fail_class(GWP_UPSTREAM_END_TLS, 0), gcp->idx, up->host,
+		ip_to_str(&up->addr), why ? "certificate verify failed: " : "",
+		why ? why : gwp_ssl_errstr());
+	gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TLS, 0);
+}
+
+bool gwp_upstream_tls_cut(struct gwp_conn_pair *gcp)
+{
+	if (!gcp->target.tls)
+		return false;
+	if (gwp_http_fwd_active(gcp) &&
+	    gwp_http_fwd_res_state(gcp->http_conn) == GWP_HTTP_RES_FAILED)
+		return false;
+	return gwp_ssl_rx_cut(gcp->target.tls);
+}
+#endif /* CONFIG_HTTPS */

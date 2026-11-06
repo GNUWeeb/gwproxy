@@ -12,6 +12,7 @@
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
 #include <gwproxy/acl.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <unistd.h>
@@ -47,8 +48,38 @@ struct gwp_iou_tls {
 	bool		closing;	/* close_notify queued             */
 	bool		prot_resume;	/* pump the protocol once tx is out */
 	bool		fwd_resume;	/* pump forwarding once tx is out */
+	/*
+	 * An https:// upstream's (gwp_conn_pair::up_tls_io) only. @tx_fwd: the
+	 * send carries what the client sent, and its completion goes on to
+	 * read the client. @rx_nop: the target "recv" in flight is a no-op,
+	 * for what the engine holds already (prep_recv_target()); @rx_err, if
+	 * not 0, is why it could not be a recv.
+	 */
+	bool		tx_fwd;
+	bool		rx_nop;
+	int		rx_err;
 	unsigned char	tx[GWP_TLS_CIPHER_CAP];
 };
+
+/* A ciphertext scratch with nothing in it. NULL if out of memory. */
+static struct gwp_iou_tls *iou_tls_new(void)
+{
+	struct gwp_iou_tls *t = malloc(sizeof(*t));
+
+	/* Only the header needs zeroing; tx is scratch. */
+	if (t)
+		memset(t, 0, offsetof(struct gwp_iou_tls, tx));
+	return t;
+}
+
+static inline bool target_is_tls(const struct gwp_conn_pair *gcp)
+{
+	return gcp->target.tls != NULL;
+}
+
+static void send_target_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    bool fwd);
+static int target_tls_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /* Defined further down but referenced by earlier prep/dispatch code. */
 static int handle_sock_ret(int r);
@@ -64,6 +95,22 @@ static inline bool client_is_tls(const struct gwp_conn_pair *gcp)
 	return gcp->client.tls != NULL;
 }
 #endif /* CONFIG_HTTPS */
+
+/*
+ * The target's read side is at its end and everything it sent has been taken
+ * in: an https:// upstream's engine may still hold records that came in
+ * before the end, which are its data as much as any.
+ */
+static inline bool target_rx_done(const struct gwp_conn_pair *gcp)
+{
+	if (!gcp->target.rd_eof)
+		return false;
+#ifdef CONFIG_HTTPS
+	if (gcp->target.tls)
+		return !gwp_ssl_rx_more(gcp->target.tls);
+#endif
+	return true;
+}
 
 /* Defined below handle_prot_*, but the connect path above needs it. */
 static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -522,7 +569,7 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * that as soon as the next candidate joins the race. attempt_addr[] is
 	 * per-slot and stays put for as long as the attempt is in flight.
 	 */
-	if (!ctx->upstream.enabled)
+	if (!gcp->upstream)
 		ca = &gcp->attempt_addr[slot];
 
 	if (ca->sa.sa_family == AF_INET)
@@ -558,7 +605,33 @@ static struct io_uring_sqe *prep_recv_target(struct gwp_wrk *w,
 		return NULL;
 
 	s = get_sqe_nofail(w);
-	io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
+#ifdef CONFIG_HTTPS
+	/*
+	 * An https:// upstream's ciphertext goes straight into the engine's
+	 * input queue, as a TLS client's does. The engine may also hold
+	 * plaintext, or records already off the socket, and the socket may be
+	 * at its end: no recv would complete for any of those. A no-op brings
+	 * handle_ev_target_recv() round to them instead, where errors can be
+	 * acted on.
+	 */
+	if (target_is_tls(gcp)) {
+		struct gwp_iou_tls *t = gcp->up_tls_io;
+
+		buf = NULL;
+		if (!gcp->target.rd_eof && !gwp_ssl_rx_more(gcp->target.tls)) {
+			buf = gwp_ssl_rx_space(gcp->target.tls,
+					       GWP_SSL_RECORD_MAX, &len);
+			if (unlikely(!buf))
+				t->rx_err = -ENOMEM;
+		}
+		t->rx_nop = !buf;
+		if (t->rx_nop)
+			io_uring_prep_nop(s);
+		else
+			io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
+	} else
+#endif
+		io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TARGET_RECV;
 	gcp->target_rx = true;
@@ -614,6 +687,14 @@ static struct io_uring_sqe *prep_send_target(struct gwp_wrk *w,
 	char *buf = gcp->client.buf;
 	int fd = gcp->target.fd;
 	struct io_uring_sqe *s;
+
+#ifdef CONFIG_HTTPS
+	/* An https:// upstream is sent ciphertext, see send_target_tls(). */
+	if (target_is_tls(gcp)) {
+		send_target_tls(w, gcp, true);
+		return NULL;
+	}
+#endif
 
 	s = get_sqe_nofail(w);
 #if USE_SEND_ZC
@@ -816,7 +897,7 @@ static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return;			/* nothing left to start */
 	if (ctx->cfg.connect_attempt_delay <= 0)
 		return;			/* racing disabled: fall back only */
-	if (ctx->upstream.enabled)
+	if (gcp->upstream)
 		return;			/* one proxy, nothing to race */
 
 	__arm_attempt_timer(w, gcp, ctx->cfg.connect_attempt_delay);
@@ -1048,7 +1129,7 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (t->tx_len)
 		prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
-	else if (gcp->target.fd >= 0 && !gcp->target.rd_eof)
+	else if (gcp->target.fd >= 0 && !target_rx_done(gcp))
 		prep_recv_target(w, gcp);
 }
 
@@ -1111,6 +1192,235 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	return prep_recv_client(w, gcp);
+}
+
+/*
+ * ------------------------------------------------------------------------
+ * TLS to an https:// upstream proxy, on the target side, once the tunnel
+ * through it is up. Mirrors the client's: ciphertext is received straight
+ * into the engine's input queue and sent from the pair's up_tls_io scratch.
+ * ------------------------------------------------------------------------
+ */
+static void prep_send_target_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				    uint64_t ev_bit)
+{
+	struct gwp_iou_tls *t = gcp->up_tls_io;
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	io_uring_prep_send(s, gcp->target.fd, t->tx + t->tx_sent,
+			   t->tx_len - t->tx_sent, MSG_NOSIGNAL);
+	io_uring_sqe_set_data(s, gcp);
+	s->user_data |= ev_bit;
+	get_gcp_io(gcp, s);
+}
+
+/* Take the next ciphertext the target's engine has to send into the scratch. */
+static bool target_cipher_next(struct gwp_conn_pair *gcp)
+{
+	struct gwp_iou_tls *t = gcp->up_tls_io;
+	int n;
+
+	n = gwp_ssl_bio_read(gcp->target.tls, t->tx, sizeof(t->tx));
+	t->tx_len = (n > 0) ? (uint32_t)n : 0;
+	t->tx_sent = 0;
+	return t->tx_len > 0;
+}
+
+/*
+ * Send the upstream ciphertext, one scratch at a time. With @fwd, the
+ * client's data in client.buf is what to send: encrypt it first, and have
+ * the completion (handle_ev_target_send()) go on to read the client once it
+ * is all out, as for a plaintext target. Without, only send what the engine
+ * made of its own (records in answer to the proxy's, a close_notify), which
+ * leaves client.buf alone. A send already on its way picks up what is added
+ * meanwhile.
+ */
+static void send_target_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    bool fwd)
+{
+	struct gwp_iou_tls *t = gcp->up_tls_io;
+
+	if (fwd)
+		t->tx_fwd = true;
+	if (t->tx_sent < t->tx_len)
+		return;
+
+	while (t->tx_fwd && gcp->client.len) {
+		size_t consumed = 0;
+		int sr = gwp_ssl_write(gcp->target.tls, gcp->client.buf,
+				       gcp->client.len, &consumed);
+
+		if (sr != GWP_SSL_OK || !consumed)
+			break;
+		gwp_conn_buf_advance(&gcp->client, consumed);
+	}
+
+	if (target_cipher_next(gcp))
+		prep_send_target_cipher(w, gcp, EV_BIT_IOU_TARGET_SEND);
+}
+
+/*
+ * Decrypt what the upstream's engine holds into target.buf and hand it to the
+ * client; with nothing to hand over, read more of the upstream unless its
+ * stream has ended. Records the engine made of its own go out on the way, and
+ * while more of those are queued than forwarding leaves there, the upstream is
+ * not read (gwp_ssl_tx_backlog()); handle_ev_target_send() picks it up again.
+ *
+ * What was decrypted ahead of a bad record is delivered, and the stream then
+ * counts as cut (iou_forward_progress()).
+ */
+static int target_tls_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_conn *c = &gcp->target;
+	int sr;
+
+	for (;;) {
+		size_t space = c->cap - c->len, got = 0;
+		uint32_t from = c->len;
+
+		sr = GWP_SSL_WANT_READ;
+		if (space && gwp_ssl_rx_more(c->tls)) {
+			sr = gwp_ssl_read(c->tls, c->buf + c->len, space, &got);
+			if (sr == GWP_SSL_ERROR) {
+				if (!c->len)
+					return -EIO;
+				c->rd_eof = true;
+			} else if (sr == GWP_SSL_OK && !got) {
+				c->rd_eof = true;	/* close_notify */
+			}
+			c->len += (uint32_t)got;
+		}
+
+		if (gwp_http_fwd_active(gcp) && (c->len > from || c->rd_eof)) {
+			int r = gwp_http_fwd_in(w, gcp, c, from);
+
+			if (r)
+				return r;
+		}
+
+		/* An HTTP forwarding filter may have dropped all of it. */
+		if (c->len || !got || c->rd_eof)
+			break;
+	}
+
+	if (gwp_ssl_bio_pending(c->tls) > 0)
+		send_target_tls(w, gcp, false);
+
+	if (c->len) {
+		prep_send_client(w, gcp);
+		return 0;
+	}
+	/*
+	 * The socket's end comes as a recv of 0 bytes, with whatever the
+	 * engine still holds decrypted after it.
+	 */
+	if (c->rd_eof && !gwp_ssl_rx_more(c->tls))
+		return iou_forward_progress(w, gcp);
+	if (gwp_ssl_tx_backlog(c->tls, gcp->client.cap)) {
+		gcp->up_tls_io->fwd_resume = true;
+		return 0;
+	}
+
+	prep_recv_target(w, gcp);
+	return 0;
+}
+
+/*
+ * A target recv completed: ciphertext from an https:// upstream, its end, or
+ * the no-op prep_recv_target() queued for what the engine already holds.
+ */
+static int target_tls_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   int r)
+{
+	struct gwp_iou_tls *t = gcp->up_tls_io;
+
+	if (t->rx_nop) {
+		t->rx_nop = false;
+		if (t->rx_err)
+			return t->rx_err;
+		return target_tls_pump(w, gcp);
+	}
+
+	gwp_ssl_rx_commit(gcp->target.tls, r > 0 ? (size_t)r : 0);
+	if (r < 0) {
+		if (r == -EAGAIN || r == -EINTR) {
+			prep_recv_target(w, gcp);
+			return 0;
+		}
+		return r;
+	}
+	if (r == 0)
+		gcp->target.rd_eof = true;
+	return target_tls_pump(w, gcp);
+}
+
+/*
+ * A ciphertext send to the upstream completed. Send the rest, then what has
+ * been queued since; once all is out, go on with what waited for that: the
+ * upstream's input held up by the engine's backlog, the client's next data
+ * (when this send carried the last), and the close.
+ */
+static int target_tls_sent(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   int r)
+{
+	struct gwp_iou_tls *t = gcp->up_tls_io;
+
+	t->tx_sent += (uint32_t)r;
+	if (t->tx_sent < t->tx_len) {
+		prep_send_target_cipher(w, gcp, EV_BIT_IOU_TARGET_SEND);
+		return 0;
+	}
+	t->tx_len = t->tx_sent = 0;
+
+	if ((t->tx_fwd && gcp->client.len) ||
+	    gwp_ssl_bio_pending(gcp->target.tls) > 0) {
+		send_target_tls(w, gcp, false);
+		if (t->tx_len)
+			return 0;
+	}
+
+	if (t->fwd_resume &&
+	    !gwp_ssl_tx_backlog(gcp->target.tls, gcp->client.cap)) {
+		t->fwd_resume = false;
+		r = target_tls_pump(w, gcp);
+		if (r)
+			return r;
+	}
+
+	if (t->tx_fwd) {
+		t->tx_fwd = false;
+		if (!gcp->client.rd_eof) {
+			if (client_is_tls(gcp))
+				return tls_forward_pump(w, gcp);
+			return prep_recv_client(w, gcp);
+		}
+	}
+
+	if (gcp->client.rd_eof && !gcp->target.wr_shut)
+		return iou_forward_progress(w, gcp);
+	return 0;
+}
+
+/*
+ * The client is done, and an https:// upstream is owed a close_notify before
+ * the FIN, as the client's TLS peer is (tls_close_client()). Returns true once
+ * nothing of ours is left to send.
+ */
+static bool tls_close_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_iou_tls *t = gcp->up_tls_io;
+
+	if (t->tx_sent < t->tx_len)
+		return false;
+	if (t->closing)
+		return true;
+
+	t->closing = true;
+	gwp_ssl_shutdown(gcp->target.tls);
+	if (!target_cipher_next(gcp))
+		return true;
+	prep_send_target_cipher(w, gcp, EV_BIT_IOU_TARGET_SEND);
+	return false;
 }
 
 /* Reading the client was held up in tls_forward_pump(): go on if it may. */
@@ -1347,15 +1657,9 @@ static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return prep_recv_client_prot(w, gcp);
 	}
 
-	/* Only the header needs zeroing; tx is scratch. */
-	gcp->tls_io = malloc(sizeof(*gcp->tls_io));
+	gcp->tls_io = iou_tls_new();
 	if (unlikely(!gcp->tls_io))
 		return -ENOMEM;
-	gcp->tls_io->tx_len = 0;
-	gcp->tls_io->tx_sent = 0;
-	gcp->tls_io->closing = false;
-	gcp->tls_io->prot_resume = false;
-	gcp->tls_io->fwd_resume = false;
 
 	gcp->client.tls = gwp_ssl_server_new(ctx->ssl_ctx);
 	if (unlikely(!gcp->client.tls))
@@ -1677,7 +1981,30 @@ static int handle_sock_ret(int r);
 static struct io_uring_sqe *prep_upstream_send(struct gwp_wrk *w,
 					       struct gwp_conn_pair *gcp)
 {
-	struct io_uring_sqe *s = get_sqe_nofail(w);
+	struct io_uring_sqe *s;
+
+#ifdef CONFIG_HTTPS
+	/*
+	 * An https:// upstream: encrypt the request, then send the ciphertext
+	 * from the scratch; handle_ev_upstream_s5() sends the rest.
+	 */
+	if (target_is_tls(gcp)) {
+		while (gcp->target.len) {
+			size_t consumed = 0;
+			int sr = gwp_ssl_write(gcp->target.tls, gcp->target.buf,
+					       gcp->target.len, &consumed);
+
+			if (sr != GWP_SSL_OK || !consumed)
+				break;
+			gwp_conn_buf_advance(&gcp->target, consumed);
+		}
+		target_cipher_next(gcp);
+		prep_send_target_cipher(w, gcp, EV_BIT_IOU_UPSTREAM_S5);
+		return NULL;
+	}
+#endif
+
+	s = get_sqe_nofail(w);
 
 	io_uring_prep_send(s, gcp->target.fd, gcp->target.buf, gcp->target.len,
 			   MSG_NOSIGNAL);
@@ -1692,8 +2019,18 @@ static struct io_uring_sqe *prep_upstream_recv(struct gwp_wrk *w,
 {
 	size_t len = gcp->target.cap - gcp->target.len;
 	char *buf = gcp->target.buf + gcp->target.len;
-	struct io_uring_sqe *s = get_sqe_nofail(w);
+	struct io_uring_sqe *s;
 
+#ifdef CONFIG_HTTPS
+	/* The upstream's ciphertext goes into its engine (upstream_tls_rx()). */
+	if (target_is_tls(gcp)) {
+		buf = gwp_ssl_rx_space(gcp->target.tls, GWP_SSL_RECORD_MAX, &len);
+		if (unlikely(!buf))
+			return NULL;
+	}
+#endif
+
+	s = get_sqe_nofail(w);
 	io_uring_prep_recv(s, gcp->target.fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UPSTREAM_S5;
@@ -1713,6 +2050,7 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->up_tx = false;
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
+	gwp_conn_upstream_up(gcp);
 
 	r = gwp_http_fwd_begin(w, gcp);
 	if (r)
@@ -1750,6 +2088,48 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 /*
+ * gwp_conn_upstream_failed() has moved the pair to another server of its
+ * pool after the attempt on the old one failed with @err, with nothing in
+ * flight on the old socket. Close it, put the pair back as it was before
+ * it dialled (an https:// upstream's engine and scratch go too), and dial
+ * the new server through the candidate walk, as the first dial went.
+ * Nothing of the client's has been sent: it waits in its socket, or in
+ * client.buf, until the tunnel is up, so nothing is replayed or lost. The
+ * connect timer and the client watch stay armed: the retry has what is
+ * left of the pair's connect timeout, no more. Returns 0 once the new
+ * attempt is under way, else the error that ends the pair, with the client
+ * answered as for any failure.
+ */
+static int upstream_iou_redial(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			       int err)
+{
+	if (gcp->target.fd >= 0) {
+		prep_close(w, gcp->target.fd);
+		gcp->target.fd = -1;
+	}
+
+	switch (gcp->prot_type) {
+	case GWP_PROT_TYPE_SOCKS5:
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_SOCKS5_CONNECT);
+		break;
+	case GWP_PROT_TYPE_HTTP:
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_HTTP_CONNECT);
+		break;
+	default:
+		/* Plain forwarding connects from the state it was made in. */
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_INIT);
+		break;
+	}
+#ifdef CONFIG_HTTPS
+	free(gcp->up_tls_io);
+	gcp->up_tls_io = NULL;
+#endif
+
+	gcp->next_cand = 0;
+	return connect_next_candidate(w, gcp, err);
+}
+
+/*
  * A handshake with the upstream proxy failed. Tell the downstream client in
  * whatever protocol it speaks and return @err so the caller tears the pair
  * down; the reply's send goes out ahead of the teardown's cancels.
@@ -1757,16 +2137,116 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 static int upstream_iou_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			     int err)
 {
+	/*
+	 * The old socket can go only with nothing in flight on it: a
+	 * completion for it would be taken for the new attempt's.
+	 */
+	if (gwp_conn_upstream_failed(w, gcp, err, !gcp->nr_ops_target))
+		return upstream_iou_redial(w, gcp, err);
 	if (gwp_upstream_fail_reply(w, gcp, err) > 0)
 		prep_send_client(w, gcp);
 	return err;
 }
 
-/* Begin the upstream-proxy handshake and queue the first request send. */
+#ifdef CONFIG_HTTPS
+static int upstream_iou_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * Step the TLS handshake with an https:// upstream and send what it produced,
+ * or wait for the proxy's next flight. Once it has completed, the CONNECT
+ * starts over it.
+ */
+static int upstream_tls_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int hs = gwp_ssl_handshake(gcp->target.tls);
+
+	if (hs == GWP_SSL_ERROR) {
+		gwp_upstream_tls_fail(w, gcp);
+		/* A retry goes first: the alert's send would hold the socket. */
+		if (gwp_conn_upstream_failed(w, gcp, -EPROTO,
+					     !gcp->nr_ops_target))
+			return upstream_iou_redial(w, gcp, -EPROTO);
+		/*
+		 * The alert tells the proxy why. Like the client's reply, its
+		 * send goes out ahead of the teardown's cancels.
+		 */
+		if (target_cipher_next(gcp))
+			prep_send_target_cipher(w, gcp, EV_BIT_IOU_UPSTREAM_S5);
+		return upstream_iou_fail(w, gcp, -EPROTO);
+	}
+
+	if (target_cipher_next(gcp)) {
+		gcp->up_tx = true;
+		prep_send_target_cipher(w, gcp, EV_BIT_IOU_UPSTREAM_S5);
+		return 0;
+	}
+
+	if (hs == GWP_SSL_OK) {
+		pr_dbg(&w->ctx->lh, "Upstream TLS handshake complete (idx=%u)",
+			gcp->idx);
+		return upstream_iou_start(w, gcp);
+	}
+
+	gcp->up_tx = false;
+	if (unlikely(!prep_upstream_recv(w, gcp)))
+		return upstream_iou_fail(w, gcp, -ENOMEM);
+	return 0;
+}
+
+/*
+ * Decrypt what the upstream sent into target.buf, for the CONNECT's reply. Its
+ * close_notify ends the stream as a hangup would, once what came before it has
+ * been looked at.
+ */
+static int upstream_tls_rx(struct gwp_conn_pair *gcp)
+{
+	struct gwp_conn *c = &gcp->target;
+	size_t got;
+	int sr;
+
+	while (c->len < c->cap) {
+		got = 0;
+		sr = gwp_ssl_read(c->tls, c->buf + c->len, c->cap - c->len, &got);
+		if (sr == GWP_SSL_ERROR)
+			return -ECONNRESET;
+		if (!got) {
+			if (sr == GWP_SSL_OK)
+				c->rd_eof = true;
+			break;
+		}
+		c->len += (uint32_t)got;
+	}
+	return 0;
+}
+#endif
+
+/*
+ * Begin the upstream-proxy handshake and queue the first request send. An
+ * https:// upstream gets there only once the TLS handshake with it has
+ * completed, and its certificate has been verified: nothing of ours goes out
+ * before that.
+ */
 static int upstream_iou_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	int r = gwp_upstream_hs_start(w, gcp);
+	int r;
 
+#ifdef CONFIG_HTTPS
+	/* Not before the handshake has finished, whoever calls. */
+	if (gcp->upstream->use_tls &&
+	    (!gcp->target.tls || !gwp_ssl_hs_done(gcp->target.tls))) {
+		if (!gcp->target.tls) {
+			gcp->up_tls_io = iou_tls_new();
+			if (unlikely(!gcp->up_tls_io))
+				return upstream_iou_fail(w, gcp, -ENOMEM);
+			r = gwp_upstream_tls_start(w, gcp);
+			if (unlikely(r))
+				return upstream_iou_fail(w, gcp, r);
+		}
+		return upstream_tls_step(w, gcp);
+	}
+#endif
+
+	r = gwp_upstream_hs_start(w, gcp);
 	if (r == GWP_UPSTREAM_IO_SEND) {
 		prep_upstream_send(w, gcp);
 		return 0;
@@ -1792,11 +2272,11 @@ static bool client_send_busy(struct gwp_conn_pair *gcp)
  * Connected to the upstream proxy, but the handshake with it has not begun:
  * finish_target_connect() left that to the completion of a client send.
  */
-static bool upstream_start_held(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static bool upstream_start_held(struct gwp_conn_pair *gcp)
 {
 	int cs = gcp->conn_state;
 
-	return w->ctx->upstream.enabled && gcp->target.fd >= 0 &&
+	return gcp->upstream && gcp->target.fd >= 0 &&
 	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
 }
 
@@ -1807,6 +2287,36 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	if (r < 0)
 		return upstream_iou_fail(w, gcp, r);
+
+#ifdef CONFIG_HTTPS
+	if (target_is_tls(gcp)) {
+		struct gwp_iou_tls *t = gcp->up_tls_io;
+
+		if (gcp->up_tx) {
+			/* Ciphertext went out: the rest, the next, or a reply. */
+			t->tx_sent += (uint32_t)r;
+			if (t->tx_sent < t->tx_len || target_cipher_next(gcp)) {
+				prep_send_target_cipher(w, gcp,
+							EV_BIT_IOU_UPSTREAM_S5);
+				return 0;
+			}
+			gcp->up_tx = false;
+			if (gcp->conn_state == CONN_STATE_UPSTREAM_TLS_HS)
+				return upstream_tls_step(w, gcp);
+			if (unlikely(!prep_upstream_recv(w, gcp)))
+				return upstream_iou_fail(w, gcp, -ENOMEM);
+			return 0;
+		}
+
+		gwp_ssl_rx_commit(gcp->target.tls, (size_t)r);
+		if (gcp->conn_state == CONN_STATE_UPSTREAM_TLS_HS)
+			return upstream_tls_step(w, gcp);
+		r = upstream_tls_rx(gcp);
+		if (r)
+			return upstream_iou_fail(w, gcp, r);
+		goto parse;
+	}
+#endif
 
 	if (gcp->up_tx) {
 		/* A request send completed. */
@@ -1827,13 +2337,20 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (r > 0)
 		gcp->target.len += (uint32_t)r;
 
+#ifdef CONFIG_HTTPS
+parse:
+#endif
 	r = gwp_upstream_hs_on_reply(w, gcp);
 	switch (r) {
 	case GWP_UPSTREAM_IO_SEND:
 		prep_upstream_send(w, gcp);
 		return 0;
 	case GWP_UPSTREAM_IO_RECV:
-		prep_upstream_recv(w, gcp);
+		/* An https:// upstream's close_notify, see upstream_tls_rx(). */
+		if (gcp->target.rd_eof)
+			return upstream_iou_fail(w, gcp, -ECONNRESET);
+		if (unlikely(!prep_upstream_recv(w, gcp)))
+			return upstream_iou_fail(w, gcp, -ENOMEM);
 		return 0;
 	case GWP_UPSTREAM_IO_DONE:
 		return upstream_iou_finish(w, gcp);
@@ -1895,7 +2412,7 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * also take the request for what is left of the reply. Leave the
 	 * handshake to that completion (handle_ev_client_send()).
 	 */
-	if (w->ctx->upstream.enabled) {
+	if (gcp->upstream) {
 		if (client_send_busy(gcp))
 			return 0;
 		return upstream_iou_start(w, gcp);
@@ -2111,6 +2628,15 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		    gwp_in_dns_lookup(gcp)) {
 			uint32_t len;
 
+			/* Not while the name resolves: no upstream yet. */
+			if (!gwp_in_dns_lookup(gcp)) {
+				gwp_upstream_note_end(gcp,
+						      GWP_UPSTREAM_END_TIMEOUT,
+						      gwp_upstream_timeout_val(gcp));
+				/* No time left to retry in. */
+				gwp_conn_upstream_failed(w, gcp, r, false);
+			}
+
 			if (gwp_in_upstream_hs(gcp)) {
 				gcp->target.len = 0;
 				gwp_conn_buf_compact(&gcp->target);
@@ -2191,8 +2717,11 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 {
 	bool shut_client = false, shut_target = false, done;
 
-	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
+	if (target_rx_done(gcp) && gcp->target.len == 0 && !gcp->client.wr_shut) {
 #ifdef CONFIG_HTTPS
+		/* As for a TLS client below: not an end to pass on. */
+		if (gwp_upstream_tls_cut(gcp))
+			return -ECONNRESET;
 		if (client_is_tls(gcp) && !tls_close_client(w, gcp))
 			return 0;
 #endif
@@ -2209,9 +2738,15 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 		/* Not an end to pass on; see gwp_free_conn_pair(). */
 		if (client_is_tls(gcp) && gwp_ssl_rx_cut(gcp->client.tls))
 			return -ECONNRESET;
+		if (target_is_tls(gcp) && !tls_close_target(w, gcp))
+			return 0;
 #endif
 		shut_target = true;
 		gcp->target.wr_shut = true;
+#ifdef CONFIG_HTTPS
+		if (target_is_tls(gcp))
+			gwp_ssl_tx_close(gcp->target.tls);
+#endif
 	}
 
 	/*
@@ -2289,6 +2824,10 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	uint32_t from;
 
 	gcp->target_rx = false;
+#ifdef CONFIG_HTTPS
+	if (target_is_tls(gcp))
+		return target_tls_recv(w, gcp, r);
+#endif
 	if (r < 0) {
 		if (r == -EAGAIN || r == -EINTR) {
 			prep_recv_target(w, gcp);
@@ -2350,12 +2889,12 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (gcp->target.len > 0 ||
 		    gwp_ssl_bio_pending(gcp->client.tls) > 0) {
 			send_client_tls(w, gcp);
-		} else if (upstream_start_held(w, gcp)) {
+		} else if (upstream_start_held(gcp)) {
 			return upstream_iou_start(w, gcp);
 		} else if (t->prot_resume) {
 			t->prot_resume = false;
 			return tls_prot_pump(w, gcp);
-		} else if (gcp->target.rd_eof) {
+		} else if (target_rx_done(gcp)) {
 			r = iou_forward_progress(w, gcp);
 			if (r)
 				return r;
@@ -2380,14 +2919,14 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	/* The reply is out; the upstream handshake may use target.buf now. */
-	if (upstream_start_held(w, gcp))
+	if (upstream_start_held(gcp))
 		return upstream_iou_start(w, gcp);
 
 	/*
 	 * The target may have finished while this send was in flight: the HTTP
 	 * forwarding filter delivers its own reply after the origin's EOF.
 	 */
-	if (gcp->target.rd_eof)
+	if (target_rx_done(gcp))
 		return iou_forward_progress(w, gcp);
 
 	if (gcp->target.fd >= 0)
@@ -2403,6 +2942,11 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	r = handle_sock_ret(r);
 	if (r < 0)
 		return r;
+
+#ifdef CONFIG_HTTPS
+	if (target_is_tls(gcp))
+		return target_tls_sent(w, gcp, r);
+#endif
 
 	if (r > 0)
 		gwp_conn_buf_consume(&gcp->client, (size_t)r);
@@ -2508,7 +3052,7 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * -j MARK or -j BIND, which is this candidate's alone: the
 		 * next one may well carry another, or none.
 		 */
-		if (w->ctx->upstream.enabled && !gcp->acl_sockopt.mark_set &&
+		if (gcp->upstream && !gcp->acl_sockopt.mark_set &&
 		    !gcp->acl_sockopt.bind.set)
 			break;
 	}
@@ -2533,6 +3077,11 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 exhausted:
 	pr_dbg(&w->ctx->lh, "No target address left to try (idx=%u): %s",
 		gcp->idx, strerror(-err));
+	/* No socket left to close: the retry walks the candidates again. */
+	if (gwp_conn_upstream_failed(w, gcp, err, true)) {
+		gcp->next_cand = 0;
+		return connect_next_candidate(w, gcp, err);
+	}
 
 	/*
 	 * Report the failure instead of just hanging up, so the client learns
@@ -3146,8 +3695,9 @@ static int fish_events(struct gwp_wrk *w)
 		return 0;
 	}
 
+	/* A signal, such as the SIGHUP that reloads the files: nothing amiss. */
 	if (r == -EINTR) {
-		pr_info(&w->ctx->lh, "io_uring_submit_and_wait() interrupted");
+		pr_dbg(&w->ctx->lh, "io_uring_submit_and_wait() interrupted");
 		return 0;
 	}
 

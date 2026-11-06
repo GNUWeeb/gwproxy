@@ -1,4 +1,13 @@
 
+# The flags given to make, before anything below adds to them, for the
+# configure run that creates config.make. Once that exists, it records the
+# flags configure was given, overriding these, so that a rerun after
+# configure changes passes the same ones again.
+USER_CFLAGS := $(CFLAGS)
+USER_CXXFLAGS := $(CXXFLAGS)
+USER_LDFLAGS := $(LDFLAGS)
+USER_LIB_LDFLAGS := $(LIB_LDFLAGS)
+
 ifndef OPTIMIZE
 	OPTIMIZE = -O2
 endif
@@ -32,6 +41,7 @@ GWPROXY_CC_SOURCES = \
 	$(GWPROXY_DIR)/net.c \
 	$(GWPROXY_DIR)/iplimit.c \
 	$(GWPROXY_DIR)/upstream.c \
+	$(GWPROXY_DIR)/upstream_lb.c \
 	$(GWPROXY_DIR)/ev/epoll.c \
 	$(GWPROXY_DIR)/http1.c \
 	$(GWPROXY_DIR)/http.c
@@ -91,17 +101,27 @@ LIBGWIPLIM_TEST_TARGET = $(GWPROXY_DIR)/tests/iplimit.t
 LIBGWIPLIM_TEST_CC_SOURCES = $(GWPROXY_DIR)/tests/iplimit.c
 LIBGWIPLIM_TEST_OBJECTS = $(LIBGWIPLIM_TEST_CC_SOURCES:%.c=%.c.o)
 
+# The shared upstream server state and a pool's choice of a server
+# (upstream_lb.c), linked straight into its unit test.
+GWUPLB_TEST_TARGET = $(GWPROXY_DIR)/tests/upstream_lb.t
+GWUPLB_TEST_CC_SOURCES = $(GWPROXY_DIR)/tests/upstream_lb.c
+GWUPLB_TEST_OBJECTS = $(GWUPLB_TEST_CC_SOURCES:%.c=%.c.o)
+
 # The epoll loop's timer heap (ev/tmr.h) is header-only, so its unit test is
 # built straight from its source.
 GWTMR_TEST_TARGET = $(GWPROXY_DIR)/tests/tmr.t
+
+# The upstream failure classes (upstream.h) are header-only too.
+GWUPSTREAM_TEST_TARGET = $(GWPROXY_DIR)/tests/upstream.t
 
 ALL_TEST_TARGETS = $(LIBGWDNS_TEST_TARGET) $(LIBGWDNS_CACHE_TEST_TARGET) \
 		   $(LIBGWDNS_SCHED_TEST_TARGET) \
 		   $(LIBGWPSOCKS5_TEST_TARGET) \
 		   $(LIBGWHTTP1_TEST_TARGET) $(LIBGWHTTP_TEST_TARGET) \
 		   $(LIBGWACL_TEST_TARGET) $(LIBGWLOG_TEST_TARGET) \
-		   $(LIBGWIPLIM_TEST_TARGET) $(GWTMR_TEST_TARGET)
-ALL_OBJECTS = $(GWPROXY_OBJECTS) $(LIBGWPSOCKS5_OBJECTS) $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWPSOCKS5_TEST_OBJECTS) $(LIBGWHTTP_TEST_OBJECTS) $(LIBGWACL_OBJECTS) $(LIBGWACL_TEST_OBJECTS) $(LIBGWLOG_TEST_OBJECTS) $(LIBGWIPLIM_TEST_OBJECTS)
+		   $(LIBGWIPLIM_TEST_TARGET) $(GWTMR_TEST_TARGET) \
+		   $(GWUPSTREAM_TEST_TARGET) $(GWUPLB_TEST_TARGET)
+ALL_OBJECTS = $(GWPROXY_OBJECTS) $(LIBGWPSOCKS5_OBJECTS) $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWPSOCKS5_TEST_OBJECTS) $(LIBGWHTTP_TEST_OBJECTS) $(LIBGWACL_OBJECTS) $(LIBGWACL_TEST_OBJECTS) $(LIBGWLOG_TEST_OBJECTS) $(LIBGWIPLIM_TEST_OBJECTS) $(GWUPLB_TEST_OBJECTS)
 ALL_TARGETS = $(GWPROXY_TARGET) $(LIBGWPSOCKS5_TARGET) $(LIBGWDNS_TARGET) $(ALL_TEST_TARGETS)
 ALL_DEPFILES = $(ALL_OBJECTS:.o=.o.d)
 
@@ -122,11 +142,12 @@ config.make: configure
 	else								\
 	  echo "$@ is out-of-date";					\
 	  echo "Running configure ...";					\
+	  sed -n "/.*Configured with/s/[^:]*: //p" "$@" |		\
 	  LDFLAGS="$(USER_LDFLAGS)"					\
 	      LIB_LDFLAGS="$(USER_LIB_LDFLAGS)"				\
 	      CFLAGS="$(USER_CFLAGS)" 					\
 	      CXXFLAGS="$(USER_CXXFLAGS)"				\
-	      sed -n "/.*Configured with/s/[^:]*: //p" "$@" | sh;	\
+	      sh;							\
 	fi;
 
 endif
@@ -236,7 +257,13 @@ $(LIBGWLOG_TEST_TARGET): $(GWPROXY_DIR)/log.c.o $(LIBGWLOG_TEST_OBJECTS)
 $(LIBGWIPLIM_TEST_TARGET): $(GWPROXY_DIR)/iplimit.c.o $(LIBGWIPLIM_TEST_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+$(GWUPLB_TEST_TARGET): $(GWPROXY_DIR)/upstream_lb.c.o $(GWUPLB_TEST_OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+
 $(GWTMR_TEST_TARGET): $(GWPROXY_DIR)/tests/tmr.c $(GWPROXY_DIR)/ev/tmr.h $(GWPROXY_DIR)/gwproxy.h $(EXTRA_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+
+$(GWUPSTREAM_TEST_TARGET): $(GWPROXY_DIR)/tests/upstream.c $(GWPROXY_DIR)/upstream.h $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
 ifeq ($(CONFIG_HTTPS),y)

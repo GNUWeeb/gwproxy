@@ -21,6 +21,22 @@
 #include <gwproxy/ssl.h>
 #endif
 
+/*
+ * Take @fd out of the epoll set; done before every close() of a descriptor
+ * that may be in it. close() alone does not remove it: epoll drops an item
+ * only when the last reference to the file goes, and another process may
+ * hold one for a moment, as anything reading /proc/<pid>/fd does (ls -l,
+ * ss -p, lsof). An event that comes in meanwhile is still reported, with the
+ * data of the pair the descriptor belonged to, which may be freed by then.
+ *
+ * -ENOENT, for a descriptor that was never added or is already out, is
+ * expected and ignored; nothing else can fail on a valid descriptor.
+ */
+static void ep_del(struct gwp_wrk *w, int fd)
+{
+	if (fd >= 0)
+		__sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, fd, NULL);
+}
 
 #ifdef CONFIG_HTTPS
 static int tls_flush_hs(struct gwp_conn *c);
@@ -88,6 +104,11 @@ static int handle_raw_dns_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 					 GWP_MAX_CONN_CAND, &nr);
 	if (ret == -ESRCH)
 		return 1;
+	/* The lookup is over: its socket is done with; see ep_del(). */
+	if (ret != -EAGAIN) {
+		ep_del(w, gcp->gdp->fd);
+		gwp_dns_res_drop_query(gcp->gdp);
+	}
 	if (ret == -EAGAIN) {
 		/* Retry with the fallback record type. */
 		ret = send_dns_payload(gcp);
@@ -465,6 +486,21 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 				nr_fd_closed++;
 	}
 
+	/*
+	 * gwp_free_conn_pair() closes them; out of the epoll set first, see
+	 * ep_del(). The raw DNS query's socket is out already, see
+	 * free_conn_pair().
+	 */
+	ep_del(w, gcp->client.fd);
+	ep_del(w, gcp->target.fd);
+	ep_del(w, gcp->udp_fd);
+	{
+		uint8_t i;
+
+		for (i = 0; i < GWP_MAX_CONN_CAND; i++)
+			ep_del(w, gcp->attempt_fd[i]);
+	}
+
 	r = gwp_free_conn_pair(w, gcp);
 	if (unlikely(r)) {
 		pr_err(&ctx->lh, "Failed to free connection pair: %s", strerror(-r));
@@ -482,9 +518,9 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * throwing away the rest of the batch only to collect it again.
  *
  * Its descriptors stay open until then, which also keeps their numbers from
- * being reused within the batch. The one way to reach a pair that is not an
- * event of its own, a raw DNS reply looked up by transaction id, is cut off
- * here, so a reply later in the batch cannot revive it.
+ * being reused within the batch, and stay in the epoll set until they are
+ * closed (__free_conn_pair()). A raw DNS query's socket is taken out and
+ * closed here instead, so a reply later in the batch cannot revive the pair.
  */
 static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -512,6 +548,7 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (w->ctx->cfg.use_raw_dns && gcp->gdp && gcp->gdp->fd >= 0) {
 		int r;
 
+		ep_del(w, gcp->gdp->fd);
 		gwp_dns_res_drop_query(gcp->gdp);
 		r = credit_fd_closed(w, 1);
 		if (unlikely(r))
@@ -631,9 +668,16 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	target_fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt,
 					   &gcp->is_target_alive, true);
 	if (target_fd < 0) {
-		if (target_fd != -EMFILE && target_fd != -ENFILE)
+		if (target_fd != -EMFILE && target_fd != -ENFILE) {
 			pr_err(&ctx->lh, "Failed to create target socket: %s",
 				strerror(-target_fd));
+			/*
+			 * A connect refused at once, say: with nothing set up
+			 * yet, its retry is just this again.
+			 */
+			if (gwp_conn_upstream_failed(w, gcp, target_fd, true))
+				return start_new_target(w, gcp);
+		}
 		return target_fd;
 	}
 	gcp->target.fd = target_fd;
@@ -643,7 +687,7 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * Force the connect-result path so the upstream handshake runs
 	 * (see handle_ev_target_conn_result).
 	 */
-	if (ctx->upstream.enabled)
+	if (gcp->upstream)
 		gcp->is_target_alive = false;
 
 	return register_new_client(w, gcp, EV_BIT_CLIENT);
@@ -1084,18 +1128,26 @@ static bool adj_epl_out(struct gwp_conn *src, struct gwp_conn *dst)
 }
 
 /*
- * Whether to leave the client's input alone until it has read what the TLS
- * engine has for it (see gwp_ssl_tx_backlog()).
+ * Whether to leave @c's input alone until its peer has read what the TLS
+ * engine has for it (see gwp_ssl_tx_backlog()). @c is the client, or the target
+ * when that is an https:// upstream proxy. What is forwarded to @c comes from
+ * the other side's buffer, whose size bounds it.
  */
-static bool client_rx_held(struct gwp_conn_pair __unused *gcp)
+static bool conn_rx_held(struct gwp_conn_pair __unused *gcp,
+			 struct gwp_conn __unused *c)
 {
 #ifdef CONFIG_HTTPS
-	struct gwp_conn *c = &gcp->client;
+	struct gwp_conn *o = c == &gcp->client ? &gcp->target : &gcp->client;
 
 	if (c->tls)
-		return gwp_ssl_tx_backlog(c->tls, gcp->target.cap);
+		return gwp_ssl_tx_backlog(c->tls, o->cap);
 #endif
 	return false;
+}
+
+static bool client_rx_held(struct gwp_conn_pair *gcp)
+{
+	return conn_rx_held(gcp, &gcp->client);
 }
 
 static bool adj_epl_in(struct gwp_conn *src, bool hold)
@@ -1167,7 +1219,8 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 */
 	if (gcp->is_target_alive) {
 		target_need_ctl |= adj_epl_out(&gcp->client, &gcp->target);
-		target_need_ctl |= adj_epl_in(&gcp->target, false);
+		target_need_ctl |= adj_epl_in(&gcp->target,
+					      conn_rx_held(gcp, &gcp->target));
 	}
 
 	if (client_need_ctl) {
@@ -1456,7 +1509,7 @@ static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	do {
 		full = false;
-		if (do_recv && !(src == &gcp->client && client_rx_held(gcp))) {
+		if (do_recv && !conn_rx_held(gcp, src)) {
 			uint32_t from = src->len;
 
 			ret = splice_recv(src, first);
@@ -1505,7 +1558,7 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
  * ------------------------------------------------------------------------
  * Upstream SOCKS5 proxy client handshake (epoll).
  *
- * When ctx->upstream.enabled, the "target" socket is connected to an upstream
+ * When gcp->upstream is set, the "target" socket is connected to an upstream
  * SOCKS5 proxy rather than the real destination. Before forwarding, we perform
  * the SOCKS5 client handshake on that socket:
  *
@@ -1519,6 +1572,82 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
  */
 
 /*
+ * Plain and transparent forwarding's retry: a new target socket to the
+ * pair's new upstream, registered as start_new_target() does, but with the
+ * client already registered. Like any connect it ends in
+ * handle_ev_target_conn_result() or handle_ev_target_conn_err().
+ */
+static int redial_plain(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_sockaddr *ca;
+	struct epoll_event ev;
+	int fd;
+
+	fd = gwp_conn_dial_addr(w->ctx, gcp, &ca);
+	if (unlikely(fd))
+		return fd;
+
+	fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt,
+				    &gcp->is_target_alive, true);
+	if (fd < 0) {
+		/* Counted; the one retry is spent. */
+		gwp_conn_upstream_failed(w, gcp, fd, false);
+		return fd;
+	}
+	gcp->target.fd = fd;
+	/* The handshake runs from the connect result, as for the first. */
+	gcp->is_target_alive = false;
+	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
+	ev.events = gcp->target.ep_mask;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
+	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+/*
+ * gwp_conn_upstream_failed() has moved the pair to another server of its
+ * pool after the attempt on the old one failed with @err. Close that
+ * attempt's socket, put the pair back as it was before it dialled, and
+ * dial the new server: through the attempt path for the SOCKS5 and HTTP
+ * front-ends, a direct socket for plain forwarding, as the first dial
+ * went. Nothing of the client's has been sent (it waits in client.buf
+ * until the tunnel is up), so nothing is replayed or lost. The connect
+ * timer is left running: the retry has what is left of the pair's connect
+ * timeout, no more. Returns 0 once the new attempt is under way, else the
+ * error that ends the pair, with the client answered as for any failure.
+ */
+static int upstream_redial(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   int err)
+{
+	int r;
+
+	if (gcp->target.fd >= 0) {
+		/* Not by closing it alone; see ep_del(). */
+		ep_del(w, gcp->target.fd);
+		__sys_close(gcp->target.fd);
+		gcp->target.fd = -1;
+		gcp->target.ep_mask = 0;
+		r = credit_fd_closed(w, 1);
+		if (unlikely(r))
+			return r;
+	}
+
+	switch (gcp->prot_type) {
+	case GWP_PROT_TYPE_SOCKS5:
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_SOCKS5_CONNECT);
+		break;
+	case GWP_PROT_TYPE_HTTP:
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_HTTP_CONNECT);
+		break;
+	default:
+		gwp_upstream_hs_reset(w, gcp, CONN_STATE_FORWARDING);
+		return redial_plain(w, gcp);
+	}
+
+	gcp->next_cand = 0;
+	return connect_next_candidate(w, gcp, err);
+}
+
+/*
  * Describe the upstream destination for logging. With socks5h:// the real
  * destination is a hostname (target_addr is unset), so show up_dst instead.
  */
@@ -1530,7 +1659,11 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
 static int upstream_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			 int err)
 {
-	int r = gwp_upstream_fail_reply(w, gcp, err);
+	int r;
+
+	if (gwp_conn_upstream_failed(w, gcp, err, true))
+		return upstream_redial(w, gcp, err);
+	r = gwp_upstream_fail_reply(w, gcp, err);
 
 	if (r > 0) {
 		ssize_t sr = __do_send(&gcp->target, &gcp->client);
@@ -1619,6 +1752,7 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->up_tx = false;
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
+	gwp_conn_upstream_up(gcp);
 
 	r = gwp_http_fwd_begin(w, gcp);
 	if (unlikely(r))
@@ -1645,6 +1779,19 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Whether some of the request to the upstream proxy is still to be sent: in
+ * target.buf, or for an https:// upstream also as ciphertext in the engine.
+ */
+static bool upstream_tx_pending(struct gwp_conn_pair *gcp)
+{
+#ifdef CONFIG_HTTPS
+	if (gcp->target.tls && gwp_ssl_bio_pending(gcp->target.tls) > 0)
+		return true;
+#endif
+	return gcp->target.len > 0;
+}
+
+/*
  * Send the request the handshake has just queued. It is tried at once rather
  * than after another EPOLLOUT: the socket has just connected or answered, so
  * it almost always takes the whole request, and then the reply is all there is
@@ -1658,18 +1805,95 @@ static int upstream_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (unlikely(sr < 0))
 		return (int)sr;
 
-	if (gcp->target.len)
+	if (upstream_tx_pending(gcp))
 		return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
 
 	gcp->up_tx = false;
 	return upstream_arm(w, gcp, EPOLLIN | EPOLLRDHUP);
 }
 
-/* Begin the upstream-proxy handshake and send its first request. */
+#ifdef CONFIG_HTTPS
+static int upstream_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * The TLS handshake with an https:// upstream proxy: take in what it sent,
+ * step the handshake and flush what that produced. Once it is complete, start
+ * the CONNECT over it. @events is the target's epoll event, 0 to just step.
+ */
+static int upstream_tls_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   uint32_t events)
+{
+	struct gwp_conn *t = &gcp->target;
+	uint32_t mask = EPOLLIN | EPOLLRDHUP;
+	ssize_t n;
+	size_t len;
+	void *p;
+	int hs, r;
+
+	if (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) {
+		p = gwp_ssl_rx_space(t->tls, GWP_SSL_RECORD_MAX, &len);
+		if (unlikely(!p))
+			return -ENOMEM;
+		n = __sys_recv(t->fd, p, len, MSG_NOSIGNAL);
+		gwp_ssl_rx_commit(t->tls, n > 0 ? (size_t)n : 0);
+		if (n == 0)
+			return -ECONNRESET;
+		if (n < 0 && n != -EAGAIN && n != -EINTR)
+			return (int)n;
+	}
+
+	hs = gwp_ssl_handshake(t->tls);
+	if (hs == GWP_SSL_ERROR) {
+		gwp_upstream_tls_fail(w, gcp);
+		/* The alert tells the proxy why; best effort. */
+		tls_flush_hs(t);
+		return -EPROTO;
+	}
+
+	r = tls_flush_hs(t);
+	if (unlikely(r))
+		return r;
+
+	if (hs == GWP_SSL_OK) {
+		pr_dbg(&w->ctx->lh, "Upstream TLS handshake complete (idx=%u)",
+			gcp->idx);
+		return upstream_start(w, gcp);
+	}
+
+	if (gwp_ssl_bio_pending(t->tls) > 0)
+		mask |= EPOLLOUT;
+	return upstream_arm(w, gcp, mask);
+}
+#endif
+
+/*
+ * Begin the upstream-proxy handshake and send its first request. An https://
+ * upstream gets there only once the TLS handshake with it has completed, and
+ * its certificate has been verified: nothing of ours goes out before that.
+ */
 static int upstream_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	int r = gwp_upstream_hs_start(w, gcp);
+	int r;
 
+#ifdef CONFIG_HTTPS
+	/* Not before the handshake has finished, whoever calls. */
+	if (gcp->upstream->use_tls &&
+	    (!gcp->target.tls || !gwp_ssl_hs_done(gcp->target.tls))) {
+		if (!gcp->target.tls) {
+			r = gwp_upstream_tls_start(w, gcp);
+			if (unlikely(r))
+				return upstream_fail(w, gcp, r);
+		}
+		/*
+		 * Its first flight can fail at once (an upstream that resets
+		 * before the ClientHello): that is a failure like any other.
+		 */
+		r = upstream_tls_io(w, gcp, 0);
+		return r < 0 ? upstream_fail(w, gcp, r) : r;
+	}
+#endif
+
+	r = gwp_upstream_hs_start(w, gcp);
 	if (r == GWP_UPSTREAM_IO_SEND)
 		r = upstream_send(w, gcp);
 	return r < 0 ? upstream_fail(w, gcp, r) : r;
@@ -1692,11 +1916,11 @@ static bool client_reply_pending(struct gwp_conn_pair *gcp)
  * Connected to the upstream proxy, but the handshake with it has not begun:
  * upstream_hold() left that until the client has its reply.
  */
-static bool upstream_start_held(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static bool upstream_start_held(struct gwp_conn_pair *gcp)
 {
 	int cs = gcp->conn_state;
 
-	return w->ctx->upstream.enabled && gcp->target.fd >= 0 &&
+	return gcp->upstream && gcp->target.fd >= 0 &&
 	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
 }
 
@@ -1730,13 +1954,18 @@ static int upstream_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	ssize_t sr;
 	int r;
 
+#ifdef CONFIG_HTTPS
+	if (gcp->conn_state == CONN_STATE_UPSTREAM_TLS_HS)
+		return upstream_tls_io(w, gcp, ev->events);
+#endif
+
 	/* Transmit phase: flush the pending request to the proxy. */
 	if (gcp->up_tx) {
 		if (ev->events & EPOLLOUT) {
 			sr = __do_send(&gcp->target, &gcp->target);
 			if (unlikely(sr < 0))
 				return (int)sr;
-			if (gcp->target.len == 0)
+			if (!upstream_tx_pending(gcp))
 				gcp->up_tx = false;
 		}
 
@@ -1755,17 +1984,32 @@ static int upstream_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		sr = __do_recv(&gcp->target);
 		if (unlikely(sr < 0))
 			return (int)sr;
-		if (unlikely(gcp->target.rd_eof))
-			return -ECONNRESET;
 	}
 
+	/*
+	 * The end of the stream fails the handshake only once what came before
+	 * it has been looked at: an https:// upstream's refusal and its
+	 * close_notify are decrypted in one go.
+	 */
 	r = gwp_upstream_hs_on_reply(w, gcp);
 	switch (r) {
 	case GWP_UPSTREAM_IO_SEND:
 		return upstream_send(w, gcp);
 	case GWP_UPSTREAM_IO_RECV:
-		if (ev->events & (EPOLLRDHUP | EPOLLHUP))
+		if (gcp->target.rd_eof || (ev->events & (EPOLLRDHUP | EPOLLHUP)))
 			return -ECONNRESET;
+#ifdef CONFIG_HTTPS
+		/*
+		 * The engine may have records of its own to send in answer
+		 * (a KeyUpdate); target.buf holds the partial reply, not
+		 * anything to send.
+		 */
+		if (gcp->target.tls) {
+			r = tls_flush_hs(&gcp->target);
+			if (unlikely(r))
+				return r;
+		}
+#endif
 		return upstream_arm(w, gcp, EPOLLIN | EPOLLRDHUP);
 	case GWP_UPSTREAM_IO_DONE:
 		return upstream_finish(w, gcp);
@@ -1804,9 +2048,12 @@ static int adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int fd = gcp->attempt_fd[slot];
 	int closed, r;
+	uint8_t i;
 
 	gcp->attempt_fd[slot] = -1;
 	tmr_disarm(w, gcp, GWP_TMR_ATTEMPT);
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++)
+		ep_del(w, gcp->attempt_fd[i]);	/* the losers; see ep_del() */
 	closed = gwp_conn_close_attempts(gcp);
 	if (closed) {
 		/*
@@ -1827,7 +2074,6 @@ __hot
 static int handle_ev_target_conn_result(struct gwp_wrk *w,
 					struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
 	int r;
 
 	/*
@@ -1835,7 +2081,7 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 	 * before forwarding; the connect timer is kept to bound it, also while
 	 * the client's reply is still being flushed (upstream_hold()).
 	 */
-	if (ctx->upstream.enabled) {
+	if (gcp->upstream) {
 		if (client_reply_pending(gcp))
 			return upstream_hold(w, gcp);
 		return upstream_start(w, gcp);
@@ -1917,6 +2163,7 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 			strerror(err), fd, gcp->idx,
 			ip_to_str(&gcp->target_addr));
 
+		ep_del(w, fd);
 		__sys_close(fd);
 		gcp->attempt_fd[slot] = -1;
 		r = credit_fd_closed(w, 1);
@@ -1950,17 +2197,16 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 }
 
 /*
- * The target is done and its data has been handed to the client side. Before
- * the client's write side can be shut, a TLS client is owed a close_notify,
- * and all of the ciphertext must have left: a slow client may not have taken
- * it yet, and adj_epl_out() keeps EPOLLOUT armed to flush the rest and come
- * back here. Returns 1 when the write side can be shut, 0 to wait, or <0 on
- * error.
+ * The other side is done and its data has been handed to @c's side. Before
+ * @c's write side can be shut, a TLS peer (a TLS client, an https:// upstream
+ * proxy) is owed a close_notify, and all of the ciphertext must have left: a
+ * slow peer may not have taken it yet, and adj_epl_out() keeps EPOLLOUT armed
+ * to flush the rest and come back here. Returns 1 when the write side can be
+ * shut, 0 to wait, or <0 on error.
  */
-static int client_wr_flushed(struct gwp_conn_pair __unused *gcp)
+static int conn_wr_flushed(struct gwp_conn __unused *c)
 {
 #ifdef CONFIG_HTTPS
-	struct gwp_conn *c = &gcp->client;
 	int r;
 
 	if (c->tls) {
@@ -1976,30 +2222,37 @@ static int client_wr_flushed(struct gwp_conn_pair __unused *gcp)
 }
 
 /*
- * While the client's input is held up (client_rx_held()), the engine can be left
- * with whole records whose ciphertext has already left the socket. No EPOLLIN
- * brings those back, and whichever send takes the hold away may be the last
- * event for a while, so whoever gets here takes them in.
+ * While @c's input is held up (conn_rx_held()), the engine can be left with
+ * whole records whose ciphertext has already left the socket. No EPOLLIN brings
+ * those back, and whichever send takes the hold away may be the last event for
+ * a while, so whoever gets here takes them in. The same goes for records that
+ * came in behind an https:// upstream proxy's reply to the CONNECT, which the
+ * reply's buffer had no room for. @c is the client, or the target when it is
+ * an https:// upstream proxy, and @t the other side.
  *
  * This never reads the socket, which is what the EPOLLIN that adj_epl_in() gives
  * back is for: the work is bounded by what the engine holds, however busy the
- * client is. Doing so can put the send queue over the limit again, with the
+ * peer is. Doing so can put the send queue over the limit again, with the
  * EPOLLOUT edge that took it down long used up and the mask unchanged, so always
  * send what it produced. Either that empties the queue or the socket fills up,
  * and then a new edge follows.
  */
-static int client_rx_resume(struct gwp_wrk __unused *w,
-			    struct gwp_conn_pair __unused *gcp)
+static int conn_rx_resume(struct gwp_wrk __unused *w,
+			  struct gwp_conn_pair __unused *gcp,
+			  struct gwp_conn __unused *c,
+			  struct gwp_conn __unused *t)
 {
 #ifdef CONFIG_HTTPS
-	struct gwp_conn *c = &gcp->client, *t = &gcp->target;
 	bool again = true;
 	ssize_t ret;
 
 	if (!c->tls || t->wr_shut)
 		return 0;
+	/* Until the tunnel is up, the target's engine is the handshake's. */
+	if (c == &gcp->target && !gcp->is_target_alive)
+		return 0;
 
-	while (again && !client_rx_held(gcp) && c->len < c->cap &&
+	while (again && !conn_rx_held(gcp, c) && c->len < c->cap &&
 	       gwp_ssl_rx_more(c->tls)) {
 		uint32_t from = c->len;
 
@@ -2015,9 +2268,9 @@ static int client_rx_resume(struct gwp_wrk __unused *w,
 		}
 
 		/* Otherwise the engine has run out of what it can decrypt. */
-		again = c->len == c->cap || client_rx_held(gcp);
+		again = c->len == c->cap || conn_rx_held(gcp, c);
 
-		if (gcp->is_target_alive) {
+		if (t != &gcp->target || gcp->is_target_alive) {
 			ret = __do_send(c, t);
 			if (unlikely(ret < 0))
 				return (int)ret;
@@ -2049,12 +2302,20 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	bool shut_client = false, shut_target = false, done;
 	int r;
 
-	r = client_rx_resume(w, gcp);
+	r = conn_rx_resume(w, gcp, &gcp->client, &gcp->target);
+	if (unlikely(r))
+		return r;
+	r = conn_rx_resume(w, gcp, &gcp->target, &gcp->client);
 	if (unlikely(r))
 		return r;
 
 	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
-		r = client_wr_flushed(gcp);
+#ifdef CONFIG_HTTPS
+		/* As for a TLS client below: not an end to pass on. */
+		if (gwp_upstream_tls_cut(gcp))
+			return -ECONNRESET;
+#endif
+		r = conn_wr_flushed(&gcp->client);
 		if (r < 0)
 			return r;
 		/*
@@ -2087,8 +2348,17 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * nothing, though, so the pair goes now.
 		 */
 		if (gcp->is_target_alive) {
-			shut_target = true;
-			gcp->target.wr_shut = true;
+			r = conn_wr_flushed(&gcp->target);
+			if (r < 0)
+				return r;
+			if (r) {
+				shut_target = true;
+				gcp->target.wr_shut = true;
+#ifdef CONFIG_HTTPS
+				if (gcp->target.tls)
+					gwp_ssl_tx_close(gcp->target.tls);
+#endif
+			}
 		} else if (gcp->client.wr_shut) {
 			return -ECONNRESET;
 		}
@@ -2101,7 +2371,7 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * socket: close() answers unread data with an RST instead of a FIN,
 	 * so a socket whose read side has not reached EOF still gets the
 	 * explicit shutdown(). Likewise a hung-up fd needs no EPOLL_CTL_DEL
-	 * when close() is about to remove it.
+	 * here: the teardown takes it out (__free_conn_pair()).
 	 */
 	done = gcp->client.wr_shut && gcp->target.wr_shut;
 	if (shut_client && !(done && gcp->client.rd_eof))
@@ -2199,17 +2469,33 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r;
 
 	/*
+	 * No target socket, so this event is for one that is gone: a retry
+	 * (upstream_redial()) started from a client event closed it after
+	 * epoll had reported it in the same batch. EV_BIT_TARGET is only
+	 * ever registered for target.fd.
+	 */
+	if (unlikely(gcp->target.fd < 0))
+		return 0;
+
+	/*
 	 * Held before the upstream handshake, the target is watched only for
 	 * a hangup: the upstream went away before it was spoken to.
 	 */
-	if (unlikely(upstream_start_held(w, gcp)))
+	if (unlikely(upstream_start_held(gcp))) {
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_HUP, 0);
+		if (gwp_conn_upstream_failed(w, gcp, -ECONNRESET, true))
+			return upstream_redial(w, gcp, -ECONNRESET);
 		return -ECONNRESET;
+	}
 
 	if (unlikely(ev->events & EPOLLERR)) {
 		if (!gcp->is_target_alive) {
 			r = handle_ev_target_conn_err(w, gcp);
 			if (gwp_in_upstream_hs(gcp))
 				return upstream_fail(w, gcp, r);
+			/* Plain forwarding's connect to its upstream. */
+			if (gwp_conn_upstream_failed(w, gcp, r, true))
+				return upstream_redial(w, gcp, r);
 			return r;
 		}
 
@@ -2332,7 +2618,7 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (gwp_in_upstream_hs(gcp))
 		return handle_ev_client_upstream_hs(w, gcp, ev);
 
-	if (unlikely(upstream_start_held(w, gcp)))
+	if (unlikely(upstream_start_held(gcp)))
 		return handle_ev_client_held(w, gcp, ev);
 
 	if (ev->events & (EPOLLIN | EPOLLHUP)) {
@@ -2403,6 +2689,13 @@ static int handle_conn_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	     gwp_in_dns_lookup(gcp)) && !gcp->is_target_alive) {
 		uint32_t len;
 
+		/* Not while the name resolves: no upstream is involved yet. */
+		if (!gwp_in_dns_lookup(gcp)) {
+			gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TIMEOUT,
+					      gwp_upstream_timeout_val(gcp));
+			/* No time left to retry in. */
+			gwp_conn_upstream_failed(w, gcp, -ETIMEDOUT, false);
+		}
 		if (gwp_in_upstream_hs(gcp))
 			gcp->target.len = 0;
 		len = gcp->target.len;
@@ -2518,7 +2811,7 @@ static int arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return 0;			/* nothing left to start */
 	if (w->ctx->cfg.connect_attempt_delay <= 0)
 		return 0;			/* racing disabled: fall back only */
-	if (w->ctx->upstream.enabled)
+	if (gcp->upstream)
 		return 0;			/* one proxy, nothing to race */
 
 	ms = w->ctx->cfg.connect_attempt_delay;
@@ -2597,7 +2890,7 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * -j MARK or -j BIND, which is this candidate's alone: the
 		 * next one may well carry another, or none.
 		 */
-		if (w->ctx->upstream.enabled && !gcp->acl_sockopt.mark_set &&
+		if (gcp->upstream && !gcp->acl_sockopt.mark_set &&
 		    !gcp->acl_sockopt.bind.set)
 			break;
 	}
@@ -2622,6 +2915,11 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 exhausted:
 	pr_dbg(&w->ctx->lh, "No target address left to try (idx=%u): %s",
 		gcp->idx, strerror(-err));
+	/* No socket left to close: the retry walks the candidates again. */
+	if (gwp_conn_upstream_failed(w, gcp, err, true)) {
+		gcp->next_cand = 0;
+		return connect_next_candidate(w, gcp, err);
+	}
 
 	if (!gwp_conn_fail_reply(w, gcp, err) && gcp->target.len) {
 		ssize_t sr = __do_send(&gcp->target, &gcp->client);

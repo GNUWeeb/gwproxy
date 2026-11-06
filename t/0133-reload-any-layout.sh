@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# --auth-file and --acl-file are reloaded however the file the path leads to
-# was changed, not only through the configured name in its directory: behind
-# a symlink, by a Kubernetes-style "..data" swap, by swapping the parent
-# directory (and by editing the file in the new directory afterwards), and by
-# unlink and link. Exercised on every available event loop.
+# With --watch-files=1, --auth-file and --acl-file are reloaded however the
+# file the path leads to was changed, not only through the configured name in
+# its directory: behind a symlink, by a Kubernetes-style "..data" swap, by
+# swapping the parent directory (and by editing the file in the new directory
+# afterwards), and by unlink and link. Exercised on every available event
+# loop.
 #
 # Most of these changes take the check several seconds to apply, so all the
 # proxies are started first and then wait for their changes at the same time,
@@ -123,7 +124,8 @@ for loop in epoll io_uring; do
 		"layout_$how"
 		pp="$(pick_port)"
 		gwp_start "127.0.0.1:$pp" --as-socks5=1 --auth-file="$path" \
-			--acl-allow-all --event-loop="$loop" --nr-workers=1
+			--acl-allow-all --event-loop="$loop" --nr-workers=1 \
+			--watch-files=1
 		fetch "$pp" alice pw || fail "[$loop/$how] initial credentials rejected"
 		fetch "$pp" bob pw && fail "[$loop/$how] bob accepted too early"
 		names+=("$loop/$how")
@@ -140,7 +142,7 @@ for loop in epoll io_uring; do
 	ln -s "$d/real/acl" "$d/cfg/acl"
 	pp="$(pick_port)"
 	gwp_start "127.0.0.1:$pp" --as-socks5=1 --acl-file="$d/cfg/acl" \
-		--event-loop="$loop" --nr-workers=1
+		--event-loop="$loop" --nr-workers=1 --watch-files=1
 	fetch "$pp" x x || fail "[$loop/acl] the origin is not allowed at first"
 	acl_names+=("$loop/acl")
 	acl_ports+=("$pp")

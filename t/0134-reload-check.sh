@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# The periodic check of --auth-file and --acl-file reloads a file when it
-# changed and at no other time: not while it sits idle, not a second time
-# after inotify already reported the change, and not over and over while the
-# file is missing or malformed, which is logged once with the current contents
-# kept in force. It waits for a change to settle, so a writer that pauses does
-# not get its half written file reloaded before it closes it. A reload that
-# failed for want of descriptors is retried. A FIFO it finds is not read: that
-# would block for a writer that may never come and hold up shutdown. Exercised
-# on every available event loop.
+# The periodic check of --auth-file and --acl-file (--watch-files=1) reloads a
+# file when it changed and at no other time: not while it sits idle, not a
+# second time after inotify already reported the change, and not over and over
+# while the file is missing or malformed, which is logged once with the
+# current contents kept in force. It waits for a change to settle, so a writer
+# that pauses does not get its half written file reloaded before it closes it.
+# A reload that failed for want of descriptors is retried. A FIFO it finds is
+# not read: that would block for a writer that may never come and hold up
+# shutdown. Exercised on every available event loop.
 #
 # Most of this is waiting for the check, so each scenario gets a proxy of its
 # own and they all run at the same time, which keeps the test well within the
@@ -108,7 +108,7 @@ start_scenario()
 	pp="$(pick_port)"
 	log="$WORK/gwp.$pp.log"
 	gwp_start "127.0.0.1:$pp" --as-socks5=1 --event-loop="$loop" \
-		--nr-workers=1 "$@"
+		--nr-workers=1 --watch-files=1 "$@"
 }
 
 # stop_scenario <what>: the proxy exits when told to, so no reload is stuck.

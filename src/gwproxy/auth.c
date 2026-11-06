@@ -14,7 +14,10 @@
 #include <strings.h>
 #include <stdint.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <pthread.h>
+#include <sys/stat.h>
 
 #include "auth.h"
 
@@ -200,6 +203,45 @@ out_free_u:
 }
 
 /*
+ * Open the credential file at @path for reading. Only a regular file is read:
+ * opening a FIFO waits for a writer, and reading one or a device waits for
+ * data, which may never come. At startup that hangs the proxy before it
+ * listens; on a reload it stalls the reload thread, every later reload, and
+ * the shutdown, which waits for that thread. So the file is opened without
+ * waiting (O_NONBLOCK, which does nothing to a regular file's reads) and
+ * refused unless it is regular, as the ACL loader does.
+ */
+static FILE *open_auth_file(const char *path, int *err)
+{
+	struct stat st;
+	FILE *fp;
+	int fd;
+
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0) {
+		*err = -errno;
+		return NULL;
+	}
+	if (fstat(fd, &st)) {
+		*err = -errno;
+		close(fd);
+		return NULL;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "auth: %s: not a regular file\n", path);
+		close(fd);
+		*err = -EINVAL;
+		return NULL;
+	}
+	fp = fdopen(fd, "rb");
+	if (!fp) {
+		*err = -errno;
+		close(fd);
+	}
+	return fp;
+}
+
+/*
  * Read and parse the credential file at @path into a new set. The file is
  * opened afresh on every call: a file replaced by rename (an editor, mv,
  * install) is a new inode, and a handle kept from an earlier open would go on
@@ -218,9 +260,8 @@ static int load_auth_set(const char *path, struct auth_set **out)
 	if (!set)
 		return -ENOMEM;
 
-	fp = fopen(path, "rb");
+	fp = open_auth_file(path, &r);
 	if (!fp) {
-		r = -errno;
 		free(set);
 		return r;
 	}

@@ -56,10 +56,12 @@ import time
 MAX_GROWTH = 8 << 20    # how much the proxy's memory may grow
 STALL_SECS = 3          # no progress for this long: the client has been stopped
 # Answers that are kept make the proxy grow by 1.5 MiB or more over these, counted
-# from where a sanitizer's quarantine has filled up: it takes about 1 MiB itself.
+# from where the proxy has handled SHUT_SETTLE of them: a sanitizer's quarantine
+# has filled up by then, and it takes about 1 MiB itself.
 SHUT_UPDATES = 128 << 10
 SHUT_SETTLE = 32 << 10
 SHUT_GROWTH = 1 << 20
+SHUT_STALL = 30         # the origin got nothing for this long: it is stuck
 BURST_SNDBUF = 256 << 10  # one read gets the engine past its limit with less
 BURST_RUN = 20          # OpenSSL allows 32 KeyUpdates without data in between
 STRAND_ROUNDS = 3       # it depends on timing: this makes it show nearly always
@@ -68,6 +70,7 @@ STRAND_SNDBUF = 128 << 10
 STRAND_DATA = b"x" * 64
 STRAND_TALK = b"p" * 200
 STRAND_STALL = 30       # the origin got nothing for this long: it is stuck
+STRAND_MSS = 8192       # what the client sends in, see strand_round()
 
 SSL_ERROR_WANT_READ = 2
 SSL_ERROR_WANT_WRITE = 3
@@ -128,8 +131,10 @@ def check_growth(pid, before, limit, count, what):
 
 
 class Client:
-    def __init__(self, port, rcvbuf=0):
+    def __init__(self, port, rcvbuf=0, mss=0):
         self.s = socket.socket()
+        if mss:
+            self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, mss)
         if rcvbuf:
             self.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
             self.s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, rcvbuf)
@@ -412,6 +417,43 @@ def burst(port, pid):
     return None
 
 
+def stall_state(pid, c, sink, sent, stuck):
+    """What a stalled round looks like, for the test's log: where the bytes
+    the origin is short of could be, and what the proxy is waiting on."""
+    import os
+    import subprocess
+
+    out = ["origin got %d of %d bytes, stuck message %s" %
+           (sink.count, sent, "still unsent" if stuck else "sent")]
+    try:
+        r = subprocess.run(["ss", "-tnmiep"], capture_output=True, text=True,
+                           timeout=5).stdout.splitlines()
+        for i, l in enumerate(r):
+            if "pid=%s," % pid in l:
+                out += ["  ss " + x.strip() for x in r[i:i + 2]]
+    except (OSError, subprocess.SubprocessError):
+        out.append("  ss: not available")
+    fds = "/proc/%s/fd" % pid
+    try:
+        for fd in sorted(os.listdir(fds), key=int):
+            try:
+                if os.readlink("%s/%s" % (fds, fd)) != "anon_inode:[io_uring]":
+                    continue
+                with open("/proc/%s/fdinfo/%s" % (pid, fd)) as f:
+                    out += ["  io_uring fd %s: %s" % (fd, l.rstrip())
+                            for l in f.read().splitlines()[:200]]
+            except OSError:
+                pass
+    except OSError:
+        out.append("  /proc/%s: gone" % pid)
+    try:
+        ti = c.s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
+        out.append("  client tcp_info %d bytes: %s" % (len(ti), ti[:104].hex()))
+    except OSError:
+        pass
+    return "\n".join(out)
+
+
 def strand_round(port, pid):
     sink = Talker()
     # Its receive buffer is left to the kernel. Set, it cannot grow, and a
@@ -423,7 +465,17 @@ def strand_round(port, pid):
     # while its answers are not taken, reads nothing from the client
     # either. Left alone, the buffer grows instead, and only the window
     # holds the proxy up, which reopens as soon as the client reads.
-    c = Client(port)
+    #
+    # Its segments are kept small, as on any real network. On the loopback
+    # they can be as large as half the most the proxy ever offered, and
+    # once the flood has queued them up that large, the window the proxy
+    # offers later may stay below one of them: the client then sends only
+    # when its zero-window probe timer runs out, and every segment of the
+    # origin's talk that the proxy passes on puts that timer off again. On
+    # CI that kept the client from sending anything for the whole 100 s,
+    # with the proxy waiting for it, nothing of its own queued, and an
+    # empty receive queue.
+    c = Client(port, mss=STRAND_MSS)
     connect_tunnel(c, sink)
     c.s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, STRAND_SNDBUF)
     c.s.setblocking(False)
@@ -461,6 +513,8 @@ def strand_round(port, pid):
     # the origin is short of by then is what the proxy took and sat on.
     stuck = True
     seen = -1
+    start = time.monotonic()
+    rd, sink0, sent0 = 0, sink.count, sent
     deadline = time.monotonic() + 100
     moved = time.monotonic()
     err = None
@@ -472,11 +526,19 @@ def strand_round(port, pid):
         if now > deadline or (not stuck and now - moved > STRAND_STALL):
             err = "tunnel did not resume: origin got %d of %d bytes" % (
                 sink.count, sent)
+            err += ("\n  %s after %.1f s of reading, %.1f s since the origin"
+                    " last got data; client read %d bytes; at the start of"
+                    " reading the origin had %d of %d; proxy pid %d" % (
+                        "deadline" if now > deadline else "stall",
+                        now - start, now - moved, rd, sink0, sent0, pid))
+            err += "\n" + stall_state(pid, c, sink, sent, stuck)
             break
         try:
-            if not c.s.recv(random.choice((256, 512, 1024, 4096))):
+            d = c.s.recv(random.choice((256, 512, 1024, 4096)))
+            if not d:
                 err = "proxy hung up"
                 break
+            rd += len(d)
         except BlockingIOError:
             pass
         time.sleep(random.choice((0, 0.0002, 0.001)))
@@ -489,10 +551,10 @@ def strand_round(port, pid):
 
 
 def strand(port, pid):
-    for _ in range(STRAND_ROUNDS):
+    for i in range(STRAND_ROUNDS):
         err = strand_round(port, pid)
         if err:
-            return err
+            return "round %d of %d: %s" % (i + 1, STRAND_ROUNDS, err)
     return None
 
 
@@ -505,20 +567,40 @@ def shut(port, pid):
         n = LIB.SSL_read(c.ssl, c.buf, len(c.buf))
         if n <= 0:
             break
+
+    # Each KeyUpdate goes with a byte, so what the origin got is how many of
+    # them the proxy has handled. The client can be far ahead of that: the
+    # sockets hold tens of thousands of them, and a proxy slowed down by load
+    # may have handled only a few thousand by the time SHUT_SETTLE are sent.
+    # Count from the proxy's progress, and look again once it is done.
+    before = None
+
+    def settled():
+        nonlocal before
+        if before is None and sink.count >= SHUT_SETTLE:
+            before = vm_hwm(pid)
+        return before is not None
+
     sent = 0
     while sent < SHUT_UPDATES:
         c.key_update()
         c.write(b"x")
         sent += 1
-        if sent == SHUT_SETTLE:
-            before = vm_hwm(pid)
-        elif sent > SHUT_SETTLE and sent % 4096 == 0:
-            check_growth(pid, before, SHUT_GROWTH, sent, "KeyUpdates")
-    deadline = time.monotonic() + 60
+        if sent % 1024 == 0 and settled() and sent % 4096 == 0:
+            check_growth(pid, before, SHUT_GROWTH, sink.count,
+                         "KeyUpdates handled")
+    # The proxy may still have most of them to handle, at its own pace: give
+    # up only once it has stopped.
+    seen, moved = -1, time.monotonic()
     while sink.count < sent:
-        if time.monotonic() > deadline:
+        if sink.count != seen:
+            seen, moved = sink.count, time.monotonic()
+        elif time.monotonic() - moved > SHUT_STALL:
             return "origin got %d of %d bytes" % (sink.count, sent)
-        time.sleep(0.1)
+        settled()
+        time.sleep(0.01)
+    settled()
+    check_growth(pid, before, SHUT_GROWTH, sent, "KeyUpdates")
     return None
 
 

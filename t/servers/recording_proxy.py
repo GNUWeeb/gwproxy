@@ -11,9 +11,13 @@
 # One line is appended to the log per request:
 #   socks5: "atyp=<n> addr=<host> port=<n>"
 #   http:   "authority=<host:port>"
+# and, when the request carried credentials (SOCKS5 user/password, which is
+# then accepted, or an HTTP Proxy-Authorization: Basic header), at its end:
+#   socks5: " user=<user> pass=<pass>"
+#   http:   " auth=<user:pass>"
 #
 # Usage: recording_proxy.py <socks5|http> <bind_host> <bind_port> <logfile>
-import selectors, socket, struct, sys, threading
+import base64, selectors, socket, struct, sys, threading
 
 mode, host, port, logpath = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 log_lock = threading.Lock()
@@ -78,8 +82,16 @@ def recv_exactly(s, n):
 
 def handle_socks5(c):
     ver, nmeth = recv_exactly(c, 2)
-    recv_exactly(c, nmeth)
-    c.sendall(b'\x05\x00')			# no authentication required
+    creds = ''
+    if 2 in recv_exactly(c, nmeth):
+        c.sendall(b'\x05\x02')		# username/password (RFC 1929)
+        recv_exactly(c, 1)
+        user = recv_exactly(c, recv_exactly(c, 1)[0]).decode()
+        pw = recv_exactly(c, recv_exactly(c, 1)[0]).decode()
+        creds = ' user=%s pass=%s' % (user, pw)
+        c.sendall(b'\x01\x00')
+    else:
+        c.sendall(b'\x05\x00')		# no authentication required
     hdr = recv_exactly(c, 4)
     atyp = hdr[3]
     if atyp == 1:
@@ -93,7 +105,7 @@ def handle_socks5(c):
         c.close()
         return
     dport = struct.unpack('!H', recv_exactly(c, 2))[0]
-    record('atyp=%d addr=%s port=%d' % (atyp, addr, dport))
+    record('atyp=%d addr=%s port=%d%s' % (atyp, addr, dport, creds))
 
     try:
         up = socket.create_connection((addr, dport), timeout=10)
@@ -120,7 +132,14 @@ def handle_http(c):
         c.close()
         return
     authority = parts[1]
-    record('authority=%s' % authority)
+    creds = ''
+    for h in buf.split(b'\r\n\r\n', 1)[0].split(b'\r\n')[1:]:
+        name, _, val = h.decode().partition(':')
+        val = val.strip().split()
+        if (name.strip().lower() == 'proxy-authorization' and
+                len(val) == 2 and val[0].lower() == 'basic'):
+            creds = ' auth=%s' % base64.b64decode(val[1]).decode()
+    record('authority=%s%s' % (authority, creds))
 
     hostpart, _, portpart = authority.rpartition(':')
     try:

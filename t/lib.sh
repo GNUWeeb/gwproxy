@@ -293,19 +293,48 @@ wait_listen()
 	return 1
 }
 
-# wait_sigterm_handled <pid>: wait until <pid> has its SIGTERM handler in place.
-# The listeners come up before the handler does, so a signal sent right after
-# wait_listen() can still kill the proxy, which is no clean exit.
-wait_sigterm_handled()
+# wait_sig_handled <pid> <signo>: wait until <pid> has a handler for signal
+# <signo> in place. The listeners come up before the handlers do, so a signal
+# sent right after wait_listen() can still kill the proxy, which is no clean
+# exit.
+wait_sig_handled()
 {
-	local pid="$1" i v
+	local pid="$1" bit=$(( 1 << ($2 - 1) )) i v
 
 	for i in $(seq 1 300); do
 		v="$(sed -n 's/^SigCgt:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)"
-		[ -n "$v" ] && [ $(( 0x$v & 0x4000 )) != 0 ] && return 0
+		[ -n "$v" ] && [ $(( 0x$v & bit )) != 0 ] && return 0
 		sleep 0.1
 	done
 	return 1
+}
+
+# wait_sigterm_handled <pid>: wait until <pid> has its SIGTERM handler in place.
+wait_sigterm_handled()
+{
+	wait_sig_handled "$1" 15
+}
+
+# gwp_hup <pid> <log> <nr-files>: have the proxy reload its auth and ACL files
+# with SIGHUP and wait until the reload is over, which is when its outcome
+# ("Reloaded ..." or "Failed to reload ...") is logged for each of <nr-files>
+# files after the SIGHUP's own line. With 0, wait for that line only.
+gwp_hup()
+{
+	local pid="$1" log="$2" want="$3" n i
+
+	wait_sig_handled "$pid" 1 || fail "gwp_hup: $pid has no SIGHUP handler"
+	n="$(grep -c 'Received SIGHUP' "$log")"
+	kill -HUP "$pid" || fail "gwp_hup: cannot signal $pid"
+	for i in $(seq 1 600); do
+		awk -v n="$n" -v want="$want" '
+			/Received SIGHUP/ { seen++; next }
+			seen > n && /Reloaded (authentication|ACL) file|Failed to reload (authentication|ACL) file/ { got++ }
+			END { exit !(seen > n && got >= want) }' "$log" && return 0
+		sleep 0.1
+	done
+	sed 's/^/# gwp: /' "$log" >&2
+	fail "gwp_hup: the reload after SIGHUP did not finish"
 }
 
 # gwp_start <bind> [args...]: start gwproxy bound to <bind> (e.g. "[::1]:1080"
@@ -400,6 +429,91 @@ time.sleep(3600)' >"$log" 2>&1 &
 		sleep 0.05
 	done
 	fail "could not reserve a closed port"
+}
+
+# start_dns_responder <mode> [<count-file> [<query-log>]]: start
+# t/servers/dns_malformed.py answering in <mode> on 127.0.0.1 and wait until
+# it has bound its port: it prints "ready" then. Sets DNS_PORT and DNS_PID.
+#
+# A fixed sleep before the proxy's first query is no wait at all on a loaded
+# host, and the query then goes to a port nothing has bound yet. pick_port()
+# reserves a TCP number; another test's UDP socket may hold it, in which case
+# the responder dies on bind and another number is tried.
+start_dns_responder()
+{
+	local mode="$1" log pid port i try
+
+	for try in 1 2 3 4 5; do
+		_DNS_N=$((${_DNS_N:-0} + 1))
+		log="$WORK/dns.$_DNS_N.log"
+		port="$(pick_port)"
+		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$port" \
+			"${@:2}" >"$log" 2>&1 &
+		pid=$!
+		_PIDS+=("$pid")
+		for i in $(seq 1 300); do
+			if grep -qx ready "$log"; then
+				DNS_PORT="$port"
+				DNS_PID="$pid"
+				return 0
+			fi
+			kill -0 "$pid" 2>/dev/null || break
+			sleep 0.05
+		done
+		kill "$pid" 2>/dev/null
+		wait "$pid" 2>/dev/null
+	done
+	sed 's/^/# dns: /' "$log" >&2
+	fail "the DNS responder ($mode) did not start"
+}
+
+# gwp_parallel <func> <arg>...: run "<func> <arg>" for every <arg> at once,
+# each in a subshell of its own, and fail once all have ended if any of them
+# failed: exited, or returned anything but 0. For a long test whose parts are independent, such as the same checks
+# on each event loop: run one after the other, they came near the time limit
+# on a loaded host.
+#
+# A part must keep to files of its own (under a directory of its own in
+# $WORK, say) and may use everything set up before the call. What it starts
+# goes in its own _PIDS and is stopped when it ends, however it ends; the
+# ports it reserves are released with the test's, at its end.
+gwp_parallel()
+{
+	local f="$1" i rc=0
+	local -a pids=() args=()
+
+	shift
+	for i in "$@"; do
+		(
+			_PIDS=()
+			trap '_gwp_parallel_cleanup' EXIT
+			trap 'exit 143' INT TERM
+			"$f" "$i"
+		) &
+		pids+=("$!")
+		args+=("$i")
+	done
+	for i in "${!pids[@]}"; do
+		wait "${pids[$i]}" && continue
+		rc=1
+		diag "$f ${args[$i]}: failed"
+	done
+	[ "$rc" = 0 ] || fail "$f: not every part passed"
+}
+
+# Stop what one part of gwp_parallel() started, and nothing else: the test's
+# work directory, ports and own processes stay for the other parts.
+_gwp_parallel_cleanup()
+{
+	local pid
+
+	for pid in "${_PIDS[@]:-}"; do
+		[ -n "$pid" ] && kill "$pid" 2>/dev/null
+	done
+	for pid in "${_PIDS[@]:-}"; do
+		[ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+	done
+	return 0
 }
 
 # start_httpd <port> <docroot> [http_version]: start the dual-stack test HTTP

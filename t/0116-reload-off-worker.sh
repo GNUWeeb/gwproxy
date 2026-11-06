@@ -2,17 +2,22 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Reloading --auth-file or --acl-file must not hold up a worker. A single
-# worker proxies while a reload is stuck: the file is replaced by a FIFO, so
-# the reload blocks opening and reading it until the test writes the new
-# contents. In the meantime the worker must keep serving with the current
-# credentials and rules; once the contents arrive the reload completes (or,
-# for the ACL, which cannot be read from a FIFO, fails and keeps the current
-# rules). Exercised on every available event loop.
+# worker proxies while an auth reload is stuck: the file is replaced by one
+# with a hole of terabytes after the new contents, so the reload a SIGHUP starts
+# reads on until the test cuts the file short. In the meantime the worker must keep serving with
+# the current credentials; once the contents arrive the reload completes. The
+# ACL loader reads regular files only and does not wait on a FIFO in place of
+# the ACL file: that reload fails at once and the current rules stay, the
+# worker keeps serving throughout, and the proxy still stops on SIGTERM. So the
+# ACL half no longer holds a reload stuck; that the reload thread is off the
+# worker is shown by the auth half, whose reloads run on the same thread.
+# Exercised on every available event loop.
 
 . "$(dirname "$0")/lib.sh"
 require curl
 require python3
 require mkfifo
+require truncate
 
 hp="$(pick_port)"
 make_payload "$WORK/payload.bin" 1000
@@ -41,81 +46,62 @@ wait_fetch()
 	return 1
 }
 
-# stuck_replace <file> <contents>: replace <file> by a FIFO and wait until
-# the proxy's reload has opened it. The write end is held open, so the reload
-# then blocks reading it until $WORK/go appears and <contents> is written.
-#
-# Closing the write end is itself a change to the file (IN_CLOSE_WRITE), so
-# the proxy opens the FIFO again; until $WORK/done appears the writer serves
-# the same contents to every such reader, which settle_replace() then puts
-# in place as a regular file. The writer opens the FIFO through a second
-# link, so it still reaches a reader that opened <file> before that.
+# stuck_replace <file> <contents>: replace <file> by <contents> followed by a
+# hole of terabytes, have the proxy reload it with SIGHUP and wait until the
+# reload is reading it. A hole reads as NUL bytes, which the auth loader takes
+# for blank lines, so the reload reads on for hours, all the while holding the
+# new credentials unpublished, until finish_replace() cuts the file short
+# through a second link. A FIFO can no longer hold it: the loader refuses
+# anything but a regular file.
 stuck_replace()
 {
-	rm -f "$WORK/go" "$WORK/ready" "$WORK/done" "$WORK/fifo"
-	mkfifo "$WORK/fifo"
-	ln -f "$WORK/fifo" "$WORK/fifo.lnk"
-	mv -f "$WORK/fifo.lnk" "$1"
-	python3 - "$WORK/fifo" "$WORK/ready" "$WORK/go" "$WORK/done" "$2" <<-'PY' &
-	import os, sys, time
-	fifo, ready, go, done, data = sys.argv[1:]
-	def open_reader(until):
-	    while time.monotonic() < until:
-	        try:
-	            return os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-	        except OSError:
-	            time.sleep(0.02)
-	    return -1
-	def serve(fd):
-	    # The reader that just got the contents may still hold the FIFO
-	    # open (and so let the next open succeed) until it reads the end;
-	    # it then leaves without reading, which is harmless.
-	    try:
-	        os.set_blocking(fd, True)
-	        os.write(fd, data.encode())
-	    except OSError:
-	        pass
-	    os.close(fd)
-	    time.sleep(0.2)
-	end = time.monotonic() + 30
-	fd = open_reader(end)
-	if fd < 0:
-	    sys.exit(1)
-	open(ready, "w").close()
-	while not os.path.exists(go) and time.monotonic() < end:
-	    time.sleep(0.02)
-	serve(fd)
-	while not os.path.exists(done) and time.monotonic() < end:
-	    fd = open_reader(time.monotonic() + 0.05)
-	    if fd >= 0:
-	        serve(fd)
-	PY
-	WRITER_PID=$!
-	_PIDS+=("$WRITER_PID")
+	local i s rc0 rc1
 
-	local i
+	rm -f "$WORK/hold" "$WORK/hold.lnk"
+	printf '%s' "$2" >"$WORK/hold"
+	HOLD_LEN="$(wc -c <"$WORK/hold")"
+	for s in 8T 1T 64G; do
+		truncate -s "$s" "$WORK/hold" 2>/dev/null && break
+	done
+	[ "$(wc -c <"$WORK/hold")" -gt "$HOLD_LEN" ] || return 1
+	ln -f "$WORK/hold" "$WORK/hold.lnk"
+	mv -f "$WORK/hold.lnk" "$1"
+	wait_sig_handled "$GWP_PID" 1 || return 1
+	kill -HUP "$GWP_PID" || return 1
+
+	# The read count of the process grows by about a GB a second while
+	# the reload reads the hole. Where it cannot be read, the reload
+	# has started at least once its SIGHUP is logged.
 	for i in $(seq 1 100); do
-		[ -e "$WORK/ready" ] && return 0
+		grep -q 'Received SIGHUP' "$WORK/gwp.$pp.log" && break
 		sleep 0.1
+	done
+	grep -q 'Received SIGHUP' "$WORK/gwp.$pp.log" || return 1
+	for i in $(seq 1 100); do
+		rc0="$(sed -n 's/^rchar: //p' "/proc/$GWP_PID/io" 2>/dev/null)"
+		[ -n "$rc0" ] || return 0
+		sleep 0.1
+		rc1="$(sed -n 's/^rchar: //p' "/proc/$GWP_PID/io" 2>/dev/null)"
+		[ -n "$rc1" ] || return 0
+		[ $((rc1 - rc0)) -gt 1000000 ] && return 0
 	done
 	return 1
 }
 
-# finish_replace: let the stuck reload read its contents and finish.
+# finish_replace: cut the file the stuck reload reads back to its contents, so
+# the reload reaches its end and applies them.
 finish_replace()
 {
-	touch "$WORK/go"
+	truncate -s "$HOLD_LEN" "$WORK/hold"
 }
 
-# settle_replace <file> <contents>: put <contents> back as a regular file and
-# stop the FIFO writer.
+# settle_replace <file> <contents>: put <contents> back as a regular file of
+# its own.
 settle_replace()
 {
 	printf '%s' "$2" >"$WORK/settle"
 	mv -f "$WORK/settle" "$1"
-	sleep 0.5
-	touch "$WORK/done"
-	wait "$WRITER_PID"
+	rm -f "$WORK/hold"
 }
 
 for loop in epoll io_uring; do
@@ -130,7 +116,7 @@ for loop in epoll io_uring; do
 
 	# Auth reload stuck: the worker still serves the current credentials.
 	stuck_replace "$WORK/auth" $'bob:pw-b\n' \
-		|| fail "[$loop] the auth reload never opened the new file"
+		|| fail "[$loop] the auth reload never started reading the new file"
 	fetch "$pp" alice pw-a \
 		|| fail "[$loop] the worker stopped serving during an auth reload"
 	finish_replace
@@ -140,29 +126,45 @@ for loop in epoll io_uring; do
 		&& fail "[$loop] credentials removed by the reload still work"
 	settle_replace "$WORK/auth" $'bob:pw-b\n'
 
-	# ACL reload stuck: the worker still serves under the current rules.
-	# The ACL loader needs a seekable file, so this reload fails once it
-	# gets past the open: the current rules must stay in force, and a
-	# valid file put in place afterwards must still be applied.
+	# A FIFO in place of the ACL file: the reload refuses it without
+	# opening it for good, so nothing is stuck. The current rules must
+	# stay in force, and a valid file put in place afterwards must still
+	# be applied.
 	acl="-A OUTPUT -d 127.0.0.1 --dports $hp -j REJECT"$'\n-P INPUT ACCEPT\n-P OUTPUT ACCEPT\n'
-	stuck_replace "$WORK/acl" "$acl" \
-		|| fail "[$loop] the ACL reload never opened the new file"
+	rm -f "$WORK/acl.fifo"
+	mkfifo "$WORK/acl.fifo"
+	mv -f "$WORK/acl.fifo" "$WORK/acl"
+	gwp_hup "$GWP_PID" "$WORK/gwp.$pp.log" 2
 	fetch "$pp" bob pw-b \
 		|| fail "[$loop] the worker stopped serving during an ACL reload"
-	finish_replace
-	for i in $(seq 1 50); do
-		grep -q "Failed to reload ACL file" "$WORK/gwp.$pp.log" && break
-		sleep 0.1
-	done
 	grep -q "Failed to reload ACL file" "$WORK/gwp.$pp.log" \
 		|| fail "[$loop] the failed ACL reload was not reported"
+	grep -q "acl: $WORK/acl: not a regular file" "$WORK/gwp.$pp.log" \
+		|| fail "[$loop] the FIFO in place of the ACL file was not reported"
 	fetch "$pp" bob pw-b \
 		|| fail "[$loop] a failed ACL reload dropped the current rules"
-	settle_replace "$WORK/acl" "$acl"
+	printf '%s' "$acl" >"$WORK/settle"
+	mv -f "$WORK/settle" "$WORK/acl"
+	gwp_hup "$GWP_PID" "$WORK/gwp.$pp.log" 2
 	wait_fetch 0 "$pp" bob pw-b \
 		|| fail "[$loop] the ACL file put in place was not applied"
 
+	# With a FIFO in place again, SIGTERM still stops the proxy: no
+	# reload is left stuck on it.
+	mkfifo "$WORK/acl.fifo"
+	mv -f "$WORK/acl.fifo" "$WORK/acl"
+	gwp_hup "$GWP_PID" "$WORK/gwp.$pp.log" 2
+	[ "$(grep -c "Failed to reload ACL file" "$WORK/gwp.$pp.log")" -ge 2 ] \
+		|| fail "[$loop] the second FIFO was not refused"
 	kill "$GWP_PID" 2>/dev/null
+	for i in $(seq 1 300); do
+		kill -0 "$GWP_PID" 2>/dev/null || break
+		sleep 0.1
+	done
+	kill -0 "$GWP_PID" 2>/dev/null \
+		&& fail "[$loop] the proxy did not exit on SIGTERM"
+	# The next loop writes the ACL file anew, which would block on a FIFO.
+	rm -f "$WORK/acl"
 done
 
 pass

@@ -12,11 +12,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <stdatomic.h>
 #include <sched.h>
 #include <time.h>
 #include <sys/random.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
@@ -32,6 +36,8 @@ enum gwp_acl_action {
 	 */
 	GWP_ACL_ACT_MARK	= 3,
 	GWP_ACL_ACT_BIND	= 4,
+	/* Records the upstream pool (or DIRECT) the connection is to use. */
+	GWP_ACL_ACT_UPSTREAM	= 5,
 };
 
 enum gwp_acl_chain {
@@ -67,6 +73,48 @@ struct gwp_acl_dnat {
 	uint8_t		family;		/* AF_INET/AF_INET6 when set_addr */
 	uint16_t	port;		/* host byte order when set_port */
 	uint8_t		addr[16];	/* network bytes when set_addr */
+};
+
+/* Limits of the upstream pools of one rule set. */
+#define ACL_POOL_NAME_MAX	64
+#define ACL_POOL_MAX_SERVERS	64
+#define ACL_MAX_POOLS		1024
+/* What gwp_parse_upstream() takes after the scheme, NUL included. */
+#define ACL_URL_REST_MAX	512
+
+/*
+ * An "upstream NAME { ... }" block. Built while its file is parsed, then
+ * read-only. The ruleset that defined it holds a reference, and so does
+ * every evaluation result that names it (see gwp_acl_eval_output()).
+ */
+struct gwp_acl_pool {
+	_Atomic(uint32_t)	ref;
+	/* gwp_acl_pool_next(): the one thing in a pool that changes. */
+	_Atomic(uint32_t)	cursor;
+	uint32_t		nr_servers;
+	/* The server URLs as written, credentials included. */
+	char			**servers;
+	/*
+	 * What @ops made of each URL, NULL without @ops; the pool holds a
+	 * reference to each, dropped with @ops->put when it is freed.
+	 */
+	void			**srv;
+	const struct gwp_acl_server_ops *ops;
+	uint8_t			method;		/* enum gwp_acl_pool_method */
+	bool			remote_dns;
+	bool			have_method;	/* "least_conn;" seen */
+	char			name[ACL_POOL_NAME_MAX + 1];
+};
+
+/*
+ * A -j UPSTREAM choice. While the rule set loads, @name is the pool the
+ * rule names (pools may be defined after the rules that use them); once the
+ * whole set is read the name is resolved to @pool and freed. Both NULL means
+ * "--to DIRECT".
+ */
+struct gwp_acl_up {
+	char			*name;
+	struct gwp_acl_pool	*pool;
 };
 
 /*
@@ -118,6 +166,7 @@ struct gwp_acl_rule {
 		struct gwp_acl_dnat	dnat;	 /* GWP_ACL_ACT_DNAT (--to) */
 		uint32_t		setmark; /* GWP_ACL_ACT_MARK (--set-mark) */
 		struct gwp_acl_bind	bind;	 /* GWP_ACL_ACT_BIND (--to-*) */
+		struct gwp_acl_up	up;	 /* GWP_ACL_ACT_UPSTREAM (--to) */
 	} act;
 
 	bool			has_src : 1, has_dst : 1, has_domain : 1,
@@ -129,7 +178,7 @@ struct gwp_acl_rule {
 	bool			domain_is_re : 1;	/* --domain-regexp */
 	bool			user_is_re : 1;		/* --user-regexp */
 	/*
-	 * --accept on a MARK/BIND rule: apply the modifier, then stop and
+	 * --accept on a MARK/BIND/UPSTREAM rule: apply the modifier, then stop and
 	 * accept. Saves writing the same match twice (once to set the mark or
 	 * bind, once for a following -j ACCEPT) when the rule is known to be
 	 * the final word for the connections it matches.
@@ -216,8 +265,13 @@ struct gwp_acl_ruleset {
 	uint32_t		gen;
 	/* Rules covered by the run indexes, both chains. */
 	uint32_t		nr_indexed;
+	/* The upstream pools, sorted by name once the set is loaded. */
+	struct gwp_acl_pool	**pools;
+	uint32_t		nr_pools;
 	/* OUTPUT has a -m statistic rule: its verdicts must not be cached. */
 	bool			out_has_stat;
+	/* OUTPUT has a -j UPSTREAM rule; see gwp_acl_eval_upstream(). */
+	bool			out_has_upstream;
 };
 
 /*
@@ -229,6 +283,14 @@ struct gwp_acl_ruleset {
 struct gwp_acl {
 	_Atomic(struct gwp_acl_ruleset *) rs;
 	char			*path;
+	/* Makes the pool servers of every load; see gwp_acl_create_ops(). */
+	const struct gwp_acl_server_ops *ops;
+	/*
+	 * The files the last load or reload read or tried to read, @path
+	 * first; see gwp_acl_file(). Only the reloading thread touches them.
+	 */
+	struct acl_file		*files;
+	size_t			nr_files;
 	/* Serialises reloads; evaluations never take it. */
 	pthread_mutex_t		reload_lock;
 	/* Bumped by every successful reload; see gwp_acl_generation(). */
@@ -248,6 +310,88 @@ struct gwp_acl {
 #define ACL_SUM_OUT_REJECT	(1u << 3)
 
 #define ACL_MAX_TOKENS	32
+
+/*
+ * How deep "include" may nest. The --acl-file is level 0 and a file it
+ * includes is level 1, so a chain of at most ACL_MAX_INCLUDE_DEPTH + 1 files
+ * loads. That is room for any sensible layout, while a runaway chain ends
+ * with a message instead of a file descriptor per level.
+ */
+#define ACL_MAX_INCLUDE_DEPTH	8
+
+/*
+ * How many files one load may read, the top file and every include counted,
+ * a file included twice twice. The depth cap alone would let a file that
+ * includes the next one twice, at every level, read 2^8 files, and one that
+ * includes it k times k^8.
+ */
+#define ACL_MAX_FILES		64
+
+/*
+ * A file a load read or tried to read: what fstat() said right before it was
+ * read, or why it could not be opened (@err, a positive errno; 0 when @st is
+ * valid). Recorded for the first read of a file the load reads twice.
+ */
+struct acl_file {
+	char		*path;
+	int		err;
+	struct stat	st;
+	/* The credentials warning was given for this file in this load. */
+	bool		warned;
+};
+
+/* The identity of a file being parsed, for the include cycle check. */
+struct acl_file_key {
+	dev_t	dev;
+	ino_t	ino;
+};
+
+/*
+ * One load of a rule set, from text (gwp_acl_parse_str) or from a file and
+ * the files it includes (gwp_acl_create, gwp_acl_reload).
+ *   @files: every path the load read or tried to read, the top file first,
+ *     each once. Whether the load succeeds or not, a change to any of them
+ *     can change the outcome of the next one (a fixed rule, a missing file
+ *     created), so they are what a reload watches.
+ *   @path: the file whose lines are being parsed; NULL for text.
+ *   @stack, @depth: the files being parsed, the top file first.
+ *   @nr_loads: files read so far, see ACL_MAX_FILES.
+ *   @lineno: the line of @path being parsed, for the messages.
+ *   @pool, @pool_line: the upstream block being parsed and the line that
+ *     opened it, or NULL.
+ *   @refs: the -j UPSTREAM rules that name a pool, resolved once the whole
+ *     set is read (see resolve_pools()).
+ *   @ops: what turns a pool server's URL into its object, or NULL.
+ *   @creds: the file being parsed holds a server URL with credentials.
+ *   @include_failed: the error parse_line() returned came from an include.
+ *   @reported: the error parse_line() returned has been reported already.
+ */
+struct acl_pool_ref {
+	uint32_t		rule;	/* index in the OUTPUT chain */
+	unsigned		line;
+	char			*path;	/* NULL for text */
+};
+
+struct acl_load {
+	struct gwp_acl_ruleset	*rs;
+	struct acl_file		*files;
+	size_t			nr_files;
+	const char		*path;
+	struct acl_file_key	stack[ACL_MAX_INCLUDE_DEPTH + 1];
+	unsigned		depth;
+	unsigned		nr_loads;
+	unsigned		lineno;
+	struct gwp_acl_pool	*pool;
+	unsigned		pool_line;
+	struct acl_pool_ref	*refs;
+	size_t			nr_refs;
+	const struct gwp_acl_server_ops *ops;
+	bool			creds;
+	bool			include_failed;
+	bool			reported;
+};
+
+static int load_file(struct acl_load *ld, const char *path);
 
 #ifdef CONFIG_PCRE
 /*
@@ -699,6 +843,9 @@ static void free_rule(struct gwp_acl_rule *r)
 #endif
 	free(r->sports.v);
 	free(r->dports.v);
+	/* The pool belongs to the ruleset; only a name not resolved yet is ours. */
+	if (r->action == GWP_ACL_ACT_UPSTREAM)
+		free(r->act.up.name);
 }
 
 static void chain_free(struct acl_chain *c)
@@ -727,8 +874,13 @@ static void ruleset_init(struct gwp_acl_ruleset *rs)
 
 static void ruleset_free(struct gwp_acl_ruleset *rs)
 {
+	uint32_t i;
+
 	chain_free(&rs->in);
 	chain_free(&rs->out);
+	for (i = 0; i < rs->nr_pools; i++)
+		gwp_acl_pool_put(rs->pools[i]);
+	free(rs->pools);
 	ruleset_init(rs);
 }
 
@@ -778,7 +930,12 @@ static int parse_port_num(const char *s, uint16_t *out)
 	unsigned long v;
 	char *end;
 
-	if (!*s)
+	/*
+	 * Digits only: strtoul() also takes leading blanks and a sign, and
+	 * negates a "-" value in unsigned arithmetic: "-18446744073709551535"
+	 * wraps around to port 81, and " 80" and "+80" pass for 80.
+	 */
+	if (*s < '0' || *s > '9')
 		return -1;
 	errno = 0;
 	v = strtoul(s, &end, 10);
@@ -874,6 +1031,509 @@ static int tokenise(char *line, char **tok)
 	return n;
 }
 
+/*
+ * Report a problem at the line being parsed: "acl: FILE: line N: ...", or
+ * "acl: line N: ..." for text.
+ */
+static void load_vmsg(const struct acl_load *ld, const char *fmt, va_list ap)
+{
+	if (ld->path)
+		fprintf(stderr, "acl: %s: line %u: ", ld->path, ld->lineno);
+	else
+		fprintf(stderr, "acl: line %u: ", ld->lineno);
+	vfprintf(stderr, fmt, ap);
+	fputc('\n', stderr);
+}
+
+static void __attribute__((__format__(printf, 2, 3)))
+load_warn(const struct acl_load *ld, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	load_vmsg(ld, fmt, ap);
+	va_end(ap);
+}
+
+/* Report the error that fails this line; returns -EINVAL. */
+static int __attribute__((__format__(printf, 2, 3)))
+load_err(struct acl_load *ld, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	load_vmsg(ld, fmt, ap);
+	va_end(ap);
+	ld->reported = true;
+	return -EINVAL;
+}
+
+/*
+ * ------------------------------------------------------------------------
+ * Upstream pools
+ * ------------------------------------------------------------------------
+ */
+
+const char *gwp_acl_pool_name(const struct gwp_acl_pool *p)
+{
+	return p->name;
+}
+
+enum gwp_acl_pool_method gwp_acl_pool_method(const struct gwp_acl_pool *p)
+{
+	return (enum gwp_acl_pool_method)p->method;
+}
+
+bool gwp_acl_pool_remote_dns(const struct gwp_acl_pool *p)
+{
+	return p->remote_dns;
+}
+
+uint32_t gwp_acl_pool_nr_servers(const struct gwp_acl_pool *p)
+{
+	return p->nr_servers;
+}
+
+const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i)
+{
+	return i < p->nr_servers ? p->servers[i] : NULL;
+}
+
+void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i)
+{
+	return i < p->nr_servers && p->srv ? p->srv[i] : NULL;
+}
+
+uint32_t gwp_acl_pool_next(struct gwp_acl_pool *p)
+{
+	return atomic_fetch_add_explicit(&p->cursor, 1, memory_order_relaxed);
+}
+
+void gwp_acl_pool_get(struct gwp_acl_pool *p)
+{
+	atomic_fetch_add_explicit(&p->ref, 1, memory_order_relaxed);
+}
+
+void gwp_acl_pool_put(struct gwp_acl_pool *p)
+{
+	uint32_t i;
+
+	if (!p || atomic_fetch_sub_explicit(&p->ref, 1,
+					    memory_order_acq_rel) != 1)
+		return;
+	/* The URLs may hold passwords; leave none behind in freed memory. */
+	for (i = 0; i < p->nr_servers; i++) {
+		explicit_bzero(p->servers[i], strlen(p->servers[i]));
+		free(p->servers[i]);
+		if (p->srv && p->srv[i])
+			p->ops->put(p->ops->arg, p->srv[i]);
+	}
+	free(p->servers);
+	free(p->srv);
+	free(p);
+}
+
+int gwp_acl_url_redact(const char *url, char *buf, size_t size)
+{
+	const char *at = strrchr(url, '@'), *sep = strstr(url, "://");
+	size_t keep = 0;
+	int n;
+
+	/*
+	 * Whatever the shape, nothing up to the last '@' is shown but a
+	 * scheme: the letters before a "://" that comes before that '@'.
+	 * Anything else there (a ':' in it, a "://" after the '@') may be
+	 * a password, and goes.
+	 */
+	if (at && sep && sep < at &&
+	    strspn(url, "abcdefghijklmnopqrstuvwxyz"
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-") ==
+	    (size_t)(sep - url))
+		keep = (size_t)(sep - url) + 3;
+	n = snprintf(buf, size, "%.*s%s", (int)keep, url, at ? at + 1 : url);
+	return (n < 0 || (size_t)n >= size) ? -ENAMETOOLONG : 0;
+}
+
+/* A pool name: 1 to 64 of letters, digits, '_', '-' and '.'. */
+static bool pool_name_ok(const char *s)
+{
+	size_t i;
+
+	for (i = 0; s[i]; i++) {
+		char c = s[i];
+
+		if (i == ACL_POOL_NAME_MAX)
+			return false;
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		      (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+		      c == '.'))
+			return false;
+	}
+	return i > 0;
+}
+
+static bool host_char(char c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_';
+}
+
+/*
+ * Check that @url has the shape of an upstream proxy URL:
+ *
+ *	SCHEME://[user[:pass]@]HOST[:PORT]
+ *
+ * SCHEME is socks5, socks5h, http or https; HOST a name, an IPv4 address
+ * or a bracketed IPv6 one; PORT 1 to 65535. The credentials are split as
+ * gwp_parse_upstream() splits them (at the last '@'), with its limits. This
+ * checks the shape only: nothing is resolved, and the URL is kept as
+ * written for the full parse when a connection uses it. Sets *@remote_dns
+ * and *@creds, or *@why on error (-EINVAL). *@why never quotes the URL,
+ * which may hold a password.
+ */
+static int check_server_url(const char *url, bool *remote_dns, bool *creds,
+			    const char **why)
+{
+	static const struct {
+		const char	*scheme;
+		bool		remote_dns;
+	} schemes[] = {
+		{ "socks5://",	false },
+		{ "socks5h://",	true },
+		{ "http://",	true },
+		{ "https://",	true },
+	};
+	const char *rest = NULL, *host, *at, *p;
+	size_t i;
+
+	for (i = 0; i < sizeof(schemes) / sizeof(schemes[0]); i++) {
+		size_t len = strlen(schemes[i].scheme);
+
+		if (!strncmp(url, schemes[i].scheme, len)) {
+			rest = url + len;
+			*remote_dns = schemes[i].remote_dns;
+			break;
+		}
+	}
+	if (!rest) {
+		*why = "the scheme must be socks5://, socks5h://, http:// or https://";
+		return -EINVAL;
+	}
+	if (strlen(rest) >= ACL_URL_REST_MAX) {
+		*why = "the URL is too long";
+		return -EINVAL;
+	}
+
+	at = strrchr(rest, '@');
+	*creds = at != NULL;
+	if (at) {
+		const char *colon = memchr(rest, ':', (size_t)(at - rest));
+		size_t ul = colon ? (size_t)(colon - rest) : (size_t)(at - rest);
+		size_t pl = colon ? (size_t)(at - colon - 1) : 0;
+
+		if (!ul) {
+			*why = "the user name is empty";
+			return -EINVAL;
+		}
+		if (ul > 255 || pl > 255) {
+			*why = "the user name or password is longer than 255 bytes";
+			return -EINVAL;
+		}
+		host = at + 1;
+	} else {
+		host = rest;
+	}
+
+	if (*host == '[') {
+		char buf[INET6_ADDRSTRLEN];
+		struct in6_addr a6;
+		size_t n;
+
+		p = strchr(host, ']');
+		n = p ? (size_t)(p - host - 1) : 0;
+		if (!p || !n || n >= sizeof(buf)) {
+			*why = "the IPv6 address is malformed";
+			return -EINVAL;
+		}
+		memcpy(buf, host + 1, n);
+		buf[n] = '\0';
+		if (inet_pton(AF_INET6, buf, &a6) != 1) {
+			*why = "the IPv6 address is malformed";
+			return -EINVAL;
+		}
+		p++;
+	} else {
+		for (p = host; host_char(*p); p++)
+			;
+		if (p == host) {
+			*why = "the host is empty or malformed";
+			return -EINVAL;
+		}
+	}
+
+	if (*p == ':') {
+		unsigned long port = 0;
+		const char *d;
+
+		for (d = p + 1; *d >= '0' && *d <= '9' && port <= 65535; d++)
+			port = port * 10 + (unsigned long)(*d - '0');
+		if (d == p + 1 || *d || !port || port > 65535) {
+			*why = "the port must be a number from 1 to 65535";
+			return -EINVAL;
+		}
+	} else if (*p) {
+		*why = "unexpected characters after the host";
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/* The pool of @rs called @name, or NULL. Before the set is sorted. */
+static struct gwp_acl_pool *pool_find(const struct gwp_acl_ruleset *rs,
+				      const char *name)
+{
+	uint32_t i;
+
+	for (i = 0; i < rs->nr_pools; i++)
+		if (!strcmp(rs->pools[i]->name, name))
+			return rs->pools[i];
+	return NULL;
+}
+
+/* "upstream NAME {": open a pool block. */
+static int parse_pool_open(struct acl_load *ld, char **tok, int n)
+{
+	struct gwp_acl_ruleset *rs = ld->rs;
+	struct gwp_acl_pool *p, **v;
+
+	if (n != 3 || strcmp(tok[2], "{"))
+		return load_err(ld, "expected \"upstream NAME {\" alone on its line");
+	if (!pool_name_ok(tok[1]))
+		return load_err(ld, "bad upstream pool name: use 1 to %d letters, digits, '_', '-' or '.'",
+				ACL_POOL_NAME_MAX);
+	if (!strcmp(tok[1], "DIRECT"))
+		return load_err(ld, "the upstream pool name DIRECT is reserved");
+	if (pool_find(rs, tok[1]))
+		return load_err(ld, "upstream pool %s is defined twice", tok[1]);
+	if (rs->nr_pools == ACL_MAX_POOLS)
+		return load_err(ld, "more than %d upstream pools", ACL_MAX_POOLS);
+
+	v = realloc(rs->pools, (rs->nr_pools + 1) * sizeof(*v));
+	if (!v)
+		return -ENOMEM;
+	rs->pools = v;
+	p = calloc(1, sizeof(*p));
+	if (!p)
+		return -ENOMEM;
+	atomic_init(&p->ref, 1);
+	atomic_init(&p->cursor, 0);
+	p->method = GWP_ACL_POOL_ROUND_ROBIN;
+	strcpy(p->name, tok[1]);
+	rs->pools[rs->nr_pools++] = p;
+	ld->pool = p;
+	ld->pool_line = ld->lineno;
+	return 0;
+}
+
+/* Add the server @url to the open pool. */
+static int pool_add_server(struct acl_load *ld, const char *url)
+{
+	struct gwp_acl_pool *p = ld->pool;
+	uint32_t idx = p->nr_servers + 1;
+	bool remote_dns, creds;
+	const char *why;
+	char shown[160];
+	char **v, *dup;
+
+	if (p->nr_servers == ACL_POOL_MAX_SERVERS)
+		return load_err(ld, "upstream pool %s has more than %d servers",
+				p->name, ACL_POOL_MAX_SERVERS);
+	if (check_server_url(url, &remote_dns, &creds, &why))
+		return load_err(ld, "upstream pool %s server %u: %s", p->name,
+				idx, why);
+	gwp_acl_url_redact(url, shown, sizeof(shown));
+	if (p->nr_servers && remote_dns != p->remote_dns)
+		return load_err(ld, "upstream pool %s server %u (%s): resolves names %s, the servers before it %s; a pool cannot mix the two",
+				p->name, idx, shown,
+				remote_dns ? "remotely" : "locally",
+				p->remote_dns ? "remotely" : "locally");
+
+	v = realloc(p->servers, (p->nr_servers + 1) * sizeof(*v));
+	if (!v)
+		return -ENOMEM;
+	p->servers = v;
+	if (ld->ops) {
+		void **sv = realloc(p->srv, (p->nr_servers + 1) * sizeof(*sv));
+
+		if (!sv)
+			return -ENOMEM;
+		p->srv = sv;
+		p->ops = ld->ops;
+	}
+	dup = strdup(url);
+	if (!dup)
+		return -ENOMEM;
+	if (ld->ops) {
+		char err[160] = "";
+		void *srv = NULL;
+		int r;
+
+		r = ld->ops->make(ld->ops->arg, url, &srv, err, sizeof(err));
+		if (r) {
+			explicit_bzero(dup, strlen(dup));
+			free(dup);
+			if (r == -ENOMEM)
+				return r;
+			return load_err(ld, "upstream pool %s server %u (%s): %s",
+					p->name, idx, shown,
+					err[0] ? err : strerror(-r));
+		}
+		p->srv[p->nr_servers] = srv;
+	}
+	p->servers[p->nr_servers++] = dup;
+	p->remote_dns = remote_dns;
+	if (creds)
+		ld->creds = true;
+	return 0;
+}
+
+/*
+ * The arguments of a directive in a pool block, which ends in ';': the ';'
+ * may stand alone as the last word or end it. Strips it and returns the
+ * number of words left, or -1 when it is missing.
+ */
+static int directive_words(char **tok, int n)
+{
+	size_t len = strlen(tok[n - 1]);
+
+	if (!strcmp(tok[n - 1], ";"))
+		return n - 1;
+	if (len > 1 && tok[n - 1][len - 1] == ';') {
+		tok[n - 1][len - 1] = '\0';
+		return n;
+	}
+	return -1;
+}
+
+/* A line inside "upstream NAME { ... }". */
+static int parse_pool_line(struct acl_load *ld, char **tok, int n)
+{
+	struct gwp_acl_pool *p = ld->pool;
+	int w;
+
+	if (!strcmp(tok[0], "}")) {
+		if (n != 1)
+			return load_err(ld, "\"}\" must stand alone on its line");
+		if (!p->nr_servers)
+			return load_err(ld, "upstream pool %s has no server",
+					p->name);
+		ld->pool = NULL;
+		return 0;
+	}
+	if (!strcmp(tok[0], "include"))
+		return load_err(ld, "include is not allowed inside an upstream block");
+	if (!strcmp(tok[0], "upstream"))
+		return load_err(ld, "upstream blocks do not nest; \"}\" missing for pool %s",
+				p->name);
+
+	/*
+	 * The words are not quoted in the messages below: a line that went
+	 * wrong may be a server URL with its password.
+	 */
+	w = directive_words(tok, n);
+	if (strcmp(tok[0], "server") && strcmp(tok[0], "least_conn"))
+		return load_err(ld, "unknown directive in upstream pool %s (expected server, least_conn or \"}\")",
+				p->name);
+	if (w < 0)
+		return load_err(ld, "missing ';' at the end of the directive");
+	n = w;
+
+	if (!strcmp(tok[0], "server")) {
+		if (n != 2)
+			return load_err(ld, "expected \"server URL;\"");
+		return pool_add_server(ld, tok[1]);
+	}
+	if (n != 1)
+		return load_err(ld, "expected \"least_conn;\"");
+	if (p->have_method)
+		return load_err(ld, "least_conn given twice in upstream pool %s",
+				p->name);
+	p->have_method = true;
+	p->method = GWP_ACL_POOL_LEAST_CONN;
+	return 0;
+}
+
+static int pool_cmp(const void *a, const void *b)
+{
+	const struct gwp_acl_pool *const *x = a, *const *y = b;
+
+	return strcmp((*x)->name, (*y)->name);
+}
+
+static int pool_key_cmp(const void *key, const void *elem)
+{
+	const struct gwp_acl_pool *const *p = elem;
+
+	return strcmp(key, (*p)->name);
+}
+
+/*
+ * Point every -j UPSTREAM rule at the pool it names, now that the whole set
+ * has been read: a pool may be defined after the rule, or in another file.
+ */
+static int resolve_pools(struct acl_load *ld)
+{
+	struct gwp_acl_ruleset *rs = ld->rs;
+	size_t i;
+
+	if (rs->nr_pools > 1)
+		qsort(rs->pools, rs->nr_pools, sizeof(*rs->pools), pool_cmp);
+	for (i = 0; i < ld->nr_refs; i++) {
+		struct gwp_acl_rule *r = &rs->out.rules[ld->refs[i].rule];
+		struct gwp_acl_pool **p = NULL;
+
+		if (rs->nr_pools)
+			p = bsearch(r->act.up.name, rs->pools, rs->nr_pools,
+				    sizeof(*rs->pools), pool_key_cmp);
+		if (!p) {
+			if (ld->refs[i].path)
+				fprintf(stderr, "acl: %s: line %u: upstream pool %s is not defined\n",
+					ld->refs[i].path, ld->refs[i].line,
+					r->act.up.name);
+			else
+				fprintf(stderr, "acl: line %u: upstream pool %s is not defined\n",
+					ld->refs[i].line, r->act.up.name);
+			return -EINVAL;
+		}
+		free(r->act.up.name);
+		r->act.up.name = NULL;
+		r->act.up.pool = *p;
+	}
+	return 0;
+}
+
+/* Remember that the last OUTPUT rule names a pool, for resolve_pools(). */
+static int note_pool_ref(struct acl_load *ld)
+{
+	struct acl_pool_ref *v, *ref;
+
+	v = realloc(ld->refs, (ld->nr_refs + 1) * sizeof(*v));
+	if (!v)
+		return -ENOMEM;
+	ld->refs = v;
+	ref = &v[ld->nr_refs];
+	ref->rule = ld->rs->out.nr - 1;
+	ref->line = ld->lineno;
+	ref->path = NULL;
+	if (ld->path) {
+		ref->path = strdup(ld->path);
+		if (!ref->path)
+			return -ENOMEM;
+	}
+	ld->nr_refs++;
+	return 0;
+}
+
 static int parse_policy(struct gwp_acl_ruleset *rs, char **tok, int n)
 {
 	enum gwp_acl_verdict v;
@@ -905,8 +1565,9 @@ static const char *next_val(char **tok, int n, int *i)
 	return tok[*i];
 }
 
-static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
+static int parse_rule(struct acl_load *ld, char **tok, int n)
 {
+	struct gwp_acl_ruleset *rs = ld->rs;
 	struct gwp_acl_rule rule, *r = &rule;
 	enum gwp_acl_chain chain;
 	bool neg = false, m_domain = false, m_user = false, have_jump = false;
@@ -917,6 +1578,9 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 	bool have_to = false, have_setmark = false;
 	bool have_src = false, have_iface = false;
 	bool have_accept = false;	/* --accept: MARK/BIND become terminal */
+	/* --to and its spellings: parsed once -j says whose payload it is. */
+	const char *to_opt = NULL, *to_val = NULL;
+	char *up_name = NULL;		/* -j UPSTREAM --to NAME */
 	const char *v;
 	size_t l;
 	int i, ret = -EINVAL;
@@ -1121,16 +1785,30 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 				if (chain != GWP_ACL_OUTPUT)  /* egress sockets */
 					goto out;
 				r->action = GWP_ACL_ACT_BIND;
+			} else if (!strcmp(v, "UPSTREAM")) {
+				/* No user is known yet in INPUT. */
+				if (chain != GWP_ACL_OUTPUT) {
+					ret = load_err(ld, "-j UPSTREAM is only valid in the OUTPUT chain");
+					goto out;
+				}
+				r->action = GWP_ACL_ACT_UPSTREAM;
 			} else {
 				goto out;
 			}
 			have_jump = true;
-		} else if (eq(o, "--to-destination", "--to")) {
-			/* DNAT payload: no other action group may share the union. */
+		} else if (eq(o, "--to-destination", "--to") ||
+			   !strcmp(o, "--to-proxy")) {
+			/*
+			 * DNAT or UPSTREAM payload: no other action group may
+			 * share the union. Which of the two it is, and so how
+			 * to parse it, is known after the loop.
+			 */
 			v = next_val(tok, n, &i);
 			if (neg || !v || have_to || have_setmark || have_src ||
-			    have_iface || parse_dnat(v, &r->act.dnat))
+			    have_iface)
 				goto out;
+			to_opt = o;
+			to_val = v;
 			have_to = true;
 		} else if (!strcmp(o, "--set-mark")) {
 			/* MARK payload: mutually exclusive with DNAT/BIND. */
@@ -1217,6 +1895,43 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			goto out;
 		if (have_accept)		/* DNAT already terminates */
 			goto out;
+		if (!strcmp(to_opt, "--to-proxy") ||
+		    parse_dnat(to_val, &r->act.dnat))
+			goto out;
+		break;
+	case GWP_ACL_ACT_UPSTREAM:
+		if (!have_to || !strcmp(to_opt, "--to-destination")) {
+			ret = load_err(ld, "-j UPSTREAM needs --to NAME (or --to-proxy NAME)");
+			goto out;
+		}
+		if (!pool_name_ok(to_val)) {
+			ret = load_err(ld, "-j UPSTREAM: bad upstream pool name");
+			goto out;
+		}
+		/* "--to DIRECT" names no pool: it is "no upstream". */
+		if (strcmp(to_val, "DIRECT")) {
+			up_name = strdup(to_val);
+			if (!up_name) {
+				ret = -ENOMEM;
+				goto out;
+			}
+		}
+		/*
+		 * The upstream is picked before the target's name is
+		 * resolved, so -d can only match a target given by address.
+		 */
+		if (r->has_dst)
+			load_warn(ld, "warning: -d in a -j UPSTREAM rule matches only a target given as an IP address, not one given by name");
+		/*
+		 * The choice is made for TCP connections only (a UDP
+		 * ASSOCIATE is decided as one): a rule only UDP matches
+		 * could never take effect.
+		 */
+		if (r->has_proto && (r->proto == GWP_ACL_PROTO_UDP) != r->neg_proto) {
+			ret = load_err(ld, "-j UPSTREAM applies to TCP; UDP never goes through an upstream");
+			goto out;
+		}
+		r->then_accept = have_accept;
 		break;
 	case GWP_ACL_ACT_MARK:
 		if (!have_setmark)		/* MARK needs --set-mark */
@@ -1244,19 +1959,92 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 
 	/* Slots are handed out once the indexes are known; see index_chain(). */
 	r->memo_idx = ACL_NO_MEMO;
+	if (r->action == GWP_ACL_ACT_UPSTREAM) {
+		memset(&r->act.up, 0, sizeof(r->act.up));
+		r->act.up.name = up_name;
+	}
 	ret = chain_append(chain == GWP_ACL_INPUT ? &rs->in : &rs->out, r);
 	if (ret)
 		goto out;
 	if (chain == GWP_ACL_OUTPUT && r->has_statistic)
 		rs->out_has_stat = true;
+	if (r->action == GWP_ACL_ACT_UPSTREAM)
+		rs->out_has_upstream = true;
+	/* The chain owns the rule, and the name with it, from here on. */
+	if (up_name)
+		return note_pool_ref(ld);
 	return 0;
 
 out:
+	/*
+	 * Another action's option may have filled the union of a rule whose
+	 * -j is UPSTREAM, so the name is freed from @up_name, not the union.
+	 */
+	if (r->action == GWP_ACL_ACT_UPSTREAM)
+		memset(&r->act, 0, sizeof(r->act));
+	free(up_name);
 	free_rule(r);
 	return ret;
 }
 
-static int parse_line(struct gwp_acl_ruleset *rs, char *line)
+/*
+ * The path of the file that "include @inc" names in the file @parent: @inc
+ * itself when absolute, else @inc in @parent's directory. Malloc'd, or NULL.
+ */
+static char *include_path(const char *parent, const char *inc)
+{
+	const char *slash = strrchr(parent, '/');
+	char *path;
+
+	if (inc[0] == '/' || !slash)
+		return strdup(inc);
+	if (asprintf(&path, "%.*s/%s", (int)(slash - parent), parent, inc) < 0)
+		return NULL;
+	return path;
+}
+
+/*
+ * "include PATH;": parse the file PATH here, as if its lines stood in place
+ * of this one. The ';' may also stand alone as the last word, but it must be
+ * there, and PATH is one word (no quoting, no globs).
+ */
+static int parse_include(struct acl_load *ld, char **tok, int n)
+{
+	char *inc, *path;
+	size_t len;
+	int r;
+
+	if (n == 3 && !strcmp(tok[2], ";")) {
+		inc = tok[1];
+	} else if (n == 2 && (len = strlen(tok[1])) > 1 &&
+		   tok[1][len - 1] == ';') {
+		tok[1][len - 1] = '\0';
+		inc = tok[1];
+	} else {
+		return -EINVAL;
+	}
+	if (strchr(inc, ';'))
+		return -EINVAL;
+
+	if (!ld->path) {
+		fprintf(stderr, "acl: include is only valid in a rule file\n");
+		return -EINVAL;
+	}
+
+	path = include_path(ld->path, inc);
+	if (!path)
+		return -ENOMEM;
+	r = load_file(ld, path);
+	free(path);
+	if (r) {
+		/* Said where in the included file; now say where it was included. */
+		ld->include_failed = true;
+		ld->reported = false;
+	}
+	return r;
+}
+
+static int parse_line(struct acl_load *ld, char *line)
 {
 	char *tok[ACL_MAX_TOKENS];
 	char *hash;
@@ -1280,10 +2068,16 @@ static int parse_line(struct gwp_acl_ruleset *rs, char *line)
 	if (n == 0)
 		return 0;		/* blank / comment-only */
 
+	if (ld->pool)
+		return parse_pool_line(ld, tok, n);
 	if (!strcmp(tok[0], "-P"))
-		return parse_policy(rs, tok, n);
+		return parse_policy(ld->rs, tok, n);
 	if (!strcmp(tok[0], "-A"))
-		return parse_rule(rs, tok, n);
+		return parse_rule(ld, tok, n);
+	if (!strcmp(tok[0], "include"))
+		return parse_include(ld, tok, n);
+	if (!strcmp(tok[0], "upstream"))
+		return parse_pool_open(ld, tok, n);
 	return -EINVAL;
 }
 
@@ -1496,9 +2290,9 @@ static uint32_t dom_tab_find(const struct acl_dom_tab *t, uint64_t seed,
  * Can @r be answered by a run index? It must test exactly one criterion,
  * an exact -m domain, a -d or a -s, not negated; and a match must end the
  * evaluation, so that the first matching rule of the run decides it and
- * nothing after it can matter. MARK and BIND without --accept let the
- * evaluation go on (and the last one wins), so they are tested rule by
- * rule.
+ * nothing after it can matter. MARK, BIND and UPSTREAM without --accept
+ * let the evaluation go on (and the last one wins), so they are tested rule
+ * by rule.
  */
 static bool rule_indexable(const struct gwp_acl_rule *r)
 {
@@ -1660,51 +2454,141 @@ static int ruleset_index(struct gwp_acl_ruleset *rs)
 	return ret;
 }
 
-static int parse_text(struct gwp_acl_ruleset *rs, const char *text)
+static void load_init(struct acl_load *ld, struct gwp_acl_ruleset *rs)
 {
-	char *copy, *cursor, *line;
-	unsigned lineno = 0;
-	int r = 0;
-
+	memset(ld, 0, sizeof(*ld));
+	ld->rs = rs;
 	ruleset_init(rs);
+}
 
-	copy = strdup(text);
-	if (!copy)
-		return -ENOMEM;
+/* End a load whose parse returned @r: index the rules, or free them. */
+static int load_finish(struct acl_load *ld, int r)
+{
+	size_t i;
 
-	cursor = copy;
-	while ((line = strsep(&cursor, "\n")) != NULL) {
-		lineno++;
-		r = parse_line(rs, line);
-		if (r) {
-			fprintf(stderr, "acl: parse error on line %u: %s\n",
-				lineno, strerror(-r));
-			break;
-		}
-	}
 	if (!r)
-		r = ruleset_index(rs);
+		r = resolve_pools(ld);
+	for (i = 0; i < ld->nr_refs; i++)
+		free(ld->refs[i].path);
+	free(ld->refs);
+	ld->refs = NULL;
+	ld->nr_refs = 0;
+	if (!r)
+		r = ruleset_index(ld->rs);
 	if (r)
-		ruleset_free(rs);
-
-	free(copy);
+		ruleset_free(ld->rs);
 	return r;
 }
 
-static int read_file(const char *path, char **out)
+static void files_free(struct acl_file *files, size_t nr)
 {
-	long sz;
+	size_t i;
+
+	for (i = 0; i < nr; i++)
+		free(files[i].path);
+	free(files);
+}
+
+/*
+ * Add @path to @ld->files unless it is there already. Returns the new entry,
+ * for the caller to record the file's identity in, or NULL: when the file is
+ * listed already (*@r = 0) or memory ran out (*@r = -ENOMEM).
+ */
+static struct acl_file *load_note_file(struct acl_load *ld, const char *path,
+				       int *r)
+{
+	struct acl_file *v;
+	char *dup;
+	size_t i;
+
+	*r = 0;
+	for (i = 0; i < ld->nr_files; i++) {
+		if (!strcmp(ld->files[i].path, path))
+			return NULL;
+	}
+	dup = strdup(path);
+	if (!dup)
+		goto oom;
+	v = realloc(ld->files, (ld->nr_files + 1) * sizeof(*v));
+	if (!v) {
+		free(dup);
+		goto oom;
+	}
+	ld->files = v;
+	v = &v[ld->nr_files++];
+	memset(v, 0, sizeof(*v));
+	v->path = dup;
+	v->err = EIO;
+	return v;
+oom:
+	*r = -ENOMEM;
+	return NULL;
+}
+
+/* Parse the rule text @text (modified in place) line by line into @ld. */
+static int parse_lines(struct acl_load *ld, char *text)
+{
+	char *cursor = text, *line;
+	unsigned lineno = 0;
+	int r;
+
+	while ((line = strsep(&cursor, "\n")) != NULL) {
+		lineno++;
+		ld->lineno = lineno;
+		ld->include_failed = false;
+		ld->reported = false;
+		r = parse_line(ld, line);
+		if (!r)
+			continue;
+		if (ld->reported)
+			;	/* the line's own message said it all */
+		else if (ld->include_failed)
+			fprintf(stderr, "acl: %s: line %u: failed to include a file\n",
+				ld->path, lineno);
+		else if (ld->path)
+			fprintf(stderr, "acl: %s: parse error on line %u: %s\n",
+				ld->path, lineno, strerror(-r));
+		else
+			fprintf(stderr, "acl: parse error on line %u: %s\n",
+				lineno, strerror(-r));
+		return r;
+	}
+
+	/* An include is refused inside a block, so the block is this file's. */
+	if (ld->pool) {
+		ld->lineno = ld->pool_line;
+		return load_err(ld, "upstream pool %s is not closed: \"}\" missing before the end of the file",
+				ld->pool->name);
+	}
+	return 0;
+}
+
+/* Wipe and free a buffer from read_file() of @size bytes. */
+static void text_free(char *text, size_t size)
+{
+	explicit_bzero(text, size);
+	free(text);
+}
+
+/*
+ * Read the whole of the open file @fd, which this closes, into a malloc'd
+ * NUL-terminated string at *@out of *@size bytes, the NUL included; free it
+ * with text_free(). @path is for the messages.
+ *
+ * read(2), not stdio: the text may hold upstream passwords, and a stdio
+ * buffer would keep a copy that nothing here could wipe. Every buffer this
+ * returns or drops is wiped, error paths included.
+ */
+static int read_file(int fd, const char *path, char **out, size_t *size)
+{
+	size_t sz, rd = 0;
+	ssize_t n = 0;
+	off_t end;
 	char *buf;
-	size_t rd;
-	FILE *fp;
 
-	fp = fopen(path, "rb");
-	if (!fp)
-		return -errno;
-
-	if (fseek(fp, 0, SEEK_END) || (sz = ftell(fp)) < 0 ||
-	    fseek(fp, 0, SEEK_SET)) {
-		fclose(fp);
+	end = lseek(fd, 0, SEEK_END);
+	if (end < 0 || lseek(fd, 0, SEEK_SET) < 0) {
+		close(fd);
 		return -EIO;
 	}
 
@@ -1714,15 +2598,16 @@ static int read_file(const char *path, char **out)
 	 * with two ACCEPT policies. A file meant to have no rules still needs
 	 * a line (a comment will do), so refuse an empty one.
 	 */
-	if (!sz) {
+	if (!end) {
 		fprintf(stderr, "acl: %s: file is empty\n", path);
-		fclose(fp);
+		close(fd);
 		return -ENODATA;
 	}
 
-	buf = malloc((size_t)sz + 1);
+	sz = (size_t)end;
+	buf = malloc(sz + 1);
 	if (!buf) {
-		fclose(fp);
+		close(fd);
 		return -ENOMEM;
 	}
 
@@ -1734,22 +2619,152 @@ static int read_file(const char *path, char **out)
 	 * rather than load a partial rule set. Asking for one byte more than
 	 * the size is what notices a file that grew.
 	 */
-	rd = fread(buf, 1, (size_t)sz + 1, fp);
-	if (ferror(fp) || rd != (size_t)sz) {
+	while (rd < sz + 1) {
+		n = read(fd, buf + rd, sz + 1 - rd);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		rd += (size_t)n;
+	}
+	close(fd);
+	if (n < 0 || rd != sz) {
 		fprintf(stderr, "acl: %s: changed while being read\n", path);
-		free(buf);
-		fclose(fp);
+		text_free(buf, sz + 1);
 		return -EIO;
 	}
-	fclose(fp);
 	if (memchr(buf, '\0', rd)) {
 		fprintf(stderr, "acl: %s: contains a NUL byte\n", path);
-		free(buf);
+		text_free(buf, sz + 1);
 		return -EINVAL;
 	}
 	buf[rd] = '\0';
 	*out = buf;
+	*size = sz + 1;
 	return 0;
+}
+
+/*
+ * The file @path, of mode @st, holds an upstream server URL with a password
+ * in it: say so once per load when other users can read it. Only a warning,
+ * as refusing it would take every rule down over a permission bit.
+ */
+static void warn_creds_mode(struct acl_load *ld, const char *path,
+			    const struct stat *st)
+{
+	size_t i;
+
+	if (!(st->st_mode & (S_IRGRP | S_IROTH)))
+		return;
+	for (i = 0; i < ld->nr_files; i++) {
+		if (!strcmp(ld->files[i].path, path)) {
+			if (ld->files[i].warned)
+				return;
+			ld->files[i].warned = true;
+			break;
+		}
+	}
+	fprintf(stderr, "acl: %s: warning: holds upstream credentials but is readable by group or others (mode %04o)\n",
+		path, (unsigned)(st->st_mode & 07777));
+}
+
+/*
+ * Parse the rule file @path into @ld, and through its include lines the
+ * files it includes. A file that is still being parsed further up the chain
+ * (compared by identity, so another name for it is no way round) would
+ * include itself forever and is refused, and so is a chain deeper than
+ * ACL_MAX_INCLUDE_DEPTH or a load of more than ACL_MAX_FILES files.
+ *
+ * Only a regular file is read. The open does not block, so a FIFO (or a
+ * device) put in place of a rule file is refused instead of stopping the
+ * reload, and every later one, until a writer comes along.
+ */
+static int load_file(struct acl_load *ld, const char *path)
+{
+	const char *parent = ld->path;
+	struct acl_file *rec;
+	struct stat st;
+	size_t size;
+	bool creds;
+	char *text;
+	unsigned i;
+	int fd, r;
+
+	if (++ld->nr_loads > ACL_MAX_FILES) {
+		fprintf(stderr, "acl: %s: more than %d files in one load\n",
+			path, ACL_MAX_FILES);
+		return -E2BIG;
+	}
+
+	rec = load_note_file(ld, path, &r);
+	if (r)
+		return r;
+
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0) {
+		r = -errno;
+		if (rec)
+			rec->err = -r;
+		/* The caller reports the top file, by its option. */
+		if (parent)
+			fprintf(stderr, "acl: %s: %s\n", path, strerror(-r));
+		return r;
+	}
+	if (fstat(fd, &st)) {
+		r = -errno;
+		if (rec)
+			rec->err = -r;
+		close(fd);
+		return r;
+	}
+	/*
+	 * Taken before the read, so a change made from here on differs from
+	 * it, and the reload watch cannot mistake it for what was read.
+	 */
+	if (rec) {
+		rec->err = 0;
+		rec->st = st;
+	}
+
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "acl: %s: not a regular file\n", path);
+		close(fd);
+		return -EINVAL;
+	}
+	if (ld->depth > ACL_MAX_INCLUDE_DEPTH) {
+		fprintf(stderr, "acl: %s: includes nest deeper than %d levels\n",
+			path, ACL_MAX_INCLUDE_DEPTH);
+		close(fd);
+		return -ELOOP;
+	}
+	for (i = 0; i < ld->depth; i++) {
+		if (ld->stack[i].dev == st.st_dev &&
+		    ld->stack[i].ino == st.st_ino) {
+			fprintf(stderr, "acl: %s: include cycle, the file includes itself\n",
+				path);
+			close(fd);
+			return -ELOOP;
+		}
+	}
+
+	r = read_file(fd, path, &text, &size);
+	if (r)
+		return r;
+
+	ld->stack[ld->depth].dev = st.st_dev;
+	ld->stack[ld->depth].ino = st.st_ino;
+	ld->depth++;
+	ld->path = path;
+	creds = ld->creds;
+	ld->creds = false;
+	r = parse_lines(ld, text);
+	if (!r && ld->creds)
+		warn_creds_mode(ld, path, &st);
+	ld->creds = creds;
+	ld->path = parent;
+	ld->depth--;
+	text_free(text, size);
+	return r;
 }
 
 /*
@@ -1962,47 +2977,72 @@ static void rs_retire(struct gwp_acl_ruleset *old)
 	ruleset_destroy(old);
 }
 
-int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
+/* A new ACL that publishes @rs, which it takes on success. */
+static int acl_alloc(struct gwp_acl **out, struct gwp_acl_ruleset *rs)
 {
-	struct gwp_acl_ruleset *rs;
 	struct gwp_acl *acl;
 	int r;
 
 	acl = calloc(1, sizeof(*acl));
-	rs = malloc(sizeof(*rs));
-	if (!acl || !rs) {
-		free(acl);
-		free(rs);
+	if (!acl)
 		return -ENOMEM;
-	}
 
 	r = pthread_mutex_init(&acl->reload_lock, NULL);
 	if (r) {
 		free(acl);
-		free(rs);
 		return -r;
 	}
 
-	r = parse_text(rs, text);
-	if (r) {
-		pthread_mutex_destroy(&acl->reload_lock);
-		free(acl);
-		free(rs);
-		return r;
-	}
 	rs->gen = 0;
 	atomic_init(&acl->rs, rs);
 	atomic_init(&acl->gen, 0);
 	atomic_init(&acl->sum, ruleset_summary(rs));
-
 	*out = acl;
 	return 0;
 }
 
+int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
+{
+	struct gwp_acl_ruleset *rs;
+	struct acl_load ld;
+	size_t size;
+	char *copy;
+	int r;
+
+	rs = malloc(sizeof(*rs));
+	size = strlen(text) + 1;
+	copy = strdup(text);
+	if (!rs || !copy) {
+		free(rs);
+		free(copy);
+		return -ENOMEM;
+	}
+
+	load_init(&ld, rs);
+	r = load_finish(&ld, parse_lines(&ld, copy));
+	/* The copy may hold passwords, and its newlines are NULs now. */
+	text_free(copy, size);
+	if (!r) {
+		r = acl_alloc(out, rs);
+		if (r)
+			ruleset_free(rs);
+	}
+	if (r)
+		free(rs);
+	return r;
+}
+
 int gwp_acl_create(struct gwp_acl **out, const char *path)
 {
+	return gwp_acl_create_ops(out, path, NULL);
+}
+
+int gwp_acl_create_ops(struct gwp_acl **out, const char *path,
+		       const struct gwp_acl_server_ops *ops)
+{
+	struct gwp_acl_ruleset *rs;
 	struct gwp_acl *acl;
-	char *text;
+	struct acl_load ld;
 	int r;
 
 	if (!path || !path[0]) {
@@ -2010,15 +3050,27 @@ int gwp_acl_create(struct gwp_acl **out, const char *path)
 		return 0;
 	}
 
-	r = read_file(path, &text);
-	if (r)
-		return r;
+	rs = malloc(sizeof(*rs));
+	if (!rs)
+		return -ENOMEM;
 
-	r = gwp_acl_parse_str(&acl, text);
-	free(text);
-	if (r)
+	load_init(&ld, rs);
+	ld.ops = ops;
+	r = load_finish(&ld, load_file(&ld, path));
+	if (!r) {
+		r = acl_alloc(&acl, rs);
+		if (r)
+			ruleset_free(rs);
+	}
+	if (r) {
+		free(rs);
+		files_free(ld.files, ld.nr_files);
 		return r;
+	}
 
+	acl->files = ld.files;
+	acl->nr_files = ld.nr_files;
+	acl->ops = ops;
 	acl->path = strdup(path);
 	if (!acl->path) {
 		gwp_acl_destroy(acl);
@@ -2032,30 +3084,41 @@ int gwp_acl_create(struct gwp_acl **out, const char *path)
 int gwp_acl_reload(struct gwp_acl *acl)
 {
 	struct gwp_acl_ruleset *rs, *old;
+	struct acl_load ld;
 	uint32_t gen;
-	char *text;
 	int r;
 
 	if (!acl || !acl->path)
 		return -EINVAL;
 
-	r = read_file(acl->path, &text);
-	if (r)
-		return r;
-
 	rs = malloc(sizeof(*rs));
-	if (!rs) {
-		free(text);
+	if (!rs)
 		return -ENOMEM;
+
+	load_init(&ld, rs);
+	ld.ops = acl->ops;
+	r = load_finish(&ld, load_file(&ld, acl->path));
+
+	/*
+	 * The files this attempt met replace the list even when it failed:
+	 * they are the ones whose change can make the next attempt succeed.
+	 * Running out of memory may have cut the list short, though, and
+	 * says nothing about the files, so then the old list stays.
+	 */
+	pthread_mutex_lock(&acl->reload_lock);
+	if (r == -ENOMEM) {
+		files_free(ld.files, ld.nr_files);
+	} else {
+		files_free(acl->files, acl->nr_files);
+		acl->files = ld.files;
+		acl->nr_files = ld.nr_files;
 	}
-	r = parse_text(rs, text);
-	free(text);
 	if (r) {
+		pthread_mutex_unlock(&acl->reload_lock);
 		free(rs);
 		return r;			/* keep the old rules */
 	}
 
-	pthread_mutex_lock(&acl->reload_lock);
 	gen = atomic_load_explicit(&acl->gen, memory_order_relaxed) + 1;
 	rs->gen = gen;
 	old = atomic_exchange_explicit(&acl->rs, rs, memory_order_seq_cst);
@@ -2074,6 +3137,23 @@ int gwp_acl_reload(struct gwp_acl *acl)
 	return 0;
 }
 
+const char *gwp_acl_file(const struct gwp_acl *acl, size_t i)
+{
+	if (!acl || i >= acl->nr_files)
+		return NULL;
+	return acl->files[i].path;
+}
+
+int gwp_acl_file_stat(const struct gwp_acl *acl, size_t i, struct stat *st)
+{
+	if (!acl || i >= acl->nr_files)
+		return -ENOENT;
+	if (acl->files[i].err)
+		return -acl->files[i].err;
+	*st = acl->files[i].st;
+	return 0;
+}
+
 /* The caller guarantees that no evaluation is running or will start. */
 void gwp_acl_destroy(struct gwp_acl *acl)
 {
@@ -2081,6 +3161,7 @@ void gwp_acl_destroy(struct gwp_acl *acl)
 		return;
 	ruleset_destroy(atomic_load_explicit(&acl->rs, memory_order_relaxed));
 	pthread_mutex_destroy(&acl->reload_lock);
+	files_free(acl->files, acl->nr_files);
 	free(acl->path);
 	free(acl);
 }
@@ -2152,11 +3233,19 @@ static bool user_match(const struct gwp_acl_rule *r, const char *user)
  * Only ever call this behind a @has_statistic test: @st_every is 0 on a rule
  * that does not use the module, so an unguarded call divides by zero.
  */
-static bool statistic_match(struct gwp_acl_rule *r)
+static bool statistic_match(struct gwp_acl_rule *r, bool peek)
 {
 	uint32_t n;
 
-	n = atomic_fetch_add_explicit(&r->st_count, 1, memory_order_relaxed);
+	/*
+	 * gwp_acl_eval_upstream() asks what the next evaluation would say,
+	 * without taking its turn: the connection's real evaluations follow.
+	 */
+	if (peek)
+		n = atomic_load_explicit(&r->st_count, memory_order_relaxed);
+	else
+		n = atomic_fetch_add_explicit(&r->st_count, 1,
+					      memory_order_relaxed);
 	return (n % r->st_every) == r->st_packet;
 }
 
@@ -2191,9 +3280,45 @@ static bool name_crit_ok(const struct gwp_acl_rule *r,
 	return ok;
 }
 
+/* Does @r test the target: its address, its port or its name? */
+static bool rule_tests_target(const struct gwp_acl_rule *r)
+{
+	return r->has_dst || r->has_dports || r->has_domain;
+}
+
+/*
+ * With no target at all (@q->no_target), would @r match but for its target
+ * criteria? The criteria that do not look at the target, in either
+ * polarity. A statistic is taken as one that could match: whether it does
+ * depends on other connections, and the answer should not.
+ */
+static bool rule_matches_but_target(struct gwp_acl_rule *r,
+				    const struct gwp_acl_req *q)
+{
+	if (CRIT_FAILS(r, has_proto, neg_proto, q->proto == r->proto))
+		return false;
+	if (CRIT_FAILS(r, has_sports, neg_sports,
+		       ports_match(&r->sports, q->sport)))
+		return false;
+	if (CRIT_FAILS(r, has_src, neg_src,
+		       q->client && cidr_match(&r->src, q->client)))
+		return false;
+	return !CRIT_FAILS(r, has_user, neg_user, user_match(r, q->user));
+}
+
 static bool rule_matches(struct gwp_acl_rule *r,
 			 const struct gwp_acl_req *q)
 {
+	/*
+	 * No target at all: whatever a rule says about the target is
+	 * undecidable, in either polarity, so such a rule never matches. A
+	 * "! --domain" would otherwise match, as for an address target that
+	 * truly has no name, and an "except that name" rule would apply to
+	 * every target.
+	 */
+	if (q->no_target && rule_tests_target(r))
+		return false;
+
 	/*
 	 * -d cannot be evaluated for a domain-only request (remote-DNS
 	 * upstream: no resolved IP), and neither can --dports when the port is
@@ -2237,7 +3362,8 @@ static bool rule_matches(struct gwp_acl_rule *r,
 	 * connections it does not select and the split would be against the
 	 * wrong population.
 	 */
-	return !CRIT_FAILS(r, has_statistic, neg_statistic, statistic_match(r));
+	return !CRIT_FAILS(r, has_statistic, neg_statistic,
+			   statistic_match(r, q->upstream_only));
 }
 
 /* Read a sockaddr's port (host byte order) regardless of family. */
@@ -2292,8 +3418,8 @@ static void apply_dnat(struct gwp_acl_req *req, const struct gwp_acl_dnat *d)
 
 /*
  * Walk chain @c, returning the first terminal verdict. DNAT rewrites
- * @req->dnat; MARK is a composable modifier that records @req->mark and
- * keeps matching. An indexed run is answered by its first matching rule,
+ * @req->dnat; MARK, BIND and UPSTREAM are composable modifiers that record
+ * @req->mark, @req->bind and @req->upstream(_pool) and keep matching. An indexed run is answered by its first matching rule,
  * found by lookup instead of testing each of its rules.
  */
 static enum gwp_acl_verdict __eval_chain(const struct acl_chain *c,
@@ -2306,7 +3432,14 @@ static enum gwp_acl_verdict __eval_chain(const struct acl_chain *c,
 	while (i < c->nr) {
 		struct gwp_acl_rule *r;
 
-		if (run != run_end && i == run->start) {
+		/*
+		 * With no target the index cannot answer: its runs test
+		 * nothing but the target or the source, and a run's rule
+		 * that tests the target must still be seen to leave the
+		 * pick unsure. Walk such a request rule by rule; it is
+		 * evaluated once per association.
+		 */
+		if (!req->no_target && run != run_end && i == run->start) {
 			uint32_t pos = run_find(run, seed, req);
 
 			i = run->end;
@@ -2316,8 +3449,18 @@ static enum gwp_acl_verdict __eval_chain(const struct acl_chain *c,
 			r = &c->rules[pos];
 		} else {
 			r = &c->rules[i++];
-			if (!rule_matches(r, req))
+			if (!rule_matches(r, req)) {
+				/*
+				 * A pool rule passed over for want of a target
+				 * might send the request to its pool.
+				 */
+				if (req->no_target &&
+				    r->action == GWP_ACL_ACT_UPSTREAM &&
+				    r->act.up.pool && rule_tests_target(r) &&
+				    rule_matches_but_target(r, req))
+					req->upstream_unsure = true;
 				continue;
+			}
 		}
 
 		switch (r->action) {
@@ -2336,6 +3479,17 @@ static enum gwp_acl_verdict __eval_chain(const struct acl_chain *c,
 		case GWP_ACL_ACT_BIND:
 			/* Modifier: record the source/iface bind, keep matching. */
 			req->bind = r->act.bind;
+			if (r->then_accept)
+				return GWP_ACL_ACCEPT;
+			continue;
+		case GWP_ACL_ACT_UPSTREAM:
+			/*
+			 * Modifier: record the pool (no reference yet, see
+			 * gwp_acl_eval_output()), keep matching.
+			 */
+			req->upstream_pool = r->act.up.pool;
+			req->upstream = r->act.up.pool ? GWP_ACL_UPSTREAM_POOL
+						       : GWP_ACL_UPSTREAM_DIRECT;
 			if (r->then_accept)
 				return GWP_ACL_ACCEPT;
 			continue;
@@ -2372,15 +3526,21 @@ static enum gwp_acl_verdict eval_chain(const struct gwp_acl_ruleset *rs,
 	if (!regex_failed())
 		return v;
 
+	/* A pick that missed a rule may have missed a pool: not known. */
+	if (req->upstream_only)
+		req->upstream_unsure = true;
+
 	req->dnat_applied = false;
 	req->mark_set = false;
 	req->bind.set = false;
+	req->upstream = GWP_ACL_UPSTREAM_NONE;
+	req->upstream_pool = NULL;
 	req->cacheable = false;
 	return GWP_ACL_REJECT;
 }
 
-enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
-					 struct gwp_acl_req *req)
+static enum gwp_acl_verdict eval_output(struct gwp_acl *acl,
+				       struct gwp_acl_req *req, bool pick)
 {
 	struct gwp_acl_ruleset *rs;
 	enum gwp_acl_verdict verdict;
@@ -2391,8 +3551,13 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 	req->dnat_applied = false;
 	req->mark_set = false;
 	req->bind.set = false;
+	req->upstream = GWP_ACL_UPSTREAM_NONE;
+	req->upstream_pool = NULL;
+	req->upstream_unsure = false;
 	req->gen = 0;
 	req->cacheable = true;
+	if (!pick)
+		req->no_target = false;
 	if (!acl)
 		return GWP_ACL_ACCEPT;
 
@@ -2407,6 +3572,11 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 	rs = rs_get(acl, &slot);
 	req->gen = rs->gen;
 	req->cacheable = !rs->out_has_stat;
+	if (pick && !rs->out_has_upstream) {
+		rs_put(slot);
+		return GWP_ACL_ACCEPT;
+	}
+	req->upstream_only = pick;
 	/* Memo slots are only meaningful for the ruleset that filled them. */
 	if (req->memo && (!req->memo->valid || req->memo->gen != req->gen)) {
 		req->memo->valid = true;
@@ -2415,8 +3585,43 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 		req->memo->ok = 0;
 	}
 	verdict = eval_chain(rs, &rs->out, req);
+	req->upstream_only = false;
+	if (req->upstream_unsure) {
+		req->upstream = GWP_ACL_UPSTREAM_UNSURE;
+		req->upstream_pool = NULL;
+	}
+	/*
+	 * The pool is freed with the ruleset once a reload retires it, which
+	 * may happen as soon as this read section ends. The caller needs the
+	 * pool longer than that, so it gets a reference, taken while the
+	 * section still keeps the ruleset alive. A refused request has no use
+	 * for an upstream, and gets none. A pick keeps what it found, whatever
+	 * its own verdict: it cannot test -d on a name, so its verdict is not
+	 * the request's, and the real evaluations that follow decide that. A
+	 * pick that dropped the pool on a REJECT that only says "no -d rule
+	 * matched" would send the request past its pool.
+	 */
+	if (verdict != GWP_ACL_ACCEPT && !pick) {
+		req->upstream = GWP_ACL_UPSTREAM_NONE;
+		req->upstream_pool = NULL;
+	} else if (req->upstream_pool) {
+		gwp_acl_pool_get(req->upstream_pool);
+	}
 	rs_put(slot);
 	return verdict;
+}
+
+enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
+					 struct gwp_acl_req *req)
+{
+	return eval_output(acl, req, false);
+}
+
+enum gwp_acl_upstream gwp_acl_eval_upstream(struct gwp_acl *acl,
+					    struct gwp_acl_req *req)
+{
+	eval_output(acl, req, true);
+	return (enum gwp_acl_upstream)req->upstream;
 }
 
 uint32_t gwp_acl_generation(struct gwp_acl *acl)
@@ -2443,6 +3648,8 @@ enum gwp_acl_verdict gwp_acl_eval_input(struct gwp_acl *acl,
 						 : GWP_ACL_ACCEPT;
 
 	rs = rs_get(acl, &slot);
+	req->upstream_only = false;
+	req->no_target = false;
 	verdict = eval_chain(rs, &rs->in, req);
 	rs_put(slot);
 	return verdict;
