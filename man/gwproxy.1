@@ -1553,7 +1553,11 @@ the target and gets reply 0x01 (general failure): a SOCKS5 upstream's reply
 address type of gwproxy's request not supported) or any unassigned one, an
 HTTP 407, which says the upstream refused gwproxy's credentials, and any other
 status (403, 500, 503, ...), as well as a SOCKS5 upstream that refuses the
-credentials.
+credentials. So does an upstream that cannot be reached at all, its TCP
+connection refused, reset or unreachable: that is the upstream's failure, not
+the target's (HTTP 502). One that does not get through the handshake in time
+is answered as a target that times out is, reply 0x06 or HTTP 504 (see
+.BR \-\-connect\-timeout ).
 .PP
 The end of the upstream's stream reaches the client as a normal end of stream
 only if it is one, as for a TLS client in the other direction (see
@@ -1737,8 +1741,8 @@ nothing and loses nothing. It has what is left of the connection's
 no more: a connection that ran out of time is not retried, and when the retry
 runs out of it, that does not count against its server. With no other
 server to take, or once its retry has failed too, the client gets the reply
-it would have had without one: SOCKS5 reply 0x05 for a refused connection and
-0x01 for a failed handshake, or HTTP 502. A failure that does not count is not
+it would have had without one: SOCKS5 reply 0x01 (general failure), for a
+refused connection as for a failed handshake, or HTTP 502. A failure that does not count is not
 retried, and neither is a connection through
 .BR \-\-upstream\-proxy .
 .PP

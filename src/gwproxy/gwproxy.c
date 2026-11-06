@@ -4941,6 +4941,22 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	if (timed_out)
 		err = -ETIMEDOUT;
 
+	/*
+	 * Through an upstream proxy, a connect that failed was to the proxy,
+	 * not to the destination: a proxy that refused it, reset it or could
+	 * not be reached says nothing about the destination, so it is the
+	 * chain's failure, REP 0x01, as a failed handshake with the proxy is
+	 * (gwp_upstream_fail_reply(), which has noted how the handshake
+	 * ended). These are the errnos that count against the proxy's
+	 * health. Anything else keeps its answer: a destination of a family
+	 * --outgoing-family forbids (REP 0x08), local trouble (0x01), and a
+	 * timeout, which still says that time ran out.
+	 */
+	if (!timed_out && gcp->upstream &&
+	    (gcp->flags & GWP_CONN_FLAG_UP_FAILED) && !gcp->up_end &&
+	    gwp_upstream_connect_class(err) == GWP_UPSTREAM_FAIL_UPSTREAM)
+		err = -EPROTO;
+
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5)
 		return gwp_socks5_prep_connect_reply(w, gcp, err);
 
