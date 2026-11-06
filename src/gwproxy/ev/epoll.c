@@ -21,6 +21,22 @@
 #include <gwproxy/ssl.h>
 #endif
 
+/*
+ * Take @fd out of the epoll set; done before every close() of a descriptor
+ * that may be in it. close() alone does not remove it: epoll drops an item
+ * only when the last reference to the file goes, and another process may
+ * hold one for a moment, as anything reading /proc/<pid>/fd does (ls -l,
+ * ss -p, lsof). An event that comes in meanwhile is still reported, with the
+ * data of the pair the descriptor belonged to, which may be freed by then.
+ *
+ * -ENOENT, for a descriptor that was never added or is already out, is
+ * expected and ignored; nothing else can fail on a valid descriptor.
+ */
+static void ep_del(struct gwp_wrk *w, int fd)
+{
+	if (fd >= 0)
+		__sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, fd, NULL);
+}
 
 #ifdef CONFIG_HTTPS
 static int tls_flush_hs(struct gwp_conn *c);
@@ -88,6 +104,11 @@ static int handle_raw_dns_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 					 GWP_MAX_CONN_CAND, &nr);
 	if (ret == -ESRCH)
 		return 1;
+	/* The lookup is over: its socket is done with; see ep_del(). */
+	if (ret != -EAGAIN) {
+		ep_del(w, gcp->gdp->fd);
+		gwp_dns_res_drop_query(gcp->gdp);
+	}
 	if (ret == -EAGAIN) {
 		/* Retry with the fallback record type. */
 		ret = send_dns_payload(gcp);
@@ -465,6 +486,21 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 				nr_fd_closed++;
 	}
 
+	/*
+	 * gwp_free_conn_pair() closes them; out of the epoll set first, see
+	 * ep_del(). The raw DNS query's socket is out already, see
+	 * free_conn_pair().
+	 */
+	ep_del(w, gcp->client.fd);
+	ep_del(w, gcp->target.fd);
+	ep_del(w, gcp->udp_fd);
+	{
+		uint8_t i;
+
+		for (i = 0; i < GWP_MAX_CONN_CAND; i++)
+			ep_del(w, gcp->attempt_fd[i]);
+	}
+
 	r = gwp_free_conn_pair(w, gcp);
 	if (unlikely(r)) {
 		pr_err(&ctx->lh, "Failed to free connection pair: %s", strerror(-r));
@@ -482,9 +518,9 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * throwing away the rest of the batch only to collect it again.
  *
  * Its descriptors stay open until then, which also keeps their numbers from
- * being reused within the batch. The one way to reach a pair that is not an
- * event of its own, a raw DNS reply looked up by transaction id, is cut off
- * here, so a reply later in the batch cannot revive it.
+ * being reused within the batch, and stay in the epoll set until they are
+ * closed (__free_conn_pair()). A raw DNS query's socket is taken out and
+ * closed here instead, so a reply later in the batch cannot revive the pair.
  */
 static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -512,6 +548,7 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (w->ctx->cfg.use_raw_dns && gcp->gdp && gcp->gdp->fd >= 0) {
 		int r;
 
+		ep_del(w, gcp->gdp->fd);
 		gwp_dns_res_drop_query(gcp->gdp);
 		r = credit_fd_closed(w, 1);
 		if (unlikely(r))
@@ -1584,7 +1621,8 @@ static int upstream_redial(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r;
 
 	if (gcp->target.fd >= 0) {
-		/* Closing it takes it out of the epoll set too. */
+		/* Not by closing it alone; see ep_del(). */
+		ep_del(w, gcp->target.fd);
 		__sys_close(gcp->target.fd);
 		gcp->target.fd = -1;
 		gcp->target.ep_mask = 0;
@@ -2010,9 +2048,12 @@ static int adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int fd = gcp->attempt_fd[slot];
 	int closed, r;
+	uint8_t i;
 
 	gcp->attempt_fd[slot] = -1;
 	tmr_disarm(w, gcp, GWP_TMR_ATTEMPT);
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++)
+		ep_del(w, gcp->attempt_fd[i]);	/* the losers; see ep_del() */
 	closed = gwp_conn_close_attempts(gcp);
 	if (closed) {
 		/*
@@ -2122,6 +2163,7 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 			strerror(err), fd, gcp->idx,
 			ip_to_str(&gcp->target_addr));
 
+		ep_del(w, fd);
 		__sys_close(fd);
 		gcp->attempt_fd[slot] = -1;
 		r = credit_fd_closed(w, 1);
@@ -2329,7 +2371,7 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * socket: close() answers unread data with an RST instead of a FIN,
 	 * so a socket whose read side has not reached EOF still gets the
 	 * explicit shutdown(). Likewise a hung-up fd needs no EPOLL_CTL_DEL
-	 * when close() is about to remove it.
+	 * here: the teardown takes it out (__free_conn_pair()).
 	 */
 	done = gcp->client.wr_shut && gcp->target.wr_shut;
 	if (shut_client && !(done && gcp->client.rd_eof))

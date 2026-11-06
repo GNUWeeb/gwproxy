@@ -184,10 +184,8 @@ int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 		return -ESRCH;
 
 	r = gwdns_parse_query(txid, gdp->port, buf, len, addrs, cap, nr_addrs);
-	if (!r) {
-		gwp_dns_res_drop_query(gdp);
+	if (!r)
 		return 0;
-	}
 
 	/*
 	 * A datagram arrives whole, so "need more data" from the parser
@@ -213,6 +211,5 @@ int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 		r = tmp;
 	}
 
-	gwp_dns_res_drop_query(gdp);
 	return (int)r;
 }
