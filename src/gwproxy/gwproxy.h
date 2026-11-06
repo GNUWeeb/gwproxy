@@ -1092,6 +1092,19 @@ static inline void gwp_upstream_note_end(struct gwp_conn_pair *gcp,
 }
 
 /*
+ * Whether the upstream said the attempt failed at the destination (a SOCKS5
+ * REP 0x03 to 0x06, an HTTP 502 or 504): the one kind of upstream failure a
+ * client can be told about as the destination's.
+ */
+static inline bool gwp_upstream_dst_failed(const struct gwp_conn_pair *gcp)
+{
+	return gcp->up_end &&
+	       gwp_upstream_fail_classify((enum gwp_upstream_end)(gcp->up_end - 1),
+					  gcp->up_val) ==
+	       GWP_UPSTREAM_FAIL_DESTINATION;
+}
+
+/*
  * The attempt through @gcp's upstream failed with @err, before the tunnel
  * was up: a connect, the TLS or proxy handshake, or the time they had.
  * Every way such an attempt fails, on both event loops, ends here, and
