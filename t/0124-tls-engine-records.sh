@@ -30,6 +30,13 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
 
 # The scenarios take a lot of CPU, more so under a sanitizer, and each looks at
 # the memory of a proxy of its own: run them all at once.
+#
+# A scenario gives up once its proxy has stopped making progress, however long
+# a proxy starved of CPU takes to get there. The timeout only catches a client
+# that hangs: let it run for as long as the runner lets the test (t/run-one.sh),
+# less the time to collect what the scenarios have to say.
+limit=$((${GWP_TEST_TIMEOUT:-180} - 30))
+[ "$limit" -ge 150 ] || limit=150
 declare -a runs=()
 start_scenario()
 {
@@ -40,7 +47,7 @@ start_scenario()
 	gwp_start "127.0.0.1:$pp" --as-http=1 --event-loop="$loop" \
 		--tls-cert="$WORK/cert.pem" --tls-key="$WORK/key.pem" \
 		--nr-workers=1 --protocol-timeout=60 "$@"
-	timeout 150 python3 "$SERVERS_DIR/tls_keyupdate_client.py" \
+	timeout "$limit" python3 "$SERVERS_DIR/tls_keyupdate_client.py" \
 		"$scenario" "$pp" "$GWP_PID" >"$WORK/$loop.$scenario" 2>&1 &
 	runs+=("$!:$loop.$scenario")
 }
