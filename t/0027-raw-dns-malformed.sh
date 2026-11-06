@@ -72,91 +72,98 @@ except Exception:
 # loop"), so there is no second loop to iterate here. Spelling it out because
 # every other test in this directory does iterate both, and a build without
 # io_uring hides the difference.
-for loop in epoll; do
+loop=epoll
 
-	for mode in good uncompressed-name cname-jump rdata-truncated \
-		    field-truncated tc-set question-label; do
-		rm -f "$WORK/nr_queries"
-		start_dns_responder "$mode" "$WORK/nr_queries"
+# Each case has a responder and a proxy of its own, so they all run at once:
+# one after the other, starting the Python and the proxies of nine of them
+# took minutes on a loaded host. A case keeps its files in $WORK/<case>.
+dns_case()
+{
+	local mode="$1" W="$WORK/$1" dp p rep nq code
+
+	mkdir -p "$W"
+	case "$mode" in
+	http)
+		# The HTTP proxy resolves through the same raw resolver. Its
+		# CONNECT path used to treat the pending raw query as a
+		# getaddrinfo() entry and hand a field of the DNS packet to
+		# epoll_ctl() as a descriptor, so the query was never even sent.
+		start_dns_responder good
 		dp="$DNS_PORT"
-		dns_pid="$DNS_PID"
-
+		p="$(pick_port)"
+		gwp_start "127.0.0.1:$p" --as-http=1 --raw-dns=1 \
+			--dns-server="127.0.0.1:$dp" --event-loop="$loop" \
+			--nr-workers=1
+		code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+			-p -x "http://127.0.0.1:$p" \
+			"http://probe.example.com:$hp/index.html")"
+		[ "$code" = 200 ] || \
+			fail "[$loop] HTTP CONNECT through raw DNS got '$code' (want 200)"
+		kill -0 "$GWP_PID" 2>/dev/null || \
+			fail "[$loop] proxy died on an HTTP CONNECT through raw DNS"
+		return 0
+		;;
+	absent)
+		# ...and the case where no response comes back at all. The
+		# socket is connected, so a DNS server that is simply not there
+		# answers with an ICMP port unreachable, which surfaces as
+		# -ECONNREFUSED on recv. That used to break the event loop: one
+		# unreachable resolver and the worker took every connection
+		# down with it. Nothing is started on this port on purpose.
+		dp="$(pick_port)"
 		p="$(pick_port)"
 		gwp_start "127.0.0.1:$p" --as-socks5=1 --raw-dns=1 \
 			--dns-server="127.0.0.1:$dp" --event-loop="$loop" \
 			--nr-workers=1
-
 		rep="$(ask "$p" "$hp")"
-		case "$mode" in
-		good|uncompressed-name)
-			# Resolved to 127.0.0.1 and connected to the origin.
-			[ "$rep" = "REP=0x00" ] || \
-				fail "[$loop] $mode did not resolve (got '$rep')"
-			;;
-		*)
-			case "$mode:$rep" in
-			*:REP=0x00)
-				fail "[$loop] $mode was used to connect" ;;
-			# A question that is not ours to parse is not an
-			# answer at all: the lookup ignores it and waits.
-			question-label:NONE) ;;
-			*:NONE)
-				fail "[$loop] $mode was not refused with a reply" ;;
-			esac
-			# Anything still being sent would show up by now.
-			sleep 0.5
-			nq="$(cat "$WORK/nr_queries" 2>/dev/null)"
-			[ -n "$nq" ] && [ "$nq" -le 2 ] || \
-				fail "[$loop] $mode took '$nq' queries (want at most 2)"
-			;;
-		esac
-
-		# Still serving, not merely still running.
+		[ "$rep" = "NONE" ] || \
+			fail "[$loop] an absent DNS server somehow answered (got '$rep')"
 		kill -0 "$GWP_PID" 2>/dev/null || \
-			fail "[$loop] proxy died on a '$mode' DNS response"
+			fail "[$loop] proxy died because its DNS server was unreachable"
+		return 0
+		;;
+	esac
 
-		kill "$GWP_PID" 2>/dev/null
-		wait "$GWP_PID" 2>/dev/null
-		kill "$dns_pid" 2>/dev/null
-	done
-
-	# The HTTP proxy resolves through the same raw resolver. Its CONNECT
-	# path used to treat the pending raw query as a getaddrinfo() entry
-	# and hand a field of the DNS packet to epoll_ctl() as a descriptor,
-	# so the query was never even sent.
-	start_dns_responder good
+	start_dns_responder "$mode" "$W/nr_queries"
 	dp="$DNS_PORT"
-	dns_pid="$DNS_PID"
-	p="$(pick_port)"
-	gwp_start "127.0.0.1:$p" --as-http=1 --raw-dns=1 \
-		--dns-server="127.0.0.1:$dp" --event-loop="$loop" --nr-workers=1
-	code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
-		-p -x "http://127.0.0.1:$p" "http://probe.example.com:$hp/index.html")"
-	[ "$code" = 200 ] || \
-		fail "[$loop] HTTP CONNECT through raw DNS got '$code' (want 200)"
-	kill -0 "$GWP_PID" 2>/dev/null || \
-		fail "[$loop] proxy died on an HTTP CONNECT through raw DNS"
-	kill "$GWP_PID" 2>/dev/null
-	wait "$GWP_PID" 2>/dev/null
-	kill "$dns_pid" 2>/dev/null
 
-	# ...and the case where no response comes back at all. The socket is
-	# connected, so a DNS server that is simply not there answers with an
-	# ICMP port unreachable, which surfaces as -ECONNREFUSED on recv. That
-	# used to break the event loop: one unreachable resolver and the worker
-	# took every connection down with it. Nothing is started on this port
-	# on purpose.
-	dp="$(pick_port)"
 	p="$(pick_port)"
 	gwp_start "127.0.0.1:$p" --as-socks5=1 --raw-dns=1 \
-		--dns-server="127.0.0.1:$dp" --event-loop="$loop" --nr-workers=1
+		--dns-server="127.0.0.1:$dp" --event-loop="$loop" \
+		--nr-workers=1
+
 	rep="$(ask "$p" "$hp")"
-	[ "$rep" = "NONE" ] || \
-		fail "[$loop] an absent DNS server somehow answered (got '$rep')"
+	case "$mode" in
+	good|uncompressed-name)
+		# Resolved to 127.0.0.1 and connected to the origin.
+		[ "$rep" = "REP=0x00" ] || \
+			fail "[$loop] $mode did not resolve (got '$rep')"
+		;;
+	*)
+		case "$mode:$rep" in
+		*:REP=0x00)
+			fail "[$loop] $mode was used to connect" ;;
+		# A question that is not ours to parse is not an answer at
+		# all: the lookup ignores it and waits.
+		question-label:NONE) ;;
+		*:NONE)
+			fail "[$loop] $mode was not refused with a reply" ;;
+		esac
+		# Anything still being sent would show up by now.
+		sleep 0.5
+		nq="$(cat "$W/nr_queries" 2>/dev/null)"
+		[ -n "$nq" ] && [ "$nq" -le 2 ] || \
+			fail "[$loop] $mode took '$nq' queries (want at most 2)"
+		;;
+	esac
+
+	# Still serving, not merely still running.
 	kill -0 "$GWP_PID" 2>/dev/null || \
-		fail "[$loop] proxy died because its DNS server was unreachable"
-	kill "$GWP_PID" 2>/dev/null
-	wait "$GWP_PID" 2>/dev/null
-done
+		fail "[$loop] proxy died on a '$mode' DNS response"
+	return 0
+}
+
+gwp_parallel dns_case good uncompressed-name cname-jump rdata-truncated \
+	field-truncated tc-set question-label http absent
 
 pass
