@@ -927,43 +927,43 @@ static void gwp_ctx_free_log(struct gwp_ctx *ctx)
  * only truncated once we hold its lock, so a second instance pointed at the
  * same file leaves the first one's PID alone. The lock is held, and the file
  * kept, for as long as the proxy runs; gwp_ctx_free_pid_file() removes it.
+ *
+ * Nothing here stops the proxy: a PID file that cannot be written (a symlink,
+ * one locked by another instance, a read-only directory) is warned about and
+ * the proxy runs without it, as the manual says. Hence no return value.
  */
 __cold
-static int gwp_ctx_init_pid_file(struct gwp_ctx *ctx)
+static void gwp_ctx_init_pid_file(struct gwp_ctx *ctx)
 {
 	const char *path = ctx->cfg.pid_file;
 	char buf[32];
-	int fd, n, r;
+	int fd, n;
 
 	fd = open(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644);
 	if (fd < 0) {
-		r = -errno;
-		pr_warn(&ctx->lh, "Failed to open PID file '%s': %s", path,
-			strerror(-r));
-		return r;
+		pr_warn(&ctx->lh, "Failed to open PID file '%s': %s; running without it",
+			path, strerror(errno));
+		return;
 	}
 
 	if (flock(fd, LOCK_EX | LOCK_NB)) {
-		r = -errno;
 		pr_warn(&ctx->lh, "PID file '%s' is locked by another process; not writing it",
 			path);
 		close(fd);
-		return r;
+		return;
 	}
 
 	n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
 	errno = 0;
 	if (ftruncate(fd, 0) || write(fd, buf, (size_t)n) != n) {
-		r = errno ? -errno : -EIO;
-		pr_warn(&ctx->lh, "Failed to write PID file '%s': %s", path,
-			strerror(-r));
+		pr_warn(&ctx->lh, "Failed to write PID file '%s': %s; running without it",
+			path, strerror(errno ? errno : EIO));
 		close(fd);
-		return r;
+		return;
 	}
 
 	pr_info(&ctx->lh, "Writing PID to '%s' (pid=%d)", path, (int)getpid());
 	ctx->pid_fd = fd;
-	return 0;
 }
 
 __cold
@@ -1802,7 +1802,8 @@ static void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 		gwp_reload_begin(ctx->cfg.auth_file, &ctx->auth_reload);
 		r = gwp_auth_reload(ctx->auth);
 		if (gwp_reload_end(&ctx->auth_reload, r))
-			pr_warn(&ctx->lh, "Failed to reload authentication file; keeping current credentials");
+			pr_warn(&ctx->lh, "Failed to reload authentication file: %s; keeping current credentials",
+				strerror(-r));
 		else if (!r)
 			pr_info(&ctx->lh, "Reloaded authentication file");
 	}
@@ -1830,7 +1831,8 @@ static void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 				log_err = e;
 		}
 		if (log_err)
-			pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
+			pr_warn(&ctx->lh, "Failed to reload ACL file: %s; keeping current rules",
+				strerror(-r));
 		else if (!r)
 			pr_info(&ctx->lh, "Reloaded ACL file");
 	}
@@ -4094,6 +4096,18 @@ void gwp_conn_upstream_up(struct gwp_conn_pair *gcp)
 	gcp->up_pool = NULL;
 }
 
+/* Block or unblock (@how) SIGINT and SIGTERM on the calling thread. */
+__cold
+static void gwp_block_stop_signals(int how)
+{
+	sigset_t set;
+
+	sigemptyset(&set);
+	sigaddset(&set, SIGINT);
+	sigaddset(&set, SIGTERM);
+	pthread_sigmask(how, &set, NULL);
+}
+
 __cold
 static int gwp_ctx_init(struct gwp_ctx *ctx)
 {
@@ -4191,6 +4205,19 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	r = gwp_ctx_init_reload(ctx);
 	if (r < 0)
 		goto out_free_iplim;
+
+	/*
+	 * From here on threads start (the DNS workers) and the listeners
+	 * open, and either would make a SIGINT or SIGTERM with no handler
+	 * yet a death by signal: the default action, which skips the
+	 * cleanup and fails whatever waited for the proxy to listen. Keep
+	 * them pending instead, as SIGHUP is from the top of main(), so the
+	 * handler takes them as a stop once it is in place; the threads
+	 * started meanwhile inherit the block, so they never land there.
+	 * Before this point a signal still stops a slow or stuck startup
+	 * (a log FIFO with no reader, a large ACL file) at once.
+	 */
+	gwp_block_stop_signals(SIG_BLOCK);
 
 	r = gwp_ctx_init_dns(ctx);
 	if (r < 0)
@@ -6615,7 +6642,17 @@ static void *gwp_ctx_thread_entry(void *arg)
 
 	ctx->stop = true;
 	gwp_ctx_signal_all_workers(ctx);
-	pr_info(&ctx->lh, "Worker %u stopped", w->idx);
+	/*
+	 * An error here stops the whole proxy and becomes its exit status
+	 * (see main()). Many of the paths that return one log nothing of
+	 * their own, so say here, once per worker, which worker stopped and
+	 * why.
+	 */
+	if (r < 0)
+		pr_err(&ctx->lh, "Worker %u stopped on an error, stopping the proxy: %s",
+		       w->idx, strerror(-r));
+	else
+		pr_info(&ctx->lh, "Worker %u stopped", w->idx);
 	return (void *)(intptr_t)r;
 }
 
@@ -6815,6 +6852,13 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Failed to set signal handlers: %s\n", strerror(-r));
 		goto out_free;
 	}
+	/*
+	 * A SIGINT or SIGTERM held since gwp_ctx_init() started the threads
+	 * is taken here and stops the proxy before a worker runs: each worker
+	 * finds ctx.stop set and leaves its loop at once, and the proxy exits
+	 * as on any other stop.
+	 */
+	gwp_block_stop_signals(SIG_UNBLOCK);
 	pthread_sigmask(SIG_UNBLOCK, &hup, NULL);
 
 	r = gwp_ctx_run(&ctx);

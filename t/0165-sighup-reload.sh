@@ -9,8 +9,8 @@
 #    all take effect at once;
 #  - a broken file keeps its current contents in force, the other file still
 #    reloads, and a later SIGHUP applies the fixed file;
-#  - SIGHUPs that arrive while a reload runs (here one stuck reading a FIFO)
-#    give one more reload after it, not one each;
+#  - SIGHUPs that arrive while a reload runs (here one held reading a file
+#    with a hole of terabytes) give one more reload after it, not one each;
 #  - a SIGHUP, even many of them, neither stops the proxy nor disturbs a tunnel
 #    in flight, with or without files to reload, and SIGTERM still stops it;
 #  - --watch-files=1 reloads a changed file by itself, and SIGHUP still works;
@@ -24,6 +24,7 @@
 require curl
 require python3
 require mkfifo
+require truncate
 
 hp="$(pick_port)"
 make_payload "$WORK/payload.bin" 1000
@@ -38,6 +39,30 @@ fetch()
 {
 	curl -s --max-time 10 --proxy "socks5h://$2:$3@127.0.0.1:$1" \
 		"http://127.0.0.1:${4:-$hp}/payload.bin" -o /dev/null
+}
+
+# reading_hole <pid> <log> <n>: wait until the reload after SIGHUP number
+# <n>+1 in <log> reads the auth file's hole: the read count of <pid> grows by
+# about a GB a second then. Where that count cannot be read, the reload has
+# started at least once its SIGHUP is logged.
+reading_hole()
+{
+	local i rc0 rc1
+
+	for i in $(seq 1 300); do
+		[ "$(grep -c "$hup_seen" "$2")" -gt "$3" ] && break
+		sleep 0.1
+	done
+	[ "$(grep -c "$hup_seen" "$2")" -gt "$3" ] || return 1
+	for i in $(seq 1 100); do
+		rc0="$(sed -n 's/^rchar: //p' "/proc/$1/io" 2>/dev/null)"
+		[ -n "$rc0" ] || return 0
+		sleep 0.1
+		rc1="$(sed -n 's/^rchar: //p' "/proc/$1/io" 2>/dev/null)"
+		[ -n "$rc1" ] || return 0
+		[ $((rc1 - rc0)) -gt 1000000 ] && return 0
+	done
+	return 1
 }
 
 # wait_exit <pid>: poll until <pid> is gone (at most 30 s).
@@ -170,40 +195,22 @@ for loop in epoll io_uring; do
 	fetch "$pp" dave pw-d \
 		|| fail "[$loop] the fixed auth file was not applied"
 
-	# A burst of SIGHUPs while a reload runs. The auth file becomes a FIFO
-	# the reload blocks reading until the writer below lets it go; ten
-	# SIGHUPs meanwhile must give one more reload, not ten.
-	rm -f "$d/fifo" "$d/ready" "$d/go"
-	mkfifo "$d/fifo"
-	mv -f "$d/fifo" "$d/auth"
-	python3 - "$d/auth" "$d/ready" "$d/go" <<-'PY' &
-	import os, sys, time
-	fifo, ready, go = sys.argv[1:]
-	end = time.monotonic() + 60
-	while time.monotonic() < end:
-	    try:
-	        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-	        break
-	    except OSError:
-	        time.sleep(0.02)
-	else:
-	    sys.exit(1)
-	open(ready, "w").close()
-	while not os.path.exists(go) and time.monotonic() < end:
-	    time.sleep(0.02)
-	os.set_blocking(fd, True)
-	os.write(fd, b"erin:pw-e\n")
-	os.close(fd)
-	PY
-	wpid=$!
-	_PIDS+=("$wpid")
+	# A burst of SIGHUPs while a reload runs. The auth file becomes one
+	# with a hole of terabytes after its contents, which the reload reads
+	# on (as blank lines) until the file is cut short through the second
+	# link below; ten SIGHUPs meanwhile must give one more reload, not ten.
+	rm -f "$d/hold" "$d/hold.lnk"
+	printf 'erin:pw-e\n' >"$d/hold"
+	for s in 8T 1T 64G; do
+		truncate -s "$s" "$d/hold" 2>/dev/null && break
+	done
+	[ "$(wc -c <"$d/hold")" -gt 10 ] || fail "[$loop] cannot make a sparse file"
+	ln -f "$d/hold" "$d/hold.lnk"
+	mv -f "$d/hold.lnk" "$d/auth"
 	n0="$(grep -c "$hup_seen" "$log")"
 	kill -HUP "$GWP_PID"
-	for _ in $(seq 1 300); do
-		[ -e "$d/ready" ] && break
-		sleep 0.1
-	done
-	[ -e "$d/ready" ] || fail "[$loop] the SIGHUP reload never opened the FIFO"
+	reading_hole "$GWP_PID" "$log" "$n0" \
+		|| fail "[$loop] the SIGHUP reload never started reading the file"
 	for _ in $(seq 1 10); do
 		kill -HUP "$GWP_PID"
 		sleep 0.05
@@ -216,8 +223,8 @@ for loop in epoll io_uring; do
 	# The reload after it reads a regular file again.
 	printf 'frank:pw-f\n' >"$d/auth.new"
 	mv -f "$d/auth.new" "$d/auth"
-	touch "$d/go"
-	wait "$wpid" || fail "[$loop] the FIFO writer failed"
+	truncate -s 10 "$d/hold"
+	rm -f "$d/hold"
 	for _ in $(seq 1 300); do
 		[ "$(grep -c "$hup_seen" "$log")" -ge $((n0 + 2)) ] && break
 		sleep 0.1

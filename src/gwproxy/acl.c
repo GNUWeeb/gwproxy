@@ -930,7 +930,12 @@ static int parse_port_num(const char *s, uint16_t *out)
 	unsigned long v;
 	char *end;
 
-	if (!*s)
+	/*
+	 * Digits only: strtoul() also takes leading blanks and a sign, and
+	 * negates a "-" value in unsigned arithmetic: "-18446744073709551535"
+	 * wraps around to port 81, and " 80" and "+80" pass for 80.
+	 */
+	if (*s < '0' || *s > '9')
 		return -1;
 	errno = 0;
 	v = strtoul(s, &end, 10);

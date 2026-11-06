@@ -8,7 +8,9 @@
 # strace makes a worker's event wait fail. It counts calls per thread, so
 # which worker gets there first depends on where the connections land; with 4
 # workers it is rarely worker 0, the main thread. Whichever it is, the exit
-# status must not be 0. A shutdown by signal, under the same strace, must be.
+# status must not be 0, and the log must say which worker stopped the proxy and
+# why: many of the errors that stop a worker log nothing of their own. A
+# shutdown by signal, under the same strace, must exit with 0.
 
 . "$(dirname "$0")/lib.sh"
 require strace
@@ -82,6 +84,11 @@ for loop in epoll io_uring; do
 			sed 's/^/# gwp: /' "$WORK/gwp.$PP.log" >&2
 			grep INJECTED "$SLOG" | sed 's/^/# strace: /' >&2
 			fail "[$loop] try $try: exit status $rc, want EINVAL (22)"
+		}
+		grep -q 'Worker [0-9]* stopped on an error, stopping the proxy: Invalid argument' \
+			"$WORK/gwp.$PP.log" || {
+			sed 's/^/# gwp: /' "$WORK/gwp.$PP.log" >&2
+			fail "[$loop] try $try: the log does not say which worker stopped the proxy, and why"
 		}
 	done
 done
