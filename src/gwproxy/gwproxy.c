@@ -1041,7 +1041,11 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 
 	r = __sys_bind(fd, (struct sockaddr *)ba, slen);
 	if (r < 0) {
-		pr_err(&w->ctx->lh, "Failed to bind socket: %s", strerror(-r));
+		/* What an IPv6 address gets on a host with IPv6 turned off. */
+		pr_err(&w->ctx->lh, "Failed to bind %s: %s%s", ip_to_str(ba),
+		       strerror(-r),
+		       ba->sa.sa_family == AF_INET6 && r == -EADDRNOTAVAIL ?
+		       " (is IPv6 disabled on this host?)" : "");
 		goto out_close;
 	}
 
@@ -1061,7 +1065,7 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 
 	w->tcp_fd = fd;
 	pr_info(&w->ctx->lh, "Worker %u is listening on %s (fd=%d)", w->idx,
-		cfg->bind, fd);
+		ip_to_str(&w->listen_addr), fd);
 	return 0;
 
 out_close:
@@ -1372,6 +1376,53 @@ static void gwp_ctx_warn_open_proxy(struct gwp_ctx *ctx,
 		ip_to_str(addr));
 }
 
+/*
+ * A kernel without IPv6 (booted with ipv6.disable=1) refuses every AF_INET6
+ * socket. The wildcard [::] -- the default --bind among others -- asks for
+ * every address the host has, which there are the IPv4 ones: listen on
+ * 0.0.0.0 instead, and say so, rather than refuse to start. Not with
+ * --bind-ipv6-only=1, which asks for IPv6 alone. Any other IPv6 address
+ * cannot be listened on at all, and the error says why.
+ *
+ * A host that has IPv6 but turned it off with the disable_ipv6 sysctl still
+ * creates the socket, and a [::] bind there works and takes IPv4 clients;
+ * a bind to an IPv6 address then fails, see gwp_ctx_init_thread_sock().
+ */
+__cold
+static int gwp_ctx_check_bind_family(struct gwp_ctx *ctx,
+				     struct gwp_sockaddr *addr)
+{
+	uint16_t port = addr->i6.sin6_port;
+	int fd;
+
+	if (addr->sa.sa_family != AF_INET6)
+		return 0;
+
+	fd = __sys_socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd >= 0) {
+		__sys_close(fd);
+		return 0;
+	}
+	/* Anything else is for the listener's own setup to report. */
+	if (fd != -EAFNOSUPPORT)
+		return 0;
+
+	if (!IN6_IS_ADDR_UNSPECIFIED(&addr->i6.sin6_addr) ||
+	    ctx->cfg.bind_ipv6_only) {
+		pr_err(&ctx->lh, "Cannot listen on %s: IPv6 is not available on this host",
+		       ip_to_str(addr));
+		return -EAFNOSUPPORT;
+	}
+
+	memset(addr, 0, sizeof(*addr));
+	addr->i4.sin_family = AF_INET;
+	addr->i4.sin_addr.s_addr = htonl(INADDR_ANY);
+	addr->i4.sin_port = port;
+	pr_warn(&ctx->lh, "IPv6 is not available on this host: listening on %s, IPv4 only, instead of %s",
+		ip_to_str(addr), ctx->cfg.bind);
+	return 0;
+}
+
 __cold
 static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 {
@@ -1390,6 +1441,9 @@ static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 		pr_err(&ctx->lh, "Invalid bind address '%s'", cfg->bind);
 		return r;
 	}
+	r = gwp_ctx_check_bind_family(ctx, &bind_addr);
+	if (r)
+		return r;
 	gwp_ctx_warn_open_proxy(ctx, &bind_addr);
 
 	if (posix_memalign((void **)&workers, GWP_CACHELINE,

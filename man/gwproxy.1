@@ -91,7 +91,24 @@ A port outside 0 to 65535, or one with anything behind its digits, is refused
 at startup, here and in every other address option.
 The default,
 .BR [::]:1080 ,
-listens on the dual\-stack IPv4/IPv6 wildcard. A SOCKS5 or HTTP proxy
+listens on the dual\-stack IPv4/IPv6 wildcard. On a host without IPv6 (a
+kernel booted with
+.BR ipv6.disable=1 ),
+a
+.B [::]
+bind, the default included, listens on
+.B 0.0.0.0
+instead and logs a warning saying so; with
+.B \-\-bind\-ipv6\-only=1
+it fails at startup, as does any other IPv6 address. Where IPv6 is only turned
+off with the
+.B disable_ipv6
+sysctl,
+.B [::]
+still works and an IPv6 address such as
+.B [::1]
+fails to bind, with a message that points at IPv6 being disabled.
+A SOCKS5 or HTTP proxy
 listening on anything but loopback without
 .B \-\-auth\-file
 is open to every client that can reach it; gwproxy logs a warning at startup
