@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #define test_socks5_init_ctx_no_auth(CTX)		\
 do {							\
@@ -493,23 +494,28 @@ static void test_auth_userpass(void)
 }
 
 /*
- * Load a credential file made of @data; returns gwp_auth_create()'s result
- * and destroys the store again.
+ * Load a credential file made of the @len bytes at @data; returns
+ * gwp_auth_create()'s result and destroys the store again.
  */
-static int try_cred_file(const char *data)
+static int try_cred_buf(const char *data, size_t len)
 {
 	char cred_file[] = "/tmp/gwp_socks5_auth.XXXXXX";
 	struct gwp_auth *auth = NULL;
 	ssize_t w;
 	int r;
 
-	w = write_temp_file(cred_file, data, strlen(data));
-	assert(w == (ssize_t)strlen(data));
+	w = write_temp_file(cred_file, data, len);
+	assert(w == (ssize_t)len);
 	r = gwp_auth_create(&auth, cred_file);
 	if (!r)
 		gwp_auth_destroy(auth);
 	unlink(cred_file);
 	return r;
+}
+
+static int try_cred_file(const char *data)
+{
+	return try_cred_buf(data, strlen(data));
 }
 
 /*
@@ -574,6 +580,48 @@ static void test_auth_file_lines(void)
 	longline[sizeof(longline) - 1] = '\0';
 	memcpy(longline + 4100, ":pw", 3);
 	assert(try_cred_file(longline) == -EINVAL);
+
+}
+
+/*
+ * A NUL byte anywhere in a line refuses the file. One at the start of a line
+ * used to make it read as blank and be skipped, so a line could be hidden
+ * from the loader; one inside a line was refused only by accident, as a line
+ * too long.
+ */
+static void test_auth_file_nul(void)
+{
+	static const char lead[] = "user:pw\n\0other:pw\n";
+	static const char lead_only[] = "user:pw\n\0\n";
+	static const char mid[] = "user:pw\nother\0:pw\n";
+	static const char tail[] = "user:pw\nother:pw\0\n";
+	static const char last[] = "user:pw\nother:pw\0";
+	static const char good[] = "user:pw\n";
+	char cred_file[] = "/tmp/gwp_socks5_auth.XXXXXX";
+	struct gwp_auth *auth;
+	ssize_t w;
+	int fd;
+
+	assert(try_cred_buf(lead, sizeof(lead) - 1) == -EINVAL);
+	assert(try_cred_buf(lead_only, sizeof(lead_only) - 1) == -EINVAL);
+	assert(try_cred_buf(mid, sizeof(mid) - 1) == -EINVAL);
+	assert(try_cred_buf(tail, sizeof(tail) - 1) == -EINVAL);
+	assert(try_cred_buf(last, sizeof(last) - 1) == -EINVAL);
+	assert(!try_cred_buf(good, sizeof(good) - 1));
+
+	/* A reload that meets one keeps the credentials in force. */
+	w = write_temp_file(cred_file, good, sizeof(good) - 1);
+	assert(w == (ssize_t)sizeof(good) - 1);
+	assert(!gwp_auth_create(&auth, cred_file));
+	fd = open(cred_file, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, lead, sizeof(lead) - 1) == (ssize_t)sizeof(lead) - 1);
+	close(fd);
+	assert(gwp_auth_reload(auth) == -EINVAL);
+	assert(gwp_auth_check(auth, "user", 4, "pw", 2));
+	assert(!gwp_auth_check(auth, "other", 5, "pw", 2));
+	gwp_auth_destroy(auth);
+	unlink(cred_file);
 }
 
 /*
@@ -1179,6 +1227,7 @@ static void gwp_socks5_run_tests(void)
 
 	/* Once: each refused file prints its parse error. */
 	test_auth_file_lines();
+	test_auth_file_nul();
 	test_auth_check_lengths();
 
 	for (i = 0; i < 5000; i++) {
