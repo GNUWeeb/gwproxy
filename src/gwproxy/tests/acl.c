@@ -746,6 +746,31 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT -d 999.0.0.1 -j REJECT\n",	    /* bad CIDR */
 		"-A OUTPUT -d 1.2.3.4/33 -j REJECT\n",	    /* bad prefix */
 		"-A OUTPUT --dports 70000 -j REJECT\n",	    /* port range */
+		/*
+		 * Every number starts with a digit: strtoul() alone takes a
+		 * sign, and wraps a "-" value around, so the last --dports
+		 * here would load as 80-81.
+		 */
+		"-A OUTPUT --dports +80 -j REJECT\n",	    /* port sign */
+		"-A OUTPUT --dports -80 -j REJECT\n",	    /* empty lo */
+		"-A OUTPUT --sports +80 -j REJECT\n",	    /* port sign */
+		"-A OUTPUT --dports 80,+443 -j REJECT\n",	    /* sign in list */
+		"-A OUTPUT --dports 80-+90 -j REJECT\n",	    /* sign on hi */
+		"-A OUTPUT --dports 80--18446744073709551535 -j REJECT\n", /* 80-81 */
+		"-A OUTPUT -d 10.0.0.0/+8 -j REJECT\n",	    /* prefix sign */
+		"-A OUTPUT -s 10.0.0.0/-0 -j REJECT\n",	    /* prefix sign */
+		"-A OUTPUT -d ::/+64 -j REJECT\n",		    /* v6 prefix sign */
+		"-A OUTPUT -d 10.0.0.0/ -j REJECT\n",	    /* empty prefix */
+		"-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:+80\n",	    /* DNAT sign */
+		"-A OUTPUT -d 1.2.3.4 -j DNAT --to :+80\n",		    /* DNAT sign */
+		"-A OUTPUT -d 1.2.3.4 -j DNAT --to [::1]:+80\n",	    /* DNAT sign */
+		"-A OUTPUT -d 1.2.3.4 -j DNAT --to :-18446744073709551535\n", /* 81 */
+		"-A OUTPUT -j MARK --set-mark +5\n",		    /* mark sign */
+		"-A OUTPUT -j MARK --set-mark -1\n",		    /* mark wraps */
+		"-A OUTPUT -j MARK --set-mark 0x\n",		    /* empty hex */
+		"-A OUTPUT -m statistic --mode nth --every +2 -j ACCEPT\n",	      /* --every sign */
+		"-A OUTPUT -m statistic --mode nth --every 2 --packet +1 -j ACCEPT\n", /* --packet sign */
+		"-A OUTPUT -m statistic --mode nth --every 2 --packet -0 -j ACCEPT\n", /* --packet sign */
 		"-A WEIRD -d 1.2.3.4 -j REJECT\n",	    /* bad chain */
 		"garbage line\n",			    /* not -P/-A */
 	};

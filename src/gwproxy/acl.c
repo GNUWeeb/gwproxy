@@ -599,6 +599,29 @@ static void mask_addr(uint8_t *addr, uint8_t bits, size_t len)
 		addr[i] = 0;
 }
 
+/*
+ * Parse all of @s as an unsigned number in @base (as strtoul() takes it) of at
+ * most @max into @out; -1 if it is not one. It must start with a digit:
+ * strtoul() also takes leading blanks and a sign, and negates a "-" value in
+ * unsigned arithmetic, so "-18446744073709551535" would wrap around to 81, and
+ * " 80" and "+80" would pass for 80.
+ */
+static int parse_num(const char *s, int base, unsigned long max,
+		     unsigned long *out)
+{
+	unsigned long v;
+	char *end;
+
+	if (*s < '0' || *s > '9')
+		return -1;
+	errno = 0;
+	v = strtoul(s, &end, base);
+	if (errno || *end || v > max)
+		return -1;
+	*out = v;
+	return 0;
+}
+
 /* Parse "IP" or "IP/prefixlen" into a canonicalised prefix. */
 static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 {
@@ -629,16 +652,8 @@ static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 		return -EINVAL;
 	}
 
-	if (slash) {
-		char *end;
-
-		errno = 0;
-		bits = strtoul(slash + 1, &end, 10);
-		if (errno || *end || slash[1] == '\0')
-			return -EINVAL;
-		if (bits > (c->is_v4 ? 32u : 128u))
-			return -EINVAL;
-	}
+	if (slash && parse_num(slash + 1, 10, c->is_v4 ? 32 : 128, &bits))
+		return -EINVAL;
 
 	/*
 	 * cidr_match() folds a v4-mapped target (::ffff:a.b.c.d) into IPv4, so
@@ -689,21 +704,16 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 	for (tok = strtok_r(buf, ",", &save); tok;
 	     tok = strtok_r(NULL, ",", &save)) {
 		unsigned long lo, hi;
-		char *dash, *end;
+		char *dash;
 
 		dash = strchr(tok, '-');
 		if (dash)
 			*dash = '\0';
 
-		errno = 0;
-		lo = strtoul(tok, &end, 10);
-		if (errno || *end || tok[0] == '\0' || lo > 65535)
+		if (parse_num(tok, 10, 65535, &lo))
 			goto einval;
 		if (dash) {
-			errno = 0;
-			hi = strtoul(dash + 1, &end, 10);
-			if (errno || *end || dash[1] == '\0' || hi > 65535 ||
-			    hi < lo)
+			if (parse_num(dash + 1, 10, 65535, &hi) || hi < lo)
 				goto einval;
 		} else {
 			hi = lo;
@@ -795,12 +805,9 @@ static int parse_dnat(const char *s, struct gwp_acl_dnat *d)
 
 	if (have_port) {
 		unsigned long port;
-		char *end;
 
 		*colon = '\0';
-		errno = 0;
-		port = strtoul(colon + 1, &end, 10);
-		if (errno || *end || colon[1] == '\0' || port > 65535)
+		if (parse_num(colon + 1, 10, 65535, &port))
 			return -EINVAL;
 		d->port = (uint16_t)port;
 		d->set_port = true;
@@ -912,13 +919,8 @@ static bool eq(const char *a, const char *b1, const char *b2)
 static int parse_u32(const char *s, uint32_t *out)
 {
 	unsigned long v;
-	char *end;
 
-	if (!*s)
-		return -1;
-	errno = 0;
-	v = strtoul(s, &end, 0);
-	if (errno || *end || v > 0xffffffffUL)
+	if (parse_num(s, 0, 0xffffffffUL, &v))
 		return -1;
 	*out = (uint32_t)v;
 	return 0;
@@ -928,18 +930,8 @@ static int parse_u32(const char *s, uint32_t *out)
 static int parse_port_num(const char *s, uint16_t *out)
 {
 	unsigned long v;
-	char *end;
 
-	/*
-	 * Digits only: strtoul() also takes leading blanks and a sign, and
-	 * negates a "-" value in unsigned arithmetic: "-18446744073709551535"
-	 * wraps around to port 81, and " 80" and "+80" pass for 80.
-	 */
-	if (*s < '0' || *s > '9')
-		return -1;
-	errno = 0;
-	v = strtoul(s, &end, 10);
-	if (errno || *end || v > 65535)
+	if (parse_num(s, 10, 65535, &v))
 		return -1;
 	*out = (uint16_t)v;
 	return 0;

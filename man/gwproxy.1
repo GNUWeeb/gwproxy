@@ -462,6 +462,19 @@ or
 .B "! \-p tcp"
 could never take effect, and is a load error.
 .IP
+Every number in a rule \(em a port, port range or list, a prefix length, a
+.B \-\-to
+port, a mark, and the values of
+.BR \-\-every " and " \-\-packet
+\(em starts with a digit: a sign or anything else in front of the digits, as in
+.B \-\-dports +80
+or
+.BR 10.0.0.0/+8 ,
+fails the load like any malformed line. A mark may still be written in
+hexadecimal with a
+.B 0x
+prefix.
+.IP
 .B \-j MARK
 sets the fwmark
 .RB ( SO_MARK )
