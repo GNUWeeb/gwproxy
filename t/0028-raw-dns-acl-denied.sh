@@ -27,10 +27,8 @@ hp="$(pick_port)"
 start_httpd "$hp" "$DOC"
 
 # The responder answers every name with 127.0.0.1.
-dp="$(pick_port)"
-python3 "$SERVERS_DIR/dns_malformed.py" good "$dp" 2>/dev/null &
-_PIDS+=("$!")
-sleep 0.4
+start_dns_responder good
+dp="$DNS_PORT"
 
 # SOCKS5 CONNECT to probe.example.com:<port> via the proxy on $1. Prints the
 # reply byte, then (on success) the first line of an HTTP GET sent through
