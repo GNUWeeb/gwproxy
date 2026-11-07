@@ -771,6 +771,10 @@ struct gwp_conn_pair {
 	bool			client_tx;
 	/* A recv of the target's data is in flight. */
 	bool			target_rx;
+	/* The client watch (multishot poll, see prep_client_watch()) is armed. */
+	bool			client_watch;
+	/* The client watch saw a FIN during the lookup (do_prep_connect()). */
+	bool			client_fin;
 #endif
 };
 
