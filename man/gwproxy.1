@@ -64,8 +64,16 @@ Every boolean option takes an explicit
 .B 0
 or
 .B 1
-argument. A numeric argument must be a whole decimal integer; anything else,
-or a value out of the option's range, is rejected at startup.
+argument. A numeric argument must be a whole decimal integer: decimal digits,
+after a
+.B \-
+for an option that takes negative values, and nothing else, so a
+.B +
+sign or a blank in front is refused too.
+.B \-\-mark
+alone also takes hexadecimal (see there). Anything else, or a value out of the
+option's range, is rejected at startup with exit status 22 and a message naming
+the option.
 Long options and their single\-letter equivalents are interchangeable.
 .SS General
 .TP
@@ -479,10 +487,21 @@ port, a mark, and the values of
 .B \-\-dports +80
 or
 .BR 10.0.0.0/+8 ,
-fails the load like any malformed line. A mark may still be written in
-hexadecimal with a
+fails the load like any malformed line. Ports and prefix lengths are
+decimal digits only. A mark and the values of
+.BR \-\-every " and " \-\-packet
+are decimal, or hexadecimal after a
 .B 0x
-prefix.
+(or
+.BR 0X )
+prefix; in these a decimal number other than
+.B 0
+may not start with
+.BR 0 ,
+so
+.BR 010 ,
+which an earlier version read as octal 8, fails the load rather than meaning
+10. No other base or prefix is taken.
 .IP
 .B \-j MARK
 sets the fwmark
@@ -1108,7 +1127,14 @@ Set
 (fwmark) on outgoing connections, for policy routing and iptables matching.
 The mark is a 32\-bit value, written in decimal or, with a
 .B 0x
-prefix, in hexadecimal.
+(or
+.BR 0X )
+prefix, in hexadecimal. A decimal mark other than
+.B 0
+may not start with
+.BR 0 :
+.BR \-\-mark=010 ,
+which an earlier version read as octal 8, is refused rather than taken as 10.
 Requires
 .B CAP_NET_ADMIN
 or, since Linux 5.11,

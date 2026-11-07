@@ -600,24 +600,45 @@ static void mask_addr(uint8_t *addr, uint8_t bits, size_t len)
 }
 
 /*
- * Parse all of @s as an unsigned number in @base (as strtoul() takes it) of at
- * most @max into @out; -1 if it is not one. It must start with a digit:
- * strtoul() also takes leading blanks and a sign, and negates a "-" value in
- * unsigned arithmetic, so "-18446744073709551535" would wrap around to 81, and
- * " 80" and "+80" would pass for 80.
+ * Parse all of @s as an unsigned number of at most @max into @out; -1 if it is
+ * not one. It is decimal digits, or with @hex also "0x" (or "0X") and
+ * hexadecimal digits; nothing else. strtoul() is not used: it also takes
+ * leading blanks and a sign, and negates a "-" value in unsigned arithmetic, so
+ * "-18446744073709551535" would wrap around to 81, and " 80" and "+80" would
+ * pass for 80; with base 0 it reads "010" as octal 8, and a newer C library
+ * "0b10" as binary 2. Where @hex allows a prefix, a decimal number may not
+ * start with 0, so "010", which meant 8 before, is refused rather than quietly
+ * read as 10; without @hex it is plain decimal and "010" is 10, as it always
+ * was.
  */
-static int parse_num(const char *s, int base, unsigned long max,
+static int parse_num(const char *s, bool hex, unsigned long max,
 		     unsigned long *out)
 {
-	unsigned long v;
-	char *end;
+	unsigned long v = 0, d, base = 10;
 
 	if (*s < '0' || *s > '9')
 		return -1;
-	errno = 0;
-	v = strtoul(s, &end, base);
-	if (errno || *end || v > max)
-		return -1;
+	if (hex && s[0] == '0' && s[1]) {
+		if (s[1] != 'x' && s[1] != 'X')
+			return -1;
+		base = 16;
+		s += 2;
+		if (!*s)
+			return -1;
+	}
+	for (; *s; s++) {
+		if (*s >= '0' && *s <= '9')
+			d = (unsigned long)(*s - '0');
+		else if (base == 16 && *s >= 'a' && *s <= 'f')
+			d = (unsigned long)(*s - 'a' + 10);
+		else if (base == 16 && *s >= 'A' && *s <= 'F')
+			d = (unsigned long)(*s - 'A' + 10);
+		else
+			return -1;
+		if (d > max || v > (max - d) / base)
+			return -1;
+		v = v * base + d;
+	}
 	*out = v;
 	return 0;
 }
@@ -652,7 +673,7 @@ static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 		return -EINVAL;
 	}
 
-	if (slash && parse_num(slash + 1, 10, c->is_v4 ? 32 : 128, &bits))
+	if (slash && parse_num(slash + 1, false, c->is_v4 ? 32 : 128, &bits))
 		return -EINVAL;
 
 	/*
@@ -710,10 +731,10 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 		if (dash)
 			*dash = '\0';
 
-		if (parse_num(tok, 10, 65535, &lo))
+		if (parse_num(tok, false, 65535, &lo))
 			goto einval;
 		if (dash) {
-			if (parse_num(dash + 1, 10, 65535, &hi) || hi < lo)
+			if (parse_num(dash + 1, false, 65535, &hi) || hi < lo)
 				goto einval;
 		} else {
 			hi = lo;
@@ -807,7 +828,7 @@ static int parse_dnat(const char *s, struct gwp_acl_dnat *d)
 		unsigned long port;
 
 		*colon = '\0';
-		if (parse_num(colon + 1, 10, 65535, &port))
+		if (parse_num(colon + 1, false, 65535, &port))
 			return -EINVAL;
 		d->port = (uint16_t)port;
 		d->set_port = true;
@@ -915,12 +936,15 @@ static bool eq(const char *a, const char *b1, const char *b2)
 	return !strcmp(a, b1) || (b2 && !strcmp(a, b2));
 }
 
-/* Parse a 32-bit unsigned value (decimal, or 0x hex) into @out; -1 on error. */
+/*
+ * Parse a 32-bit unsigned value (decimal without a leading 0, or 0x hex) into
+ * @out; -1 on error.
+ */
 static int parse_u32(const char *s, uint32_t *out)
 {
 	unsigned long v;
 
-	if (parse_num(s, 0, 0xffffffffUL, &v))
+	if (parse_num(s, true, 0xffffffffUL, &v))
 		return -1;
 	*out = (uint32_t)v;
 	return 0;
@@ -931,7 +955,7 @@ static int parse_port_num(const char *s, uint16_t *out)
 {
 	unsigned long v;
 
-	if (parse_num(s, 10, 65535, &v))
+	if (parse_num(s, false, 65535, &v))
 		return -1;
 	*out = (uint16_t)v;
 	return 0;

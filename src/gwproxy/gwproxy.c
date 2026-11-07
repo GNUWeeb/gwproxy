@@ -342,26 +342,68 @@ static const char *opt_name(int c)
 }
 
 /*
- * Parse the argument of option @c as a whole integer in [@min, @max], in
- * @base as for strtoll(). atoi() took "abc" or "5s" for a number, quietly
- * turned "0x10" into 0 and had undefined behaviour on overflow, so a typo
- * started the proxy with some other setting than the one asked for.
+ * Parse the argument of option @c as a whole integer in [@min, @max] (@max at
+ * least 0): decimal digits, after a "-" when @min is negative, or with @hex
+ * also "0x" (or "0X") and hexadecimal digits. atoi() took "abc" or "5s" for a
+ * number, quietly turned "0x10" into 0 and had undefined behaviour on
+ * overflow, so a typo started the proxy with some other setting than the one
+ * asked for. strtoll() is not used either: it takes leading blanks and a "+",
+ * which no option documents, and in base 0 reads "010" as octal 8. Where @hex
+ * allows a prefix, a decimal number may not start with 0, so "010" is refused
+ * rather than read as 10 now; without @hex, "010" is decimal 10, as it was.
  */
 static int opt_num(int c, const char *arg, long long min, long long max,
-		   int base, long long *out)
+		   bool hex, long long *out)
 {
-	char *end;
-	long long v;
+	unsigned long long v = 0, d, lim = (unsigned long long)max, base = 10;
+	const char *p = arg, *why = "";
+	bool neg = false;
 
-	errno = 0;
-	v = strtoll(arg, &end, base);
-	if (!*arg || *end || errno || v < min || v > max) {
-		fprintf(stderr, "Error: --%s: '%s' is not an integer in the range %lld..%lld\n",
-			opt_name(c), arg, min, max);
-		return -EINVAL;
+	if (*p == '-' && min < 0) {
+		neg = true;
+		lim = -(unsigned long long)min;
+		p++;
 	}
-	*out = v;
+	if (*p < '0' || *p > '9')
+		goto bad;
+	if (hex && p[0] == '0' && p[1]) {
+		if (p[1] != 'x' && p[1] != 'X') {
+			if (p[1] >= '0' && p[1] <= '9')
+				why = " (no leading 0: it once meant octal)";
+			goto bad;
+		}
+		base = 16;
+		p += 2;
+		if (!*p)
+			goto bad;
+	}
+	for (; *p; p++) {
+		if (*p >= '0' && *p <= '9')
+			d = (unsigned long long)(*p - '0');
+		else if (base == 16 && *p >= 'a' && *p <= 'f')
+			d = (unsigned long long)(*p - 'a' + 10);
+		else if (base == 16 && *p >= 'A' && *p <= 'F')
+			d = (unsigned long long)(*p - 'A' + 10);
+		else
+			goto bad;
+		if (d > lim || v > (lim - d) / base)
+			goto bad;
+		v = v * base + d;
+	}
+	if (neg) {
+		/* v is at most -@min, so -v fits even for LLONG_MIN. */
+		*out = v ? -(long long)(v - 1) - 1 : 0;
+	} else {
+		*out = (long long)v;
+		if (*out < min)
+			goto bad;
+	}
 	return 0;
+bad:
+	fprintf(stderr, "Error: --%s: '%s' is not a %sinteger in the range %lld..%lld%s\n",
+		opt_name(c), arg, hex ? "decimal or 0x hexadecimal " : "decimal ",
+		min, max, why);
+	return -EINVAL;
 }
 
 static int opt_int(int c, const char *arg, int min, int max, int *out)
@@ -369,7 +411,7 @@ static int opt_int(int c, const char *arg, int min, int max, int *out)
 	long long v;
 	int r;
 
-	r = opt_num(c, arg, min, max, 10, &v);
+	r = opt_num(c, arg, min, max, false, &v);
 	if (!r)
 		*out = (int)v;
 	return r;
@@ -381,7 +423,7 @@ static int opt_bool(int c, const char *arg, bool *out)
 	long long v;
 	int r;
 
-	r = opt_num(c, arg, INT_MIN, INT_MAX, 10, &v);
+	r = opt_num(c, arg, INT_MIN, INT_MAX, false, &v);
 	if (!r)
 		*out = !!v;
 	return r;
@@ -564,7 +606,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->upstream_auth_file = optarg;
 			break;
 		case 'M':
-			if (opt_num(c, optarg, 0, UINT32_MAX, 0, &v))
+			if (opt_num(c, optarg, 0, UINT32_MAX, true, &v))
 				goto einval;
 			cfg->mark = (uint32_t)v;
 			break;
