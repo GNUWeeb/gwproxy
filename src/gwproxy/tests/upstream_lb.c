@@ -13,6 +13,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static struct gwp_sockaddr addr_of(const char *ip, uint16_t port)
@@ -207,11 +208,123 @@ static void test_many(void)
 
 #define NONE	UINT32_MAX
 
+/*
+ * A pool for the pick tests: @nr servers of distinct identities, whose open
+ * counts and ejections a test sets, and a clock it moves.
+ */
+struct tpool {
+	struct gwp_up_table	*t;
+	struct gwp_up_state	**s;
+	void			**st;
+	uint32_t		nr;
+	uint32_t		clock;
+	uint32_t		clock_reads;
+	uint32_t		nr_back;
+	uint32_t		last_back;
+};
+
+static uint32_t tp_now(void *arg)
+{
+	struct tpool *p = arg;
+
+	p->clock_reads++;
+	return p->clock;
+}
+
+static void tp_back(void *arg, uint32_t i)
+{
+	struct tpool *p = arg;
+
+	p->nr_back++;
+	p->last_back = i;
+}
+
+static void tp_init(struct tpool *p, uint32_t nr)
+{
+	uint32_t i;
+
+	memset(p, 0, sizeof(*p));
+	p->t = gwp_up_table_create();
+	p->s = calloc(nr, sizeof(*p->s));
+	p->st = calloc(nr, sizeof(*p->st));
+	assert(p->t && p->s && p->st);
+	p->nr = nr;
+	p->clock = 1000000;
+	for (i = 0; i < nr; i++) {
+		struct gwp_up_key k = many_key(i);
+
+		p->s[i] = gwp_up_state_get(p->t, &k);
+		assert(p->s[i]);
+		p->st[i] = p->s[i];
+	}
+}
+
+static void tp_free(struct tpool *p)
+{
+	uint32_t i;
+
+	for (i = 0; i < p->nr; i++) {
+		while (gwp_up_state_open(p->s[i]))
+			gwp_up_state_give(p->s[i]);
+		gwp_up_state_put(p->s[i]);
+	}
+	assert(gwp_up_table_destroy(p->t) == 0);
+	free(p->s);
+	free(p->st);
+}
+
+/* Give server @i @n open pairs. */
+static void tp_open(struct tpool *p, uint32_t i, uint32_t n)
+{
+	while (gwp_up_state_open(p->s[i]) < n)
+		gwp_up_state_take(p->s[i]);
+	while (gwp_up_state_open(p->s[i]) > n)
+		gwp_up_state_give(p->s[i]);
+}
+
+/* Eject server @i (in service) so that its ejection runs @left ms more. */
+static void tp_eject(struct tpool *p, uint32_t i, uint32_t left)
+{
+	uint32_t at = p->clock + left - GWP_UP_EJECT_MS;
+
+	assert(left && left <= GWP_UP_EJECT_MS);
+	assert(!gwp_up_state_ejected(p->s[i], p->clock, NULL));
+	assert(!gwp_up_state_fail(p->s[i], at - 2));
+	assert(!gwp_up_state_fail(p->s[i], at - 1));
+	assert(gwp_up_state_fail(p->s[i], at));
+	assert(gwp_up_state_ejected(p->s[i], p->clock, NULL) == left);
+}
+
+static uint32_t tp_pick(struct tpool *p, bool least_conn, uint32_t rr,
+			uint32_t skip)
+{
+	struct gwp_up_pick pk = {
+		.st = p->st, .nr = p->nr, .least_conn = least_conn, .rr = rr,
+		.skip = skip, .now = tp_now, .back = tp_back, .arg = p,
+	};
+	uint32_t before = p->clock_reads, i;
+
+	i = gwp_up_lb_pick(&pk);
+	/* The clock: once at most. */
+	assert(p->clock_reads - before <= 1);
+	return i;
+}
+
 /* A pick with every server in service and none to skip. */
 static uint32_t pick(bool least_conn, uint32_t rr, const uint32_t *open,
 		     uint32_t nr)
 {
-	return gwp_up_lb_pick(least_conn, rr, open, NULL, nr, NONE);
+	struct tpool p;
+	uint32_t i;
+
+	tp_init(&p, nr);
+	for (i = 0; i < nr; i++)
+		tp_open(&p, i, open[i]);
+	i = tp_pick(&p, least_conn, rr, NONE);
+	/* None may be ejected: no clock needed. */
+	assert(!p.clock_reads);
+	tp_free(&p);
+	return i;
 }
 
 /* Round-robin: the cursor's server, whatever the counts. */
@@ -230,6 +343,8 @@ static void test_round_robin(void)
 	assert(pick(false, 7, open, 1) == 0);
 	/* The cursor wraps at 2^32 and the pick stays in range. */
 	assert(pick(false, UINT32_MAX, open, 3) == UINT32_MAX % 3);
+	assert(pick(false, UINT32_MAX - 1, open, 3) == (UINT32_MAX - 1) % 3);
+	assert(pick(false, 0, open, 3) == 0);
 }
 
 /* Least-connections: the fewest open, ties from the cursor on. */
@@ -237,6 +352,7 @@ static void test_least_conn(void)
 {
 	uint32_t open[4] = { 3, 1, 4, 1 };
 	uint32_t hits[4] = { 0 }, rr, i;
+	struct tpool p;
 
 	/* Servers 1 and 3 tie: whichever comes first from the cursor on. */
 	assert(pick(true, 0, open, 4) == 1);
@@ -244,6 +360,7 @@ static void test_least_conn(void)
 	assert(pick(true, 2, open, 4) == 3);
 	assert(pick(true, 3, open, 4) == 3);
 	assert(pick(true, 4, open, 4) == 1);
+	assert(pick(true, UINT32_MAX, open, 4) == 3);
 
 	/* A single least-loaded server wins from every cursor position. */
 	open[3] = 0;
@@ -254,18 +371,22 @@ static void test_least_conn(void)
 	 * Fed back (each pick opens a pair on its server), new pairs fill the
 	 * idle servers up to the busy one, then spread evenly.
 	 */
-	open[0] = 5;
-	open[1] = open[2] = open[3] = 0;
+	tp_init(&p, 4);
+	tp_open(&p, 0, 5);
 	for (rr = 0; rr < 15; rr++)
-		open[pick(true, rr, open, 4)]++;
-	assert(open[0] == 5 && open[1] == 5 && open[2] == 5 && open[3] == 5);
+		gwp_up_state_take(p.s[tp_pick(&p, true, rr, NONE)]);
+	for (i = 0; i < 4; i++)
+		assert(gwp_up_state_open(p.s[i]) == 5);
 
 	/* All equal and nothing changing: the ties rotate with the cursor. */
-	memset(open, 0, sizeof(open));
+	for (i = 0; i < 4; i++)
+		tp_open(&p, i, 0);
 	for (rr = 0; rr < 400; rr++)
-		hits[pick(true, rr, open, 4)]++;
+		hits[tp_pick(&p, true, rr, NONE)]++;
 	for (i = 0; i < 4; i++)
 		assert(hits[i] == 100);
+	assert(!p.clock_reads);
+	tp_free(&p);
 
 	assert(pick(true, 5, open, 1) == 0);
 }
@@ -408,80 +529,228 @@ static void test_eject_rebuild(void)
 	assert(gwp_up_table_destroy(t) == 0);
 }
 
-/* The pick leaves ejected servers out, and spreads their share evenly. */
+/*
+ * The pick steps past ejected servers: round-robin gives an ejected
+ * server's turns to the next one in service, least_conn never takes one
+ * for its low count.
+ */
 static void test_pick_ejected(void)
 {
-	uint32_t eject[4] = { 0, 5000, 0, 0 };
-	uint32_t open[4] = { 0, 0, 0, 0 };
 	uint32_t hits[4] = { 0 }, rr, i;
+	struct tpool p;
 
-	/* Round-robin over 0, 2 and 3; 1 never. */
-	for (rr = 0; rr < 300; rr++)
-		hits[gwp_up_lb_pick(false, rr, open, eject, 4, NONE)]++;
-	assert(hits[0] == 100 && hits[1] == 0 && hits[2] == 100 &&
+	tp_init(&p, 4);
+	tp_eject(&p, 1, 5000);
+	/* Round-robin over 0, 2 and 3; 1's turns go to 2. */
+	for (rr = 0; rr < 400; rr++)
+		hits[tp_pick(&p, false, rr, NONE)]++;
+	assert(hits[0] == 100 && hits[1] == 0 && hits[2] == 200 &&
 	       hits[3] == 100);
-	assert(gwp_up_lb_pick(false, 0, open, eject, 4, NONE) == 0);
-	assert(gwp_up_lb_pick(false, 1, open, eject, 4, NONE) == 2);
-	assert(gwp_up_lb_pick(false, 2, open, eject, 4, NONE) == 3);
+	assert(tp_pick(&p, false, 0, NONE) == 0);
+	assert(tp_pick(&p, false, 1, NONE) == 2);
+	assert(tp_pick(&p, false, 2, NONE) == 2);
+	assert(tp_pick(&p, false, 3, NONE) == 3);
 
 	/* least_conn: an ejected server's low count does not draw pairs. */
-	open[0] = 4;
-	open[1] = 0;
-	open[2] = 2;
-	open[3] = 2;
+	tp_open(&p, 0, 4);
+	tp_open(&p, 2, 2);
+	tp_open(&p, 3, 2);
 	for (rr = 0; rr < 8; rr++) {
-		i = gwp_up_lb_pick(true, rr, open, eject, 4, NONE);
+		i = tp_pick(&p, true, rr, NONE);
 		assert(i == 2 || i == 3);
 	}
-	/* Ties rotate from the cursor's server among those in service. */
-	assert(gwp_up_lb_pick(true, 1, open, eject, 4, NONE) == 2);
-	assert(gwp_up_lb_pick(true, 2, open, eject, 4, NONE) == 3);
-	assert(gwp_up_lb_pick(true, 0, open, eject, 4, NONE) == 2);
+	/* Ties rotate from the cursor's place, past the ejected one. */
+	assert(tp_pick(&p, true, 1, NONE) == 2);
+	assert(tp_pick(&p, true, 2, NONE) == 2);
+	assert(tp_pick(&p, true, 3, NONE) == 3);
+	assert(tp_pick(&p, true, 0, NONE) == 2);
+	/* An idle one in service ends the scan; equal later ones lose. */
+	tp_open(&p, 2, 0);
+	tp_open(&p, 3, 0);
+	assert(tp_pick(&p, true, 3, NONE) == 3);
+	assert(tp_pick(&p, true, 1, NONE) == 2);
 
-	/* All ejected: the one back soonest, whatever the method. */
-	eject[0] = 900;
-	eject[1] = 700;
-	eject[2] = 800;
-	eject[3] = 701;
-	for (rr = 0; rr < 8; rr++) {
-		assert(gwp_up_lb_pick(false, rr, open, eject, 4, NONE) == 1);
-		assert(gwp_up_lb_pick(true, rr, open, eject, 4, NONE) == 1);
-	}
-	/* Equal ends take turns. */
-	eject[3] = 700;
-	assert(gwp_up_lb_pick(false, 0, open, eject, 4, NONE) == 1);
-	assert(gwp_up_lb_pick(false, 2, open, eject, 4, NONE) == 3);
-	assert(gwp_up_lb_pick(false, 3, open, eject, 4, NONE) == 3);
-
-	/* A pool of one is never left without its server. */
-	assert(gwp_up_lb_pick(false, 3, open, eject, 1, NONE) == 0);
-	assert(gwp_up_lb_pick(true, 3, open, eject, 1, NONE) == 0);
+	/* Its ejection ends: back in its turn, and told once. */
+	p.clock += 5000;
+	assert(tp_pick(&p, false, 1, NONE) == 1);
+	assert(p.nr_back == 1 && p.last_back == 1);
+	assert(tp_pick(&p, false, 1, NONE) == 1);
+	assert(p.nr_back == 1);
+	tp_free(&p);
 }
 
-/* A retry: another server in service, or none at all. */
+/* A run of ejected servers at the cursor: the first in service after it. */
+static void test_pick_ejected_run(void)
+{
+	uint32_t rr;
+	struct tpool p;
+
+	tp_init(&p, 6);
+	tp_eject(&p, 2, 100);
+	tp_eject(&p, 3, 100);
+	tp_eject(&p, 4, 100);
+	for (rr = 2; rr <= 4; rr++) {
+		assert(tp_pick(&p, false, rr, NONE) == 5);
+		assert(tp_pick(&p, true, rr, NONE) == 5);
+	}
+	/* The run reaches the end: wrap to the start. */
+	tp_eject(&p, 5, 100);
+	assert(tp_pick(&p, false, 3, NONE) == 0);
+	assert(tp_pick(&p, true, 3, NONE) == 0);
+	tp_open(&p, 0, 1);
+	assert(tp_pick(&p, true, 3, NONE) == 1);
+	assert(tp_pick(&p, false, 1, NONE) == 1);
+	assert(!p.nr_back);
+	tp_free(&p);
+}
+
+/* All ejected: the one back soonest, whatever the method. */
+static void test_pick_all_ejected(void)
+{
+	uint32_t rr;
+	struct tpool p;
+
+	tp_init(&p, 4);
+	tp_eject(&p, 0, 900);
+	tp_eject(&p, 1, 700);
+	tp_eject(&p, 2, 800);
+	tp_eject(&p, 3, 701);
+	for (rr = 0; rr < 8; rr++) {
+		assert(tp_pick(&p, false, rr, NONE) == 1);
+		assert(tp_pick(&p, true, rr, NONE) == 1);
+	}
+	tp_free(&p);
+
+	/* Equal ends take turns from the cursor. */
+	tp_init(&p, 4);
+	tp_eject(&p, 0, 900);
+	tp_eject(&p, 1, 700);
+	tp_eject(&p, 2, 800);
+	tp_eject(&p, 3, 700);
+	assert(tp_pick(&p, false, 0, NONE) == 1);
+	assert(tp_pick(&p, false, 2, NONE) == 3);
+	assert(tp_pick(&p, false, 3, NONE) == 3);
+	assert(tp_pick(&p, true, 2, NONE) == 3);
+	/* A retry goes only to another server in service: none. */
+	assert(tp_pick(&p, false, 0, 1) == NONE);
+	assert(tp_pick(&p, true, 0, 1) == NONE);
+	/* One back by the time of the pick is taken in its turn. */
+	p.clock += 700;
+	assert(tp_pick(&p, false, 0, NONE) == 1);
+	assert(p.nr_back == 1);
+	tp_free(&p);
+
+	/* A pool of one is never left without its server. */
+	tp_init(&p, 1);
+	tp_eject(&p, 0, 300);
+	assert(tp_pick(&p, false, 3, NONE) == 0);
+	assert(tp_pick(&p, true, 3, NONE) == 0);
+	tp_free(&p);
+}
+
+/* A retry: the next server in service after the failed one, or none. */
 static void test_pick_retry(void)
 {
-	uint32_t eject[3] = { 0, 0, 0 };
-	uint32_t open[3] = { 1, 1, 0 };
+	struct tpool p;
 	uint32_t rr;
 
+	tp_init(&p, 3);
+	tp_open(&p, 0, 1);
+	tp_open(&p, 1, 1);
 	for (rr = 0; rr < 6; rr++) {
-		assert(gwp_up_lb_pick(false, rr, open, eject, 3, 0) != 0);
-		assert(gwp_up_lb_pick(true, rr, open, eject, 3, 2) != 2);
+		/* The cursor plays no part in a retry. */
+		assert(tp_pick(&p, false, rr, 0) == 1);
+		assert(tp_pick(&p, false, rr, 1) == 2);
+		assert(tp_pick(&p, false, rr, 2) == 0);
+		assert(tp_pick(&p, true, rr, 2) == 0);
+		assert(tp_pick(&p, true, rr, 0) == 2);
 	}
-	assert(gwp_up_lb_pick(true, 0, open, eject, 3, 0) == 2);
-	assert(gwp_up_lb_pick(false, 0, open, NULL, 3, 1) == 0);
-	assert(gwp_up_lb_pick(false, 1, open, NULL, 3, 1) == 2);
+	/* least_conn: ties from the one after the failed one. */
+	tp_open(&p, 2, 1);
+	assert(tp_pick(&p, true, 0, 0) == 1);
+	assert(tp_pick(&p, true, 0, 1) == 2);
+	assert(tp_pick(&p, true, 0, 2) == 0);
 
+	/* The next one is ejected: the one after it. */
+	tp_eject(&p, 1, 50);
+	assert(tp_pick(&p, false, 0, 0) == 2);
+	assert(tp_pick(&p, true, 0, 0) == 2);
 	/* The only other server is ejected: no retry, though it exists. */
-	eject[1] = 50;
-	eject[2] = 40;
-	assert(gwp_up_lb_pick(false, 0, open, eject, 3, 2) == 0);
-	assert(gwp_up_lb_pick(false, 0, open, eject, 3, 0) == NONE);
-	assert(gwp_up_lb_pick(true, 9, open, eject, 3, 0) == NONE);
+	tp_eject(&p, 2, 40);
+	assert(tp_pick(&p, false, 0, 2) == 0);
+	assert(tp_pick(&p, false, 0, 0) == NONE);
+	assert(tp_pick(&p, true, 9, 0) == NONE);
+	/* A skip past the pool is no skip: a first pick. */
+	assert(tp_pick(&p, false, 4, 3) == 0);
+	tp_free(&p);
+
 	/* Nor in a pool of one, ejected or not. */
-	assert(gwp_up_lb_pick(false, 0, open, NULL, 1, 0) == NONE);
-	assert(gwp_up_lb_pick(false, 0, open, eject, 1, 0) == NONE);
+	tp_init(&p, 1);
+	assert(tp_pick(&p, false, 0, 0) == NONE);
+	assert(tp_pick(&p, true, 0, 0) == NONE);
+	tp_eject(&p, 0, 10);
+	assert(tp_pick(&p, false, 0, 0) == NONE);
+	tp_free(&p);
+}
+
+/* Servers with no state are never taken; no pool at all, no server. */
+static void test_pick_missing(void)
+{
+	struct gwp_up_pick pk = { .now = tp_now };
+	struct tpool p;
+
+	assert(gwp_up_lb_pick(&pk) == NONE);
+	tp_init(&p, 3);
+	p.st[1] = NULL;
+	assert(tp_pick(&p, false, 1, NONE) == 2);
+	assert(tp_pick(&p, true, 1, NONE) == 2);
+	assert(tp_pick(&p, false, 1, 0) == 2);
+	p.st[0] = p.st[2] = NULL;
+	assert(tp_pick(&p, false, 1, NONE) == NONE);
+	assert(tp_pick(&p, true, 1, NONE) == NONE);
+	p.st[0] = p.s[0];
+	p.st[1] = p.s[1];
+	p.st[2] = p.s[2];
+	tp_free(&p);
+}
+
+#define NR_BIG	8192u
+
+/*
+ * The largest pool: round-robin visits every server once per round, and
+ * least_conn finds the one server with the fewest anywhere in it, also
+ * the last, across the cursor's wrap; runs of ejected servers at the end
+ * are stepped over to the start.
+ */
+static void test_pick_big(void)
+{
+	struct tpool p;
+	uint32_t rr, i;
+
+	tp_init(&p, NR_BIG);
+	for (rr = 0; rr < 2 * NR_BIG; rr++)
+		assert(tp_pick(&p, false, rr, NONE) == rr % NR_BIG);
+	assert(tp_pick(&p, false, UINT32_MAX, NONE) == UINT32_MAX % NR_BIG);
+	for (i = 0; i < NR_BIG; i++)
+		tp_open(&p, i, 2);
+	tp_open(&p, NR_BIG - 1, 1);
+	assert(tp_pick(&p, true, 0, NONE) == NR_BIG - 1);
+	assert(tp_pick(&p, true, NR_BIG - 1, NONE) == NR_BIG - 1);
+	tp_open(&p, NR_BIG / 2, 1);
+	assert(tp_pick(&p, true, NR_BIG - 1, NONE) == NR_BIG - 1);
+	assert(tp_pick(&p, true, NR_BIG, NONE) == NR_BIG / 2);
+	tp_open(&p, 0, 0);
+	assert(tp_pick(&p, true, 7, NONE) == 0);
+	assert(tp_pick(&p, true, 7, 0) == NR_BIG / 2);
+	assert(!p.clock_reads);
+
+	for (i = NR_BIG - 100; i < NR_BIG; i++)
+		tp_eject(&p, i, 1000);
+	assert(tp_pick(&p, false, NR_BIG - 100, NONE) == 0);
+	assert(tp_pick(&p, false, 0, NR_BIG - 101) == 0);
+	tp_open(&p, NR_BIG - 50, 0);
+	assert(tp_pick(&p, true, NR_BIG - 60, NONE) == 0);
+	tp_free(&p);
 }
 
 #define NR_THREADS	8
@@ -611,7 +880,11 @@ int main(void)
 	test_eject_zero();
 	test_eject_rebuild();
 	test_pick_ejected();
+	test_pick_ejected_run();
+	test_pick_all_ejected();
 	test_pick_retry();
+	test_pick_missing();
+	test_pick_big();
 	test_eject_threads();
 	printf("All upstream_lb tests passed.\n");
 	return 0;

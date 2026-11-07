@@ -1707,9 +1707,10 @@ out while the server is waiting for the target to answer the CONNECT (a
 target that never answers holds a healthy server up), nor local trouble such
 as running out of descriptors. Three failures
 that count, within 30 seconds, eject the server for 5 minutes: no pool picks
-it meanwhile, and round\-robin and
+it meanwhile. Round\-robin gives its turns to the next server in service
+after it in the block's order, and
 .B least_conn
-alike spread its share over the servers left. As with the counts, the health
+chooses among the servers left. As with the counts, the health
 is the server's, not the pool's: failures through one pool eject the server
 from every pool that lists it. When every server of a pool is ejected, the
 pool takes the one whose ejection ends soonest; a pool of one server, and

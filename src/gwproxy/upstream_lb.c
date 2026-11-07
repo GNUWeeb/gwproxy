@@ -270,52 +270,87 @@ uint32_t gwp_up_state_ejected(struct gwp_up_state *s, uint32_t now,
 	return end && ms_after(end, now) > 0 ? (uint32_t)ms_after(end, now) : 0;
 }
 
-/* Whether a pick may take server @i. */
-static bool pick_ok(const uint32_t *eject, uint32_t i, uint32_t skip)
+/* A pick in progress: the clock, read once when first needed. */
+struct pick {
+	const struct gwp_up_pick	*pk;
+	uint32_t			now;
+	bool				have_now;
+};
+
+/*
+ * How long the ejection of the @i-th server (non-NULL) still runs, 0 while
+ * it is in service; reads the clock only for a server that may be ejected.
+ */
+static uint32_t pick_ejected(struct pick *c, struct gwp_up_state *s,
+			     uint32_t i)
 {
-	return i != skip && (!eject || !eject[i]);
+	const struct gwp_up_pick *pk = c->pk;
+	uint32_t left;
+	bool back;
+
+	if (!gwp_up_state_may_be_ejected(s))
+		return 0;
+	if (!c->have_now) {
+		c->now = pk->now(pk->arg);
+		c->have_now = true;
+	}
+	left = gwp_up_state_ejected(s, c->now, &back);
+	if (back && pk->back)
+		pk->back(pk->arg, i);
+	return left;
 }
 
-uint32_t gwp_up_lb_pick(bool least_conn, uint32_t rr, const uint32_t *open,
-			const uint32_t *eject, uint32_t nr, uint32_t skip)
+uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 {
-	uint32_t n = 0, start, best, i, j, k;
+	struct pick c = { .pk = pk };
+	uint32_t nr = pk->nr, skip = pk->skip, best = UINT32_MAX;
+	uint32_t best_val = UINT32_MAX, i, k, v;
+	bool retry = skip < nr;
+	struct gwp_up_state *s;
 
-	for (i = 0; i < nr; i++)
-		n += pick_ok(eject, i, skip);
+	if (!nr)
+		return UINT32_MAX;
+	if (retry)
+		i = skip + 1 < nr ? skip + 1 : 0;
+	else
+		i = pk->rr % nr;
 
-	if (!n) {
-		if (skip != UINT32_MAX || !eject)
-			return UINT32_MAX;
-		/* All ejected: the one back soonest, ties in turn. */
-		start = rr % nr;
-		best = start;
-		for (i = 1; i < nr; i++) {
-			j = start + i;
-			if (j >= nr)
-				j -= nr;
-			if (eject[j] < eject[best])
-				best = j;
+	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
+		s = pk->st[i];
+		if (i == skip || !s)
+			continue;
+		if (!pk->least_conn) {
+			if (!pick_ejected(&c, s, i))
+				return i;
+			continue;
 		}
-		return best;
-	}
-
-	/* The (rr % n)-th server that may be taken. */
-	k = rr % n;
-	for (start = 0;; start++) {
-		if (pick_ok(eject, start, skip) && !k--)
+		/* Not fewer than the best so far: its health does not matter. */
+		v = gwp_up_state_open(s);
+		if ((best != UINT32_MAX && v >= best_val) ||
+		    pick_ejected(&c, s, i))
+			continue;
+		best = i;
+		best_val = v;
+		if (!v)
 			break;
 	}
-	if (!least_conn)
-		return start;
+	if (best != UINT32_MAX || retry)
+		return best;
 
-	best = start;
-	for (i = 1; i < nr; i++) {
-		j = start + i;
-		if (j >= nr)
-			j -= nr;
-		if (pick_ok(eject, j, skip) && open[j] < open[best])
-			best = j;
+	/* All ejected: the one back soonest, ties in turn. */
+	i = pk->rr % nr;
+	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
+		s = pk->st[i];
+		if (!s)
+			continue;
+		v = pick_ejected(&c, s, i);
+		/* Back meanwhile: in service again. */
+		if (!v)
+			return i;
+		if (v < best_val) {
+			best = i;
+			best_val = v;
+		}
 	}
 	return best;
 }
