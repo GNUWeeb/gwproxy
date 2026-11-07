@@ -388,8 +388,8 @@ a name, an IPv4 address or a bracketed IPv6 one, an optional port), and
 (at most once) sets the method; round\-robin is the default.
 .B https://
 servers need a build with OpenSSL support; without it they fail the load.
-A pool has 1 to 64 servers, and all of them must resolve target names the
-same way:
+A pool has 1 to 8192 servers (one more fails the load), and all of them must
+resolve target names the same way:
 .B socks5://
 servers have gwproxy resolve them,
 .BR socks5h:// ", " http:// " and " https://
@@ -405,7 +405,8 @@ that use it, or in another file of the set; a rule naming a pool that is not
 defined anywhere is an error. Every server is parsed and its host resolved
 when the set loads (and only then: a reload resolves it again), as
 .B \-\-upstream\-proxy
-is at startup: a host that is neither a name nor an address, a name that does
+is at startup. Host names are resolved one by one, so a large pool of names
+loads as slowly as all its lookups in a row; an address needs no lookup. A host that is neither a name nor an address, a name that does
 not resolve, an address
 .B \-\-outgoing\-family
 forbids, or a
@@ -1752,6 +1753,16 @@ on the choices made after it. A reload starts each pool's turn from its first
 server again. Workers choosing at the same moment may see the same counts and
 choose the same server; the choices after them see the result.
 .PP
+Round\-robin costs the same whatever the size of the pool: a connection looks
+only at the server whose turn it is (and, when that one is ejected, at a few
+more, see below).
+.B least_conn
+has to compare the counts of all the servers: each new connection reads the
+count of every server of its pool, stopping early only at a server with none
+open, so in a pool of thousands of busy servers every new connection costs a
+scan of thousands of counts that other workers keep changing. Prefer
+round\-robin for large pools unless the load must follow the counts.
+.PP
 A pool also keeps track of its servers' health, from the connections they
 carry (passively: gwproxy sends no probes of its own). A failure counts
 against a server only when it is the server's own: its TCP connection
@@ -1769,9 +1780,18 @@ out while the server is waiting for the target to answer the CONNECT (a
 target that never answers holds a healthy server up), nor local trouble such
 as running out of descriptors. Three failures
 that count, within 30 seconds, eject the server for 5 minutes: no pool picks
-it meanwhile, and round\-robin and
+it meanwhile. When its turn comes, round\-robin tries up to 4 servers of
+the pool at random and takes the first one in service, so the turns of
+ejected servers, even of a run of them, are spread evenly over the servers
+left instead of all landing on the next one; only if all 4 tries find an
+ejected server does it take the next server in service in the block's
+order.
 .B least_conn
-alike spread its share over the servers left. As with the counts, the health
+chooses among the servers left; when the ejected server is where its turn
+would start the search among equally loaded servers, the same 4 random
+tries pick another starting point, so among servers with the same count
+the ejected server's turns are spread too. It still takes a server with the
+fewest connections. As with the counts, the health
 is the server's, not the pool's: failures through one pool eject the server
 from every pool that lists it. When every server of a pool is ejected, the
 pool takes the one whose ejection ends soonest; a pool of one server, and
@@ -1785,7 +1805,8 @@ numbers are fixed.
 .PP
 A connection that a pool's server fails in one of the ways that count is
 tried again, once, on another server of the same pool that is not ejected:
-the next one in the block's order, or with
+the next one in the block's order (when that one is ejected, one found as
+for an ejected server's turn), or with
 .B least_conn
 the least loaded one. This is safe because nothing the client sends is
 passed on before the tunnel through the upstream is up, so the retry repeats

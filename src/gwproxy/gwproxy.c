@@ -38,6 +38,9 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#ifdef CONFIG_HAVE_GETRANDOM
+#include <sys/random.h>
+#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -2336,6 +2339,7 @@ static const char gwp_acl_default_rules[] =
 static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
 			size_t size);
 static void acl_srv_put(void *arg, void *srv);
+static void *acl_srv_handle(void *arg, void *srv);
 
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 {
@@ -2348,6 +2352,7 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 	ctx->nr_acl_files = 0;
 	ctx->acl_srv_ops.make = acl_srv_make;
 	ctx->acl_srv_ops.put = acl_srv_put;
+	ctx->acl_srv_ops.handle = acl_srv_handle;
 	ctx->acl_srv_ops.arg = ctx;
 	atomic_init(&ctx->nr_acl_srv, 0);
 
@@ -2825,6 +2830,16 @@ static const char *up_desc(const struct gwp_acl_pool *pool, uint32_t idx,
 	return buf;
 }
 
+/* Log that @up, the @idx-th server of @pool (or the default), is back. */
+static void up_back(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
+		    uint32_t idx, struct gwp_upstream *up)
+{
+	char desc[320];
+
+	pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
+		up_desc(pool, idx, up, desc, sizeof(desc)));
+}
+
 /*
  * How many milliseconds the ejection of @up (the @idx-th server of @pool,
  * or the default upstream) still runs, 0 while it is in service. Reads the
@@ -2836,7 +2851,6 @@ static const char *up_desc(const struct gwp_acl_pool *pool, uint32_t idx,
 static uint32_t up_ejected(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
 			   uint32_t idx, struct gwp_upstream *up, uint64_t *now)
 {
-	char desc[320];
 	uint32_t left;
 	bool back;
 
@@ -2846,9 +2860,57 @@ static uint32_t up_ejected(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
 		*now = gwp_now_ms();
 	left = gwp_up_state_ejected(up->state, (uint32_t)*now, &back);
 	if (back)
-		pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
-			up_desc(pool, idx, up, desc, sizeof(desc)));
+		up_back(ctx, pool, idx, up);
 	return left;
+}
+
+/* What pool_pick_server()'s callbacks need. */
+struct pool_pick_env {
+	struct gwp_ctx		*ctx;
+	struct gwp_acl_pool	*pool;
+};
+
+static uint32_t pool_pick_now(void __unused *arg)
+{
+	return (uint32_t)gwp_now_ms();
+}
+
+/*
+ * Round-robin's probes (gwp_up_pick::random): a generator per thread, so
+ * no lock and no shared line; seeded on its first use, the only time it
+ * may make a syscall, from getrandom() or else the clock and the thread's
+ * own address. Not secret: it only spreads an ejected server's turns.
+ */
+static __thread uint32_t pool_pick_rnd;
+
+static uint32_t pool_pick_random(void __unused *arg)
+{
+	if (unlikely(!pool_pick_rnd)) {
+		struct timespec ts;
+		uint32_t seed = 0;
+
+#ifdef CONFIG_HAVE_GETRANDOM
+		if (getrandom(&seed, sizeof(seed), GRND_NONBLOCK) !=
+		    (ssize_t)sizeof(seed))
+			seed = 0;
+#endif
+		if (!seed) {
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			seed = (uint32_t)ts.tv_nsec ^ (uint32_t)ts.tv_sec;
+			seed ^= (uint32_t)(uintptr_t)&pool_pick_rnd * 2654435761u;
+		}
+		pool_pick_rnd = seed ? seed : 1;
+	}
+	return gwp_up_rand(&pool_pick_rnd);
+}
+
+static void pool_pick_back(void *arg, uint32_t i)
+{
+	struct pool_pick_env *env = arg;
+	struct gwp_upstream *up = gwp_acl_pool_server(env->pool, i);
+
+	if (up)
+		up_back(env->ctx, env->pool, i, up);
 }
 
 /*
@@ -2866,39 +2928,41 @@ static uint32_t up_ejected(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
  * @skip in pool order (least_conn: the fewest open, ties from there), or
  * UINT32_MAX for none; a retry leaves the cursor alone, so the pool's
  * turns go on as if the failed pick had worked.
+ *
+ * The pick reads the states in place, through the pool's handles (see
+ * acl_srv_handle()), with no copy: round-robin looks at the cursor's
+ * server, and only when it is ejected at a few random ones and then the
+ * next ones in turn; least_conn scans
+ * the open counts of the whole pool (see gwp_up_lb_pick()). UINT32_MAX,
+ * when the pool has no server object at all, is a bug conn_pick_upstream()
+ * reports.
  */
 static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 				 uint32_t skip)
 {
-	uint32_t nr = gwp_acl_pool_nr_servers(pool), open[64], eject[64], i, rr;
-	bool lc = gwp_acl_pool_method(pool) == GWP_ACL_POOL_LEAST_CONN;
-	uint64_t now = 0;
-	struct gwp_upstream *up;
-	bool any = false;
+	struct pool_pick_env env = { .ctx = ctx, .pool = pool };
+	struct gwp_up_pick pk = {
+		.st = gwp_acl_pool_handles(pool),
+		.nr = gwp_acl_pool_nr_servers(pool),
+		.least_conn = gwp_acl_pool_method(pool) ==
+			      GWP_ACL_POOL_LEAST_CONN,
+		.skip = skip,
+		.now = pool_pick_now,
+		.back = pool_pick_back,
+		.random = pool_pick_random,
+		.arg = &env,
+	};
 
-	/* None is a bug conn_pick_upstream() reports. */
-	if (unlikely(!nr))
-		return 0;
-	/* acl.c allows 64; past that, the first 64 are all it can pick. */
-	if (unlikely(nr > sizeof(open) / sizeof(open[0])))
-		nr = sizeof(open) / sizeof(open[0]);
-	for (i = 0; i < nr; i++) {
-		up = gwp_acl_pool_server(pool, i);
-		if (unlikely(!up)) {
-			/* Likewise; never pick it. */
-			open[i] = UINT32_MAX;
-			eject[i] = UINT32_MAX;
-			any = true;
-			continue;
-		}
-		if (lc)
-			open[i] = gwp_up_state_open(up->state);
-		eject[i] = up_ejected(ctx, pool, i, up, &now);
-		any |= eject[i] != 0;
-	}
-	rr = skip == UINT32_MAX ? gwp_acl_pool_next(pool) : skip;
-	return gwp_up_lb_pick(lc, rr, open, any ? eject : NULL, nr, skip);
+	if (unlikely(!pk.st))
+		return UINT32_MAX;
+	if (skip == UINT32_MAX)
+		pk.rr = gwp_acl_pool_next(pool);
+	return gwp_up_lb_pick(&pk);
 }
+
+/* Every place in a pool fits gwp_conn_pair::up_srv. */
+_Static_assert(GWP_ACL_POOL_MAX_SERVERS - 1 <= UINT16_MAX,
+	       "gwp_conn_pair::up_srv cannot hold a pool server's place");
 
 /*
  * Decide, once per pair and before its target's name is resolved, which
@@ -2950,7 +3014,7 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		gwp_conn_set_upstream(ctx, gcp, up);
 		/* Kept for the logs and the retry, until the tunnel is up. */
 		gcp->up_pool = gwp_acl_req_take_pool(&req);
-		gcp->up_srv = (uint8_t)i;
+		gcp->up_srv = (uint16_t)i;
 		pr_dbg(&ctx->lh, "Upstream for idx=%u: pool %s server %u, %s (%s), %u open",
 		       gcp->idx, gwp_acl_pool_name(gcp->up_pool), i + 1,
 		       ip_to_str(&up->addr), up->host,
@@ -3977,6 +4041,18 @@ static void acl_srv_put(void __unused *arg, void *srv)
 }
 
 /*
+ * A pool keeps each server's shared state beside it, which the server holds
+ * until it is freed, so pool_pick_server() reads the states without
+ * reaching every server object.
+ */
+static void *acl_srv_handle(void __unused *arg, void *srv)
+{
+	struct gwp_upstream *up = srv;
+
+	return up->state;
+}
+
+/*
  * The one place a pair's upstream changes, so the open-pair count of each
  * server identity (struct gwp_up_state) follows the pairs that hold one of
  * its servers: a pair takes a slot with the server, when it is given it,
@@ -4047,7 +4123,7 @@ static bool upstream_retry(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	up_desc(gcp->up_pool, gcp->up_srv, old, d_old, sizeof(d_old));
 	gwp_conn_set_upstream(w->ctx, gcp, up);
-	gcp->up_srv = (uint8_t)i;
+	gcp->up_srv = (uint16_t)i;
 	/* A new attempt: its failure is its own. */
 	gcp->flags &= ~GWP_CONN_FLAG_UP_FAILED;
 	gcp->up_end = 0;

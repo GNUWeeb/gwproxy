@@ -3050,18 +3050,33 @@ static void up_srv_put(void *arg, void *srv)
 	assert(atomic_fetch_sub(&g_up_live, 1) > 0);
 }
 
+/* A pick handle: something the object holds while it lives. */
+static void *up_srv_handle(void *arg, void *srv)
+{
+	struct up_srv *s = srv;
+
+	assert(arg == &g_up_live);
+	return s->url;
+}
+
 static const struct gwp_acl_server_ops up_srv_ops = {
 	.make	= up_srv_make,
 	.put	= up_srv_put,
+	.handle	= up_srv_handle,
 	.arg	= &g_up_live,
 };
 
-/* The server object @p's @i-th URL was made into, checked against it. */
+/*
+ * The server object @p's @i-th URL was made into, checked against it, and
+ * its pick handle with it.
+ */
 static struct up_srv *up_srv_of(const struct gwp_acl_pool *p, uint32_t i)
 {
 	struct up_srv *s = gwp_acl_pool_server(p, i);
+	void *const *h = gwp_acl_pool_handles(p);
 
 	assert(s && !strcmp(s->url, gwp_acl_pool_server_url(p, i)));
+	assert(h && h[i] == s->url);
 	return s;
 }
 
@@ -3150,6 +3165,7 @@ static noinline void test_upstream_server_ops(void)
 	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
 	assert(gwp_acl_pool_server_url(req.upstream_pool, 0));
 	assert(!gwp_acl_pool_server(req.upstream_pool, 0));
+	assert(!gwp_acl_pool_handles(req.upstream_pool));
 	gwp_acl_req_release(&req);
 	gwp_acl_destroy(a);
 	assert(g_up_made == 5);
@@ -3439,6 +3455,7 @@ static noinline void test_upstream_errors(void)
 {
 	static const char srv[] = " server http://10.0.0.1:1;\n";
 	char name[80], *text, *p;
+	struct gwp_acl_req req;
 	struct gwp_acl *a;
 	int i;
 
@@ -3574,14 +3591,27 @@ static noinline void test_upstream_errors(void)
 		   " server socks5://h:1;\n}\n", -EINVAL,
 		   "server 2 (socks5://h:1): resolves names locally, the servers before it remotely");
 
-	/* The limits: 64 servers a pool, 1024 pools a set. */
-	text = malloc(1100 * 64);
+	/* The limits: 8192 servers a pool, 1024 pools a set. */
+	assert(GWP_ACL_POOL_MAX_SERVERS == 8192);
+	text = malloc(64 * 8200);
 	assert(text);
-	up_pool_text(text, "p", 64);
+	p = up_pool_text(text, "p", 8192);
+	sprintf(p, "-A OUTPUT -j UPSTREAM --to p\n");
 	assert(!gwp_acl_parse_str(&a, text));
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	assert(gwp_acl_pool_nr_servers(req.upstream_pool) == 8192);
+	assert(!strcmp(gwp_acl_pool_server_url(req.upstream_pool, 0),
+		       "socks5h://10.0.0.1:1080"));
+	assert(!strcmp(gwp_acl_pool_server_url(req.upstream_pool, 4097),
+		       "socks5h://10.0.16.98:1080"));
+	assert(!strcmp(gwp_acl_pool_server_url(req.upstream_pool, 8191),
+		       "socks5h://10.0.32.192:1080"));
+	assert(!gwp_acl_pool_server_url(req.upstream_pool, 8192));
+	gwp_acl_req_release(&req);
 	gwp_acl_destroy(a);
-	up_pool_text(text, "p", 65);
-	up_refused(text, -EINVAL, "line 66: upstream pool p has more than 64 servers");
+	up_pool_text(text, "p", 8193);
+	up_refused(text, -EINVAL, "line 8194: upstream pool p has more than 8192 servers");
 	for (p = text, i = 0; i < 1024; i++) {
 		snprintf(name, sizeof(name), "p%d", i);
 		p = up_pool_text(p, name, 1);

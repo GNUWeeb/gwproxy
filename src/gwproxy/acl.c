@@ -77,7 +77,6 @@ struct gwp_acl_dnat {
 
 /* Limits of the upstream pools of one rule set. */
 #define ACL_POOL_NAME_MAX	64
-#define ACL_POOL_MAX_SERVERS	64
 #define ACL_MAX_POOLS		1024
 /* What gwp_parse_upstream() takes after the scheme, NUL included. */
 #define ACL_URL_REST_MAX	512
@@ -92,6 +91,8 @@ struct gwp_acl_pool {
 	/* gwp_acl_pool_next(): the one thing in a pool that changes. */
 	_Atomic(uint32_t)	cursor;
 	uint32_t		nr_servers;
+	/* What @servers and @srv have room for (pool_add_server()). */
+	uint32_t		cap_servers;
 	/* The server URLs as written, credentials included. */
 	char			**servers;
 	/*
@@ -99,6 +100,8 @@ struct gwp_acl_pool {
 	 * reference to each, dropped with @ops->put when it is freed.
 	 */
 	void			**srv;
+	/* @ops->handle of each of @srv, NULL without @ops->handle. */
+	void			**hdl;
 	const struct gwp_acl_server_ops *ops;
 	uint8_t			method;		/* enum gwp_acl_pool_method */
 	bool			remote_dns;
@@ -1120,6 +1123,11 @@ void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i)
 	return i < p->nr_servers && p->srv ? p->srv[i] : NULL;
 }
 
+void *const *gwp_acl_pool_handles(const struct gwp_acl_pool *p)
+{
+	return p->hdl ? p->hdl : p->srv;
+}
+
 uint32_t gwp_acl_pool_next(struct gwp_acl_pool *p)
 {
 	return atomic_fetch_add_explicit(&p->cursor, 1, memory_order_relaxed);
@@ -1146,6 +1154,7 @@ void gwp_acl_pool_put(struct gwp_acl_pool *p)
 	}
 	free(p->servers);
 	free(p->srv);
+	free(p->hdl);
 	free(p);
 }
 
@@ -1361,9 +1370,9 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 	char shown[160];
 	char **v, *dup;
 
-	if (p->nr_servers == ACL_POOL_MAX_SERVERS)
-		return load_err(ld, "upstream pool %s has more than %d servers",
-				p->name, ACL_POOL_MAX_SERVERS);
+	if (p->nr_servers == GWP_ACL_POOL_MAX_SERVERS)
+		return load_err(ld, "upstream pool %s has more than %u servers",
+				p->name, GWP_ACL_POOL_MAX_SERVERS);
 	if (check_server_url(url, &remote_dns, &creds, &why))
 		return load_err(ld, "upstream pool %s server %u: %s", p->name,
 				idx, why);
@@ -1374,18 +1383,37 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 				remote_dns ? "remotely" : "locally",
 				p->remote_dns ? "remotely" : "locally");
 
-	v = realloc(p->servers, (p->nr_servers + 1) * sizeof(*v));
-	if (!v)
-		return -ENOMEM;
-	p->servers = v;
-	if (ld->ops) {
-		void **sv = realloc(p->srv, (p->nr_servers + 1) * sizeof(*sv));
+	/*
+	 * Room for one more, doubling: a pool may have thousands of servers,
+	 * and growing by one would copy the arrays once per server.
+	 */
+	if (p->nr_servers == p->cap_servers) {
+		uint32_t cap = p->cap_servers ? p->cap_servers * 2 : 4;
 
-		if (!sv)
+		if (cap > GWP_ACL_POOL_MAX_SERVERS)
+			cap = GWP_ACL_POOL_MAX_SERVERS;
+		v = realloc(p->servers, cap * sizeof(*v));
+		if (!v)
 			return -ENOMEM;
-		p->srv = sv;
-		p->ops = ld->ops;
+		p->servers = v;
+		if (ld->ops) {
+			void **sv = realloc(p->srv, cap * sizeof(*sv));
+
+			if (!sv)
+				return -ENOMEM;
+			p->srv = sv;
+		}
+		if (ld->ops && ld->ops->handle) {
+			void **hv = realloc(p->hdl, cap * sizeof(*hv));
+
+			if (!hv)
+				return -ENOMEM;
+			p->hdl = hv;
+		}
+		p->cap_servers = cap;
 	}
+	if (ld->ops)
+		p->ops = ld->ops;
 	dup = strdup(url);
 	if (!dup)
 		return -ENOMEM;
@@ -1405,6 +1433,9 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 					err[0] ? err : strerror(-r));
 		}
 		p->srv[p->nr_servers] = srv;
+		if (p->hdl)
+			p->hdl[p->nr_servers] = ld->ops->handle(ld->ops->arg,
+								srv);
 	}
 	p->servers[p->nr_servers++] = dup;
 	p->remote_dns = remote_dns;
