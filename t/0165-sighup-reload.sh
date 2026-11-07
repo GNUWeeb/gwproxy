@@ -10,7 +10,8 @@
 #  - a broken file keeps its current contents in force, the other file still
 #    reloads, and a later SIGHUP applies the fixed file;
 #  - SIGHUPs that arrive while a reload runs (here one held reading a file
-#    with a hole of terabytes) give one more reload after it, not one each;
+#    with gigabytes of blank lines) give one more reload after it, not one
+#    each;
 #  - a SIGHUP, even many of them, neither stops the proxy nor disturbs a tunnel
 #    in flight, with or without files to reload, and SIGTERM still stops it;
 #  - --watch-files=1 reloads a changed file by itself, and SIGHUP still works;
@@ -41,11 +42,11 @@ fetch()
 		"http://127.0.0.1:${4:-$hp}/payload.bin" -o /dev/null
 }
 
-# reading_hole <pid> <log> <n>: wait until the reload after SIGHUP number
-# <n>+1 in <log> reads the auth file's hole: the read count of <pid> grows by
-# about a GB a second then. Where that count cannot be read, the reload has
-# started at least once its SIGHUP is logged.
-reading_hole()
+# reading_hold <pid> <log> <n>: wait until the reload after SIGHUP number
+# <n>+1 in <log> reads the auth file's blank lines: the read count of <pid>
+# grows by tens of MB a second then. Where that count cannot be read, the
+# reload has started at least once its SIGHUP is logged.
+reading_hold()
 {
 	local i rc0 rc1
 
@@ -60,7 +61,7 @@ reading_hole()
 		sleep 0.1
 		rc1="$(sed -n 's/^rchar: //p' "/proc/$1/io" 2>/dev/null)"
 		[ -n "$rc1" ] || return 0
-		[ $((rc1 - rc0)) -gt 1000000 ] && return 0
+		[ $((rc1 - rc0)) -gt 100000 ] && return 0
 	done
 	return 1
 }
@@ -196,20 +197,18 @@ for loop in epoll io_uring; do
 		|| fail "[$loop] the fixed auth file was not applied"
 
 	# A burst of SIGHUPs while a reload runs. The auth file becomes one
-	# with a hole of terabytes after its contents, which the reload reads
-	# on (as blank lines) until the file is cut short through the second
-	# link below; ten SIGHUPs meanwhile must give one more reload, not ten.
+	# with gigabytes of blank lines after its contents
+	# (t/servers/blank_hold.py), which the reload reads on until the file
+	# is cut short through the second link below; ten SIGHUPs meanwhile
+	# must give one more reload, not ten.
 	rm -f "$d/hold" "$d/hold.lnk"
-	printf 'erin:pw-e\n' >"$d/hold"
-	for s in 8T 1T 64G; do
-		truncate -s "$s" "$d/hold" 2>/dev/null && break
-	done
-	[ "$(wc -c <"$d/hold")" -gt 10 ] || fail "[$loop] cannot make a sparse file"
+	python3 "$SERVERS_DIR/blank_hold.py" "$d/hold" $'erin:pw-e\n' \
+		>/dev/null || fail "[$loop] cannot write the held auth file"
 	ln -f "$d/hold" "$d/hold.lnk"
 	mv -f "$d/hold.lnk" "$d/auth"
 	n0="$(grep -c "$hup_seen" "$log")"
 	kill -HUP "$GWP_PID"
-	reading_hole "$GWP_PID" "$log" "$n0" \
+	reading_hold "$GWP_PID" "$log" "$n0" \
 		|| fail "[$loop] the SIGHUP reload never started reading the file"
 	for _ in $(seq 1 10); do
 		kill -HUP "$GWP_PID"

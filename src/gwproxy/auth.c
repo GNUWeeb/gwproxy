@@ -242,6 +242,31 @@ static FILE *open_auth_file(const char *path, int *err)
 }
 
 /*
+ * Read the next line of @fp, newline included, into @buf and NUL-terminate
+ * it; *len gets its length, which counts any NUL bytes it holds (fgets()
+ * would hide them). Returns 1 for a line, 0 at the end of the file, and
+ * -E2BIG for a line of @size bytes or more, which no valid line is (two
+ * 255-byte fields and a colon): taking it in pieces would make each piece an
+ * entry of its own.
+ */
+static int read_line(FILE *fp, char *buf, size_t size, size_t *len)
+{
+	size_t n = 0;
+	int c;
+
+	while ((c = getc(fp)) != EOF) {
+		if (n == size - 1)
+			return -E2BIG;
+		buf[n++] = (char)c;
+		if (c == '\n')
+			break;
+	}
+	buf[n] = '\0';
+	*len = n;
+	return n > 0;
+}
+
+/*
  * Read and parse the credential file at @path into a new set. The file is
  * opened afresh on every call: a file replaced by rename (an editor, mv,
  * install) is a new inode, and a handle kept from an earlier open would go on
@@ -255,6 +280,7 @@ static int load_auth_set(const char *path, struct auth_set **out)
 	FILE *fp;
 	size_t l;
 	int r = 0;
+	int rl;
 
 	set = calloc(1, sizeof(*set));
 	if (!set)
@@ -266,16 +292,22 @@ static int load_auth_set(const char *path, struct auth_set **out)
 		return r;
 	}
 
-	while ((t = fgets(buf, sizeof(buf), fp))) {
+	while ((rl = read_line(fp, buf, sizeof(buf), &l))) {
 		lineno++;
-		/*
-		 * A line too long for the buffer would come back in pieces,
-		 * each taken for an entry of its own. No valid line is that
-		 * long (two 255-byte fields and a colon).
-		 */
-		l = strlen(buf);
-		if (l && buf[l - 1] != '\n' && !feof(fp)) {
+		if (rl < 0) {
 			fprintf(stderr, "auth: line %u is too long\n", lineno);
+			r = -EINVAL;
+			break;
+		}
+		/*
+		 * No valid line holds a NUL byte. The string functions below
+		 * would end the line at it: one at its start would make the
+		 * line read as blank and be skipped, and one inside it would
+		 * cut off the rest, so refuse the file rather than guess.
+		 */
+		if (memchr(buf, '\0', l)) {
+			fprintf(stderr, "auth: line %u holds a NUL byte\n",
+				lineno);
 			r = -EINVAL;
 			break;
 		}

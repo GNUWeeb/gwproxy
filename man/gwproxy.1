@@ -462,6 +462,19 @@ or
 .B "! \-p tcp"
 could never take effect, and is a load error.
 .IP
+Every number in a rule \(em a port, port range or list, a prefix length, a
+.B \-\-to
+port, a mark, and the values of
+.BR \-\-every " and " \-\-packet
+\(em starts with a digit: a sign or anything else in front of the digits, as in
+.B \-\-dports +80
+or
+.BR 10.0.0.0/+8 ,
+fails the load like any malformed line. A mark may still be written in
+hexadecimal with a
+.B 0x
+prefix.
+.IP
 .B \-j MARK
 sets the fwmark
 .RB ( SO_MARK )
@@ -1377,9 +1390,14 @@ The credential file named by
 .B \-\-auth\-file
 holds one
 .B username:password
-entry per line. The same store backs SOCKS5 (RFC 1929) and HTTP "Basic" (RFC
-7617) authentication; whenever it is configured, clients of either protocol
-must authenticate. Credentials can be updated without a restart: edit the file
+entry per line, each part 1 to 255 bytes. Blank lines, and lines whose first
+character other than a blank is
+.BR # ,
+are skipped. A line that is no such entry, or that holds a NUL byte anywhere,
+fails the load with its line number: at startup gwproxy exits, and a reload
+keeps the current credentials. The same store backs SOCKS5 (RFC 1929) and HTTP
+"Basic" (RFC 7617) authentication; whenever it is configured, clients of either
+protocol must authenticate. Credentials can be updated without a restart: edit the file
 and send gwproxy a
 .B SIGHUP
 (see
