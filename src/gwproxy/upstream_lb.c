@@ -315,20 +315,31 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 	else
 		i = pk->rr % nr;
 
-	if (!pk->least_conn) {
+	/*
+	 * The start's server is the pick (round-robin) or where the ties
+	 * start (least_conn). When it cannot be taken, a random one in
+	 * service replaces it, if a probe finds one, so its turns are
+	 * spread; else round-robin takes the next in service, and
+	 * least_conn's ties start where they would have.
+	 */
+	s = pk->st[i];
+	if (i == skip || !s || pick_ejected(&c, s, i)) {
 		uint32_t p, j;
 
-		s = pk->st[i];
-		if (i != skip && s && !pick_ejected(&c, s, i))
-			return i;
-		/* A miss: random probes, then the next in service. */
 		for (p = 0; pk->random && p < GWP_UP_PICK_PROBES; p++) {
 			/* Uniform over [0, nr), no division. */
 			j = (uint32_t)(((uint64_t)pk->random(pk->arg) * nr) >> 32);
 			s = pk->st[j];
-			if (j != skip && s && !pick_ejected(&c, s, j))
-				return j;
+			if (j != skip && s && !pick_ejected(&c, s, j)) {
+				i = j;
+				break;
+			}
 		}
+	}
+	if (!pk->least_conn) {
+		s = pk->st[i];
+		if (i != skip && s && !pick_ejected(&c, s, i))
+			return i;
 	}
 
 	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {

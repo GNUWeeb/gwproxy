@@ -1725,7 +1725,11 @@ left instead of all landing on the next one; only if all 4 tries find an
 ejected server does it take the next server in service in the block's
 order.
 .B least_conn
-chooses among the servers left. As with the counts, the health
+chooses among the servers left; when the ejected server is where its turn
+would start the search among equally loaded servers, the same 4 random
+tries pick another starting point, so among servers with the same count
+the ejected server's turns are spread too. It still takes a server with the
+fewest connections. As with the counts, the health
 is the server's, not the pool's: failures through one pool eject the server
 from every pool that lists it. When every server of a pool is ejected, the
 pool takes the one whose ejection ends soonest; a pool of one server, and

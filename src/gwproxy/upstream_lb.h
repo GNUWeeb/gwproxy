@@ -242,18 +242,19 @@ struct gwp_up_pick {
 	 */
 	void		(*back)(void *arg, uint32_t i);
 	/*
-	 * A uniformly distributed 32-bit random number, for round-robin's
-	 * probes when the server whose turn it is is ejected; called at most
-	 * GWP_UP_PICK_PROBES times per pick, and never while that server is
-	 * in service. NULL: no probes.
+	 * A uniformly distributed 32-bit random number, for the probes when
+	 * the server whose turn it is (or where least_conn's ties start) is
+	 * ejected; called at most GWP_UP_PICK_PROBES times per pick, and
+	 * never while that server is in service. NULL: no probes.
 	 */
 	uint32_t	(*random)(void *arg);
 	void		*arg;
 };
 
 /*
- * How many random servers round-robin tries when the one whose turn it is
- * is ejected, before it falls back to the next in service after it.
+ * How many random servers a pick tries when the one whose turn it is (or
+ * where least_conn's ties start) is ejected, before it falls back to the
+ * next in service after it.
  */
 #define GWP_UP_PICK_PROBES	4u
 
@@ -288,7 +289,10 @@ static inline uint32_t gwp_up_rand(uint32_t *state)
  * Least-connections (@least_conn) takes the server in service with the
  * fewest open pairs, among equals the first from the same start on, so
  * the cursor moving on rotates the ties and servers that are equally
- * loaded share the new connections. It reads every server's open count,
+ * loaded share the new connections. When the start's server is ejected,
+ * the same probes choose another start among the servers in service, so
+ * among equals an ejected server's turns are spread too; the choice of
+ * the fewest stays exact. It reads every server's open count,
  * stopping at the first idle one in service (none can have fewer), and
  * the health only of a server that would be the best so far.
  *

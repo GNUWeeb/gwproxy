@@ -330,10 +330,9 @@ static uint32_t tp_pick(struct tpool *p, bool least_conn, uint32_t rr,
 	uint32_t before = p->clock_reads, rnd = p->nr_random, i;
 
 	i = gwp_up_lb_pick(&pk);
-	/* The clock: once at most; probes: a few, round-robin only. */
+	/* The clock: once at most; probes: a few. */
 	assert(p->clock_reads - before <= 1);
 	assert(p->nr_random - rnd <= GWP_UP_PICK_PROBES);
-	assert(!least_conn || p->nr_random == rnd);
 	return i;
 }
 
@@ -810,8 +809,44 @@ static void test_pick_probe(void)
 	assert(tp_pick(&p, false, 2, NONE) == 4);
 	p.st[6] = p.s[6];
 
-	/* least_conn never probes. */
+	/*
+	 * least_conn: the start's server ejected, a probe moves where the
+	 * ties start; with all tied (0 open) the probed one wins. All
+	 * probes missing: the ties start at the cursor as before.
+	 */
+	vals[0] = tp_at(8, 5);
+	vals[1] = tp_at(8, 6);
+	p.nr_fake = 2;
+	p.ifake = 0;
+	n = p.nr_random;
+	assert(tp_pick(&p, true, 2, NONE) == 6);
+	assert(p.nr_random - n == 2);
+	vals[0] = vals[1] = tp_at(8, 5);
+	p.ifake = 0;
 	assert(tp_pick(&p, true, 2, NONE) == 3);
+	/* The fewest still wins wherever the ties start (1 is ejected). */
+	tp_open(&p, 6, 1);
+	tp_open(&p, 7, 1);
+	tp_open(&p, 0, 1);
+	tp_open(&p, 4, 1);
+	vals[0] = tp_at(8, 6);
+	p.ifake = 0;
+	assert(tp_pick(&p, true, 2, NONE) == 3);
+	tp_open(&p, 3, 1);
+	p.ifake = 0;
+	assert(tp_pick(&p, true, 2, NONE) == 6);
+	/* With its start in service, least_conn draws nothing. */
+	n = p.nr_random;
+	assert(tp_pick(&p, true, 3, NONE) == 3);
+	assert(p.nr_random == n);
+	/* A retry: never the skipped one, wherever the ties start. */
+	vals[0] = tp_at(8, 0);
+	vals[1] = tp_at(8, 7);
+	p.ifake = 0;
+	assert(tp_pick(&p, true, 0, 0) == 7);
+	for (n = 0; n < 8; n++)
+		if (n != 2 && n != 5)
+			tp_open(&p, n, 0);
 
 	/* All ejected: probes all miss, the one back soonest as before. */
 	tp_free(&p);
@@ -868,6 +903,39 @@ static void test_pick_spread(uint32_t first, uint32_t run, uint32_t seed)
 	assert(p.nr_random >= run * (NR_DIST_PICKS / NR_DIST));
 	assert(p.nr_random <= GWP_UP_PICK_PROBES * run *
 			      (NR_DIST_PICKS / NR_DIST));
+	tp_free(&p);
+}
+
+/*
+ * test_pick_spread() for least_conn with every count tied (connections
+ * short enough to have ended before the next pick): the ties' start
+ * moves off an ejected server by the same probes, so each server in
+ * service gets its equal share within 3%, the one after the run too.
+ */
+static void test_pick_spread_lc(uint32_t first, uint32_t run, uint32_t seed)
+{
+	uint32_t hits[NR_DIST] = { 0 }, rr, i, want, tol;
+	struct tpool p;
+
+	tp_init(&p, NR_DIST);
+	p.xs = seed;
+	for (i = first; i < first + run; i++)
+		tp_eject(&p, i, 1000);
+	for (rr = 0; rr < NR_DIST_PICKS; rr++)
+		hits[tp_pick(&p, true, rr, NONE)]++;
+	want = NR_DIST_PICKS / (NR_DIST - run);
+	tol = want * 3 / 100;
+	for (i = 0; i < NR_DIST; i++) {
+		if (i >= first && i < first + run) {
+			assert(!hits[i]);
+			continue;
+		}
+		if (hits[i] + tol < want || hits[i] > want + tol) {
+			fprintf(stderr, "least_conn server %u: %u picks, want %u +- %u\n",
+				i, hits[i], want, tol);
+			assert(0);
+		}
+	}
 	tp_free(&p);
 }
 
@@ -1046,6 +1114,9 @@ int main(void)
 	test_pick_spread(3, 1, 12345);
 	test_pick_spread(3, 3, 777);
 	test_pick_spread(7, 3, 0x9e3779b9);
+	test_pick_spread_lc(3, 1, 4242);
+	test_pick_spread_lc(3, 3, 99);
+	test_pick_spread_lc(7, 3, 0x2545f491);
 	test_eject_threads();
 	printf("All upstream_lb tests passed.\n");
 	return 0;
