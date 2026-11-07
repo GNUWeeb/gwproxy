@@ -1553,20 +1553,29 @@ and is logged with the reason, for example
 .IR "certificate verify failed: hostname mismatch" .
 .PP
 An upstream that turns the CONNECT down is answered to an HTTP client with
-"502 Bad Gateway", whatever its reason. A SOCKS5 client gets reply 0x05
-(connection refused) only when the upstream says the target could not be
-reached: a
+"502 Bad Gateway", or "504 Gateway Timeout" for a
 .B socks5://
 or
 .B socks5h://
-upstream's failed reply, or a 502 or 504 from an
+upstream's reply 0x06 (TTL expired). A SOCKS5 client is told the target's
+failure only when the upstream says the target could not be reached: a SOCKS5
+upstream's reply 0x03 (network unreachable), 0x04 (host unreachable), 0x05
+(connection refused) or 0x06 reaches the client as it is, and a 502 or 504
+from an
 .B http://
 or
 .B https://
-one. A 407, which says the upstream refused gwproxy's credentials, and any
-other status (403, 500, 503, ...) say nothing about the target and get reply
-0x01 (general failure), as does a SOCKS5 upstream that refuses the
-credentials.
+one as reply 0x05 (connection refused). Every other refusal says nothing about
+the target and gets reply 0x01 (general failure): a SOCKS5 upstream's reply
+0x01 or 0x02 (not allowed by its ruleset), 0x07 or 0x08 (the command or
+address type of gwproxy's request not supported) or any unassigned one, an
+HTTP 407, which says the upstream refused gwproxy's credentials, and any other
+status (403, 500, 503, ...), as well as a SOCKS5 upstream that refuses the
+credentials. So does an upstream that cannot be reached at all, its TCP
+connection refused, reset or unreachable: that is the upstream's failure, not
+the target's (HTTP 502). One that does not get through the handshake in time
+is answered as a target that times out is, reply 0x06 or HTTP 504 (see
+.BR \-\-connect\-timeout ).
 .PP
 The end of the upstream's stream reaches the client as a normal end of stream
 only if it is one, as for a TLS client in the other direction (see
@@ -1718,9 +1727,9 @@ authentication methods, refuses the credentials or answers reply 0x07 or
 server hanging up, or the connect timeout running out before gwproxy has
 sent its CONNECT request (during the TCP connect, the TLS handshake or the
 SOCKS5 method and authentication exchange). A failure the server reports for
-the target (SOCKS5 replies 0x03 to 0x06, HTTP 502 and 504) reaches the client
-as it is and never counts, and neither do ambiguous refusals (SOCKS5 replies
-0x01 and 0x02, HTTP 403, 500, 503 and any other status), the timeout running
+the target (SOCKS5 replies 0x03 to 0x06, HTTP 502 and 504) is passed on to the
+client as the target's failure and never counts, and neither do ambiguous
+refusals (SOCKS5 replies 0x01 and 0x02, HTTP 403, 500, 503 and any other status), the timeout running
 out while the server is waiting for the target to answer the CONNECT (a
 target that never answers holds a healthy server up), nor local trouble such
 as running out of descriptors. Three failures
@@ -1750,8 +1759,8 @@ nothing and loses nothing. It has what is left of the connection's
 no more: a connection that ran out of time is not retried, and when the retry
 runs out of it, that does not count against its server. With no other
 server to take, or once its retry has failed too, the client gets the reply
-it would have had without one: SOCKS5 reply 0x05 for a refused connection and
-0x01 for a failed handshake, or HTTP 502. A failure that does not count is not
+it would have had without one: SOCKS5 reply 0x01 (general failure), for a
+refused connection as for a failed handshake, or HTTP 502. A failure that does not count is not
 retried, and neither is a connection through
 .BR \-\-upstream\-proxy .
 .PP

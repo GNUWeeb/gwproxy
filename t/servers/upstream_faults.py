@@ -18,6 +18,7 @@
 #   partial_close    hang up halfway through the CONNECT reply
 #   rst_connect      reset the connection instead of answering the CONNECT
 #   auth_fail        take user/password auth, then refuse the credentials
+#   rep_NN           answer the CONNECT with REP 0xNN (rep_03, say)
 #
 # Faults of the HTTP mode:
 #   refuse           answer the CONNECT with 403
@@ -67,6 +68,8 @@ def socks5(c, fault):
         c.sendall(b'\x04\x00' + S5_OK_ADDR)
     elif fault == 'refuse':
         c.sendall(b'\x05\x05' + S5_OK_ADDR)
+    elif fault.startswith('rep_'):
+        c.sendall(b'\x05' + bytes([int(fault[4:], 16)]) + S5_OK_ADDR)
 
 
 def http(c, fault):
