@@ -337,24 +337,32 @@ gwp_hup()
 	fail "gwp_hup: the reload after SIGHUP did not finish"
 }
 
+# have_bind_family <bind>: whether this host can listen on <bind>: an IPv6
+# address needs IPv6, [::1] its loopback; [::] always works (gwproxy falls
+# back to 0.0.0.0). For a test that skips only one case without IPv6.
 # require_bind_family <bind>: skip the test if this host has no IPv6 for an
 # IPv6 <bind> ("[...]:port"): none at all (a kernel booted with
 # ipv6.disable=1, with no /proc/net/if_inet6), or no ::1 for "[::1]:port"
 # (IPv6 turned off on loopback with the disable_ipv6 sysctl). The wildcard
 # "[::]" needs no IPv6: gwproxy then listens on 0.0.0.0.
-require_bind_family()
+have_bind_family()
 {
 	case "$1" in
 	\[::\]:*) return 0 ;;
-	\[*) [ -e /proc/net/if_inet6 ] || skip "no IPv6 on this host for $1" ;;
+	\[*) [ -e /proc/net/if_inet6 ] || return 1 ;;
 	*) return 0 ;;
 	esac
 	case "$1" in
 	\[::1\]:*)
 		grep -q '^00000000000000000000000000000001 ' /proc/net/if_inet6 \
-			|| skip "no IPv6 loopback on this host for $1" ;;
+			|| return 1 ;;
 	esac
 	return 0
+}
+
+require_bind_family()
+{
+	have_bind_family "$1" || skip "no IPv6 for $1 on this host"
 }
 
 # gwp_start <bind> [args...]: start gwproxy bound to <bind> (e.g. "[::1]:1080"
@@ -492,9 +500,11 @@ start_dns_responder()
 
 # gwp_parallel <func> <arg>...: run "<func> <arg>" for every <arg> at once,
 # each in a subshell of its own, and fail once all have ended if any of them
-# failed: exited, or returned anything but 0. For a long test whose parts are independent, such as the same checks
-# on each event loop: run one after the other, they came near the time limit
-# on a loaded host.
+# failed: exited, or returned anything but 0 or the skip code. A part that
+# skips (skip(), require_bind_family(), ...) skips only itself; the test is
+# skipped only when every part was. For a long test whose parts are
+# independent, such as the same checks on each event loop: run one after the
+# other, they came near the time limit on a loaded host.
 #
 # A part must keep to files of its own (under a directory of its own in
 # $WORK, say) and may use everything set up before the call. What it starts
@@ -502,7 +512,7 @@ start_dns_responder()
 # ports it reserves are released with the test's, at its end.
 gwp_parallel()
 {
-	local f="$1" i rc=0
+	local f="$1" i rc=0 st ran=0
 	local -a pids=() args=()
 
 	shift
@@ -517,11 +527,18 @@ gwp_parallel()
 		args+=("$i")
 	done
 	for i in "${!pids[@]}"; do
-		wait "${pids[$i]}" && continue
-		rc=1
-		diag "$f ${args[$i]}: failed"
+		st=0
+		wait "${pids[$i]}" || st=$?
+		case "$st" in
+		0)	ran=$((ran + 1)) ;;
+		"$SKIP_CODE")
+			diag "$f ${args[$i]}: skipped" ;;
+		*)	rc=1
+			diag "$f ${args[$i]}: failed" ;;
+		esac
 	done
 	[ "$rc" = 0 ] || fail "$f: not every part passed"
+	[ "$ran" -gt 0 ] || skip "$f: every part skipped"
 }
 
 # Stop what one part of gwp_parallel() started, and nothing else: the test's
