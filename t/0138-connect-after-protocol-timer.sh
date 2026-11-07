@@ -19,7 +19,9 @@
 # must still not leave its pair behind, whether the wait is for a target that never
 # answers or an upstream that accepts and says nothing, and whether or not a FIN
 # came first. A FIN alone may come from a client that only finished sending, so
-# that one is held. See gone_cases below.
+# that one is held, but no longer than --protocol-timeout from the FIN on, also
+# when it is queued behind more than the proxy can take in; only with
+# --protocol-timeout=0 as well is it held without a limit. See gone_cases below.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -168,6 +170,29 @@ gone()
 	if how.startswith("fin"):
 	    c.shutdown(socket.SHUT_WR)
 	    time.sleep(0.5)
+	if how == "finbound":
+	    # --protocol-timeout from the FIN on: REP 0x06, if the client can
+	    # still read it, and the pair goes.
+	    t = time.monotonic()
+	    c.settimeout(PROT + 20)
+	    try:
+	        got = c.recv(10)
+	    except ConnectionResetError:
+	        got = b""
+	    except socket.timeout:
+	        sys.exit("no reply nor end %d s after the FIN" % (PROT + 20))
+	    if time.monotonic() - t < PROT - 1:
+	        sys.exit("ended %.1f s after the FIN, before the protocol "
+	                 "timeout" % (time.monotonic() - t))
+	    if got and got[:2] != b"\x05\x06":
+	        sys.exit("got %r, want REP 0x06" % got)
+	    while fds() > base and time.monotonic() - t < LIMIT:
+	        time.sleep(0.1)
+	    if fds() > base:
+	        sys.exit("%d descriptors above idle %d s after the FIN" %
+	                 (fds() - base, LIMIT))
+	    print("ok")
+	    sys.exit(0)
 	if how in ("stay", "fin"):
 	    # Past what the protocol timer would have allowed.
 	    c.settimeout(PROT + 3)
@@ -202,14 +227,15 @@ gone_cases()
 	cat <<-EOF
 	up-stay		stay	socks5	$none $up
 	up-rst		rst	socks5	$none $up
-	up-fin		fin	socks5	$none $up
-	up-fullfin	fullfin	socks5	$none $up --client-buf-size=4096
+	up-fin		finbound	socks5	$none $up
+	up-fullfin	fullfinbound	socks5	$none $up --client-buf-size=4096
 	up-finrst	finrst	socks5	$none $up
 	up-fullrst	fullrst	socks5	$none $up --client-buf-size=4096
 	up-nolimit	fin	socks5	--connect-timeout=0 --protocol-timeout=0 $up
 	hup-rst		rst	socks5	$none $hup
 	hole-rst	rst	socks5	$none
-	hole-fin	fin	socks5	$none
+	hole-fin	finbound	socks5	$none
+	hole-fullfin	fullfinbound	socks5	$none --client-buf-size=4096
 	plain-rst	rst	plain	$none $up --target=127.0.0.1:9
 	timed-rst	rst	socks5	--connect-timeout=300 --protocol-timeout=$PROT $up
 	EOF
