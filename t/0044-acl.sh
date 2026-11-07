@@ -135,21 +135,27 @@ acl_loop()
 	# CIDR blocks the IPv6 target (::1) but still serves an IPv4 target
 	# (the dual-stack httpd is reachable both ways). Exercises the v6
 	# address match and a v6 listener on both loops.
-	printf -- '%s\n' '-A OUTPUT -d ::1/128 -j REJECT' \
-		'-P OUTPUT ACCEPT' >"$W/v6.acl"
-	v6p="$(pick_port)"
-	gwp_start "[::1]:$v6p" --as-socks5=1 --event-loop="$loop" \
-		--acl-file="$W/v6.acl"
-	if curl -s --max-time 10 -x "socks5h://[::1]:$v6p" \
-		"http://[::1]:$hp/payload.bin" -o /dev/null 2>/dev/null; then
-		fail "$loop IPv6 ACL rule did not block the ::1 target"
+	# Only where the host has an IPv6 loopback: elsewhere skip this case,
+	# not the rest of the loop's checks.
+	if have_bind_family "[::1]:0"; then
+		printf -- '%s\n' '-A OUTPUT -d ::1/128 -j REJECT' \
+			'-P OUTPUT ACCEPT' >"$W/v6.acl"
+		v6p="$(pick_port)"
+		gwp_start "[::1]:$v6p" --as-socks5=1 --event-loop="$loop" \
+			--acl-file="$W/v6.acl"
+		if curl -s --max-time 10 -x "socks5h://[::1]:$v6p" \
+			"http://[::1]:$hp/payload.bin" -o /dev/null 2>/dev/null; then
+			fail "$loop IPv6 ACL rule did not block the ::1 target"
+		fi
+		curl -s --max-time 20 -x "socks5h://[::1]:$v6p" \
+			"http://127.0.0.1:$hp/payload.bin" -o "$W/v6.out" \
+			|| fail "$loop IPv6 listener wrongly blocked the IPv4 target"
+		assert_files_equal "$WORK/payload.bin" "$W/v6.out" \
+			"$loop IPv6 path corrupted the IPv4-target payload"
+		kill "$GWP_PID" 2>/dev/null
+	else
+		diag "$loop: no IPv6 loopback on this host, IPv6 case skipped"
 	fi
-	curl -s --max-time 20 -x "socks5h://[::1]:$v6p" \
-		"http://127.0.0.1:$hp/payload.bin" -o "$W/v6.out" \
-		|| fail "$loop IPv6 listener wrongly blocked the IPv4 target"
-	assert_files_equal "$WORK/payload.bin" "$W/v6.out" \
-		"$loop IPv6 path corrupted the IPv4-target payload"
-	kill "$GWP_PID" 2>/dev/null
 
 	# -m domain: a socks5h request naming a blocked host is refused (the
 	# domain is matched before resolution), while a literal-IP request
