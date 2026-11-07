@@ -92,6 +92,8 @@ struct gwp_acl_pool {
 	/* gwp_acl_pool_next(): the one thing in a pool that changes. */
 	_Atomic(uint32_t)	cursor;
 	uint32_t		nr_servers;
+	/* What @servers and @srv have room for (pool_add_server()). */
+	uint32_t		cap_servers;
 	/* The server URLs as written, credentials included. */
 	char			**servers;
 	/*
@@ -1358,18 +1360,30 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 				remote_dns ? "remotely" : "locally",
 				p->remote_dns ? "remotely" : "locally");
 
-	v = realloc(p->servers, (p->nr_servers + 1) * sizeof(*v));
-	if (!v)
-		return -ENOMEM;
-	p->servers = v;
-	if (ld->ops) {
-		void **sv = realloc(p->srv, (p->nr_servers + 1) * sizeof(*sv));
+	/*
+	 * Room for one more, doubling: a pool may have thousands of servers,
+	 * and growing by one would copy the arrays once per server.
+	 */
+	if (p->nr_servers == p->cap_servers) {
+		uint32_t cap = p->cap_servers ? p->cap_servers * 2 : 4;
 
-		if (!sv)
+		if (cap > ACL_POOL_MAX_SERVERS)
+			cap = ACL_POOL_MAX_SERVERS;
+		v = realloc(p->servers, cap * sizeof(*v));
+		if (!v)
 			return -ENOMEM;
-		p->srv = sv;
-		p->ops = ld->ops;
+		p->servers = v;
+		if (ld->ops) {
+			void **sv = realloc(p->srv, cap * sizeof(*sv));
+
+			if (!sv)
+				return -ENOMEM;
+			p->srv = sv;
+		}
+		p->cap_servers = cap;
 	}
+	if (ld->ops)
+		p->ops = ld->ops;
 	dup = strdup(url);
 	if (!dup)
 		return -ENOMEM;
