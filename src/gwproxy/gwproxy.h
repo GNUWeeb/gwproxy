@@ -721,8 +721,9 @@ struct gwp_conn_pair {
 	 * (gwp_upstream_note_end()).
 	 */
 	uint16_t		up_val;
+	/* @upstream's place in @up_pool: under GWP_ACL_POOL_MAX_SERVERS. */
+	uint16_t		up_srv;
 	uint8_t			up_end;
-	uint8_t			up_srv;
 
 	/* One-byte scalars last, so they pack instead of each opening a hole. */
 	bool			is_target_alive;

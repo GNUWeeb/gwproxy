@@ -77,7 +77,6 @@ struct gwp_acl_dnat {
 
 /* Limits of the upstream pools of one rule set. */
 #define ACL_POOL_NAME_MAX	64
-#define ACL_POOL_MAX_SERVERS	64
 #define ACL_MAX_POOLS		1024
 /* What gwp_parse_upstream() takes after the scheme, NUL included. */
 #define ACL_URL_REST_MAX	512
@@ -1355,9 +1354,9 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 	char shown[160];
 	char **v, *dup;
 
-	if (p->nr_servers == ACL_POOL_MAX_SERVERS)
-		return load_err(ld, "upstream pool %s has more than %d servers",
-				p->name, ACL_POOL_MAX_SERVERS);
+	if (p->nr_servers == GWP_ACL_POOL_MAX_SERVERS)
+		return load_err(ld, "upstream pool %s has more than %u servers",
+				p->name, GWP_ACL_POOL_MAX_SERVERS);
 	if (check_server_url(url, &remote_dns, &creds, &why))
 		return load_err(ld, "upstream pool %s server %u: %s", p->name,
 				idx, why);
@@ -1375,8 +1374,8 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 	if (p->nr_servers == p->cap_servers) {
 		uint32_t cap = p->cap_servers ? p->cap_servers * 2 : 4;
 
-		if (cap > ACL_POOL_MAX_SERVERS)
-			cap = ACL_POOL_MAX_SERVERS;
+		if (cap > GWP_ACL_POOL_MAX_SERVERS)
+			cap = GWP_ACL_POOL_MAX_SERVERS;
 		v = realloc(p->servers, cap * sizeof(*v));
 		if (!v)
 			return -ENOMEM;

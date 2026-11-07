@@ -79,7 +79,13 @@ enum gwp_acl_pool_method gwp_acl_pool_method(const struct gwp_acl_pool *p);
  */
 bool gwp_acl_pool_remote_dns(const struct gwp_acl_pool *p);
 
-/* How many servers the pool has: at least 1, at most 64. */
+/*
+ * The most servers a pool may have; one more is a load error. A pick reads
+ * the pool in place (see gwp_up_lb_pick()), whatever its size.
+ */
+#define GWP_ACL_POOL_MAX_SERVERS	8192u
+
+/* How many servers the pool has: at least 1, at most the above. */
 uint32_t gwp_acl_pool_nr_servers(const struct gwp_acl_pool *p);
 
 /*

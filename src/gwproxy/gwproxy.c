@@ -2884,6 +2884,10 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 	return gwp_up_lb_pick(&pk);
 }
 
+/* Every place in a pool fits gwp_conn_pair::up_srv. */
+_Static_assert(GWP_ACL_POOL_MAX_SERVERS - 1 <= UINT16_MAX,
+	       "gwp_conn_pair::up_srv cannot hold a pool server's place");
+
 /*
  * Decide, once per pair and before its target's name is resolved, which
  * upstream @gcp goes through: the one an ACL -j UPSTREAM rule picks for
@@ -2934,7 +2938,7 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		gwp_conn_set_upstream(ctx, gcp, up);
 		/* Kept for the logs and the retry, until the tunnel is up. */
 		gcp->up_pool = gwp_acl_req_take_pool(&req);
-		gcp->up_srv = (uint8_t)i;
+		gcp->up_srv = (uint16_t)i;
 		pr_dbg(&ctx->lh, "Upstream for idx=%u: pool %s server %u, %s (%s), %u open",
 		       gcp->idx, gwp_acl_pool_name(gcp->up_pool), i + 1,
 		       ip_to_str(&up->addr), up->host,
@@ -4043,7 +4047,7 @@ static bool upstream_retry(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	up_desc(gcp->up_pool, gcp->up_srv, old, d_old, sizeof(d_old));
 	gwp_conn_set_upstream(w->ctx, gcp, up);
-	gcp->up_srv = (uint8_t)i;
+	gcp->up_srv = (uint16_t)i;
 	/* A new attempt: its failure is its own. */
 	gcp->flags &= ~GWP_CONN_FLAG_UP_FAILED;
 	gcp->up_end = 0;

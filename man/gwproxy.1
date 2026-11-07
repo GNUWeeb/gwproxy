@@ -371,8 +371,8 @@ a name, an IPv4 address or a bracketed IPv6 one, an optional port), and
 (at most once) sets the method; round\-robin is the default.
 .B https://
 servers need a build with OpenSSL support; without it they fail the load.
-A pool has 1 to 64 servers, and all of them must resolve target names the
-same way:
+A pool has 1 to 8192 servers (one more fails the load), and all of them must
+resolve target names the same way:
 .B socks5://
 servers have gwproxy resolve them,
 .BR socks5h:// ", " http:// " and " https://
@@ -388,7 +388,8 @@ that use it, or in another file of the set; a rule naming a pool that is not
 defined anywhere is an error. Every server is parsed and its host resolved
 when the set loads (and only then: a reload resolves it again), as
 .B \-\-upstream\-proxy
-is at startup: a host that is neither a name nor an address, a name that does
+is at startup. Host names are resolved one by one, so a large pool of names
+loads as slowly as all its lookups in a row; an address needs no lookup. A host that is neither a name nor an address, a name that does
 not resolve, an address
 .B \-\-outgoing\-family
 forbids, or a
@@ -1689,6 +1690,16 @@ its count across a reload, so connections opened before a reload still weigh
 on the choices made after it. A reload starts each pool's turn from its first
 server again. Workers choosing at the same moment may see the same counts and
 choose the same server; the choices after them see the result.
+.PP
+Round\-robin costs the same whatever the size of the pool: a connection looks
+only at the server whose turn it is (and at the next ones while they are
+ejected, see below).
+.B least_conn
+has to compare the counts of all the servers: each new connection reads the
+count of every server of its pool, stopping early only at a server with none
+open, so in a pool of thousands of busy servers every new connection costs a
+scan of thousands of counts that other workers keep changing. Prefer
+round\-robin for large pools unless the load must follow the counts.
 .PP
 A pool also keeps track of its servers' health, from the connections they
 carry (passively: gwproxy sends no probes of its own). A failure counts
