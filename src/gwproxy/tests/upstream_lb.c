@@ -221,7 +221,31 @@ struct tpool {
 	uint32_t		clock_reads;
 	uint32_t		nr_back;
 	uint32_t		last_back;
+	/*
+	 * The random source: none (no probes) by default; the values of
+	 * @fake[] in turn, or with @xs a real generator from that seed.
+	 */
+	const uint32_t		*fake;
+	uint32_t		nr_fake;
+	uint32_t		ifake;		/* the next of @fake[] */
+	uint32_t		xs;
+	uint32_t		nr_random;
 };
+
+static uint32_t tp_random(void *arg)
+{
+	struct tpool *p = arg;
+	p->nr_random++;
+	if (p->fake)
+		return p->fake[p->ifake++ % p->nr_fake];
+	return gwp_up_rand(&p->xs);
+}
+
+/* The random value whose probe lands on server @j of @nr. */
+static uint32_t tp_at(uint32_t nr, uint32_t j)
+{
+	return (uint32_t)((((uint64_t)j << 32) + nr - 1) / nr);
+}
 
 static uint32_t tp_now(void *arg)
 {
@@ -301,12 +325,15 @@ static uint32_t tp_pick(struct tpool *p, bool least_conn, uint32_t rr,
 	struct gwp_up_pick pk = {
 		.st = p->st, .nr = p->nr, .least_conn = least_conn, .rr = rr,
 		.skip = skip, .now = tp_now, .back = tp_back, .arg = p,
+		.random = p->fake || p->xs ? tp_random : NULL,
 	};
-	uint32_t before = p->clock_reads, i;
+	uint32_t before = p->clock_reads, rnd = p->nr_random, i;
 
 	i = gwp_up_lb_pick(&pk);
-	/* The clock: once at most. */
+	/* The clock: once at most; probes: a few, round-robin only. */
 	assert(p->clock_reads - before <= 1);
+	assert(p->nr_random - rnd <= GWP_UP_PICK_PROBES);
+	assert(!least_conn || p->nr_random == rnd);
 	return i;
 }
 
@@ -714,6 +741,136 @@ static void test_pick_missing(void)
 	tp_free(&p);
 }
 
+/*
+ * Round-robin's probes, driven by a fake random source: none while the
+ * cursor's server is in service; on a miss the first probe that lands on a
+ * server in service wins; probes landing on an ejected server, on the one
+ * a retry skips or on a missing one go on to the next; GWP_UP_PICK_PROBES
+ * misses fall back to the next in service from the cursor.
+ */
+static void test_pick_probe(void)
+{
+	uint32_t vals[GWP_UP_PICK_PROBES];
+	struct tpool p;
+	uint32_t n;
+
+	assert(GWP_UP_PICK_PROBES == 4);
+	tp_init(&p, 8);
+	vals[0] = tp_at(8, 6);
+	p.fake = vals;
+	p.nr_fake = 1;
+	p.ifake = 0;
+	assert(tp_pick(&p, false, 2, NONE) == 2);
+	assert(!p.nr_random);
+
+	tp_eject(&p, 2, 100);
+	tp_eject(&p, 5, 100);
+	assert(tp_pick(&p, false, 2, NONE) == 6);
+	assert(p.nr_random == 1);
+	assert(tp_at(8, 0) == 0 && tp_at(8, 7) > tp_at(8, 6));
+
+	/* Misses: ejected 5, the cursor's own 2, then 7 is in service. */
+	vals[0] = tp_at(8, 5);
+	vals[1] = tp_at(8, 2);
+	vals[2] = tp_at(8, 7);
+	p.nr_fake = 3;
+	p.ifake = 0;
+	n = p.nr_random;
+	assert(tp_pick(&p, false, 10, NONE) == 7);
+	assert(p.nr_random - n == 3);
+
+	/* Every probe misses: the next in service after the cursor. */
+	vals[0] = vals[1] = vals[2] = vals[3] = tp_at(8, 5);
+	p.nr_fake = 4;
+	p.ifake = 0;
+	n = p.nr_random;
+	assert(tp_pick(&p, false, 2, NONE) == 3);
+	assert(p.nr_random - n == GWP_UP_PICK_PROBES);
+
+	/* A retry: the one after the failed server, else probes, never it. */
+	vals[0] = tp_at(8, 1);
+	vals[1] = tp_at(8, 4);
+	p.nr_fake = 2;
+	p.ifake = 0;
+	n = p.nr_random;
+	assert(tp_pick(&p, false, 99, 0) == 1);
+	assert(p.nr_random == n);
+	assert(tp_pick(&p, false, 99, 1) == 4);
+	vals[0] = vals[1] = tp_at(8, 0);
+	p.ifake = 0;
+	assert(tp_pick(&p, false, 99, 0) == 1);
+	tp_eject(&p, 1, 100);
+	p.ifake = 0;
+	assert(tp_pick(&p, false, 99, 0) == 3);
+	/* A missing state is a miss too. */
+	vals[0] = tp_at(8, 6);
+	vals[1] = tp_at(8, 4);
+	p.ifake = 0;
+	p.st[6] = NULL;
+	assert(tp_pick(&p, false, 2, NONE) == 4);
+	p.st[6] = p.s[6];
+
+	/* least_conn never probes. */
+	assert(tp_pick(&p, true, 2, NONE) == 3);
+
+	/* All ejected: probes all miss, the one back soonest as before. */
+	tp_free(&p);
+	tp_init(&p, 3);
+	vals[0] = tp_at(3, 1);
+	p.fake = vals;
+	p.nr_fake = 1;
+	p.ifake = 0;
+	tp_eject(&p, 0, 300);
+	tp_eject(&p, 1, 100);
+	tp_eject(&p, 2, 200);
+	assert(tp_pick(&p, false, 0, NONE) == 1);
+	assert(tp_pick(&p, false, 0, 2) == NONE);
+	tp_free(&p);
+}
+
+#define NR_DIST		10u
+#define NR_DIST_PICKS	200000u
+
+/*
+ * With a real generator, the turns of ejected servers are spread evenly:
+ * every server in service gets its equal share of the picks within 3%,
+ * the one right after the ejected ones included (it would get k + 1 shares
+ * if the turns went to the next in service). One ejected server, then a
+ * run of 3 at the cursor's path. The share of a server in service is
+ * NR_DIST_PICKS / in-service; the ejected turns (a tenth or three tenths)
+ * are binomial over it, so 3% is several standard deviations wide.
+ */
+static void test_pick_spread(uint32_t first, uint32_t run, uint32_t seed)
+{
+	uint32_t hits[NR_DIST] = { 0 }, rr, i, want, tol;
+	struct tpool p;
+
+	tp_init(&p, NR_DIST);
+	p.xs = seed;
+	for (i = first; i < first + run; i++)
+		tp_eject(&p, i, 1000);
+	for (rr = 0; rr < NR_DIST_PICKS; rr++)
+		hits[tp_pick(&p, false, rr, NONE)]++;
+	want = NR_DIST_PICKS / (NR_DIST - run);
+	tol = want * 3 / 100;
+	for (i = 0; i < NR_DIST; i++) {
+		if (i >= first && i < first + run) {
+			assert(!hits[i]);
+			continue;
+		}
+		if (hits[i] + tol < want || hits[i] > want + tol) {
+			fprintf(stderr, "server %u: %u picks, want %u +- %u\n",
+				i, hits[i], want, tol);
+			assert(0);
+		}
+	}
+	/* Each ejected turn took one or a few draws, never more than 4. */
+	assert(p.nr_random >= run * (NR_DIST_PICKS / NR_DIST));
+	assert(p.nr_random <= GWP_UP_PICK_PROBES * run *
+			      (NR_DIST_PICKS / NR_DIST));
+	tp_free(&p);
+}
+
 #define NR_BIG	8192u
 
 /*
@@ -885,6 +1042,10 @@ int main(void)
 	test_pick_retry();
 	test_pick_missing();
 	test_pick_big();
+	test_pick_probe();
+	test_pick_spread(3, 1, 12345);
+	test_pick_spread(3, 3, 777);
+	test_pick_spread(7, 3, 0x9e3779b9);
 	test_eject_threads();
 	printf("All upstream_lb tests passed.\n");
 	return 0;

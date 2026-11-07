@@ -38,6 +38,9 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#ifdef CONFIG_HAVE_GETRANDOM
+#include <sys/random.h>
+#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -2830,6 +2833,35 @@ static uint32_t pool_pick_now(void __unused *arg)
 	return (uint32_t)gwp_now_ms();
 }
 
+/*
+ * Round-robin's probes (gwp_up_pick::random): a generator per thread, so
+ * no lock and no shared line; seeded on its first use, the only time it
+ * may make a syscall, from getrandom() or else the clock and the thread's
+ * own address. Not secret: it only spreads an ejected server's turns.
+ */
+static __thread uint32_t pool_pick_rnd;
+
+static uint32_t pool_pick_random(void __unused *arg)
+{
+	if (unlikely(!pool_pick_rnd)) {
+		struct timespec ts;
+		uint32_t seed = 0;
+
+#ifdef CONFIG_HAVE_GETRANDOM
+		if (getrandom(&seed, sizeof(seed), GRND_NONBLOCK) !=
+		    (ssize_t)sizeof(seed))
+			seed = 0;
+#endif
+		if (!seed) {
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			seed = (uint32_t)ts.tv_nsec ^ (uint32_t)ts.tv_sec;
+			seed ^= (uint32_t)(uintptr_t)&pool_pick_rnd * 2654435761u;
+		}
+		pool_pick_rnd = seed ? seed : 1;
+	}
+	return gwp_up_rand(&pool_pick_rnd);
+}
+
 static void pool_pick_back(void *arg, uint32_t i)
 {
 	struct pool_pick_env *env = arg;
@@ -2857,7 +2889,8 @@ static void pool_pick_back(void *arg, uint32_t i)
  *
  * The pick reads the states in place, through the pool's handles (see
  * acl_srv_handle()), with no copy: round-robin looks at the cursor's
- * server, and the next ones only while they are ejected; least_conn scans
+ * server, and only when it is ejected at a few random ones and then the
+ * next ones in turn; least_conn scans
  * the open counts of the whole pool (see gwp_up_lb_pick()). UINT32_MAX,
  * when the pool has no server object at all, is a bug conn_pick_upstream()
  * reports.
@@ -2874,6 +2907,7 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 		.skip = skip,
 		.now = pool_pick_now,
 		.back = pool_pick_back,
+		.random = pool_pick_random,
 		.arg = &env,
 	};
 

@@ -1692,8 +1692,8 @@ server again. Workers choosing at the same moment may see the same counts and
 choose the same server; the choices after them see the result.
 .PP
 Round\-robin costs the same whatever the size of the pool: a connection looks
-only at the server whose turn it is (and at the next ones while they are
-ejected, see below).
+only at the server whose turn it is (and, when that one is ejected, at a few
+more, see below).
 .B least_conn
 has to compare the counts of all the servers: each new connection reads the
 count of every server of its pool, stopping early only at a server with none
@@ -1718,8 +1718,12 @@ out while the server is waiting for the target to answer the CONNECT (a
 target that never answers holds a healthy server up), nor local trouble such
 as running out of descriptors. Three failures
 that count, within 30 seconds, eject the server for 5 minutes: no pool picks
-it meanwhile. Round\-robin gives its turns to the next server in service
-after it in the block's order, and
+it meanwhile. When its turn comes, round\-robin tries up to 4 servers of
+the pool at random and takes the first one in service, so the turns of
+ejected servers, even of a run of them, are spread evenly over the servers
+left instead of all landing on the next one; only if all 4 tries find an
+ejected server does it take the next server in service in the block's
+order.
 .B least_conn
 chooses among the servers left. As with the counts, the health
 is the server's, not the pool's: failures through one pool eject the server
@@ -1735,7 +1739,8 @@ numbers are fixed.
 .PP
 A connection that a pool's server fails in one of the ways that count is
 tried again, once, on another server of the same pool that is not ejected:
-the next one in the block's order, or with
+the next one in the block's order (when that one is ejected, one found as
+for an ejected server's turn), or with
 .B least_conn
 the least loaded one. This is safe because nothing the client sends is
 passed on before the tunnel through the upstream is up, so the retry repeats

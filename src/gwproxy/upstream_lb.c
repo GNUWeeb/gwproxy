@@ -315,6 +315,22 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 	else
 		i = pk->rr % nr;
 
+	if (!pk->least_conn) {
+		uint32_t p, j;
+
+		s = pk->st[i];
+		if (i != skip && s && !pick_ejected(&c, s, i))
+			return i;
+		/* A miss: random probes, then the next in service. */
+		for (p = 0; pk->random && p < GWP_UP_PICK_PROBES; p++) {
+			/* Uniform over [0, nr), no division. */
+			j = (uint32_t)(((uint64_t)pk->random(pk->arg) * nr) >> 32);
+			s = pk->st[j];
+			if (j != skip && s && !pick_ejected(&c, s, j))
+				return j;
+		}
+	}
+
 	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
 		s = pk->st[i];
 		if (i == skip || !s)

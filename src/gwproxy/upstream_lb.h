@@ -241,17 +241,49 @@ struct gwp_up_pick {
 	 * server (gwp_up_state_ejected()'s *back), for the caller to log.
 	 */
 	void		(*back)(void *arg, uint32_t i);
+	/*
+	 * A uniformly distributed 32-bit random number, for round-robin's
+	 * probes when the server whose turn it is is ejected; called at most
+	 * GWP_UP_PICK_PROBES times per pick, and never while that server is
+	 * in service. NULL: no probes.
+	 */
+	uint32_t	(*random)(void *arg);
 	void		*arg;
 };
+
+/*
+ * How many random servers round-robin tries when the one whose turn it is
+ * is ejected, before it falls back to the next in service after it.
+ */
+#define GWP_UP_PICK_PROBES	4u
+
+/*
+ * A small, fast generator for @random (xorshift32): advances *@state, which
+ * must not be 0, and returns the new value. Not for anything secret.
+ */
+static inline uint32_t gwp_up_rand(uint32_t *state)
+{
+	uint32_t x = *state;
+
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	*state = x;
+	return x;
+}
 
 /*
  * Which of @pk's servers (from 0) the next connection goes to, read in place
  * with no copy and no allocation; only servers in service are taken.
  *
- * Round-robin starts at server @rr % @nr and takes the first in service
- * from there in pool order, wrapping: with none ejected that is the
- * cursor's server, and the pick reads one server's health only; an
- * ejected server's turns go to the next in service after it.
+ * Round-robin takes server @rr % @nr when it is in service: with none
+ * ejected that is the cursor's server, and the pick reads one server's
+ * health only. When it is ejected, the pick tries up to GWP_UP_PICK_PROBES
+ * servers drawn at random (@random) and takes the first in service, so an
+ * ejected server's turns are spread evenly over the rest, a run of ejected
+ * servers' turns too, instead of all going to the server after them; only
+ * when every probe misses does it take the next in service from the
+ * cursor on, in pool order, wrapping.
  *
  * Least-connections (@least_conn) takes the server in service with the
  * fewest open pairs, among equals the first from the same start on, so
@@ -261,8 +293,9 @@ struct gwp_up_pick {
  * the health only of a server that would be the best so far.
  *
  * A retry (@skip) starts at the server after @skip instead of the cursor:
- * the next in service in pool order (least-connections: the fewest open,
- * ties from there), never @skip itself.
+ * that one when it is in service, else (round-robin) the same probes and
+ * then the next in service in pool order (least-connections: the fewest
+ * open, ties from there), never @skip itself.
  *
  * When no server may be taken: for a first pick, every server is ejected,
  * and the one whose ejection ends soonest is taken (ties from @rr % @nr
