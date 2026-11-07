@@ -771,6 +771,36 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT -m statistic --mode nth --every +2 -j ACCEPT\n",	      /* --every sign */
 		"-A OUTPUT -m statistic --mode nth --every 2 --packet +1 -j ACCEPT\n", /* --packet sign */
 		"-A OUTPUT -m statistic --mode nth --every 2 --packet -0 -j ACCEPT\n", /* --packet sign */
+		/*
+		 * A mark, --every and --packet are decimal or 0x hexadecimal,
+		 * and nothing else: strtoul() with base 0 read "010" as octal
+		 * 8, so a leading 0 before a decimal digit is refused rather
+		 * than read differently now; so are other prefixes, a second
+		 * "0x" and overflow.
+		 */
+		"-A OUTPUT -j MARK --set-mark 010\n",		    /* was octal */
+		"-A OUTPUT -j MARK --set-mark 00\n",		    /* was octal */
+		"-A OUTPUT -j MARK --set-mark 08\n",		    /* leading 0 */
+		"-A OUTPUT -j MARK --set-mark 0b1\n",		    /* binary */
+		"-A OUTPUT -j MARK --set-mark 0o7\n",		    /* octal */
+		"-A OUTPUT -j MARK --set-mark 0x0x10\n",	    /* two prefixes */
+		"-A OUTPUT -j MARK --set-mark 0x+1\n",		    /* sign after 0x */
+		"-A OUTPUT -j MARK --set-mark 0x-1\n",		    /* sign after 0x */
+		"-A OUTPUT -j MARK --set-mark 0xg\n",		    /* not hex */
+		"-A OUTPUT -j MARK --set-mark 0x1g\n",		    /* hex junk */
+		"-A OUTPUT -j MARK --set-mark 12a\n",		    /* hex w/o 0x */
+		"-A OUTPUT -j MARK --set-mark 0x100000000\n",	    /* > 32 bits */
+		"-A OUTPUT -j MARK --set-mark 4294967296\n",	    /* > 32 bits */
+		"-A OUTPUT -j MARK --set-mark 0x10000000000000000\n", /* > 64 bits */
+		"-A OUTPUT -j MARK --set-mark 18446744073709551616\n", /* > 64 bits */
+		"-A OUTPUT -m statistic --mode nth --every 010 -j ACCEPT\n",	      /* was octal */
+		"-A OUTPUT -m statistic --mode nth --every 9 --packet 07 -j ACCEPT\n", /* was octal */
+		"-A OUTPUT -m statistic --mode nth --every 0x -j ACCEPT\n",	      /* empty hex */
+		"-A OUTPUT -m statistic --mode nth --every 4294967296 -j ACCEPT\n",  /* > 32 bits */
+		/* Ports and prefixes are decimal only: no 0x. */
+		"-A OUTPUT --dports 0x50 -j REJECT\n",	    /* hex port */
+		"-A OUTPUT -d 10.0.0.0/0x8 -j REJECT\n",	    /* hex prefix */
+		"-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:0x50\n", /* hex DNAT port */
 		"-A WEIRD -d 1.2.3.4 -j REJECT\n",	    /* bad chain */
 		"garbage line\n",			    /* not -P/-A */
 	};
@@ -1266,6 +1296,104 @@ static noinline void test_domain_only_target_criteria(void)
 		"-P OUTPUT ACCEPT\n"));
 	assert(out(a, NULL, "internal.corp", 0, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	assert(out(a, NULL, "other.com", 0, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+}
+
+/* Load "-j MARK --set-mark @v" and return the mark an evaluation sets. */
+static noinline uint32_t mark_of(const char *v)
+{
+	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
+	struct gwp_acl *a = NULL;
+	struct gwp_acl_req req;
+	char *rules;
+
+	assert(asprintf(&rules, "-A OUTPUT -j MARK --set-mark %s\n"
+			"-P OUTPUT ACCEPT\n", v) > 0);
+	assert(!gwp_acl_parse_str(&a, rules));
+	free(rules);
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.mark_set);
+	gwp_acl_destroy(a);
+	return req.mark;
+}
+
+/*
+ * Load "-m statistic --mode nth --every @every [--packet @packet]" and return
+ * which of the first 64 evaluations it selects, one bit each.
+ */
+static noinline uint64_t nth_hits(const char *every, const char *packet)
+{
+	struct gwp_sockaddr t = sa4("1.2.3.4", 443);
+	struct gwp_acl *a = NULL;
+	uint64_t hits = 0;
+	char *rules;
+	int i;
+
+	assert(asprintf(&rules,
+			"-A OUTPUT -m statistic --mode nth --every %s%s%s -j REJECT\n"
+			"-P OUTPUT ACCEPT\n", every, packet ? " --packet " : "",
+			packet ? packet : "") > 0);
+	assert(!gwp_acl_parse_str(&a, rules));
+	free(rules);
+	for (i = 0; i < 64; i++)
+		if (out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT)
+			hits |= (uint64_t)1 << i;
+	gwp_acl_destroy(a);
+	return hits;
+}
+
+/* The bits nth_hits() should return for --every @n --packet @p. */
+static uint64_t nth_mask(int n, int p)
+{
+	uint64_t m = 0;
+	int i;
+
+	for (i = 0; i < 64; i++)
+		if (i % n == p)
+			m |= (uint64_t)1 << i;
+	return m;
+}
+
+/*
+ * Numbers in a rule: a mark, --every and --packet are decimal or 0x
+ * hexadecimal (either case), a lone 0 included; ports and prefix lengths are
+ * decimal, where a leading 0 never meant octal and still reads as decimal. The
+ * forms refused are in test_parse_errors().
+ */
+static noinline void test_number_bases(void)
+{
+	struct gwp_sockaddr t = sa4("10.1.2.3", 80);
+	struct gwp_acl *a = NULL;
+
+	assert(mark_of("0") == 0);
+	assert(mark_of("9") == 9);
+	assert(mark_of("10") == 10);
+	assert(mark_of("0x10") == 16);
+	assert(mark_of("0X1f") == 31);
+	assert(mark_of("0x0") == 0);
+	assert(mark_of("0x00000010") == 16);
+	assert(mark_of("0xDeadBeef") == 0xdeadbeef);
+	assert(mark_of("4294967295") == 0xffffffff);
+	assert(mark_of("0xffffffff") == 0xffffffff);
+
+	/* --every 10 is ten, not octal 8; 0x10 is sixteen. */
+	assert(nth_hits("10", NULL) == nth_mask(10, 0));
+	assert(nth_hits("0x10", NULL) == nth_mask(16, 0));
+	assert(nth_hits("0x10", "0x0f") == nth_mask(16, 15));
+	assert(nth_hits("0XA", "9") == nth_mask(10, 9));
+	assert(nth_hits("0x1", "0") == ~(uint64_t)0);
+
+	/* Decimal-only fields keep reading a leading 0 as decimal. */
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 10.0.0.0/08 --dports 080,0443-00444 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, &t, NULL, 444, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, &t, NULL, 64, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	t = sa4("11.1.2.3", 80);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 }
 
@@ -3596,6 +3724,7 @@ static void run_tests(void)
 		test_memo();
 		test_comments_and_default_policy();
 		test_statistic_nth();
+		test_number_bases();
 		test_statistic_counts_only_matches();
 		test_statistic_load_balance();
 		test_statistic_equal_every_is_uneven();

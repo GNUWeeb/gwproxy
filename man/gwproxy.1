@@ -470,10 +470,21 @@ port, a mark, and the values of
 .B \-\-dports +80
 or
 .BR 10.0.0.0/+8 ,
-fails the load like any malformed line. A mark may still be written in
-hexadecimal with a
+fails the load like any malformed line. Ports and prefix lengths are
+decimal digits only. A mark and the values of
+.BR \-\-every " and " \-\-packet
+are decimal, or hexadecimal after a
 .B 0x
-prefix.
+(or
+.BR 0X )
+prefix; in these a decimal number other than
+.B 0
+may not start with
+.BR 0 ,
+so
+.BR 010 ,
+which an earlier version read as octal 8, fails the load rather than meaning
+10. No other base or prefix is taken.
 .IP
 .B \-j MARK
 sets the fwmark
