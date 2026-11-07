@@ -102,8 +102,9 @@ struct gwp_up_state {
 
 	/* The table's own: under its lock. */
 	uint32_t		ref;
+	uint32_t		hash;		/* of @key */
 	struct gwp_up_table	*tab;
-	struct gwp_up_state	*next;
+	struct gwp_up_state	*next;		/* in its bucket */
 	struct gwp_up_key	key;
 };
 

@@ -14,16 +14,64 @@
 #include <string.h>
 
 /*
- * A list behind one lock. Only making and freeing server objects takes it
- * (an ACL load, and the last reference to a server going), never a pick:
- * a connection reaches its entry through its server object. A few hundred
- * identities at most (pools of up to 64 servers each), so no hashing.
+ * A hash table behind one lock. Only making and freeing server objects takes
+ * it (an ACL load, and the last reference to a server going), never a pick:
+ * a connection reaches its entry through its server object. A rule set may
+ * list many thousands of identities (pools of up to 8192 servers), and a
+ * reload gets every one of them again and puts the old ones, so both are
+ * O(1) expected: chained buckets, doubled when the entries outnumber them.
+ * They never shrink; a table that once held many identities keeps the
+ * bucket array (8 bytes a bucket) until it is destroyed. The keys come from
+ * the ACL file, not from clients, so the hash need not be keyed.
  */
+#define UP_TABLE_MIN_BUCKETS	64u
+
 struct gwp_up_table {
 	pthread_mutex_t		lock;
-	struct gwp_up_state	*head;
+	struct gwp_up_state	**bucket;
+	uint32_t		nr_bucket;	/* a power of 2 */
 	uint32_t		nr;
 };
+
+/* FNV-1a over what makes @key, which is zero past it (gwp_up_key_init()). */
+static uint32_t key_hash(const struct gwp_up_key *key)
+{
+	const uint8_t *p = (const uint8_t *)key;
+	size_t len = offsetof(struct gwp_up_key, user) + key->ulen, i;
+	uint32_t h = 2166136261u;
+
+	for (i = 0; i < len; i++) {
+		h ^= p[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+/*
+ * Double @t's buckets, under its lock. Without memory the table keeps the
+ * buckets it has: longer chains, still right.
+ */
+static void table_grow(struct gwp_up_table *t)
+{
+	uint32_t n = t->nr_bucket * 2, i;
+	struct gwp_up_state **b, *s, *next;
+
+	if (n < t->nr_bucket)
+		return;
+	b = calloc(n, sizeof(*b));
+	if (!b)
+		return;
+	for (i = 0; i < t->nr_bucket; i++) {
+		for (s = t->bucket[i]; s; s = next) {
+			next = s->next;
+			s->next = b[s->hash & (n - 1)];
+			b[s->hash & (n - 1)] = s;
+		}
+	}
+	free(t->bucket);
+	t->bucket = b;
+	t->nr_bucket = n;
+}
 
 void gwp_up_key_init(struct gwp_up_key *key, enum gwp_up_scheme scheme,
 		     const struct gwp_sockaddr *addr, const char *user,
@@ -53,7 +101,10 @@ struct gwp_up_table *gwp_up_table_create(void)
 
 	if (!t)
 		return NULL;
-	if (pthread_mutex_init(&t->lock, NULL)) {
+	t->nr_bucket = UP_TABLE_MIN_BUCKETS;
+	t->bucket = calloc(t->nr_bucket, sizeof(*t->bucket));
+	if (!t->bucket || pthread_mutex_init(&t->lock, NULL)) {
+		free(t->bucket);
 		free(t);
 		return NULL;
 	}
@@ -63,18 +114,21 @@ struct gwp_up_table *gwp_up_table_create(void)
 uint32_t gwp_up_table_destroy(struct gwp_up_table *t)
 {
 	struct gwp_up_state *s, *next;
-	uint32_t left;
+	uint32_t left, i;
 
 	if (!t)
 		return 0;
 	left = t->nr;
-	for (s = t->head; s; s = next) {
-		next = s->next;
-		/* The key holds a user name; leave none in freed memory. */
-		explicit_bzero(s, sizeof(*s));
-		free(s);
+	for (i = 0; i < t->nr_bucket; i++) {
+		for (s = t->bucket[i]; s; s = next) {
+			next = s->next;
+			/* The key holds a user name; leave none in freed memory. */
+			explicit_bzero(s, sizeof(*s));
+			free(s);
+		}
 	}
 	pthread_mutex_destroy(&t->lock);
+	free(t->bucket);
 	free(t);
 	return left;
 }
@@ -92,11 +146,13 @@ uint32_t gwp_up_table_count(struct gwp_up_table *t)
 struct gwp_up_state *gwp_up_state_get(struct gwp_up_table *t,
 				      const struct gwp_up_key *key)
 {
-	struct gwp_up_state *s;
+	uint32_t h = key_hash(key);
+	struct gwp_up_state *s, **b;
 
 	pthread_mutex_lock(&t->lock);
-	for (s = t->head; s; s = s->next) {
-		if (!memcmp(&s->key, key, sizeof(*key))) {
+	b = &t->bucket[h & (t->nr_bucket - 1)];
+	for (s = *b; s; s = s->next) {
+		if (s->hash == h && !memcmp(&s->key, key, sizeof(*key))) {
 			s->ref++;
 			goto out;
 		}
@@ -113,9 +169,11 @@ struct gwp_up_state *gwp_up_state_get(struct gwp_up_table *t,
 		s->ref = 1;
 		s->tab = t;
 		s->key = *key;
-		s->next = t->head;
-		t->head = s;
-		t->nr++;
+		s->hash = h;
+		s->next = *b;
+		*b = s;
+		if (++t->nr > t->nr_bucket)
+			table_grow(t);
 	}
 out:
 	pthread_mutex_unlock(&t->lock);
@@ -135,7 +193,8 @@ void gwp_up_state_put(struct gwp_up_state *s)
 		pthread_mutex_unlock(&t->lock);
 		return;
 	}
-	for (pp = &t->head; *pp != s; pp = &(*pp)->next)
+	for (pp = &t->bucket[s->hash & (t->nr_bucket - 1)]; *pp != s;
+	     pp = &(*pp)->next)
 		;
 	*pp = s->next;
 	t->nr--;

@@ -142,6 +142,69 @@ static void test_rebuild(void)
 	assert(gwp_up_table_destroy(NULL) == 0);
 }
 
+#define NR_MANY	20000u
+
+/* The @i-th of NR_MANY identities: addresses, ports and users all vary. */
+static struct gwp_up_key many_key(uint32_t i)
+{
+	char ip[32], user[16];
+
+	snprintf(ip, sizeof(ip), "10.%u.%u.%u", i >> 16, (i >> 8) & 255,
+		 i & 255);
+	snprintf(user, sizeof(user), "u%u", i % 7);
+	return key_of(i % 3 ? GWP_UP_SCHEME_SOCKS5 : GWP_UP_SCHEME_HTTP, ip,
+		      (uint16_t)(1000 + i % 5), i % 2 ? user : NULL);
+}
+
+/*
+ * Many identities, as large pools make: each gets its own entry however
+ * the table grows, finds it again by its key, and the last put of each
+ * takes it out, in any order, leaving the others findable.
+ */
+static void test_many(void)
+{
+	struct gwp_up_table *t = gwp_up_table_create();
+	static struct gwp_up_state *s[NR_MANY];
+	struct gwp_up_key k;
+	uint32_t i, j;
+
+	assert(t);
+	for (i = 0; i < NR_MANY; i++) {
+		k = many_key(i);
+		s[i] = gwp_up_state_get(t, &k);
+		assert(s[i]);
+		gwp_up_state_take(s[i]);
+	}
+	assert(gwp_up_table_count(t) == NR_MANY);
+	/* A reload: every identity again, then the old references go. */
+	for (i = 0; i < NR_MANY; i++) {
+		k = many_key(i);
+		assert(gwp_up_state_get(t, &k) == s[i]);
+		assert(gwp_up_state_open(s[i]) == 1);
+	}
+	for (i = 0; i < NR_MANY; i++)
+		gwp_up_state_put(s[i]);
+	assert(gwp_up_table_count(t) == NR_MANY);
+
+	/* Removed in a scattered order; the rest are still found. */
+	for (i = 0; i < NR_MANY; i++) {
+		j = (i * 7919u) % NR_MANY;
+		assert(gwp_up_state_give(s[j]) == 0);
+		gwp_up_state_put(s[j]);
+		if (i % 1000 == 0) {
+			k = many_key((j + 1) % NR_MANY);
+			gwp_up_state_put(gwp_up_state_get(t, &k));
+		}
+	}
+	assert(gwp_up_table_count(t) == 0);
+
+	/* Gone identities come back fresh. */
+	k = many_key(5);
+	s[0] = gwp_up_state_get(t, &k);
+	assert(s[0] && gwp_up_state_open(s[0]) == 0);
+	assert(gwp_up_table_destroy(t) == 1);
+}
+
 #define NONE	UINT32_MAX
 
 /* A pick with every server in service and none to skip. */
@@ -535,6 +598,7 @@ int main(void)
 {
 	test_key();
 	test_rebuild();
+	test_many();
 	test_round_robin();
 	test_least_conn();
 	test_threads();
