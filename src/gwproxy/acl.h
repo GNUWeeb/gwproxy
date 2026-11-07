@@ -98,6 +98,13 @@ const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i);
 void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i);
 
 /*
+ * What @ops->handle returned for each of the pool's servers, in pool order
+ * (the server objects themselves without @handle), or NULL when the ACL was
+ * created without ops. Read-only, as long as the pool lives.
+ */
+void *const *gwp_acl_pool_handles(const struct gwp_acl_pool *p);
+
+/*
  * The pool's round-robin cursor: the value before this call's increment,
  * from 0 on, shared by every thread and wrapping at 2^32. A reload makes
  * new pools, whose cursors start again from 0.
@@ -178,11 +185,17 @@ int gwp_acl_create(struct gwp_acl **out, const char *path);
  * URL's credentials. @put drops a reference @make handed out. Both get @arg,
  * and are called from the thread that loads or reloads, or (@put) from
  * whichever drops the last reference to a pool.
+ *
+ * @handle, when set, is called once for each object @make made, with @arg,
+ * and returns what the pool keeps beside the object for the caller's picks
+ * (gwp_acl_pool_handles()): something the object holds for as long as it
+ * lives, so a pick that scans a large pool need not reach every object.
  */
 struct gwp_acl_server_ops {
 	int	(*make)(void *arg, const char *url, void **srv, char *why,
 			size_t size);
 	void	(*put)(void *arg, void *srv);
+	void	*(*handle)(void *arg, void *srv);
 	void	*arg;
 };
 

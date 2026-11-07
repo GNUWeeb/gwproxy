@@ -2897,18 +2897,33 @@ static void up_srv_put(void *arg, void *srv)
 	assert(atomic_fetch_sub(&g_up_live, 1) > 0);
 }
 
+/* A pick handle: something the object holds while it lives. */
+static void *up_srv_handle(void *arg, void *srv)
+{
+	struct up_srv *s = srv;
+
+	assert(arg == &g_up_live);
+	return s->url;
+}
+
 static const struct gwp_acl_server_ops up_srv_ops = {
 	.make	= up_srv_make,
 	.put	= up_srv_put,
+	.handle	= up_srv_handle,
 	.arg	= &g_up_live,
 };
 
-/* The server object @p's @i-th URL was made into, checked against it. */
+/*
+ * The server object @p's @i-th URL was made into, checked against it, and
+ * its pick handle with it.
+ */
 static struct up_srv *up_srv_of(const struct gwp_acl_pool *p, uint32_t i)
 {
 	struct up_srv *s = gwp_acl_pool_server(p, i);
+	void *const *h = gwp_acl_pool_handles(p);
 
 	assert(s && !strcmp(s->url, gwp_acl_pool_server_url(p, i)));
+	assert(h && h[i] == s->url);
 	return s;
 }
 
@@ -2997,6 +3012,7 @@ static noinline void test_upstream_server_ops(void)
 	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
 	assert(gwp_acl_pool_server_url(req.upstream_pool, 0));
 	assert(!gwp_acl_pool_server(req.upstream_pool, 0));
+	assert(!gwp_acl_pool_handles(req.upstream_pool));
 	gwp_acl_req_release(&req);
 	gwp_acl_destroy(a);
 	assert(g_up_made == 5);
