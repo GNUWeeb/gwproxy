@@ -148,6 +148,7 @@ struct gwp_up_state *gwp_up_state_get(struct gwp_up_table *t,
 {
 	uint32_t h = key_hash(key);
 	struct gwp_up_state *s, **b;
+	void *mem;
 
 	pthread_mutex_lock(&t->lock);
 	b = &t->bucket[h & (t->nr_bucket - 1)];
@@ -157,10 +158,14 @@ struct gwp_up_state *gwp_up_state_get(struct gwp_up_table *t,
 			goto out;
 		}
 	}
-	s = calloc(1, sizeof(*s));
+	/* Aligned, for @nr_open's line to be its own. */
+	if (posix_memalign(&mem, GWP_UP_CACHELINE, sizeof(*s)))
+		mem = NULL;
+	s = mem;
 	if (s) {
 		uint32_t i;
 
+		memset(s, 0, sizeof(*s));
 		atomic_init(&s->nr_open, 0);
 		atomic_init(&s->fail_seq, 0);
 		for (i = 0; i < GWP_UP_EJECT_FAILS; i++)

@@ -82,19 +82,27 @@ void gwp_up_key_init(struct gwp_up_key *key, enum gwp_up_scheme scheme,
 
 struct gwp_up_table;
 
+/* What false sharing is measured in. */
+#define GWP_UP_CACHELINE	64
+
 /*
  * One identity's shared state. Only @nr_open is for the caller to touch;
  * the health fields go through gwp_up_state_fail() and _ejected().
+ *
+ * @nr_open is written by every worker on every pair it opens or closes
+ * through the server, so it has a cache line of its own: a round-robin
+ * pick reads only the health fields, and they and the table's fields
+ * must not be on the line those writes keep taking from the reader.
  */
 struct gwp_up_state {
 	/*
 	 * Connection pairs that were given a server of this identity and
 	 * have not given it back yet: gwp_up_state_take() and _give().
 	 */
-	_Atomic(uint32_t)	nr_open;
+	_Alignas(GWP_UP_CACHELINE) _Atomic(uint32_t) nr_open;
 
 	/* How many failures were ever recorded; picks the slot of the next. */
-	_Atomic(uint32_t)	fail_seq;
+	_Alignas(GWP_UP_CACHELINE) _Atomic(uint32_t) fail_seq;
 	/* When the last GWP_UP_EJECT_FAILS failures were, 0 for none. */
 	_Atomic(uint32_t)	fail_at[GWP_UP_EJECT_FAILS];
 	/* When the ejection ends, 0 while the server is in service. */
