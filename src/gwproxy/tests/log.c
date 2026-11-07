@@ -11,14 +11,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
-static int rfd;
 static FILE *wf;
+static off_t rpos;
 
 /*
- * Log @msg through __pr_log() into the pipe and return the message part of
- * what came out (after the "[time][level][tid]: " header), newline included.
+ * Log @msg through __pr_log() and return the message part of what came out
+ * (after the "[time][level][tid]: " header), newline included.
+ *
+ * The log goes to a memory file, read back from where the last line ended.
+ * Not a pipe: this thread both writes and reads, so a line longer than the
+ * pipe holds would block the write for good. A pipe usually holds 64 KiB,
+ * but only a page or two once the user has used up the pages that
+ * fs.pipe-user-pages-soft allows, as on a busy test host.
  */
 static char *log_msg(const char *msg)
 {
@@ -28,13 +35,20 @@ static char *log_msg(const char *msg)
 
 	__pr_log(wf, 3, "%s", msg);
 
-	/* One line per call, and the pipe holds all of it. */
-	do {
-		n = read(rfd, out + tot, sizeof(out) - 1 - (size_t)tot);
-		assert(n > 0);
+	for (;;) {
+		n = pread(fileno(wf), out + tot, sizeof(out) - 1 - (size_t)tot,
+			  rpos + tot);
+		assert(n >= 0);
+		if (!n)
+			break;
 		tot += n;
-	} while (out[tot - 1] != '\n');
+	}
+	rpos += tot;
 	out[tot] = '\0';
+
+	/* One call wrote exactly one line. */
+	assert(tot > 0 && out[tot - 1] == '\n');
+	assert(strchr(out, '\n') == out + tot - 1);
 
 	p = strstr(out, "]: ");
 	assert(p);
@@ -61,8 +75,7 @@ static void test_ctl(void)
 
 /*
  * Messages near and past the size of the logger's stack buffer: the escaped
- * form no longer fits where the message was formatted. The longest stays
- * within what a pipe holds (64 KiB) once escaped.
+ * form no longer fits where the message was formatted.
  */
 static void test_long(void)
 {
@@ -118,11 +131,10 @@ static void test_escape(void)
 
 int main(void)
 {
-	int fds[2];
+	int fd = memfd_create("log-test", MFD_CLOEXEC);
 
-	assert(!pipe(fds));
-	rfd = fds[0];
-	wf = fdopen(fds[1], "w");
+	assert(fd >= 0);
+	wf = fdopen(fd, "w");
 	assert(wf);
 
 	test_plain();
@@ -131,7 +143,6 @@ int main(void)
 	test_escape();
 
 	fclose(wf);
-	close(rfd);
 	printf("All log tests passed.\n");
 	return 0;
 }
