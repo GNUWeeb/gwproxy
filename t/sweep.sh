@@ -32,6 +32,59 @@ _gwp_pgid_of()
 	printf '%s' "$3"
 }
 
+# _gwp_alive <pid>: true while <pid> runs. A zombie has exited: whatever it
+# had to write before exiting, a sanitizer report among them, is written.
+_gwp_alive()
+{
+	local st
+
+	{ read -r st <"/proc/$1/stat"; } 2>/dev/null || return 1
+	st="${st##*) }"
+	[ "${st%% *}" != Z ]
+}
+
+# _gwp_wait_gone <pid>...: wait until none of the <pid>s runs, for 5 s at
+# most. Returns 1 if one still does.
+#
+# The time is for a sanitizer build: LeakSanitizer checks for leaks when the
+# proxy exits, which takes it a moment, and a SIGKILL sent before it is done
+# loses the report. A proxy exits within a fraction of a second of a SIGTERM,
+# so the bound is only reached by one that is stuck, and costs nothing else.
+_gwp_wait_gone()
+{
+	local i pid
+	local -a left
+
+	for ((i = 0; i < 100; i++)); do
+		left=()
+		for pid in "$@"; do
+			_gwp_alive "$pid" && left+=("$pid")
+		done
+		[ ${#left[@]} -gt 0 ] || return 0
+		set -- "${left[@]}"
+		sleep 0.05
+	done
+	return 1
+}
+
+# gwp_stop_pids <pid>...: SIGTERM each <pid>, give them the time
+# _gwp_wait_gone() allows to exit, then SIGKILL those left.
+gwp_stop_pids()
+{
+	local pid
+	local -a pids=()
+
+	for pid in "$@"; do
+		[ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null && pids+=("$pid")
+	done
+	[ ${#pids[@]} -gt 0 ] || return 0
+	_gwp_wait_gone "${pids[@]}" && return 0
+	for pid in "${pids[@]}"; do
+		kill -KILL "$pid" 2>/dev/null
+	done
+	return 0
+}
+
 # gwp_sweep [-q] [--all]: kill the gwproxy processes this test left behind.
 gwp_sweep()
 {
@@ -59,6 +112,7 @@ gwp_sweep()
 	# took tens of seconds of every test's time limit. Only this test's
 	# few processes get as far as the readlink.
 	local pass d pid st f exe n=0
+	local -a hit=()
 	for pass in TERM KILL; do
 		for d in /proc/[0-9]*; do
 			pid="${d#/proc/}"
@@ -75,10 +129,11 @@ gwp_sweep()
 			*) continue ;;
 			esac
 			kill "-$pass" "$pid" 2>/dev/null || continue
-			[ "$pass" = TERM ] && n=$((n + 1))
+			[ "$pass" = TERM ] && n=$((n + 1)) && hit+=("$pid")
 		done
 		[ "$n" -gt 0 ] || break
-		[ "$pass" = TERM ] && sleep 0.2
+		# Not a SIGKILL unless one is still there (see _gwp_wait_gone).
+		[ "$pass" = TERM ] && _gwp_wait_gone "${hit[@]}" && break
 	done
 
 	[ "$n" -gt 0 ] && [ "$quiet" = 0 ] && \

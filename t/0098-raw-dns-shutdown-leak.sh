@@ -26,7 +26,6 @@ dp="$DNS_PORT"
 p="$(pick_port)"
 gwp_start "127.0.0.1:$p" --as-socks5=1 --raw-dns=1 \
 	--dns-server="127.0.0.1:$dp" --nr-workers=1
-log="$WORK/gwp.$p.log"
 
 # Ask for a name and keep the client connected while it is resolved.
 python3 - "$p" <<'PY' &
@@ -57,10 +56,9 @@ kill -0 "$GWP_PID" 2>/dev/null && fail "gwproxy did not exit on SIGTERM"
 wait "$GWP_PID"
 st=$?
 
-if grep -q 'LeakSanitizer\|AddressSanitizer' "$log"; then
-	sed -n '/Sanitizer/,$p' "$log" | head -40 | sed 's/^/# gwp: /' >&2
+# lib.sh sends the report to a file of its own (see _san_env).
+san_reports &&
 	fail "gwproxy leaked memory at shutdown with a DNS query in flight"
-fi
 [ "$st" -eq 0 ] || fail "gwproxy exited with status $st"
 
 pass
