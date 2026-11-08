@@ -13,23 +13,25 @@ ifndef OPTIMIZE
 endif
 INCLUDE_FLAGS = -I./src/
 DEPFLAGS = -MMD -MP -MF $@.d
-LDFLAGS_SHARED = $(LDFLAGS) -shared
 GWPROXY_DIR = ./src/gwproxy
 LIBURING_DIR = ./src/liburing
 
-ifeq ($(DEBUG),1)
-	CFLAGS += -DDEBUG
-else
-	CFLAGS += -DNDEBUG
+#
+# make once took DEBUG=1, LTO=1 and STATIC=1, but config.make assigns CFLAGS
+# and LDFLAGS outright, so what they added never reached the compiler. They
+# are gone; say so instead of ignoring them. Only the top-level make warns:
+# variables from the command line reach every sub-make too.
+#
+ifeq ($(MAKELEVEL),0)
+ifeq ($(origin DEBUG),command line)
+$(warning DEBUG= is not supported and is ignored; use ./configure --debug)
 endif
-
-ifeq ($(LTO),1)
-	CFLAGS += -flto
-	LDFLAGS += -flto
+ifeq ($(origin LTO),command line)
+$(warning LTO= is not supported and is ignored)
 endif
-
-ifeq ($(STATIC),1)
-	LDFLAGS += -static
+ifeq ($(origin STATIC),command line)
+$(warning STATIC= is not supported and is ignored)
+endif
 endif
 
 LIBURING_TARGET = $(LIBURING_DIR)/src/liburing.a
@@ -48,7 +50,6 @@ GWPROXY_CC_SOURCES = \
 
 GWPROXY_OBJECTS = $(GWPROXY_CC_SOURCES:%.c=%.c.o)
 
-LIBGWPSOCKS5_TARGET = libgwpsocks5.so
 LIBGWPSOCKS5_CC_SOURCES = $(GWPROXY_DIR)/socks5.c $(GWPROXY_DIR)/auth.c
 LIBGWPSOCKS5_OBJECTS = $(LIBGWPSOCKS5_CC_SOURCES:%.c=%.c.o)
 LIBGWPSOCKS5_TEST_TARGET = $(GWPROXY_DIR)/tests/socks5.t
@@ -62,7 +63,6 @@ LIBGWACL_TEST_TARGET = $(GWPROXY_DIR)/tests/acl.t
 LIBGWACL_TEST_CC_SOURCES = $(GWPROXY_DIR)/tests/acl.c
 LIBGWACL_TEST_OBJECTS = $(LIBGWACL_TEST_CC_SOURCES:%.c=%.c.o)
 
-LIBGWDNS_TARGET = libgwdns.so
 LIBGWDNS_CC_SOURCES = $(GWPROXY_DIR)/dns.c $(GWPROXY_DIR)/dns_cache.c
 LIBGWDNS_OBJECTS = $(LIBGWDNS_CC_SOURCES:%.c=%.c.o)
 LIBGWDNS_TEST_TARGET = $(GWPROXY_DIR)/tests/dns.t
@@ -122,12 +122,12 @@ ALL_TEST_TARGETS = $(LIBGWDNS_TEST_TARGET) $(LIBGWDNS_CACHE_TEST_TARGET) \
 		   $(LIBGWIPLIM_TEST_TARGET) $(GWTMR_TEST_TARGET) \
 		   $(GWUPSTREAM_TEST_TARGET) $(GWUPLB_TEST_TARGET)
 ALL_OBJECTS = $(GWPROXY_OBJECTS) $(LIBGWPSOCKS5_OBJECTS) $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWPSOCKS5_TEST_OBJECTS) $(LIBGWHTTP_TEST_OBJECTS) $(LIBGWACL_OBJECTS) $(LIBGWACL_TEST_OBJECTS) $(LIBGWLOG_TEST_OBJECTS) $(LIBGWIPLIM_TEST_OBJECTS) $(GWUPLB_TEST_OBJECTS)
-ALL_TARGETS = $(GWPROXY_TARGET) $(LIBGWPSOCKS5_TARGET) $(LIBGWDNS_TARGET) $(ALL_TEST_TARGETS)
+ALL_TARGETS = $(GWPROXY_TARGET) $(ALL_TEST_TARGETS)
 ALL_DEPFILES = $(ALL_OBJECTS:.o=.o.d)
 
 ALL_GWPROXY_OBJECTS = $(GWPROXY_OBJECTS) $(LIBGWPSOCKS5_OBJECTS) $(LIBGWDNS_OBJECTS) $(LIBGWACL_OBJECTS)
 
-all: $(GWPROXY_TARGET) $(LIBGWPSOCKS5_TARGET) $(LIBGWDNS_TARGET)
+all: $(GWPROXY_TARGET)
 
 ifneq ($(MAKECMDGOALS),clean)
 ifneq ($(MAKECMDGOALS),distclean)
@@ -171,7 +171,6 @@ SSL_TEST_TARGET = $(GWPROXY_DIR)/tests/ssl.t
 SSL_TEST_OBJECTS = $(GWPROXY_DIR)/tests/ssl.c.o
 ALL_TEST_TARGETS += $(SSL_TEST_TARGET)
 ALL_OBJECTS += $(SSL_TEST_OBJECTS)
-RUN_SSL_TEST = @echo "Testing ssl..."; $(IE) ./$(SSL_TEST_TARGET);
 endif
 
 ifeq ($(CONFIG_IO_URING),y)
@@ -216,24 +215,13 @@ endif # ifeq ($(CONFIG_IO_URING),y)
 $(GWPROXY_TARGET): $(ALL_GWPROXY_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-
-#
-# TODO(*): Test against the *.so files. Currently, the tests in
-#          `tests/` are built against the static objects.
-#
-$(LIBGWPSOCKS5_TARGET): $(LIBGWPSOCKS5_OBJECTS)
-	$(CC) $(LDFLAGS_SHARED) -o $@ $^ $(LIBS)
-
-$(LIBGWPSOCKS5_TEST_TARGET): $(LIBGWPSOCKS5_OBJECTS) $(LIBGWPSOCKS5_TEST_OBJECTS) $(LIBGWPSOCKS5_TARGET)
+$(LIBGWPSOCKS5_TEST_TARGET): $(LIBGWPSOCKS5_OBJECTS) $(LIBGWPSOCKS5_TEST_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 $(LIBGWACL_TEST_TARGET): $(LIBGWACL_OBJECTS) $(LIBGWACL_TEST_OBJECTS)
 	$(CC) $(LDFLAGS) -Wl,--wrap=pcre2_match_context_create_8 -o $@ $^ $(LIBS)
 
-$(LIBGWDNS_TARGET): $(LIBGWDNS_OBJECTS)
-	$(CC) $(LDFLAGS_SHARED) -o $@ $^ $(LIBS)
-
-$(LIBGWDNS_TEST_TARGET): $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWDNS_TARGET)
+$(LIBGWDNS_TEST_TARGET): $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 $(GWPROXY_DIR)/tests/dns_parser.t: $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/dns_parser.h $(GWPROXY_DIR)/net.c $(EXTRA_DEPS)
@@ -283,8 +271,6 @@ clean:
 ifeq ($(CONFIG_IO_URING),y)
 	@$(MAKE) -C $(LIBURING_DIR) clean
 endif
-
-IE=LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):$(shell pwd)
 
 #
 # Tests run one per make target, so `make -jN test` runs N of them at once and

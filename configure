@@ -326,7 +326,12 @@ add_c_flag "-Wunsafe-loop-optimizations";
 add_c_flag "-Wno-format-truncation";
 
 printf "\n%s:\n" "-f flags";
-# Hardening: none of it is left to the toolchain's defaults, which differ.
+# Hardening is asked for explicitly: the toolchain's defaults differ between
+# distributions. PIE is the exception. The objects are built with -fPIC, but
+# nothing passes -pie, so the executable is position independent, and ASLR
+# moves its code and data, only where the compiler links PIE by default: gcc
+# built with --enable-default-pie, as most distributions ship it, and clang 15
+# and later on Linux.
 add_c_flag "-fstack-protector-strong";
 add_c_flag "-fstack-clash-protection";
 add_c_flag "-fcf-protection";
