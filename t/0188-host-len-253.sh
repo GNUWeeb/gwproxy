@@ -125,10 +125,10 @@ run_case()
 }
 
 cases=(raw system-epoll)
-if grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null; then
+if have_io_uring; then
 	cases+=(system-io_uring)
 else
-	diag "gwproxy built without io_uring; skipping that loop"
+	diag "no usable io_uring here; skipping that loop"
 fi
 gwp_parallel run_case "${cases[@]}"
 

@@ -101,7 +101,7 @@ _PIDS+=("$!")
 wait_listen "$http_up" "$!" || fail "HTTP upstream did not start on $http_up"
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	# One proxy takes both protocols: a SOCKS5 and an HTTP client each.
 	pp="$(pick_port)"

@@ -100,7 +100,7 @@ part()
 }
 
 parts=(epoll:held epoll:timed_out)
-grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null &&
+have_io_uring &&
 	parts+=(io_uring:held io_uring:timed_out)
 gwp_parallel part "${parts[@]}"
 

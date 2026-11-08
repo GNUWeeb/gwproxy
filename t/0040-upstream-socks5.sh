@@ -29,7 +29,7 @@ gwp_start "[::1]:$up" --as-socks5=1 --event-loop=epoll --nr-workers=2
 
 for scheme in socks5 socks5h; do
 	for loop in epoll io_uring; do
-		[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+		[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 		fp="$(pick_port)"
 		gwp_start "[::1]:$fp" --as-socks5=1 --event-loop="$loop" \

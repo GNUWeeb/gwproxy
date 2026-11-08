@@ -163,7 +163,7 @@ pool_loop()
 }
 
 loops=epoll
-grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && loops="$loops io_uring"
+have_io_uring && loops="$loops io_uring"
 gwp_parallel pool_loop $loops
 
 pass

@@ -100,8 +100,8 @@ run_leg()
 }
 
 for ev in epoll io_uring; do
-	if [ "$ev" = io_uring ] && ! grep -q 'CONFIG_IO_URING' "$ROOT/config.h" 2>/dev/null; then
-		diag "gwproxy built without io_uring; skipping that leg"
+	if [ "$ev" = io_uring ] && ! have_io_uring; then
+		diag "no usable io_uring here; skipping that leg"
 		continue
 	fi
 	run_leg "$ev" 1 6

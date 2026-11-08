@@ -133,7 +133,7 @@ stop_proxy()
 
 if [ "${1:-}" != --inner ]; then
 	for loop in epoll io_uring; do
-		[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+		[ "$loop" = io_uring ] && ! have_io_uring && continue
 		tag="[$loop]"
 
 		pp="$(pick_port)"
@@ -243,7 +243,7 @@ other=20001
 # The address logic is shared, so the second loop only checks the way there; a
 # test of every case on both would run past the watchdog on a loaded machine.
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 	tag="[$loop ns]"
 
 	# Dual-stack wildcard: every local address, of either family.

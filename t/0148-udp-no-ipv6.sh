@@ -38,7 +38,7 @@ start_udp_echo 127.0.0.1
 ep="$UDP_ECHO_PORT"
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	pp="$(pick_port)"
 	gwp_start "127.0.0.1:$pp" --as-socks5=1 --event-loop="$loop"

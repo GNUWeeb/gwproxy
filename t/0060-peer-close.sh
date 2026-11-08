@@ -17,7 +17,7 @@ make_payload "$WORK/payload.bin" 300000
 start_httpd "$hp" "$WORK" "1.0"
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	pp="$(pick_port)"
 	gwp_start "[::1]:$pp" --as-socks5=1 --event-loop="$loop" --nr-workers=1

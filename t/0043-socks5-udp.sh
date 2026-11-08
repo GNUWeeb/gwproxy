@@ -178,7 +178,7 @@ run_loop() {
 
 run_loop epoll
 
-if grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null; then
+if have_io_uring; then
 	run_loop io_uring
 fi
 

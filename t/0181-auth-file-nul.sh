@@ -55,7 +55,7 @@ lead='alice:pw-a\n\000mallory:pw-m\n'
 mid='alice:pw-a\nmallory:pw\000-m\n'
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	# Startup: refused, naming the line.
 	for f in lead mid; do

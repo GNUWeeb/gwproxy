@@ -53,7 +53,7 @@ fetch() {				# $1=proxy_port $2=url
 }
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	# (a) Userinfo is accepted and discarded, not treated as the host.
 	pp="$(pick_port)"

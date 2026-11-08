@@ -63,7 +63,7 @@ _PIDS+=("$!")
 wait_listen "$up" "$!" || fail "stub upstream did not listen"
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	pp="$(pick_port)"
 	# An empty --acl-file selects the built-in rules.

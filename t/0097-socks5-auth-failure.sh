@@ -24,7 +24,7 @@ evil=010775730a6572225c0478787878
 probe() { python3 "$SERVERS_DIR/socks5_oneshot.py" "$@"; }
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	for http in 0 1; do
 		p="$(pick_port)"

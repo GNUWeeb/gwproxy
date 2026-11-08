@@ -2,7 +2,8 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# CI driver for .github/workflows/ci.yml.
+# CI driver for .github/workflows/ci.yml, and for .gitlab-ci.yml, which runs a
+# subset of it.
 #
 # WHY THIS FILE EXISTS
 # ====================
@@ -54,14 +55,26 @@ CLANG_VERSION="23"
 # have no target libssl/libpcre2 available.
 DEB_EXTRA_PACKAGES="libssl-dev libpcre2-dev"
 
+# What a bare ubuntu container image lacks and the GitHub ubuntu-24.04 runner
+# image comes with, for a CI that runs the Ubuntu commands in a container
+# (see container-deps): make, binutils (as, ar) and the C library headers for
+# every build; wget, gnupg, lsb-release and add-apt-repository for
+# apt.llvm.org's llvm.sh; and for the test suite python3, curl, the openssl
+# CLI, iproute2 (ss, ip), procps (ps), util-linux (setsid, unshare, prlimit)
+# and strace.
+CONTAINER_PACKAGES="make binutils libc6-dev ca-certificates wget gnupg
+	lsb-release software-properties-common python3 curl openssl iproute2
+	procps util-linux strace"
+
 # Alpine/musl build dependencies, followed by what the test suite needs:
 # bash for t/*.sh, python3 for the helper servers in t/servers, curl as the
 # HTTP client the integration tests drive, the openssl CLI to mint the test
-# certificates, and coreutils/util-linux/iproute2 for timeout(1), setsid(1)
-# and ss(8), whose busybox applets do not take the options the tests use.
+# certificates, and coreutils/util-linux/iproute2/procps for timeout(1),
+# setsid(1), ss(8) and ps(1), whose busybox applets do not take the options
+# the tests use.
 # The caller still has to install bash itself before it can run this script.
 APK_PACKAGES="build-base musl-dev linux-headers git openssl-dev pcre2-dev
-	bash python3 curl openssl coreutils util-linux iproute2"
+	bash python3 curl openssl coreutils util-linux iproute2 procps"
 
 # Parallelism for make. Overridable for local runs.
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 1)}"
@@ -87,6 +100,9 @@ Commands:
                    Requires --arch, --cc, --cc-pkg.
   build            Run every build variant for one Ubuntu build matrix row.
                    Requires --arch, --cc, --sanitize.
+  container-deps   Install, in a bare ubuntu container, what the GitHub
+                   runner image already has and deps/build/codespell-deps
+                   need (needs root). Not used by the GitHub workflow.
   alpine-deps      Install the Alpine/musl build dependencies (needs root).
   alpine-build     Run every build variant for the Alpine/musl job.
   codespell-deps   Install codespell.
@@ -100,6 +116,16 @@ Options:
   --cc-pkg=PKG     Debian package providing --cc, or the literal "clang"
                    to install clang-${CLANG_VERSION} from apt.llvm.org.
   --sanitize=0|1   Whether this row is the AddressSanitizer/UBSan row.
+  --variant=ID[,ID...]
+                   build and alpine-build only: run just the named build
+                   variants of the row instead of all of them, for a CI
+                   that has to split a row across jobs. The GitHub
+                   workflow does not use it. IDs: default, debug,
+                   io_uring, io_uring-debug, new-dns-resolver, openssl,
+                   openssl-io_uring, openssl-io_uring-pcre (build);
+                   default, debug, io_uring, io_uring-debug, openssl,
+                   pcre (alpine-build). An ID the row does not have is
+                   an error.
   -h, --help       Print this message.
 
 Environment:
@@ -171,7 +197,9 @@ enter_topdir()
 }
 
 #
-# build_variant <name> <wipe_config> <run_tests> [configure args...]
+# build_variant <id> <name> <wipe_config> <run_tests> [configure args...]
+#
+# <id> names the variant for --variant=; <name> is what the log shows.
 #
 # <wipe_config> mirrors the "rm -vf config.h config.log config.make" that
 # some -- not all -- of the old workflow steps ran before "make clean". It
@@ -184,9 +212,20 @@ enter_topdir()
 #
 build_variant()
 {
-	local name="$1" wipe_config="$2" run_tests="$3"
+	local id="$1" name="$2" wipe_config="$3" run_tests="$4"
 
-	shift 3
+	shift 4
+
+	if [ -n "${variants}" ]; then
+		case ",${variants}," in
+		*",${id},"*)
+			variants_run="${variants_run},${id}"
+			;;
+		*)
+			return 0
+			;;
+		esac
+	fi
 
 	group_begin "build: ${name}"
 	if [ "${wipe_config}" = "1" ]; then
@@ -265,20 +304,20 @@ cmd_build()
 
 	if [ "${sanitize}" = "1" ]; then
 		san=(--sanitize)
-		build_variant "default + sanitizers" 0 "${run_tests}" \
+		build_variant default "default + sanitizers" 0 "${run_tests}" \
 			"--cc=${cc}" --sanitize
 	else
-		build_variant "default" 0 "${run_tests}" \
+		build_variant default "default" 0 "${run_tests}" \
 			"--cc=${cc}"
-		build_variant "debug" 0 "${run_tests}" \
+		build_variant debug "debug" 0 "${run_tests}" \
 			"--cc=${cc}" --debug
 	fi
 
 	# NOTE: no --cc= here, on purpose. These two take the compiler from the
 	# exported CC, which is what the workflow has always done.
-	build_variant "io_uring" 1 "${run_tests}" \
+	build_variant io_uring "io_uring" 1 "${run_tests}" \
 		--use-io-uring
-	build_variant "io_uring + debug" 1 "${run_tests}" \
+	build_variant io_uring-debug "io_uring + debug" 1 "${run_tests}" \
 		--use-io-uring --debug
 
 	# libssl/libpcre2 are only installed for the native x86_64 rows (see
@@ -298,19 +337,28 @@ cmd_build()
 	# coverage that a packet parser wants; nobody has checked it builds
 	# there yet, and a matrix row that cannot compile is worse than one
 	# that is missing.
-	build_variant "new-dns-resolver" 1 "${run_tests}" \
+	build_variant new-dns-resolver "new-dns-resolver" 1 "${run_tests}" \
 		"--cc=${cc}" --use-new-dns-resolver \
 		${san[@]+"${san[@]}"}
 
-	build_variant "openssl" 1 "${run_tests}" \
+	build_variant openssl "openssl" 1 "${run_tests}" \
 		"--cc=${cc}" --use-openssl \
 		${san[@]+"${san[@]}"}
-	build_variant "openssl + io_uring" 1 "${run_tests}" \
+	build_variant openssl-io_uring "openssl + io_uring" 1 "${run_tests}" \
 		"--cc=${cc}" --use-openssl --use-io-uring \
 		${san[@]+"${san[@]}"}
-	build_variant "openssl + io_uring + pcre" 1 "${run_tests}" \
+	build_variant openssl-io_uring-pcre "openssl + io_uring + pcre" 1 \
+		"${run_tests}" \
 		"--cc=${cc}" --use-openssl --use-io-uring --use-pcre \
 		${san[@]+"${san[@]}"}
+}
+
+cmd_container_deps()
+{
+	sudo_run apt-get update -y
+	# shellcheck disable=SC2086 # deliberate word splitting
+	sudo_run env DEBIAN_FRONTEND=noninteractive \
+		apt-get install -y --no-install-recommends ${CONTAINER_PACKAGES}
 }
 
 cmd_alpine_deps()
@@ -333,19 +381,19 @@ cmd_alpine_build()
 
 	enter_topdir
 
-	build_variant "default" 0 "${run_tests}" \
+	build_variant default "default" 0 "${run_tests}" \
 		--cc=gcc
-	build_variant "debug" 0 "${run_tests}" \
+	build_variant debug "debug" 0 "${run_tests}" \
 		--cc=gcc --debug
-	build_variant "io_uring" 1 "${run_tests}" \
+	build_variant io_uring "io_uring" 1 "${run_tests}" \
 		--cc=gcc --use-io-uring
-	build_variant "io_uring + debug" 1 "${run_tests}" \
+	build_variant io_uring-debug "io_uring + debug" 1 "${run_tests}" \
 		--cc=gcc --use-io-uring --debug
 	# Exercise the TLS module (ssl.c) against musl.
-	build_variant "openssl" 1 "${run_tests}" \
+	build_variant openssl "openssl" 1 "${run_tests}" \
 		--cc=gcc --use-openssl
 	# Exercise the ACL PCRE2 path against musl.
-	build_variant "pcre" 1 "${run_tests}" \
+	build_variant pcre "pcre" 1 "${run_tests}" \
 		--cc=gcc --use-io-uring --use-pcre
 }
 
@@ -362,10 +410,30 @@ cmd_codespell()
 	run codespell --ignore-words=.github/actions/codespell/stopwords man/
 }
 
+# check_variants: fail when --variant= named a variant the command did not
+# have, so a misspelt or retired ID cannot turn a CI job into a no-op.
+check_variants()
+{
+	local id
+
+	[ -n "${variants}" ] || return 0
+	for id in ${variants//,/ }; do
+		case "${variants_run}," in
+		*",${id},"*)
+			;;
+		*)
+			die "command '${CMD}' has no build variant '${id}'"
+			;;
+		esac
+	done
+}
+
 arch=""
 cc=""
 cc_pkg=""
 sanitize=""
+variants=""
+variants_run=""
 
 if [ "$#" -eq 0 ]; then
 	usage >&2
@@ -389,6 +457,10 @@ for opt in "$@"; do
 	--sanitize=*)
 		sanitize="${opt#*=}"
 		;;
+	--variant=*)
+		variants="${opt#*=}"
+		need "${variants}" '--variant=ID[,ID...]'
+		;;
 	-h|--help)
 		usage
 		exit 0
@@ -400,6 +472,14 @@ for opt in "$@"; do
 done
 
 case "${CMD}" in
+build|alpine-build)
+	;;
+*)
+	[ -z "${variants}" ] || die "--variant= is for build and alpine-build only"
+	;;
+esac
+
+case "${CMD}" in
 -h|--help)
 	usage
 	exit 0
@@ -407,14 +487,19 @@ case "${CMD}" in
 deps)
 	cmd_deps
 	;;
+container-deps)
+	cmd_container_deps
+	;;
 build)
 	cmd_build
+	check_variants
 	;;
 alpine-deps)
 	cmd_alpine_deps
 	;;
 alpine-build)
 	cmd_alpine_build
+	check_variants
 	;;
 codespell-deps)
 	cmd_codespell_deps

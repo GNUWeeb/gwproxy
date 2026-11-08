@@ -113,7 +113,7 @@ allow=$'-P INPUT ACCEPT\n-P OUTPUT ACCEPT\n'
 deny="-A OUTPUT -d 127.0.0.1 --dports $hp -j REJECT"$'\n'"$allow"
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	put "$WORK/auth" $'u0:pw\n'
 	put "$WORK/acl" "$allow"

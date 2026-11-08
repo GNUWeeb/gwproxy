@@ -47,7 +47,7 @@ socks5_rep() {			# $1=proxy_port $2=dst_ip $3=dst_port
 }
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	# An IPv4 target is unaffected by --outgoing-family=ipv4: the pair below
 	# is what makes the refusal cases mean something.
@@ -167,7 +167,7 @@ chain_cases() {
 }
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	for scheme in socks5 socks5h http; do
 		kind=socks5

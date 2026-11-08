@@ -35,7 +35,7 @@ count() { grep -c -- "$2" "$1"; }
 tc='Target socket connected (fd=[0-9]*, idx=[0-9]*, ca=127\.0\.0\.1:[0-9]*, ta=127\.0\.0\.1:'"$hp"')$'
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	# Plain forwarding.
 	p="$(pick_port)"

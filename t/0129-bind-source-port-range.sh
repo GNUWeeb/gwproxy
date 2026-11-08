@@ -89,7 +89,7 @@ printf -- '%s\n' '-A OUTPUT -j BIND --to-source fd01::78' \
 	'-P OUTPUT ACCEPT' >"$WORK/bind6.acl"
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	run_case "[$loop] --bind-source" 127.0.0.1 127.0.0.77 \
 		--event-loop="$loop" --bind-source=127.0.0.77
