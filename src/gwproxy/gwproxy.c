@@ -5320,7 +5320,16 @@ static bool req_host_valid(const char *host)
 		label_start = false;
 	}
 
-	return n > 0 && n <= 255;
+	/*
+	 * At most 253 characters, 254 with the root's dot: on the wire a name
+	 * takes a length byte per label and the root's zero, two more than its
+	 * text without that dot, and may not exceed 255 octets (RFC 1035
+	 * 2.3.4). A longer one can never resolve, so it is malformed, whichever
+	 * resolver would look it up.
+	 */
+	if (n && host[n - 1] == '.')
+		n--;
+	return n > 0 && n <= 253;
 }
 
 /*
