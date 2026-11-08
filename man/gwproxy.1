@@ -393,14 +393,26 @@ The line stands alone, and so does the
 .B }
 that ends the block; each line between holds one directive ending in
 .BR ; :
-.BI "server " url ;
+.BI "server " url " \fR[\fIoption\fR ...]\fB;"
 adds a server, with a URL as
 .B \-\-upstream\-proxy
 takes it
 .RB ( socks5:// ", " socks5h:// ", " http:// " or " https:// ,
 optional
 .BR user:pass@ ,
-a name, an IPv4 address or a bracketed IPv6 one, an optional port), and
+a name, an IPv4 address or a bracketed IPv6 one, an optional port) and,
+after it, the pool's options for it, as nginx writes them:
+.BI weight= n\fR,
+.BI max_conns= n\fR,
+.BI max_fails= n\fR,
+.BI fail_timeout= time\fR,
+.BI eject_time= time\fR,
+.B backup
+and
+.B down
+(see
+.BR "UPSTREAM CHAINING" ),
+each at most once; and
 .B least_conn;
 (at most once) sets the method; round\-robin is the default.
 .B https://
@@ -410,7 +422,10 @@ resolve target names the same way:
 .B socks5://
 servers have gwproxy resolve them,
 .BR socks5h:// ", " http:// " and " https://
-servers resolve them themselves, and a pool mixing the two is refused. A
+servers resolve them themselves, and a pool mixing the two is refused. A server
+marked
+.B down
+counts toward the 8192, and a pool whose servers are all down is refused. A
 .I name
 is 1 to 64 letters, digits,
 .BR _ ", " \- " and " . ,
@@ -429,12 +444,14 @@ not resolve, an address
 forbids, or a
 .B \-\-target\-buf\-size
 below the 1280 bytes an upstream handshake needs fails the load like any
-malformed line. A file that holds a server URL with credentials is warned
+malformed line, and so does an unknown, repeated or out\-of\-range server
+option. A file that holds a server URL with credentials is warned
 about (once per load, not an error) when its group or others may read it. No
 message shows the credentials: they name the pool and the server's number,
 counted from 1, and show its URL without the
 .B user:pass@
-part.
+part; a wrong option is named only when it is a known one, as the words after
+a URL may be part of a password.
 .IP \(bu 3
 .BI "\-A " "chain [matches] " "\fB\-j\fR " target
 \(em append a rule. Matches, each negatable with a leading
@@ -1486,7 +1503,9 @@ every pool server is parsed and its host resolved again, and a server that
 fails fails the reload, which keeps the rules and pools in force. New
 connections use the new pools; one already through a pool's server keeps that
 server until it ends. The servers' health, an ejection included, carries over
-as their counts do.
+as their counts do, an ejection as long as the pool's
+.BR max_fails= ", " fail_timeout= " and " eject_time=
+for the server stay the same.
 .PP
 The auth file, like the ACL files, must be a regular file. A FIFO or a device
 put in its place is refused, not waited on: the reload
@@ -1765,7 +1784,16 @@ serves it. With
 .BR least_conn ,
 a connection goes to the server with the fewest connections open through it
 at that moment, and among servers equally loaded to the next one in turn, so
-that they share the new connections. A connection counts against its server
+that they share the new connections. A server's
+.BI weight= n
+(1 to 1000, default 1) is its share of the connections relative to the
+pool's other servers: round\-robin gives it
+.I n
+turns for every one of a server of weight 1, spread out rather than in a row
+(each run of turns as long as the weights' sum, or the next power of two,
+gives each server its share give or take one turn), and
+.B least_conn
+compares the connections open divided by the weight (exactly, not rounded). A connection counts against its server
 from the moment it is given it, before it connects, until it ends, however it
 ends: closed by either side, refused, failed to connect or in the handshake,
 or timed out. The counts belong to the server, not to the pool: a server,
@@ -1778,7 +1806,9 @@ choose the same server; the choices after them see the result.
 .PP
 Round\-robin costs the same whatever the size of the pool: a connection looks
 only at the server whose turn it is (and, when that one is ejected, at a few
-more, see below).
+more, see below). With weights that differ, finding whose turn it is takes a
+search of a table made when the pool loads, a few steps more for any pool
+size.
 .B least_conn
 has to compare the counts of all the servers: each new connection reads the
 count of every server of its pool, stopping early only at a server with none
@@ -1801,9 +1831,9 @@ client as the target's failure and never counts, and neither do ambiguous
 refusals (SOCKS5 replies 0x01 and 0x02, HTTP 403, 500, 503 and any other status), the timeout running
 out while the server is waiting for the target to answer the CONNECT (a
 target that never answers holds a healthy server up), nor local trouble such
-as running out of descriptors. Three failures
-that count, within 30 seconds, eject the server for 5 minutes: no pool picks
-it meanwhile. When its turn comes, round\-robin tries up to 4 servers of
+as running out of descriptors. By default three failures
+that count, within 30 seconds, eject the server for 5 minutes: the pool picks
+it no more meanwhile. When its turn comes, round\-robin tries up to 4 servers of
 the pool at random and takes the first one in service, so the turns of
 ejected servers, even of a run of them, are spread evenly over the servers
 left instead of all landing on the next one; only if all 4 tries find an
@@ -1814,24 +1844,97 @@ chooses among the servers left; when the ejected server is where its turn
 would start the search among equally loaded servers, the same 4 random
 tries pick another starting point, so among servers with the same count
 the ejected server's turns are spread too. It still takes a server with the
-fewest connections. As with the counts, the health
-is the server's, not the pool's: failures through one pool eject the server
-from every pool that lists it. When every server of a pool is ejected, the
+fewest connections. As with the counts, the failures
+are the server's, not the pool's: those through one pool count in every pool
+that lists the server. When every server of a pool is ejected, the
 pool takes the one whose ejection ends soonest; a pool of one server, and
 .BR \-\-upstream\-proxy ,
 keep using theirs, so for them an ejection shows only in the log. A server
-that fails while ejected is not ejected for longer; once its 5 minutes are
-over it is picked again, and if it failed in its last 30 seconds out, its
-next failure ejects it again at once. A connection that gets through does not
-undo the failures before it: they count until they are 30 seconds old. These
-numbers are fixed.
+that fails while ejected is not ejected for longer; once its time out is
+over it is picked again, and if it failed close enough to the end of it (in
+its last 30 seconds out, by default), its next failure ejects it again at
+once. A connection that gets through does not undo the failures before it:
+they count until they are older than the window (30 seconds by default).
+.PP
+A pool sets its own numbers for each of its servers, after the server's URL:
+.TP
+.BI max_fails= n
+How many failures that count eject the server: 0 to 100, default 3; 0 never
+ejects it from this pool (its failures still count for the other pools that
+list it).
+.TP
+.BI fail_timeout= time
+How close together they must be: the failures from the first to the last
+within this time. Default 30s.
+.TP
+.BI eject_time= time
+How long the server then stays out. Default 5m. Unlike nginx's,
+.B fail_timeout=
+is only the window the failures must fall in, and this how long an ejection
+lasts.
+.TP
+.BI max_conns= n
+The most connections the server may have open for the pool to give it
+another: 0 to 1000000, default 0 for no limit. The count is the server's, of
+every pool that lists it, as for
+.BR least_conn .
+A full server is passed over as an ejected one is, and the limit is never
+exceeded, though workers pick at the same time. When every server of the pool
+is full, or full or ejected, the client is refused as an unreachable host:
+SOCKS5 reply 0x04, HTTP 502 (an ejected server that is not full still stands
+in when all are ejected, as above).
+.TP
+.B backup
+The server is used only when no other server of the pool may be: all of
+them ejected, full or down. The backups share the connections among
+themselves by the pool's method and their weights; with everything out, the
+pool takes the main server whose ejection ends soonest, a backup only when
+every main server is full.
+.TP
+.B down
+The server is never used, nor tried; its line still parses and counts. With
+.B backup
+it is an error.
+.PP
+A
+.I time
+is a number followed by
+.BR ms ", " s ", " m " or " h ,
+or a number of seconds, from 1ms to 24h. The numbers are the pool's: a
+server that two pools list with different ones is ejected by each when its
+failures, wherever they came from, meet that pool's numbers, and for that
+pool's time, so it may be out of one pool and still in service in another;
+pools that list it with the same numbers share one ejection. For example:
+.PP
+.RS
+.EX
+upstream rotating {
+    server socks5h://u:p@10.0.0.1:1080 weight=3 max_fails=1 eject_time=10m;
+    server socks5h://u:p@10.0.0.2:1080 max_conns=200;
+    server socks5h://u:p@10.0.0.3:1080 backup;
+    server socks5h://u:p@10.0.0.4:1080 down;
+}
+upstream patient {
+    server socks5h://u:p@10.0.0.1:1080 max_fails=10 fail_timeout=1m;
+}
+.EE
+.RE
+.PP
+Here 10.0.0.1 gets three connections of
+.I rotating
+for every one of 10.0.0.2 and leaves it for 10 minutes at its first failure,
+but stays in
+.I patient
+until ten failures within a minute; 10.0.0.2 never carries more than 200
+connections at once; 10.0.0.3 carries connections only while neither of the
+first two may; 10.0.0.4 none.
 .PP
 A connection that a pool's server fails in one of the ways that count is
-tried again, once, on another server of the same pool that is not ejected:
-the next one in the block's order (when that one is ejected, one found as
-for an ejected server's turn), or with
+tried again, once, on another server of the same pool that is in service (not
+ejected, full or down): the next one in the block's order (when that one is
+out, one found as for an ejected server's turn), or with
 .B least_conn
-the least loaded one. This is safe because nothing the client sends is
+the least loaded one; a backup only when no other main server is in service. This is safe because nothing the client sends is
 passed on before the tunnel through the upstream is up, so the retry repeats
 nothing and loses nothing. It has what is left of the connection's
 .BR \-\-connect\-timeout ,
@@ -1844,20 +1947,29 @@ retried, and neither is a connection through
 .BR \-\-upstream\-proxy .
 .PP
 A reload keeps what is known of each server that the new pools still list,
-ejection included, as it keeps the counts. A server that the reload takes out
+as it keeps the counts: its failures, and its ejection from the pools that
+still list it with the same
+.BR max_fails= ", " fail_timeout= " and " eject_time= ;
+a pool whose numbers for it change starts it in service, its failures so far
+counting toward its next ejection. The other options of the new pools apply
+at once. A server that the reload takes out
 of every pool is remembered only while connections opened before it still use
 that server; once they are gone it is forgotten, and a later reload that
 lists it again starts it afresh.
 .PP
 An ejection is logged at warning level, once however many pools list the
-server, as
+server with the same numbers, as
 .IR "Upstream pool NAME server N (ADDRESS) ejected for 300 s after 3 failures in 30 s" ,
-naming the pool of the connection whose failure ejected it (or
+with the numbers of the pool of the connection whose failure ejected it (or
 .I default upstream (ADDRESS)
 for
 .BR \-\-upstream\-proxy ),
-and the server's return at info level, when a connection first finds the 5
-minutes over. At debug level each failure is logged with whether it counted,
+and as
+.I "Upstream ADDRESS ejected for ... after ... failures in ..., in the pools that list it with these settings"
+for the pools with other numbers that the same failure ejects it from; and
+the server's return at info level, when a connection first finds its time
+out over. A client refused because every server of its pool is full or out
+is logged at info level, naming the pool. At debug level each failure is logged with whether it counted,
 each retry with both servers, and each connection that had to take an ejected
 server.
 .PP
