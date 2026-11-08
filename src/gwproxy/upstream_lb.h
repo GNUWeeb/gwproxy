@@ -112,6 +112,10 @@ struct gwp_up_opts {
 	 * 0 for no cap.
 	 */
 	uint32_t	max_conns;
+	/* Taken only when no other server (no other backup) may be. */
+	bool		backup;
+	/* Never taken. */
+	bool		down;
 	/*
 	 * The failures within @fail_timeout_ms that eject the server, for
 	 * @eject_ms; 0 (at most GWP_UP_MAX_FAILS) never ejects it. Both
@@ -127,6 +131,8 @@ static inline void gwp_up_opts_default(struct gwp_up_opts *o)
 {
 	o->weight = 1;
 	o->max_conns = 0;
+	o->backup = false;
+	o->down = false;
 	o->max_fails = GWP_UP_EJECT_FAILS;
 	o->fail_timeout_ms = GWP_UP_EJECT_WINDOW_MS;
 	o->eject_ms = GWP_UP_EJECT_MS;
@@ -348,43 +354,74 @@ struct gwp_up_member {
 	uint32_t		max_conns;
 	/* The pool's weight for it, 1 to GWP_UP_MAX_WEIGHT; 0 is taken as 1. */
 	uint16_t		weight;
+	/* GWP_UP_MEMBER_*. */
+	uint8_t			flags;
 };
 
+/* A backup (struct gwp_up_opts): in the plan's backup tier. */
+#define GWP_UP_MEMBER_BACKUP	0x01u
+/* Down: in no tier of the plan, never taken. */
+#define GWP_UP_MEMBER_DOWN	0x02u
+
 /*
- * How a pool whose servers' weights differ spreads its turns over them,
- * made once from its members (gwp_up_plan_build()) and read-only after.
+ * The servers of a pool that a pick chooses among at a time (see struct
+ * gwp_up_plan), and how their weights spread their turns.
  *
  * Each server owns as many consecutive units of [0, @total) as its weight:
- * server i those from @cum[i - 1] (0 for the first) up to @cum[i]. The
- * cursor's turn r goes to the owner of the unit at the point r takes in
- * the van der Corput sequence (r's 32 bits reversed, as a fraction of
- * 2^32), scaled to @total. Every 2^b turns in a row that start at a
- * multiple of 2^b fall on 2^b evenly spaced points, so with 2^b >= @total
- * each server gets its weight's share of them, give or take one turn; and
- * as the sequence fills [0, 1) evenly at every length, the turns of each
- * server come at nearly even intervals (no gap more than about three
- * times its share's), not in a burst. The owner of a unit is found by a
- * binary search of @cum, narrowed first by @first: the point's top bits
- * name one of 2^k slices of [0, 1) (2^k the pool's size or more), and
+ * the server at position p those from @cum[p - 1] (0 for the first) up to
+ * @cum[p]. The cursor's turn r goes to the owner of the unit at the point
+ * r takes in the van der Corput sequence (r's 32 bits reversed, as a
+ * fraction of 2^32), scaled to @total. Every 2^b turns in a row that start
+ * at a multiple of 2^b fall on 2^b evenly spaced points, so with 2^b >=
+ * @total each server gets its weight's share of them, give or take one
+ * turn; and as the sequence fills [0, 1) evenly at every length, the turns
+ * of each server come at nearly even intervals (no gap more than about
+ * three times its share's), not in a burst. The owner of a unit is found
+ * by a binary search of @cum, narrowed first by @first: the point's top
+ * bits name one of 2^k slices of [0, 1) (2^k the tier's size or more), and
  * @first[s] is the owner of the first unit of slice s, so the search is
  * over the few servers that share the slice, whatever the weights: a pick
  * costs O(1) for weights within a small factor of each other, and
- * O(log n) of the pool's n servers at worst.
+ * O(log n) of the tier's n servers at worst.
  */
-struct gwp_up_plan {
+struct gwp_up_tier {
+	/* How many servers; 0 for an empty tier. */
+	uint32_t	n;
 	/* The weights summed; 0 when all are equal: plain turns, no @cum. */
 	uint32_t	total;
-	uint32_t	nr;
 	/* 32 - k: a point's bits that do not choose its slice. */
 	uint32_t	shift;
-	/* 2^k + 1 of them; the last is the last server. */
+	/*
+	 * The place in the pool of the server at each position, in pool
+	 * order; NULL when they are the same (every server in this tier).
+	 */
+	const uint16_t	*idx;
+	/* 2^k + 1 of them; the last is the last position. */
 	const uint16_t	*first;
-	uint32_t	cum[];
+	const uint32_t	*cum;
 };
 
 /*
- * The plan of the @nr (at most 65536) members @m, by their weights, or NULL
- * without memory. Free it with free().
+ * How a pool picks among its servers, made once from its members
+ * (gwp_up_plan_build()) and read-only after: the main tier, of the servers
+ * that are neither backups nor down, and the backup tier, of the backups
+ * that are not down, each with its own turns by weight. The backups are
+ * only looked at when no main server may be taken.
+ */
+struct gwp_up_plan {
+	struct gwp_up_tier	tier[2];
+	/*
+	 * Each server's position in its tier, UINT16_MAX for one that is
+	 * down; NULL when every server is in the main tier, in pool order.
+	 */
+	const uint16_t		*pos;
+	uint32_t		nr;
+};
+
+/*
+ * The plan of the @nr (at most 65536) members @m, by their weights and
+ * flags, or NULL without memory. Free it with free(). A plan whose tiers
+ * are both empty (every server down) never picks a server.
  */
 struct gwp_up_plan *gwp_up_plan_build(const struct gwp_up_member *m,
 				      uint32_t nr);
@@ -401,8 +438,8 @@ struct gwp_up_pick {
 	const struct gwp_up_member	*m;
 	uint32_t	nr;
 	/*
-	 * Made of @m by gwp_up_plan_build(), or NULL when all the weights
-	 * are equal: plain turns.
+	 * Made of @m by gwp_up_plan_build(), or NULL: every server in the
+	 * main tier, all weights equal (plain turns), whatever @m says.
 	 */
 	const struct gwp_up_plan	*plan;
 	bool		least_conn;
@@ -465,9 +502,13 @@ static inline uint32_t gwp_up_rand(uint32_t *state)
  * if that finds it full after all: picks on other threads may have filled
  * it meanwhile.
  *
+ * The pick is made in the plan's main tier first, then, when no server
+ * there may be taken, in its backup tier, in the same way; a server that
+ * is down is in neither. Within a tier, in its servers' order (pool order):
+ *
  * Round-robin takes the server whose turn the cursor @rr is when it is in
- * service: server @rr % @nr when the weights are equal, else the plan's
- * (struct gwp_up_plan). With none ejected that is the cursor's server, and
+ * service: the tier's server @rr % n when the weights are equal, else the
+ * tier's turns by weight (struct gwp_up_tier). With none ejected that is the cursor's server, and
  * the pick reads one server's health only. When it is ejected, the pick
  * tries up to GWP_UP_PICK_PROBES servers drawn at random (@random; by
  * weight when the weights differ) and takes the first in service, so an
@@ -487,15 +528,17 @@ static inline uint32_t gwp_up_rand(uint32_t *state)
  * service (none can have fewer), and the health only of a server that
  * would be the best so far.
  *
- * A retry (@skip) starts at the server after @skip instead of the cursor:
- * that one when it is in service, else (round-robin) the same probes and
- * then the next in service in pool order (least-connections: the fewest
- * open, ties from there), never @skip itself.
+ * A retry (@skip) starts at the server after @skip in its tier instead of
+ * the cursor (at the tier's first in another tier): that one when it is in
+ * service, else (round-robin) the same probes and then the next in service
+ * in pool order (least-connections: the fewest open, ties from there),
+ * never @skip itself.
  *
  * When no server may be taken: for a first pick, the one whose ejection
  * ends soonest among the ejected servers that are not full is taken (ties
- * from @rr % @nr on), so a pool is never left without a server for its
- * ejections alone; UINT32_MAX when they are all full. For a retry, which
+ * from the tier's @rr % n on), from the main tier if it has one, else from
+ * the backups, so a pool is never left without a server for its ejections
+ * alone; UINT32_MAX when they are all full (or down). For a retry, which
  * goes only to another server in service, UINT32_MAX. Also UINT32_MAX when
  * @nr is 0 or every state is NULL.
  */

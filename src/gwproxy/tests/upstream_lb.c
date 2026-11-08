@@ -1169,13 +1169,13 @@ static void test_weights(void)
 
 	tp_init(&p, 3);
 	tp_weights(&p, eq);
-	assert(!p.plan->total);
+	assert(!p.plan->tier[0].total);
 	for (rr = 0; rr < 9; rr++)
 		assert(tp_pick(&p, false, rr, NONE) == rr % 3);
 
 	tp_weights(&p, w3);
-	assert(p.plan->total == 7);
-	assert(p.plan->cum[0] == 5 && p.plan->cum[2] == 7);
+	assert(p.plan->tier[0].total == 7);
+	assert(p.plan->tier[0].cum[0] == 5 && p.plan->tier[0].cum[2] == 7);
 	for (n = 8; n <= (1u << 16); n <<= 4) {
 		memset(hits, 0, sizeof(hits));
 		for (rr = 3 * n; rr < 4 * n; rr++)
@@ -1316,7 +1316,7 @@ static void test_weights_big(void)
 		total += w[i];
 	}
 	tp_weights(&p, w);
-	assert(p.plan->total == total);
+	assert(p.plan->tier[0].total == total);
 	memset(&pk, 0, sizeof(pk));
 	pk.m = p.m;
 	pk.nr = p.nr;
@@ -1396,6 +1396,122 @@ static void test_max_conns(void)
 	/* A cap of 0 is none. */
 	p.m[3].max_conns = 0;
 	assert(tp_pick(&p, false, 0, NONE) == 3);
+	tp_free(&p);
+}
+
+/* Give @p's servers the flags @f and plan the pool by them. */
+static void tp_flags(struct tpool *p, const uint8_t *f)
+{
+	uint32_t i;
+
+	for (i = 0; i < p->nr; i++)
+		p->m[i].flags = f[i];
+	free(p->plan);
+	p->plan = gwp_up_plan_build(p->m, p->nr);
+	assert(p->plan && p->plan->nr == p->nr);
+}
+
+/*
+ * backup and down: the tiers the plan makes of them, the backups taken
+ * only when no main server may be, by either method and on a retry, down
+ * servers never; with everything out, the main server back soonest, a
+ * backup only when no main server stands.
+ */
+static void test_backup_down(void)
+{
+	static const uint8_t f[5] = {
+		0, GWP_UP_MEMBER_BACKUP, GWP_UP_MEMBER_DOWN, 0,
+		GWP_UP_MEMBER_BACKUP,
+	};
+	uint32_t hits[5] = { 0 }, rr, i;
+	struct tpool p;
+
+	tp_init(&p, 5);
+	tp_flags(&p, f);
+	assert(p.plan->tier[0].n == 2 && p.plan->tier[1].n == 2);
+	assert(p.plan->tier[0].idx[0] == 0 && p.plan->tier[0].idx[1] == 3);
+	assert(p.plan->tier[1].idx[0] == 1 && p.plan->tier[1].idx[1] == 4);
+	assert(p.plan->pos[3] == 1 && p.plan->pos[4] == 1 &&
+	       p.plan->pos[2] == UINT16_MAX);
+	assert(!p.plan->tier[0].total && !p.plan->tier[1].total);
+
+	/* The main servers in turn; the others idle, least_conn too. */
+	for (rr = 0; rr < 8; rr++)
+		hits[tp_pick(&p, false, rr, NONE)]++;
+	assert(hits[0] == 4 && hits[3] == 4);
+	tp_open(&p, 0, 3);
+	tp_open(&p, 3, 3);
+	assert(tp_pick(&p, true, 0, NONE) == 0);
+	assert(tp_pick(&p, true, 1, NONE) == 3);
+	/* A retry goes to the other main server. */
+	assert(tp_pick(&p, false, 7, 0) == 3);
+	assert(tp_pick(&p, false, 7, 3) == 0);
+
+	/* One main server out: the other takes all. */
+	tp_eject(&p, 0, 500);
+	for (rr = 0; rr < 4; rr++)
+		assert(tp_pick(&p, false, rr, NONE) == 3);
+	assert(tp_pick(&p, false, 0, 3) == 1);
+	/* Both out (one full): the backups, in turn; least_conn's fewest. */
+	p.m[3].max_conns = 3;
+	for (rr = 0; rr < 4; rr++)
+		assert(tp_pick(&p, false, rr, NONE) == (rr % 2 ? 4 : 1));
+	tp_open(&p, 1, 2);
+	assert(tp_pick(&p, true, 0, NONE) == 4);
+	/* A backup that fails: the other backup. */
+	assert(tp_pick(&p, false, 0, 4) == 1);
+	assert(tp_pick(&p, true, 0, 1) == 4);
+
+	/* Everything out: the main server back soonest, not a backup. */
+	tp_eject(&p, 1, 100);
+	tp_eject(&p, 4, 100);
+	assert(tp_pick(&p, false, 0, NONE) == 0);
+	assert(tp_pick(&p, false, 0, 0) == NONE);
+	/* The main ones full too: a backup, ties in turn. */
+	p.m[0].max_conns = 3;
+	assert(tp_pick(&p, false, 0, NONE) == 1);
+	assert(tp_pick(&p, false, 1, NONE) == 4);
+	assert(tp_pick(&p, true, 1, NONE) == 4);
+	/* Down is never taken, even then. */
+	for (i = 0; i < 5; i++)
+		assert(tp_pick(&p, false, i, NONE) != 2);
+	tp_free(&p);
+
+	/* Every server down: nothing to pick. */
+	tp_init(&p, 2);
+	p.m[0].flags = p.m[1].flags = GWP_UP_MEMBER_DOWN;
+	p.plan = gwp_up_plan_build(p.m, p.nr);
+	assert(p.plan && !p.plan->tier[0].n && !p.plan->tier[1].n);
+	assert(tp_pick(&p, false, 0, NONE) == NONE);
+	assert(tp_pick(&p, true, 0, NONE) == NONE);
+	tp_free(&p);
+}
+
+/* Weights in each tier on their own: the backups' turns by theirs. */
+static void test_backup_weights(void)
+{
+	static const uint8_t f[5] = {
+		GWP_UP_MEMBER_BACKUP, 0, GWP_UP_MEMBER_BACKUP, 0,
+		GWP_UP_MEMBER_DOWN,
+	};
+	static const uint32_t w[5] = { 1, 1, 3, 1, 9 };
+	uint32_t hits[5] = { 0 }, rr;
+	struct tpool p;
+
+	tp_init(&p, 5);
+	for (rr = 0; rr < 5; rr++)
+		p.m[rr].flags = f[rr];
+	tp_weights(&p, w);
+	assert(!p.plan->tier[0].total && p.plan->tier[1].total == 4);
+	for (rr = 0; rr < 16; rr++)
+		hits[tp_pick(&p, false, rr, NONE)]++;
+	assert(hits[1] == 8 && hits[3] == 8);
+	tp_eject(&p, 1, 100);
+	tp_eject(&p, 3, 100);
+	memset(hits, 0, sizeof(hits));
+	for (rr = 0; rr < 16; rr++)
+		hits[tp_pick(&p, false, rr, NONE)]++;
+	assert(hits[0] == 4 && hits[2] == 12 && !hits[4]);
 	tp_free(&p);
 }
 
@@ -1596,6 +1712,8 @@ int main(void)
 	test_weights_spread();
 	test_weights_big();
 	test_max_conns();
+	test_backup_down();
+	test_backup_weights();
 	test_take_max_threads();
 	test_eject_threads();
 	printf("All upstream_lb tests passed.\n");

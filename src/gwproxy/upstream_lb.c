@@ -399,76 +399,148 @@ static uint32_t member_weight(const struct gwp_up_member *m)
 	return m->weight ? m->weight : 1;
 }
 
+/* The place in the pool of the server at @p in the tier @t. */
+static uint32_t tier_member(const struct gwp_up_tier *t, uint32_t p)
+{
+	return t->idx ? t->idx[p] : p;
+}
+
 /*
- * The server that owns the unit at the point @x (a fraction of 2^32) of
- * the weights' sum: the first from @lo whose @cum is above it, among the
- * @n from @lo (which hold it). A binary search without branches to
- * mispredict, as the turns hop around the pool: the answer stays in
- * [lo, lo + n).
+ * The position in @t of the server that owns the unit at the point @x (a
+ * fraction of 2^32) of the tier's weights: the first from @lo whose @cum
+ * is above it, among the @n from @lo (which hold it). A binary search
+ * without branches to mispredict, as the turns hop around the tier: the
+ * answer stays in [lo, lo + n).
  */
-static uint32_t owner_in(const struct gwp_up_plan *pl, uint32_t x,
+static uint32_t owner_in(const struct gwp_up_tier *t, uint32_t x,
 			 uint32_t lo, uint32_t n)
 {
-	uint32_t u = (uint32_t)(((uint64_t)x * pl->total) >> 32), half;
+	uint32_t u = (uint32_t)(((uint64_t)x * t->total) >> 32), half;
 
 	while (n > 1) {
 		half = n / 2;
-		lo = pl->cum[lo + half - 1] <= u ? lo + half : lo;
+		lo = t->cum[lo + half - 1] <= u ? lo + half : lo;
 		n -= half;
 	}
 	return lo;
 }
 
-/* The server that owns the unit at the point @x, through @pl's slices. */
-static uint32_t plan_owner(const struct gwp_up_plan *pl, uint32_t x)
+/* The owner of the unit at the point @x of @t, through its slices. */
+static uint32_t tier_owner(const struct gwp_up_tier *t, uint32_t x)
 {
-	uint32_t s = x >> pl->shift;
+	uint32_t s = x >> t->shift;
 
-	return owner_in(pl, x, pl->first[s],
-			(uint32_t)pl->first[s + 1] - pl->first[s] + 1u);
+	return owner_in(t, x, t->first[s],
+			(uint32_t)t->first[s + 1] - t->first[s] + 1u);
+}
+
+/* The flag bits of @m that choose its tier, 2 for none (down). */
+static uint32_t member_tier(const struct gwp_up_member *m)
+{
+	if (m->flags & GWP_UP_MEMBER_DOWN)
+		return 2;
+	return (m->flags & GWP_UP_MEMBER_BACKUP) ? 1 : 0;
 }
 
 struct gwp_up_plan *gwp_up_plan_build(const struct gwp_up_member *m,
 				      uint32_t nr)
 {
-	uint32_t i, sum = 0, k = 1, nr_slice;
+	uint32_t n[2] = { 0, 0 }, w0[2] = { 0, 0 }, k[2] = { 0, 0 };
+	uint32_t at[2] = { 0, 0 }, i, t, p, sum;
+	bool eq[2] = { true, true }, ident;
 	struct gwp_up_plan *pl;
-	bool equal = true;
-	uint16_t *first;
-	size_t size;
+	struct gwp_up_tier *tr;
+	uint16_t *pos = NULL;
+	size_t size, off;
+	char *base;
 
-	for (i = 1; i < nr; i++)
-		if (member_weight(&m[i]) != member_weight(&m[0]))
-			equal = false;
-	if (equal) {
-		pl = calloc(1, sizeof(*pl));
-		if (pl)
-			pl->nr = nr;
-		return pl;
+	for (i = 0; i < nr; i++) {
+		t = member_tier(&m[i]);
+		if (t > 1)
+			continue;
+		if (!n[t])
+			w0[t] = member_weight(&m[i]);
+		else if (member_weight(&m[i]) != w0[t])
+			eq[t] = false;
+		n[t]++;
 	}
+	/* Every server in the main tier, in pool order: no maps needed. */
+	ident = n[0] == nr;
 
-	/* 2^k slices, at least as many as servers (at least 2 of them). */
-	while ((1u << k) < nr)
-		k++;
-	nr_slice = 1u << k;
-	size = sizeof(*pl) + nr * sizeof(pl->cum[0]) +
-	       (nr_slice + 1) * sizeof(*first);
+	/* The 32-bit arrays first, then the 16-bit ones. */
+	size = sizeof(*pl);
+	for (t = 0; t < 2; t++)
+		if (!eq[t])
+			size += n[t] * sizeof(uint32_t);
+	for (t = 0; t < 2; t++) {
+		if (!ident)
+			size += n[t] * sizeof(uint16_t);
+		if (eq[t])
+			continue;
+		/* 2^k slices, at least as many as servers (2 at least). */
+		k[t] = 1;
+		while ((1u << k[t]) < n[t])
+			k[t]++;
+		size += ((1u << k[t]) + 1) * sizeof(uint16_t);
+	}
+	if (!ident)
+		size += nr * sizeof(uint16_t);
 	pl = calloc(1, size);
 	if (!pl)
 		return NULL;
-	/* At most 8192 servers of weight 1000 at most: no overflow. */
-	for (i = 0; i < nr; i++) {
-		sum += member_weight(&m[i]);
-		pl->cum[i] = sum;
-	}
-	pl->total = sum;
 	pl->nr = nr;
-	pl->shift = 32 - k;
-	first = (uint16_t *)(void *)&pl->cum[nr];
-	for (i = 0; i < nr_slice; i++)
-		first[i] = (uint16_t)owner_in(pl, i << pl->shift, 0, nr);
-	first[nr_slice] = (uint16_t)(nr - 1);
-	pl->first = first;
+	base = (char *)pl;
+	off = sizeof(*pl);
+	for (t = 0; t < 2; t++) {
+		pl->tier[t].n = n[t];
+		if (eq[t])
+			continue;
+		pl->tier[t].cum = (uint32_t *)(void *)(base + off);
+		off += n[t] * sizeof(uint32_t);
+	}
+	for (t = 0; t < 2; t++) {
+		if (!ident) {
+			pl->tier[t].idx = (uint16_t *)(void *)(base + off);
+			off += n[t] * sizeof(uint16_t);
+		}
+		if (eq[t])
+			continue;
+		pl->tier[t].first = (uint16_t *)(void *)(base + off);
+		off += ((1u << k[t]) + 1) * sizeof(uint16_t);
+	}
+	if (!ident) {
+		pos = (uint16_t *)(void *)(base + off);
+		pl->pos = pos;
+	}
+
+	for (i = 0; !ident && i < nr; i++) {
+		t = member_tier(&m[i]);
+		if (t > 1) {
+			pos[i] = UINT16_MAX;
+			continue;
+		}
+		((uint16_t *)pl->tier[t].idx)[at[t]] = (uint16_t)i;
+		pos[i] = (uint16_t)at[t]++;
+	}
+	for (t = 0; t < 2; t++) {
+		uint16_t *first = (uint16_t *)pl->tier[t].first;
+		uint32_t *cum = (uint32_t *)pl->tier[t].cum;
+
+		tr = &pl->tier[t];
+		if (eq[t])
+			continue;
+		/* At most 8192 servers of weight 1000 at most: no overflow. */
+		for (p = 0, sum = 0; p < n[t]; p++) {
+			sum += member_weight(&m[tier_member(tr, p)]);
+			cum[p] = sum;
+		}
+		tr->total = sum;
+		tr->shift = 32 - k[t];
+		for (i = 0; i < (1u << k[t]); i++)
+			first[i] = (uint16_t)owner_in(tr, i << tr->shift, 0,
+						      n[t]);
+		first[1u << k[t]] = (uint16_t)(n[t] - 1);
+	}
 	return pl;
 }
 
@@ -482,21 +554,21 @@ static uint32_t bit_reverse(uint32_t x)
 	return (x >> 16) | (x << 16);
 }
 
-/* Whose turn the cursor @rr is in a pool of @nr servers planned by @pl. */
-static uint32_t turn_of(const struct gwp_up_plan *pl, uint32_t nr, uint32_t rr)
+/* The position in @t whose turn the cursor @rr is. */
+static uint32_t tier_turn(const struct gwp_up_tier *t, uint32_t rr)
 {
-	if (!pl || !pl->total)
-		return rr % nr;
-	return plan_owner(pl, bit_reverse(rr));
+	if (!t->total)
+		return rr % t->n;
+	return tier_owner(t, bit_reverse(rr));
 }
 
-/* A server drawn by the random number @r: uniformly, or by weight. */
-static uint32_t drawn_by(const struct gwp_up_plan *pl, uint32_t nr, uint32_t r)
+/* A position in @t drawn by the random number @r: uniformly, or by weight. */
+static uint32_t tier_drawn(const struct gwp_up_tier *t, uint32_t r)
 {
 	/* Uniform over [0, n), no division. */
-	if (!pl || !pl->total)
-		return (uint32_t)(((uint64_t)r * nr) >> 32);
-	return plan_owner(pl, r);
+	if (!t->total)
+		return (uint32_t)(((uint64_t)r * t->n) >> 32);
+	return tier_owner(t, r);
 }
 
 /* Whether the @i-th server has as many pairs open as its pool allows. */
@@ -546,21 +618,28 @@ static uint32_t pick_ejected(struct pick *c, uint32_t i)
 	return left;
 }
 
-uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
+/* Whether the @i-th server may be taken: in service, not full, not @skip. */
+static bool pick_usable(struct pick *c, uint32_t i)
 {
-	struct pick c = { .pk = pk };
-	uint32_t nr = pk->nr, skip = pk->skip, best = UINT32_MAX;
-	uint32_t best_val = UINT32_MAX, best_w = 1, i, k, v, w;
-	const struct gwp_up_plan *pl = pk->plan;
-	bool retry = skip < nr, weighted = pl && pl->total;
-	struct gwp_up_state *s;
+	const struct gwp_up_pick *pk = c->pk;
 
-	if (!nr)
-		return UINT32_MAX;
-	if (retry)
-		i = skip + 1 < nr ? skip + 1 : 0;
-	else
-		i = turn_of(pl, nr, pk->rr);
+	return i != pk->skip && pk->m[i].st && !pick_full(pk, i) &&
+	       !pick_ejected(c, i);
+}
+
+/*
+ * The pick among the servers of the tier @t, from its position @p on (see
+ * gwp_up_lb_pick()): the place in the pool of the one taken, or
+ * UINT32_MAX when none may be.
+ */
+static uint32_t pick_tier(struct pick *c, const struct gwp_up_tier *t,
+			  uint32_t p)
+{
+	const struct gwp_up_pick *pk = c->pk;
+	uint32_t n = t->n, best = UINT32_MAX, best_val = UINT32_MAX;
+	uint32_t best_w = 1, i, k, v, w;
+	bool weighted = t->total != 0;
+	const struct gwp_up_member *m;
 
 	/*
 	 * The start's server is the pick (round-robin) or where the ties
@@ -569,41 +648,39 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 	 * spread; else round-robin takes the next in service, and
 	 * least_conn's ties start where they would have.
 	 */
-	s = pk->m[i].st;
-	if (i == skip || !s || pick_full(pk, i) || pick_ejected(&c, i)) {
-		uint32_t p, j;
+	if (!pick_usable(c, tier_member(t, p))) {
+		uint32_t q, j;
 
-		for (p = 0; pk->random && p < GWP_UP_PICK_PROBES; p++) {
-			j = drawn_by(pl, nr, pk->random(pk->arg));
-			s = pk->m[j].st;
-			if (j != skip && s && !pick_full(pk, j) &&
-			    !pick_ejected(&c, j)) {
-				i = j;
+		for (q = 0; pk->random && q < GWP_UP_PICK_PROBES; q++) {
+			j = tier_drawn(t, pk->random(pk->arg));
+			if (pick_usable(c, tier_member(t, j))) {
+				p = j;
 				break;
 			}
 		}
 	}
 	if (!pk->least_conn) {
-		s = pk->m[i].st;
-		if (i != skip && s && !pick_full(pk, i) && !pick_ejected(&c, i))
+		i = tier_member(t, p);
+		if (pick_usable(c, i))
 			return i;
 	}
 
-	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
-		s = pk->m[i].st;
-		if (i == skip || !s)
+	for (k = 0; k < n; k++, p = p + 1 < n ? p + 1 : 0) {
+		i = tier_member(t, p);
+		m = &pk->m[i];
+		if (i == pk->skip || !m->st)
 			continue;
 		if (!pk->least_conn) {
-			if (!pick_full(pk, i) && !pick_ejected(&c, i))
+			if (!pick_full(pk, i) && !pick_ejected(c, i))
 				return i;
 			continue;
 		}
 		/* Not fewer than the best so far: its health does not matter. */
-		v = gwp_up_state_open(s);
-		w = weighted ? member_weight(&pk->m[i]) : 1;
-		if ((pk->m[i].max_conns && v >= pk->m[i].max_conns) ||
+		v = gwp_up_state_open(m->st);
+		w = weighted ? member_weight(m) : 1;
+		if ((m->max_conns && v >= m->max_conns) ||
 		    (best != UINT32_MAX && !fewer_open(v, w, best_val, best_w)) ||
-		    pick_ejected(&c, i))
+		    pick_ejected(c, i))
 			continue;
 		best = i;
 		best_val = v;
@@ -611,17 +688,25 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 		if (!v)
 			break;
 	}
-	if (best != UINT32_MAX || retry)
-		return best;
+	return best;
+}
 
-	/* All ejected or full: the one back soonest, ties in turn. */
-	best_val = UINT32_MAX;
-	i = pk->rr % nr;
-	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
-		s = pk->m[i].st;
-		if (!s || pick_full(pk, i))
+/*
+ * With none in service in any tier, the server of @t, from its position
+ * @p on, whose ejection ends soonest among those that are not full; or
+ * UINT32_MAX.
+ */
+static uint32_t pick_soonest(struct pick *c, const struct gwp_up_tier *t,
+			     uint32_t p)
+{
+	const struct gwp_up_pick *pk = c->pk;
+	uint32_t best = UINT32_MAX, best_val = UINT32_MAX, i, k, v;
+
+	for (k = 0; k < t->n; k++, p = p + 1 < t->n ? p + 1 : 0) {
+		i = tier_member(t, p);
+		if (!pk->m[i].st || pick_full(pk, i))
 			continue;
-		v = pick_ejected(&c, i);
+		v = pick_ejected(c, i);
 		/* Back meanwhile: in service again. */
 		if (!v)
 			return i;
@@ -631,4 +716,55 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 		}
 	}
 	return best;
+}
+
+uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
+{
+	struct pick c = { .pk = pk };
+	const struct gwp_up_plan *pl = pk->plan;
+	uint32_t nr = pk->nr, skip = pk->skip, nr_tier = 2, t, p, i;
+	struct gwp_up_tier all = { .n = nr };
+	const struct gwp_up_tier *tier;
+	bool retry = skip < nr;
+
+	if (!nr)
+		return UINT32_MAX;
+	/* No plan: every server in one tier, in pool order, plain turns. */
+	if (pl) {
+		tier = pl->tier;
+	} else {
+		tier = &all;
+		nr_tier = 1;
+	}
+
+	/* The backups only when no main server may be taken. */
+	for (t = 0; t < nr_tier; t++) {
+		if (!tier[t].n)
+			continue;
+		if (!retry) {
+			p = tier_turn(&tier[t], pk->rr);
+		} else if ((pl && pl->pos ? member_tier(&pk->m[skip]) : 0) ==
+			   t) {
+			/* After the server that failed. */
+			p = pl && pl->pos ? pl->pos[skip] : skip;
+			p = p + 1 < tier[t].n ? p + 1 : 0;
+		} else {
+			p = 0;
+		}
+		i = pick_tier(&c, &tier[t], p);
+		if (i != UINT32_MAX)
+			return i;
+	}
+	if (retry)
+		return UINT32_MAX;
+
+	/* All out: the one back soonest, ties in turn, backups last. */
+	for (t = 0; t < nr_tier; t++) {
+		if (!tier[t].n)
+			continue;
+		i = pick_soonest(&c, &tier[t], pk->rr % tier[t].n);
+		if (i != UINT32_MAX)
+			return i;
+	}
+	return UINT32_MAX;
 }

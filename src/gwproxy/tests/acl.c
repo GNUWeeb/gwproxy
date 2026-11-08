@@ -3114,7 +3114,7 @@ static noinline void test_upstream_server_ops(void)
 	assert(!gwp_acl_pool_server(req.upstream_pool, 2));
 	/* The weights, in the members and the plan made of them. */
 	assert(gwp_acl_pool_plan(req.upstream_pool));
-	assert(gwp_acl_pool_plan(req.upstream_pool)->total == 5);
+	assert(gwp_acl_pool_plan(req.upstream_pool)->tier[0].total == 5);
 	assert(gwp_acl_pool_members(req.upstream_pool)[0].weight == 1);
 	assert(gwp_acl_pool_members(req.upstream_pool)[1].weight == 4);
 	/* What a connection does: keep the server, not the pool. */
@@ -3498,6 +3498,8 @@ static noinline void test_upstream_server_opts(void)
 		"	server socks5h://10.0.0.7:1080 weight=1 max_fails=1;\n"
 		"	server socks5h://10.0.0.8:1080 max_conns=200 eject_time=10m;\n"
 		"	server socks5h://10.0.0.9:1080 max_conns=1000000;\n"
+		"	server socks5h://10.0.0.10:1080 backup weight=2;\n"
+		"	server socks5h://10.0.0.11:1080 down;\n"
 		"}\n"
 		"-A OUTPUT -j UPSTREAM --to p\n"));
 	o = up_opts(a, NULL, 0);
@@ -3524,7 +3526,11 @@ static noinline void test_upstream_server_opts(void)
 	o = up_opts(a, NULL, 7);
 	assert(o->max_conns == 200 && o->eject_ms == 600000);
 	o = up_opts(a, NULL, 8);
-	assert(o->max_conns == 1000000);
+	assert(o->max_conns == 1000000 && !o->backup && !o->down);
+	o = up_opts(a, NULL, 9);
+	assert(o->backup && !o->down && o->weight == 2);
+	o = up_opts(a, NULL, 10);
+	assert(!o->backup && o->down);
 	gwp_acl_destroy(a);
 
 	/* Wrong ones refuse the load, naming the server and the option. */
@@ -3541,6 +3547,19 @@ static noinline void test_upstream_server_opts(void)
 		   -EINVAL, "weight= given twice");
 	up_refused("upstream p {\n server http://h:1 max_conns=1000001;\n}\n",
 		   -EINVAL, "max_conns= wants a number from 0 to 1000000");
+	up_refused("upstream p {\n server http://h:1 backup down;\n}\n",
+		   -EINVAL, "line 2: upstream pool p server 1: backup and down together make no sense");
+	up_refused("upstream p {\n server http://h:1 down backup;\n}\n",
+		   -EINVAL, "backup and down together make no sense");
+	up_refused("upstream p {\n server http://h:1 down down;\n}\n",
+		   -EINVAL, "server 1: down given twice");
+	up_refused("upstream p {\n server http://h:1 backup=1;\n}\n",
+		   -EINVAL, "word 1 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1 downs;\n}\n",
+		   -EINVAL, "word 1 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1 down;\n"
+		   " server http://h:2 down;\n}\n",
+		   -EINVAL, "line 4: upstream pool p has every server down");
 	up_refused("upstream p {\n server http://h:1 max_fails;\n}\n",
 		   -EINVAL, "word 1 after the URL is not an option");
 	up_refused("upstream p {\n server http://h:1 max_fails=1 max_fails=2;\n}\n",
@@ -3576,6 +3595,49 @@ static noinline void test_upstream_server_opts(void)
 		"-A OUTPUT -j UPSTREAM --to p\n"));
 	assert(up_opts(a, NULL, 0)->max_fails == 2);
 	gwp_acl_destroy(a);
+}
+
+/*
+ * What a pick reads of each server comes from its options: the weight, the
+ * cap, backup and down; and the plan sorts them into tiers.
+ */
+static noinline void test_upstream_members(void)
+{
+	char *dir = inc_dir(), *path;
+	const struct gwp_up_member *m;
+	const struct gwp_up_plan *pl;
+	struct gwp_acl_req req;
+	struct gwp_acl *a;
+
+	path = inc_write(dir, "main.acl",
+			 "upstream p {\n"
+			 " server http://10.0.0.1:3128 weight=3 max_conns=7;\n"
+			 " server http://10.0.0.2:3128 backup;\n"
+			 " server http://10.0.0.3:3128 down;\n"
+			 " server http://10.0.0.4:3128;\n"
+			 "}\n"
+			 "-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_create_ops(&a, path, &up_srv_ops));
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	m = gwp_acl_pool_members(req.upstream_pool);
+	pl = gwp_acl_pool_plan(req.upstream_pool);
+	assert(m && pl && pl->nr == 4);
+	assert(m[0].weight == 3 && m[0].max_conns == 7 && !m[0].flags);
+	assert(m[1].weight == 1 && !m[1].max_conns &&
+	       m[1].flags == GWP_UP_MEMBER_BACKUP);
+	assert(m[2].flags == GWP_UP_MEMBER_DOWN);
+	assert(!m[3].flags);
+	assert(pl->tier[0].n == 2 && pl->tier[0].total == 4);
+	assert(pl->tier[0].idx[0] == 0 && pl->tier[0].idx[1] == 3);
+	assert(pl->tier[1].n == 1 && pl->tier[1].idx[0] == 1);
+	/* A down server is still made, and counted. */
+	assert(gwp_acl_pool_nr_servers(req.upstream_pool) == 4);
+	assert(gwp_acl_pool_server(req.upstream_pool, 2));
+	gwp_acl_req_release(&req);
+	gwp_acl_destroy(a);
+	assert(atomic_load(&g_up_live) == 0);
+	free(path);
+	inc_rmdir(dir);
 }
 
 /* Every way the pool syntax and -j UPSTREAM can be wrong, one at a time. */
@@ -3863,6 +3925,7 @@ static void run_tests(void)
 	test_upstream_take_pool();
 	test_upstream_reload_readers();
 	test_upstream_server_ops();
+	test_upstream_members();
 	test_upstream_pick_no_target();
 	test_upstream_pick_regexp_error();
 	test_upstream_udp_refused();

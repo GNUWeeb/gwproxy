@@ -2971,8 +2971,9 @@ static void pool_pick_back(void *arg, uint32_t i)
  * Workers picking at the same time may see the same counts and choose the
  * same server; the next picks see the result, which is close enough.
  *
- * Only servers in service are taken; with all of them ejected, the one
- * back soonest. With @skip, the server of @skip's place whose attempt
+ * Only servers in service are taken: not ejected, not full (max_conns=),
+ * not down, and a backup only when no other server may be taken; with all
+ * of them out, the one back soonest that is not full. With @skip, the server of @skip's place whose attempt
  * failed, it is a retry: another server in service, the next one after
  * @skip in pool order (least_conn: the fewest open, ties from there), or
  * UINT32_MAX for none; a retry leaves the cursor alone, so the pool's

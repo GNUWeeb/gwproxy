@@ -1464,6 +1464,9 @@ static int pool_add_server(struct acl_load *ld, const char *url,
 		memset(&p->mem[p->nr_servers], 0, sizeof(*p->mem));
 		p->mem[p->nr_servers].weight = (uint16_t)opts->weight;
 		p->mem[p->nr_servers].max_conns = opts->max_conns;
+		p->mem[p->nr_servers].flags =
+			(uint8_t)((opts->backup ? GWP_UP_MEMBER_BACKUP : 0) |
+				  (opts->down ? GWP_UP_MEMBER_DOWN : 0));
 		if (ld->ops->member)
 			ld->ops->member(ld->ops->arg, srv,
 					&p->mem[p->nr_servers]);
@@ -1501,10 +1504,11 @@ static int directive_words(char **tok, int n)
 enum srv_opt_kind {
 	SRV_OPT_COUNT,		/* a number, from @min to @max */
 	SRV_OPT_TIME,		/* a time, from 1 ms to GWP_UP_MAX_TIME_MS */
+	SRV_OPT_FLAG,		/* a name alone: a bool set */
 };
 
 struct srv_opt {
-	const char	*name;		/* with its '=' */
+	const char	*name;		/* with its '=', but for a flag */
 	uint8_t		kind;		/* enum srv_opt_kind */
 	uint32_t	min, max;
 	size_t		off;		/* of its value in struct gwp_up_opts */
@@ -1521,9 +1525,11 @@ static const struct srv_opt srv_opts[] = {
 	  offsetof(struct gwp_up_opts, fail_timeout_ms) },
 	{ "eject_time=", SRV_OPT_TIME, 1, GWP_UP_MAX_TIME_MS,
 	  offsetof(struct gwp_up_opts, eject_ms) },
+	{ "backup", SRV_OPT_FLAG, 0, 0, offsetof(struct gwp_up_opts, backup) },
+	{ "down", SRV_OPT_FLAG, 0, 0, offsetof(struct gwp_up_opts, down) },
 };
 
-#define SRV_OPTS_LIST	"weight=, max_conns=, max_fails=, fail_timeout= or eject_time="
+#define SRV_OPTS_LIST	"weight=, max_conns=, max_fails=, fail_timeout=, eject_time=, backup or down"
 
 /*
  * A number of at most 10 digits, nothing else, into *@out; false when @s is
@@ -1593,7 +1599,9 @@ static int parse_server_opts(struct acl_load *ld, char **tok, int n,
 	for (i = 0; i < n; i++) {
 		for (k = 0; k < sizeof(srv_opts) / sizeof(srv_opts[0]); k++) {
 			len = strlen(srv_opts[k].name);
-			if (!strncmp(tok[i], srv_opts[k].name, len))
+			if (srv_opts[k].kind == SRV_OPT_FLAG ?
+			    !strcmp(tok[i], srv_opts[k].name) :
+			    !strncmp(tok[i], srv_opts[k].name, len))
 				break;
 		}
 		if (k == sizeof(srv_opts) / sizeof(srv_opts[0]))
@@ -1605,6 +1613,10 @@ static int parse_server_opts(struct acl_load *ld, char **tok, int n,
 					p->name, idx, so->name);
 		seen |= 1u << k;
 
+		if (so->kind == SRV_OPT_FLAG) {
+			*(bool *)(void *)((char *)o + so->off) = true;
+			continue;
+		}
 		if (so->kind == SRV_OPT_TIME)
 			ok = srv_opt_time(tok[i] + len, &v);
 		else
@@ -1620,6 +1632,10 @@ static int parse_server_opts(struct acl_load *ld, char **tok, int n,
 		}
 		*(uint32_t *)(void *)((char *)o + so->off) = (uint32_t)v;
 	}
+	/* A server that is never taken is no one's backup. */
+	if (o->backup && o->down)
+		return load_err(ld, "upstream pool %s server %u: backup and down together make no sense; a server that is down is never taken",
+				p->name, idx);
 	return 0;
 }
 
@@ -1627,6 +1643,7 @@ static int parse_server_opts(struct acl_load *ld, char **tok, int n,
 static int parse_pool_line(struct acl_load *ld, char **tok, int n)
 {
 	struct gwp_acl_pool *p = ld->pool;
+	uint32_t i;
 	int w;
 
 	if (!strcmp(tok[0], "}")) {
@@ -1634,6 +1651,11 @@ static int parse_pool_line(struct acl_load *ld, char **tok, int n)
 			return load_err(ld, "\"}\" must stand alone on its line");
 		if (!p->nr_servers)
 			return load_err(ld, "upstream pool %s has no server",
+					p->name);
+		for (i = 0; i < p->nr_servers && p->opts[i].down; i++)
+			;
+		if (i == p->nr_servers)
+			return load_err(ld, "upstream pool %s has every server down",
 					p->name);
 		if (p->mem) {
 			p->plan = gwp_up_plan_build(p->mem, p->nr_servers);
