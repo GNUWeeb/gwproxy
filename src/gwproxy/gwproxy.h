@@ -326,7 +326,7 @@ enum {
  *
  * Do not introduce a high mmap() hint, arm64 MTE/HWASAN heap tagging, or x86
  * LAM without revisiting this. EV_PTR_OK() is the enforcement, and it is
- * deliberately not assert(): release builds define NDEBUG (Makefile, configure)
+ * deliberately not assert(): release builds define NDEBUG (configure)
  * and would compile the check out exactly where it matters.
  *
  * Combine the halves arithmetically, never by writing a pointer through one
