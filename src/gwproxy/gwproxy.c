@@ -1578,6 +1578,19 @@ static const char *path_basename(const char *path)
 }
 
 /*
+ * What the watches ask for. A file is ready once written (IN_CLOSE_WRITE) or
+ * renamed into place (IN_MOVED_TO), and that is all a watch for a file needs;
+ * one for the entries an include pattern looks for also needs them to come
+ * and go. inotify keeps one mask per directory, and a directory can be
+ * watched both ways, so every watch is added with IN_MASK_ADD: the mask only
+ * grows until the watch is removed, and gwp_reload_events() picks out what
+ * each wants from the records.
+ */
+#define GWP_INO_FILE_MASK	(IN_CLOSE_WRITE | IN_MOVED_TO)
+#define GWP_INO_DIR_MASK	(GWP_INO_FILE_MASK | IN_CREATE | IN_DELETE | \
+				 IN_MOVED_FROM)
+
+/*
  * Add an inotify watch that survives an atomic replace of `path`. We watch the
  * *parent directory*, not the file: an inode watch is silently dropped the
  * moment an editor, `install`, or `mv` swaps the file via rename, and never
@@ -1606,8 +1619,25 @@ static int add_reload_watch(int ino_fd, const char *path)
 		dir[n] = '\0';
 	}
 
-	r = inotify_add_watch(ino_fd, dir, IN_CLOSE_WRITE | IN_MOVED_TO);
+	r = inotify_add_watch(ino_fd, dir, GWP_INO_FILE_MASK | IN_MASK_ADD);
 	return (r < 0) ? -errno : r;
+}
+
+/* Watch the directory @path itself (see gwp_acl_dir()). */
+static int add_reload_dir_watch(int ino_fd, const char *path)
+{
+	int r = inotify_add_watch(ino_fd, path,
+				  GWP_INO_DIR_MASK | IN_MASK_ADD | IN_ONLYDIR);
+
+	return (r < 0) ? -errno : r;
+}
+
+/* Watch @f: its directory for a file, itself for a directory. */
+static int add_reload_acl_watch(int ino_fd, const struct gwp_reload_acl_file *f)
+{
+	if (f->dir)
+		return add_reload_dir_watch(ino_fd, f->path);
+	return add_reload_watch(ino_fd, f->path);
 }
 
 /*
@@ -1615,7 +1645,9 @@ static int add_reload_watch(int ino_fd, const char *path)
  * @err (a positive errno; @st is not read then). Beyond a FIFO's or a device's
  * identity nothing is compared: writing to it is not a new version of it. The
  * ctime is what catches a rewrite that restores the mtime, at the price of a
- * harmless reload after a chmod or a new hard link.
+ * harmless reload after a chmod or a new hard link. A directory's times change
+ * as entries come and go, which is what matters in the ones an include
+ * pattern reads.
  */
 static void gwp_file_id_from_stat(const struct stat *st, int err,
 				  struct gwp_file_id *id)
@@ -1628,7 +1660,7 @@ static void gwp_file_id_from_stat(const struct stat *st, int err,
 	id->dev = (uint64_t)st->st_dev;
 	id->ino = (uint64_t)st->st_ino;
 	id->mode = (uint64_t)(st->st_mode & S_IFMT);
-	if (!S_ISREG(st->st_mode))
+	if (!S_ISREG(st->st_mode) && !S_ISDIR(st->st_mode))
 		return;
 	id->size = (uint64_t)st->st_size;
 	id->mtime_sec = (uint64_t)st->st_mtim.tv_sec;
@@ -1670,25 +1702,42 @@ static void gwp_acl_files_free(struct gwp_reload_acl_file *v, size_t nr)
 }
 
 /*
+ * The @i-th entry of the ACL's watch list: its files (gwp_acl_file()), then
+ * its directories (gwp_acl_dir()); @nr_files is how many files there are.
+ */
+static const char *gwp_acl_watch_path(struct gwp_ctx *ctx, size_t nr_files,
+				      size_t i, bool *dir, size_t *idx)
+{
+	*dir = i >= nr_files;
+	*idx = *dir ? i - nr_files : i;
+	return *dir ? gwp_acl_dir(ctx->acl, *idx) : gwp_acl_file(ctx->acl, i);
+}
+
+/*
  * Make ctx->acl_files follow the files of the ACL's last load or reload (see
- * gwp_acl_file()), which change as includes are added or dropped. A file that
+ * gwp_acl_file()), which change as includes are added or dropped, and the
+ * directories their include lines looked in (gwp_acl_dir()). A file that
  * stays keeps its state, and so the identity taken before it was read; so does
  * a new one, from what the load saw right before reading it. A stat() taken
  * now could already see a change made since, which would then never be
  * reloaded, as no watch on a new directory existed yet to report it. With
- * @watch, a new file's directory gets a watch, and a watch that neither the
- * new set nor the auth file needs any more is removed. On failure (out of
- * memory) the set stays as it was.
+ * @watch, a new file's directory gets a watch, a new directory one of its own,
+ * and a watch that neither the new set nor the auth file needs any more is
+ * removed. On failure (out of memory) the set stays as it was.
  */
 static int gwp_acl_files_sync(struct gwp_ctx *ctx, bool watch)
 {
 	struct gwp_reload_acl_file *old = ctx->acl_files, *nv;
-	size_t nr_old = ctx->nr_acl_files, nr = 0, i, j;
+	size_t nr_old = ctx->nr_acl_files, nr = 0, nr_files, i, j, idx;
 	struct stat st;
 	ssize_t *from;
+	bool dir;
 	int r = 0;
 
 	while (gwp_acl_file(ctx->acl, nr))
+		nr++;
+	nr_files = nr;
+	while (gwp_acl_dir(ctx->acl, nr - nr_files))
 		nr++;
 	nv = calloc(nr ? nr : 1, sizeof(*nv));
 	from = calloc(nr ? nr : 1, sizeof(*from));
@@ -1699,11 +1748,12 @@ static int gwp_acl_files_sync(struct gwp_ctx *ctx, bool watch)
 
 	/* Everything that can fail first, so a failure changes nothing. */
 	for (i = 0; i < nr; i++) {
-		const char *path = gwp_acl_file(ctx->acl, i);
+		const char *path = gwp_acl_watch_path(ctx, nr_files, i, &dir,
+						      &idx);
 
 		from[i] = -1;
 		for (j = 0; j < nr_old; j++) {
-			if (!strcmp(old[j].path, path)) {
+			if (old[j].dir == dir && !strcmp(old[j].path, path)) {
 				from[i] = (ssize_t)j;
 				break;
 			}
@@ -1722,21 +1772,33 @@ static int gwp_acl_files_sync(struct gwp_ctx *ctx, bool watch)
 	for (i = 0; i < nr; i++) {
 		int sr, wd;
 
+		gwp_acl_watch_path(ctx, nr_files, i, &dir, &idx);
 		if (from[i] >= 0) {
 			nv[i] = old[from[i]];
+			nv[i].idx = idx;
 			old[from[i]].path = NULL;
 			continue;
 		}
 		nv[i].wd = -1;
-		sr = gwp_acl_file_stat(ctx->acl, i, &st);
+		nv[i].dir = dir;
+		nv[i].idx = idx;
+		if (dir)
+			sr = gwp_acl_dir_stat(ctx->acl, idx, &st);
+		else
+			sr = gwp_acl_file_stat(ctx->acl, idx, &st);
 		gwp_file_id_from_stat(&st, sr < 0 ? -sr : 0, &nv[i].rf.id);
 		if (!watch)
 			continue;
-		wd = add_reload_watch(ctx->ino_fd, nv[i].path);
-		if (wd < 0)
+		wd = add_reload_acl_watch(ctx->ino_fd, &nv[i]);
+		/*
+		 * A file whose directory is missing is covered by the watch on
+		 * the deepest directory there is on the way (gwp_acl_dir()),
+		 * and a directory gone since the load by the next reload.
+		 */
+		if (wd < 0 && wd != -ENOENT && wd != -ENOTDIR)
 			pr_warn(&ctx->lh, "Failed to add inotify watch for '%s', checking it every second only: %s",
 				nv[i].path, strerror(-wd));
-		else
+		else if (wd >= 0)
 			nv[i].wd = wd;
 	}
 
@@ -1770,7 +1832,8 @@ out:
  * until the path leads to something else.
  */
 static bool gwp_reload_check_file(struct gwp_ctx *ctx, const char *path,
-				  struct gwp_reload_file *rf, uint64_t now)
+				  struct gwp_reload_file *rf, bool dir,
+				  uint64_t now)
 {
 	if (gwp_file_id_changed(path, &rf->id)) {
 		rf->settle_at = now + GWP_RELOAD_SETTLE_MS;
@@ -1780,7 +1843,8 @@ static bool gwp_reload_check_file(struct gwp_ctx *ctx, const char *path,
 		return rf->retry;
 	if (now < rf->settle_at)
 		return false;
-	if (rf->id.err || rf->id.mode == S_IFREG)
+	/* A directory is only read, opened without blocking, whatever it is. */
+	if (rf->id.err || rf->id.mode == S_IFREG || dir)
 		return true;
 
 	rf->settle_at = 0;
@@ -1797,12 +1861,12 @@ static unsigned gwp_reload_check(struct gwp_ctx *ctx, uint64_t now)
 	size_t i;
 
 	if (ctx->auth && gwp_reload_check_file(ctx, ctx->cfg.auth_file,
-					       &ctx->auth_reload, now))
+					       &ctx->auth_reload, false, now))
 		flags |= GWP_RELOAD_AUTH;
 	for (i = 0; ctx->acl_watched && i < ctx->nr_acl_files; i++) {
 		struct gwp_reload_acl_file *f = &ctx->acl_files[i];
 
-		if (gwp_reload_check_file(ctx, f->path, &f->rf, now))
+		if (gwp_reload_check_file(ctx, f->path, &f->rf, f->dir, now))
 			flags |= GWP_RELOAD_ACL;
 	}
 	return flags;
@@ -1833,10 +1897,36 @@ static bool gwp_reload_end(struct gwp_reload_file *rf, int r)
 	return r && !(was_retry && rf->retry);
 }
 
-/* True when inotify record @e names the basename of @path (NULL: never). */
+/*
+ * True when inotify record @e says that the file @path (NULL: never) is ready:
+ * written, or renamed into place.
+ */
 static bool inotify_names(const struct inotify_event *e, const char *path)
 {
-	return path && e->len && !strcmp(e->name, path_basename(path));
+	return path && e->len && (e->mask & GWP_INO_FILE_MASK) &&
+	       !strcmp(e->name, path_basename(path));
+}
+
+/*
+ * True when inotify record @e, from the watch on the ACL directory @f, says
+ * that an entry the include lines look for there came, went, or was written.
+ * A new file is taken once written or renamed into place, not when created
+ * (empty, or half written); a new directory as soon as it is there.
+ */
+static bool inotify_dir_names(const struct gwp_ctx *ctx,
+			      const struct inotify_event *e,
+			      const struct gwp_reload_acl_file *f)
+{
+	unsigned wants;
+
+	if (e->wd != f->wd || !e->len)
+		return false;
+	wants = gwp_acl_dir_wants(ctx->acl, f->idx, e->name);
+	if ((wants & GWP_ACL_DIR_FILE) &&
+	    (e->mask & (GWP_INO_FILE_MASK | IN_DELETE | IN_MOVED_FROM)))
+		return true;
+	return (wants & GWP_ACL_DIR_SUBDIR) &&
+	       (e->mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO));
 }
 
 /*
@@ -1876,7 +1966,8 @@ static unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
 			 * Files of the set can share a basename, so the
 			 * directory the record came from must match too.
 			 */
-			if (e->wd == f->wd && inotify_names(e, f->path)) {
+			if (f->dir ? inotify_dir_names(ctx, e, f) :
+			    (e->wd == f->wd && inotify_names(e, f->path))) {
 				flags |= GWP_RELOAD_ACL;
 				break;
 			}
@@ -2141,7 +2232,10 @@ static int gwp_ctx_init_watch(struct gwp_ctx *ctx)
 	for (i = 0; ctx->acl_watched && i < ctx->nr_acl_files; i++) {
 		struct gwp_reload_acl_file *f = &ctx->acl_files[i];
 
-		r = add_reload_watch(ctx->ino_fd, f->path);
+		r = add_reload_acl_watch(ctx->ino_fd, f);
+		/* Not there (include_optional): see gwp_acl_files_sync(). */
+		if (r == -ENOENT || r == -ENOTDIR)
+			continue;
 		if (r < 0) {
 			pr_err(&ctx->lh, "Failed to add inotify watch for '%s': %s",
 				f->path, strerror(-r));

@@ -2073,6 +2073,9 @@ static void inc_files(struct gwp_acl *acl, const char *dir,
 	for (i = 0; i < nr; i++) {
 		snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
 		assert(gwp_acl_file(acl, i));
+		if (strcmp(gwp_acl_file(acl, i), path))
+			fprintf(stderr, "file %zu is %s, not %s\n", i,
+				gwp_acl_file(acl, i), path);
 		assert(!strcmp(gwp_acl_file(acl, i), path));
 	}
 	assert(!gwp_acl_file(acl, nr));
@@ -2361,6 +2364,622 @@ static noinline void test_include_reload(void)
 	gwp_acl_destroy(a);
 	free(a_path);
 	free(main_path);
+	inc_rmdir(dir);
+}
+
+/*
+ * ------------------------------------------------------------------------
+ * include patterns
+ * ------------------------------------------------------------------------
+ */
+
+static void up_capture(void);
+static char *up_captured(void);
+
+/* mkdir @dir/@name; returns the malloc'd path. */
+static char *inc_mkdir(const char *dir, const char *name)
+{
+	char *path;
+
+	assert(asprintf(&path, "%s/%s", dir, name) > 0);
+	assert(!mkdir(path, 0700));
+	return path;
+}
+
+static void inc_mkdir_put(const char *dir, const char *name)
+{
+	free(inc_mkdir(dir, name));
+}
+
+/*
+ * @text as main.acl in @dir must fail to load with @err, and say @msg (with
+ * "%s" standing for main.acl's path).
+ */
+static void inc_refused_msg(const char *dir, const char *text, int err,
+			    const char *msg)
+{
+	struct gwp_acl *a = NULL;
+	char *path = inc_write(dir, "main.acl", text), *said, *want;
+	int r;
+
+	assert(asprintf(&want, msg, path) > 0);
+	up_capture();
+	r = gwp_acl_create(&a, path);
+	said = up_captured();
+	if (r != err || !strstr(said, want)) {
+		fprintf(stderr, "returned %d, not %d; want \"%s\", it said:\n%s",
+			r, err, want, said);
+		assert(0);
+	}
+	assert(!a);
+	free(said);
+	free(want);
+	free(path);
+}
+
+/* @text as main.acl in @dir loads, and its files are @names in order. */
+static struct gwp_acl *inc_loads(const char *dir, const char *text,
+				 const char *const *names, size_t nr)
+{
+	char *path = inc_write(dir, "main.acl", text);
+	struct gwp_acl *a;
+	int r;
+
+	r = gwp_acl_create(&a, path);
+	if (r) {
+		fprintf(stderr, "returned %d for:\n%s", r, text);
+		assert(0);
+	}
+	inc_files(a, dir, names, nr);
+	free(path);
+	return a;
+}
+
+/*
+ * A pattern includes every file it matches, sorted byte-wise by path
+ * whatever the directory order, and '*', '?' and "[...]" work in any
+ * component, at any number of levels. A leading '.' is matched only by a
+ * pattern that starts with one, '\' makes a character literal, and a
+ * relative pattern is taken from the including file's directory.
+ */
+static noinline void test_include_glob_order(void)
+{
+	static const char *const conf[] = {
+		"main.acl", "conf/B.conf", "conf/a.conf", "conf/b.conf",
+	};
+	static const char *const hidden[] = {
+		"main.acl", "conf/.h.conf",
+	};
+	static const char *const levels[] = {
+		"main.acl", "lv/w/y/3.conf", "lv/x/y/1.conf", "lv/x/z/2.conf",
+	};
+	static const char *const mid[] = {
+		"main.acl", "lv/w/y/3.conf", "lv/x/y/1.conf",
+	};
+	static const char *const sets[] = {
+		"main.acl", "conf/a.conf", "conf/b.conf",
+	};
+	static const char *const lit[] = { "main.acl", "conf/lit*.lit" };
+	static const char *const nested[] = {
+		"main.acl", "lv/w/y/3.conf", "lv/x/y/1.conf",
+		"lv/x/y/sub/s.conf",
+	};
+	static const char *const one_dir[] = {
+		"main.acl", "lv/x/y/1.conf", "lv/x/y/sub/s.conf",
+	};
+	char *dir = inc_dir(), *text;
+	struct gwp_acl *a;
+
+	inc_mkdir_put(dir, "conf");
+	/* Created in an order the sort must not follow. */
+	inc_put(dir, "conf/b.conf", "-A OUTPUT -d 192.0.2.1 -j ACCEPT\n");
+	inc_put(dir, "conf/a.conf", "-A OUTPUT -d 192.0.2.1 -j REJECT\n"
+				    "-A OUTPUT -d 192.0.2.2 -j ACCEPT\n");
+	inc_put(dir, "conf/B.conf", "-A OUTPUT -d 192.0.2.2 -j REJECT\n");
+	inc_put(dir, "conf/c.txt", "-A OUTPUT -j BOGUS\n");
+	inc_put(dir, "conf/.h.conf", "-A OUTPUT -d 192.0.2.3 -j REJECT\n");
+	inc_put(dir, "conf/lit*.lit", "-A OUTPUT -d 192.0.2.4 -j REJECT\n");
+	inc_put(dir, "conf/litX.lit", "-A OUTPUT -j BOGUS\n");
+
+	/* "B" sorts before "a"; a.conf's REJECT wins over b.conf's ACCEPT. */
+	a = inc_loads(dir, "include conf/*.conf;\n-P OUTPUT ACCEPT\n", conf, 4);
+	assert(inc_out(a, "192.0.2.1") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.3") == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+
+	/* Only a leading '.' in the pattern matches a hidden name. */
+	a = inc_loads(dir, "include conf/.*.conf;\n", hidden, 2);
+	assert(inc_out(a, "192.0.2.3") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	a = inc_loads(dir, "include conf/\\.h.c?nf;\n", hidden, 2);
+	gwp_acl_destroy(a);
+
+	/* '?', sets, ranges and negated sets. */
+	a = inc_loads(dir, "include conf/[ab].c?nf;\n", sets, 3);
+	gwp_acl_destroy(a);
+	a = inc_loads(dir, "include conf/[a-b].conf;\n", sets, 3);
+	gwp_acl_destroy(a);
+	a = inc_loads(dir, "include conf/[!B.l]*.conf;\n", sets, 3);
+	gwp_acl_destroy(a);
+	a = inc_loads(dir, "include conf/[^B.l]*.conf;\n", sets, 3);
+	gwp_acl_destroy(a);
+	a = inc_loads(dir, "include conf/[[:lower:]].conf;\n", sets, 3);
+	gwp_acl_destroy(a);
+
+	/* An escaped wildcard is literal, in a path and in a pattern. */
+	a = inc_loads(dir, "include conf/lit\\*.lit;\n", lit, 2);
+	assert(inc_out(a, "192.0.2.4") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	a = inc_loads(dir, "include conf/lit\\*.l?t;\n", lit, 2);
+	gwp_acl_destroy(a);
+
+	/* Several levels; hidden directories and plain files do not lead on. */
+	inc_mkdir_put(dir, "lv");
+	inc_mkdir_put(dir, "lv/x");
+	inc_mkdir_put(dir, "lv/x/y");
+	inc_mkdir_put(dir, "lv/x/z");
+	inc_mkdir_put(dir, "lv/w");
+	inc_mkdir_put(dir, "lv/w/y");
+	inc_mkdir_put(dir, "lv/.h");
+	inc_mkdir_put(dir, "lv/.h/y");
+	inc_put(dir, "lv/x/y/1.conf", "-A OUTPUT -d 192.0.2.5 -j REJECT\n");
+	inc_put(dir, "lv/x/z/2.conf", "-A OUTPUT -d 192.0.2.6 -j REJECT\n");
+	inc_put(dir, "lv/w/y/3.conf", "-A OUTPUT -d 192.0.2.7 -j REJECT\n");
+	inc_put(dir, "lv/.h/y/4.conf", "-A OUTPUT -j BOGUS\n");
+	inc_put(dir, "lv/file", "-A OUTPUT -j BOGUS\n");
+	a = inc_loads(dir, "include lv/*/*/*.conf;\n", levels, 4);
+	assert(inc_out(a, "192.0.2.5") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.6") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.7") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	/* A literal component between wildcards; doubled slashes. */
+	a = inc_loads(dir, "include lv/*/y//*.conf;\n", mid, 3);
+	gwp_acl_destroy(a);
+
+	/* A match's own includes are relative to the match's directory. */
+	inc_put(dir, "lv/x/y/1.conf", "-A OUTPUT -d 192.0.2.5 -j REJECT\n"
+				      "include sub/*.conf;\n");
+	inc_mkdir_put(dir, "lv/x/y/sub");
+	inc_put(dir, "lv/x/y/sub/s.conf", "-A OUTPUT -d 192.0.2.8 -j REJECT\n");
+	a = inc_loads(dir, "include lv/?/y/*.conf;\n", nested, 4);
+	assert(inc_out(a, "192.0.2.8") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+
+	/* An absolute pattern. */
+	assert(asprintf(&text, "include %s/lv/x/y/*.conf;\n", dir) > 0);
+	a = inc_loads(dir, text, one_dir, 3);
+	gwp_acl_destroy(a);
+	free(text);
+
+	/*
+	 * The including file's directory is taken as it is, even with
+	 * characters that would be wildcards in the pattern.
+	 */
+	inc_mkdir_put(dir, "w[e]*?\\");
+	inc_mkdir_put(dir, "w[e]*?\\/x");
+	inc_put(dir, "w[e]*?\\/x/1.conf", "-A OUTPUT -d 192.0.2.9 -j REJECT\n");
+	inc_mkdir_put(dir, "we");
+	inc_mkdir_put(dir, "we/x");
+	inc_put(dir, "we/x/1.conf", "-A OUTPUT -j BOGUS\n");
+	text = inc_write(dir, "w[e]*?\\/main.acl", "include x/*.conf;\n");
+	assert(!gwp_acl_create(&a, text));
+	assert(inc_out(a, "192.0.2.9") == GWP_ACL_REJECT);
+	assert(!gwp_acl_file(a, 2));
+	gwp_acl_destroy(a);
+	free(text);
+
+	inc_rmdir(dir);
+}
+
+/*
+ * A strict include fails the load when its pattern matches nothing, or a
+ * match is not a regular file (a directory, a FIFO, a dangling link). The
+ * syntax errors, a cycle through a pattern, and the limits.
+ */
+static noinline void test_include_glob_errors(void)
+{
+	char *dir = inc_dir(), *path, name[64], text[64];
+	struct gwp_acl *a;
+	int i;
+
+	inc_mkdir_put(dir, "conf");
+	inc_put(dir, "conf/a.conf", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
+
+	/* Nothing matches: the message names the file, line and pattern. */
+	inc_refused_msg(dir, "\ninclude conf/*.acl;\n", -ENOENT,
+			"acl: %s: line 2: include conf/*.acl: no file matches");
+	inc_refused_msg(dir, "include none/*.conf;\n", -ENOENT,
+			"line 1: include none/*.conf: no file matches");
+	inc_refused_msg(dir, "include conf/a.conf/*;\n", -ENOENT,
+			"line 1: include conf/a.conf/*: no file matches");
+
+	/* Syntax. */
+	inc_refused_msg(dir, "include conf/**.conf;\n", -EINVAL,
+			"include conf/**.conf: ** is not supported");
+	inc_refused_msg(dir, "include conf/[a.conf;\n", -EINVAL,
+			"include conf/[a.conf: a [ is not closed");
+	inc_refused_msg(dir, "include conf/[a/]b;\n", -EINVAL,
+			"a [ is not closed");
+	inc_refused_msg(dir, "include conf/[[:alpha:];\n", -EINVAL,
+			"a [ is not closed");
+	inc_refused_msg(dir, "include conf\\/a.conf;\n", -EINVAL,
+			"a \\ ends a path component");
+	inc_refused_msg(dir, "include conf/a\\;\n", -EINVAL,
+			"a \\ ends a path component");
+	inc_refused_msg(dir, "include conf/[\\]].conf;\n", -EINVAL,
+			"a \\ inside [...] is not supported");
+
+	/* Every match must be a regular file. */
+	inc_mkdir_put(dir, "conf/d.conf");
+	inc_refused_msg(dir, "include conf/*.conf;\n", -EINVAL,
+			"conf/d.conf: not a regular file");
+	assert(asprintf(&path, "%s/conf/d.conf", dir) > 0);
+	assert(!rmdir(path));
+	assert(!mkfifo(path, 0600));
+	inc_refused_msg(dir, "include conf/*.conf;\n", -EINVAL,
+			"conf/d.conf: not a regular file");
+	assert(!unlink(path));
+	assert(!symlink("nowhere.conf", path));
+	inc_refused_msg(dir, "include conf/*.conf;\n", -ENOENT,
+			"conf/d.conf: No such file or directory");
+	assert(!unlink(path));
+	free(path);
+
+	/* A pattern that matches the including file is a cycle. */
+	inc_refused_msg(dir, "include *.acl;\n", -ELOOP, "include cycle");
+	inc_put(dir, "conf/back.conf", "include ../m*.acl;\n");
+	inc_refused_msg(dir, "include conf/*.conf;\n", -ELOOP, "include cycle");
+	assert(asprintf(&path, "%s/conf/back.conf", dir) > 0);
+	assert(!unlink(path));
+	free(path);
+
+	/* Depth: a pattern's matches are one level down, as a path's. */
+	for (i = 0; i < 7; i++) {
+		snprintf(name, sizeof(name), "d%d.acl", i);
+		snprintf(text, sizeof(text), "include d[%d].acl;\n", i + 1);
+		inc_put(dir, name, text);
+	}
+	inc_put(dir, "d7.acl", "include lea?.acl;\n");
+	inc_put(dir, "leaf.acl", "-A OUTPUT -d 192.0.2.8 -j REJECT\n");
+	inc_refused_msg(dir, "include d[0].acl;\n", -ELOOP,
+			"includes nest deeper than 8 levels");
+	path = inc_write(dir, "main.acl", "include d[1].acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(inc_out(a, "192.0.2.8") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	free(path);
+
+	/*
+	 * Each match counts toward the 64 files of a load: 63 matches and the
+	 * top file load, 64 do not; 65 are refused before any is read.
+	 */
+	inc_mkdir_put(dir, "many");
+	for (i = 0; i < 63; i++) {
+		snprintf(name, sizeof(name), "many/%02d.conf", i);
+		inc_put(dir, name, "-A OUTPUT -d 192.0.2.9 -j REJECT\n");
+	}
+	path = inc_write(dir, "main.acl", "include many/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(inc_out(a, "192.0.2.9") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	free(path);
+	inc_put(dir, "many/63.conf", "-A OUTPUT -d 192.0.2.9 -j REJECT\n");
+	inc_refused_msg(dir, "include many/*.conf;\n", -E2BIG,
+			"more than 64 files in one load");
+	inc_put(dir, "many/64.conf", "-A OUTPUT -d 192.0.2.9 -j REJECT\n");
+	inc_refused_msg(dir, "include many/*.conf;\n", -E2BIG,
+			"include pattern matches more than 64 files");
+
+	/* At most 256 directories read by the patterns of one load. */
+	inc_mkdir_put(dir, "wide");
+	for (i = 0; i < 255; i++) {
+		snprintf(name, sizeof(name), "wide/%03d", i);
+		inc_mkdir_put(dir, name);
+	}
+	inc_put(dir, "wide/000/x.conf", "-A OUTPUT -d 192.0.2.10 -j REJECT\n");
+	/* wide itself and 255 below it: 256. */
+	path = inc_write(dir, "main.acl", "include wide/*/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(inc_out(a, "192.0.2.10") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	free(path);
+	inc_mkdir_put(dir, "wide/255");
+	inc_refused_msg(dir, "include wide/*/*.conf;\n", -E2BIG,
+			"read more than 256 directories");
+
+	/* A directory that cannot be read fails the load (not as root). */
+	if (geteuid()) {
+		assert(asprintf(&path, "%s/conf", dir) > 0);
+		assert(!chmod(path, 0));
+		inc_refused_msg(dir, "include conf/*.conf;\n", -EACCES,
+				"conf: Permission denied");
+		assert(!chmod(path, 0700));
+		free(path);
+	}
+
+	inc_rmdir(dir);
+}
+
+/*
+ * include_optional: a file that is not there (missing, behind a missing or
+ * non-directory component, a dangling link) or a pattern that matches
+ * nothing includes nothing, with a warning that names the file, line and
+ * path; it is still listed, so a reload picks it up once it is there. Any
+ * other failure is fatal, as for include.
+ */
+static noinline void test_include_optional(void)
+{
+	static const char *const one[] = { "main.acl", "opt.acl" };
+	static const char *const two[] = {
+		"main.acl", "conf/a.conf", "conf/b.conf",
+	};
+	static const char *const none[] = { "main.acl", "none/x.acl" };
+	static const char *const on_file[] = {
+		"main.acl", "conf/a.conf/x.acl",
+	};
+	static const char *const top[] = { "main.acl" };
+	char *dir = inc_dir(), *path, *said, *want;
+	struct gwp_acl *a;
+	struct stat st;
+	int fd;
+
+	inc_mkdir_put(dir, "conf");
+	inc_put(dir, "conf/a.conf", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
+
+	/* Missing: loads, says so with the file, line and path. */
+	path = inc_write(dir, "main.acl", "-P OUTPUT ACCEPT\n"
+			 "include_optional opt.acl;\n"
+			 "-A OUTPUT -d 192.0.2.2 -j REJECT\n");
+	up_capture();
+	assert(!gwp_acl_create(&a, path));
+	said = up_captured();
+	assert(asprintf(&want, "acl: %s: line 2: warning: include_optional %s/opt.acl: No such file or directory; nothing included",
+			path, dir) > 0);
+	if (!strstr(said, want)) {
+		fprintf(stderr, "want \"%s\", it said:\n%s", want, said);
+		assert(0);
+	}
+	free(want);
+	free(said);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.3") == GWP_ACL_ACCEPT);
+	inc_files(a, dir, one, 2);
+	assert(gwp_acl_file_stat(a, 1, &st) == -ENOENT);
+
+	/* Once it is there, a reload includes it. */
+	inc_put(dir, "opt.acl", "-A OUTPUT -d 192.0.2.3 -j REJECT\n");
+	assert(!gwp_acl_reload(a));
+	assert(inc_out(a, "192.0.2.3") == GWP_ACL_REJECT);
+	inc_files(a, dir, one, 2);
+	assert(!gwp_acl_file_stat(a, 1, &st));
+	gwp_acl_destroy(a);
+	free(path);
+	free(inc_write(dir, "opt.acl", "-A OUTPUT -j BOGUS\n"));
+	assert(asprintf(&path, "%s/opt.acl", dir) > 0);
+	assert(!unlink(path));
+
+	/* A missing directory, a file on the way, a dangling link. */
+	a = inc_loads(dir, "include_optional none/x.acl;\n", none, 2);
+	gwp_acl_destroy(a);
+	a = inc_loads(dir, "include_optional conf/a.conf/x.acl;\n",
+		      on_file, 2);
+	gwp_acl_destroy(a);
+	assert(!symlink("nowhere.acl", path));
+	a = inc_loads(dir, "include_optional opt.acl;\n", one, 2);
+	gwp_acl_destroy(a);
+
+	/* A pattern that matches nothing; one whose match dangles. */
+	inc_refused_msg(dir, "include_optional none/*.acl;\n-A\n", -EINVAL,
+			"line 1: warning: include_optional none/*.acl: no file matches; nothing included");
+	a = inc_loads(dir, "include_optional none/*.acl;\n", top, 1);
+	gwp_acl_destroy(a);
+	a = inc_loads(dir, "include_optional conf/*.acl;\n", top, 1);
+	gwp_acl_destroy(a);
+	assert(!unlink(path));
+	assert(asprintf(&want, "%s/conf/b.conf", dir) > 0);
+	assert(!symlink("nowhere.conf", want));
+	a = inc_loads(dir, "include_optional conf/*.conf;\n", two, 3);
+	assert(inc_out(a, "192.0.2.1") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	/* The same dangling match fails a strict include. */
+	inc_refused(dir, "include conf/*.conf;\n", -ENOENT);
+	assert(!unlink(want));
+	free(want);
+
+	/* Anything but absence is fatal. */
+	inc_refused(dir, "include_optional conf;\n", -EINVAL);
+	assert(!mkfifo(path, 0600));
+	inc_refused(dir, "include_optional opt.acl;\n", -EINVAL);
+	assert(!unlink(path));
+	inc_put(dir, "opt.acl", "");
+	inc_refused(dir, "include_optional opt.acl;\n", -ENODATA);
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, "#\n\0\n", 4) == 4);
+	close(fd);
+	inc_refused(dir, "include_optional opt.acl;\n", -EINVAL);
+	inc_put(dir, "opt.acl", "-A OUTPUT -j BOGUS\n");
+	inc_refused(dir, "include_optional opt.acl;\n", -EINVAL);
+	inc_put(dir, "opt.acl", "include_optional main.acl;\n");
+	inc_refused(dir, "include_optional opt.acl;\n", -ELOOP);
+	inc_refused(dir, "include_optional *.acl;\n", -ELOOP);
+	if (geteuid()) {
+		inc_put(dir, "opt.acl", "-P OUTPUT ACCEPT\n");
+		assert(!chmod(path, 0));
+		inc_refused(dir, "include_optional opt.acl;\n", -EACCES);
+		assert(!chmod(path, 0600));
+	}
+	assert(!unlink(path));
+	free(path);
+
+	/* The same syntax as include, and not inside an upstream block. */
+	inc_refused(dir, "include_optional opt.acl\n", -EINVAL);
+	inc_refused(dir, "include_optional ;\n", -EINVAL);
+	inc_refused(dir, "include_optional a b;\n", -EINVAL);
+	inc_refused_msg(dir, "include_optional conf/**;\n", -EINVAL,
+			"include_optional conf/**: ** is not supported");
+	inc_refused(dir, "upstream p {\ninclude_optional opt.acl;\n"
+			 "server socks5://127.0.0.1:1080;\n}\n", -EINVAL);
+	assert(gwp_acl_parse_str(&a, "include_optional /dev/null;\n") ==
+	       -EINVAL);
+
+	inc_rmdir(dir);
+}
+
+/*
+ * @acl's directories are @dir/<each of @names> ("" for @dir itself), in that
+ * order.
+ */
+static void inc_dirs(struct gwp_acl *acl, const char *dir,
+		     const char *const *names, size_t nr)
+{
+	char path[PATH_MAX];
+	size_t i;
+
+	for (i = 0; i < nr; i++) {
+		if (*names[i])
+			snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+		else
+			snprintf(path, sizeof(path), "%s", dir);
+		assert(gwp_acl_dir(acl, i));
+		if (strcmp(gwp_acl_dir(acl, i), path))
+			fprintf(stderr, "dir %zu is %s, not %s\n", i,
+				gwp_acl_dir(acl, i), path);
+		assert(!strcmp(gwp_acl_dir(acl, i), path));
+	}
+	if (gwp_acl_dir(acl, nr))
+		fprintf(stderr, "extra dir %s\n", gwp_acl_dir(acl, nr));
+	assert(!gwp_acl_dir(acl, nr));
+}
+
+/*
+ * The directories the include lines look in are listed for the watch: each
+ * directory a pattern reads or looks in, once, and the deepest one there is
+ * on the way to a missing file or pattern directory, with the names that
+ * matter in each: files to read, or directories on the way to them. A plain
+ * file whose own directory is there needs none: its watch covers it.
+ */
+static noinline void test_include_dirs(void)
+{
+	static const char *const conf[] = { "conf" };
+	static const char *const lv[] = { "lv", "lv/w", "lv/x", "lv/x/y" };
+	static const char *const top[] = { "" };
+	static const char *const in_a[] = { "a" };
+	static const char *const both[] = { "conf", "" };
+	char *dir = inc_dir(), *path;
+	struct stat st, st_conf;
+	struct gwp_acl *a;
+
+	inc_mkdir_put(dir, "conf");
+	inc_put(dir, "conf/a.conf", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
+	inc_mkdir_put(dir, "lv");
+	inc_mkdir_put(dir, "lv/x");
+	inc_mkdir_put(dir, "lv/x/y");
+	inc_mkdir_put(dir, "lv/w");
+	inc_put(dir, "lv/x/y/1.conf", "-A OUTPUT -d 192.0.2.2 -j REJECT\n");
+	inc_put(dir, "lv/file", "#\n");
+
+	/* One level: the files that match, nothing else. */
+	assert(asprintf(&path, "%s/conf", dir) > 0);
+	assert(!stat(path, &st_conf));
+	free(path);
+	path = inc_write(dir, "main.acl", "include conf/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, conf, 1);
+	assert(gwp_acl_dir_wants(a, 0, "a.conf") == GWP_ACL_DIR_FILE);
+	assert(gwp_acl_dir_wants(a, 0, "new.conf") == GWP_ACL_DIR_FILE);
+	assert(!gwp_acl_dir_wants(a, 0, "a.txt"));
+	assert(!gwp_acl_dir_wants(a, 0, ".a.conf"));
+	assert(!gwp_acl_dir_wants(a, 0, "."));
+	assert(!gwp_acl_dir_wants(a, 1, "a.conf"));
+	assert(!gwp_acl_dir_stat(a, 0, &st));
+	assert(st.st_ino == st_conf.st_ino && st.st_mtime == st_conf.st_mtime);
+	assert(gwp_acl_dir_stat(a, 1, &st) == -ENOENT);
+	gwp_acl_destroy(a);
+
+	/*
+	 * Several levels: every directory the pattern goes through, once,
+	 * in order, but not those it does not (lv/file, lv/w has no y).
+	 */
+	inc_put(dir, "main.acl", "include lv/*/y/*.conf;\n"
+				 "include lv/*/y/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, lv, 4);
+	assert(gwp_acl_dir_wants(a, 0, "x") == GWP_ACL_DIR_SUBDIR);
+	assert(gwp_acl_dir_wants(a, 0, "new") == GWP_ACL_DIR_SUBDIR);
+	assert(!gwp_acl_dir_wants(a, 0, ".h"));
+	assert(gwp_acl_dir_wants(a, 1, "y") == GWP_ACL_DIR_SUBDIR);
+	assert(!gwp_acl_dir_wants(a, 1, "z"));
+	assert(gwp_acl_dir_wants(a, 2, "y") == GWP_ACL_DIR_SUBDIR);
+	assert(gwp_acl_dir_wants(a, 3, "2.conf") == GWP_ACL_DIR_FILE);
+	gwp_acl_destroy(a);
+
+	/* A directory can matter both ways. */
+	inc_put(dir, "main.acl", "include lv/*;\ninclude_optional lv/*/q;\n");
+	assert(gwp_acl_create(&a, path) == -EINVAL);	/* lv/x: a directory */
+	inc_put(dir, "main.acl", "include lv/f*;\ninclude_optional lv/*/q;\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(gwp_acl_dir_wants(a, 0, "file") ==
+	       (GWP_ACL_DIR_FILE | GWP_ACL_DIR_SUBDIR));
+	assert(gwp_acl_dir_wants(a, 0, "x") == GWP_ACL_DIR_SUBDIR);
+	gwp_acl_destroy(a);
+
+	/*
+	 * Missing: the deepest directory there is on the way, for the name
+	 * that leads on, escaped; none for a file whose directory is there.
+	 */
+	inc_put(dir, "main.acl", "include_optional no\\[1]/deeper/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, top, 1);
+	assert(gwp_acl_dir_wants(a, 0, "no[1]") == GWP_ACL_DIR_SUBDIR);
+	assert(!gwp_acl_dir_wants(a, 0, "no1"));
+	gwp_acl_destroy(a);
+	/* As a pattern, the same component reads the directory. */
+	inc_put(dir, "main.acl", "include_optional no[1]/deeper/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, top, 1);
+	assert(gwp_acl_dir_wants(a, 0, "no1") == GWP_ACL_DIR_SUBDIR);
+	assert(!gwp_acl_dir_wants(a, 0, "no[1]"));
+	gwp_acl_destroy(a);
+	inc_put(dir, "main.acl", "include_optional a/b/c.acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, top, 1);
+	assert(gwp_acl_dir_wants(a, 0, "a") == GWP_ACL_DIR_SUBDIR);
+	gwp_acl_destroy(a);
+	inc_mkdir_put(dir, "a");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, in_a, 1);
+	assert(gwp_acl_dir_wants(a, 0, "b") == GWP_ACL_DIR_SUBDIR);
+	gwp_acl_destroy(a);
+	inc_put(dir, "main.acl", "include_optional a/c.acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, NULL, 0);
+	gwp_acl_destroy(a);
+	/* A file on the way: its directory, for when it is one. */
+	inc_put(dir, "main.acl", "include_optional lv/file/c.acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, lv, 1);
+	assert(gwp_acl_dir_wants(a, 0, "file") == GWP_ACL_DIR_SUBDIR);
+	gwp_acl_destroy(a);
+
+	/* A strict include lists them too, and a reload follows the lines. */
+	inc_put(dir, "main.acl", "include conf/*.conf;\ninclude none/x.acl;\n");
+	assert(gwp_acl_create(&a, path) == -ENOENT);
+	inc_put(dir, "main.acl", "include conf/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, conf, 1);
+	inc_put(dir, "main.acl", "include conf/*.conf;\ninclude none/x.acl;\n"
+				 "include lv/x/y/*.conf;\n");
+	assert(gwp_acl_reload(a) == -ENOENT);
+	inc_dirs(a, dir, both, 2);
+	assert(gwp_acl_dir_wants(a, 1, "none") == GWP_ACL_DIR_SUBDIR);
+	inc_put(dir, "main.acl", "-P OUTPUT ACCEPT\n");
+	assert(!gwp_acl_reload(a));
+	inc_dirs(a, dir, NULL, 0);
+	gwp_acl_destroy(a);
+	free(path);
+
 	inc_rmdir(dir);
 }
 
@@ -3914,6 +4533,10 @@ static void run_tests(void)
 	test_include_order();
 	test_include_errors();
 	test_include_reload();
+	test_include_glob_order();
+	test_include_glob_errors();
+	test_include_optional();
+	test_include_dirs();
 	test_upstream_errors();
 	test_upstream_server_opts();
 	test_upstream_pool_https();
