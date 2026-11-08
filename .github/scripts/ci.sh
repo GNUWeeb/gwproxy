@@ -68,11 +68,12 @@ CONTAINER_PACKAGES="make binutils libc6-dev ca-certificates wget gnupg
 # Alpine/musl build dependencies, followed by what the test suite needs:
 # bash for t/*.sh, python3 for the helper servers in t/servers, curl as the
 # HTTP client the integration tests drive, the openssl CLI to mint the test
-# certificates, and coreutils/util-linux/iproute2 for timeout(1), setsid(1)
-# and ss(8), whose busybox applets do not take the options the tests use.
+# certificates, and coreutils/util-linux/iproute2/procps for timeout(1),
+# setsid(1), ss(8) and ps(1), whose busybox applets do not take the options
+# the tests use.
 # The caller still has to install bash itself before it can run this script.
 APK_PACKAGES="build-base musl-dev linux-headers git openssl-dev pcre2-dev
-	bash python3 curl openssl coreutils util-linux iproute2"
+	bash python3 curl openssl coreutils util-linux iproute2 procps"
 
 # Parallelism for make. Overridable for local runs.
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 1)}"
