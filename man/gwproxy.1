@@ -309,7 +309,13 @@ and the
 .B \-\-acl\-file
 set by themselves when they change, in addition to
 .B SIGHUP
-(default: 0). With 0, the files are read at startup and then only when
+(default: 0). For the
+.B \-\-acl\-file
+set that covers every file it includes, and the files that come and go where
+an include pattern, or an include whose directory is missing, looks for them
+(see
+.BR include ).
+With 0, the files are read at startup and then only when
 .B SIGHUP
 asks for it: nothing watches them, so editing a file has no effect until the
 signal. See
@@ -359,30 +365,111 @@ order is the order of the lines as read top to bottom through every file. A
 relative
 .I path
 is taken from the directory of the file that holds the line, an absolute one as
-given; it is one word (no quoting, no globs), and the
+given; it is one word (no quoting), and the
 .B ;
-is required (it may also stand apart as the last word). An included file may
-include others, up to 8 levels below the
+is required (it may also stand apart as the last word).
+.I path
+may be a pattern:
+.BR * ,
+.B ?
+and
+.BI [ ... ]
+(with
+.B !
+or
+.B ^
+to negate, ranges and classes such as
+.BR [[:digit:]] )
+match in any component, at any number of levels
+.RB ( "include /etc/gwproxy/*/*/*.acl;" ),
+and
+.B \e
+makes the character after it literal, in a path without wildcards too (a
+literal
+.B \e
+is written
+.BR \e\e ).
+A name that starts with
+.B .
+is matched only by a component that starts with
+.BR . ,
+and
+.B .
+and
+.B ..
+never are.
+.B **
+is refused, as it is not the recursive match some shells give it,
+.B {a,b}
+is not special, and a
+.B \e
+inside
+.BI [ ... ]
+is refused. The files a pattern matches are read in the byte\-wise order of
+their paths, whatever order the directories list them in. A plain
+.I path
+must name a file and a pattern must match at least one, else the set fails to
+load with a message naming the file, the line and the pattern. An included file
+may include others, up to 8 levels below the
 .B \-\-acl\-file
 (a chain of 9 files), one load reads at most 64 files (the
 .B \-\-acl\-file
-and every include counted, a file included twice twice), and none may include
-itself, directly or through others. Every file of the set, the
+and every include counted, a file included twice twice, each file a pattern
+matches once; a pattern that matches more than 64 fails at once), the patterns
+of one load read at most 256 directories, and no file may include itself,
+directly, through others, or through a pattern that matches it. Every file of
+the set, the
 .B \-\-acl\-file
-included, must be a regular file (a FIFO or a device is refused rather than
-waited on) and is held to the same checks (not empty, no NUL byte, not changed
-while read, no malformed line), and
+and every match included, must be a regular file (a directory, a FIFO or a
+device is refused rather than read or waited on) and is held to the same
+checks (not empty, no NUL byte, not changed while read, no malformed line), and
 the set loads whole or not at all: any failure refuses it at startup, or keeps
 the previous rules on reload.
 .B SIGHUP
-reloads the whole set. With
+reloads the whole set, and matches every pattern again. With
 .BR \-\-watch\-files=1 ,
 every file of the set is watched like the
 .B \-\-acl\-file
 itself, and a change to any of them reloads the whole set. The watched files
 follow the include lines: a file named by a new line is watched from that
 reload on, even while it is still missing (create it and the set reloads), and
-one whose line is gone no longer is.
+one whose line is gone no longer is. For each pattern, and for each path whose
+directory is missing, the directories it goes through are watched too, one
+inotify watch each and never a whole tree below them, so that a new file that
+matches, a matched file removed or renamed away, a new directory at a wildcard
+level, or a missing directory that appears reloads the set. A file that comes
+this way is taken once it is written and closed or renamed into place; any
+change in such a directory is also seen by the once a second check (see
+.BR "RELOADING THE FILES" ),
+which may reload the set after an unrelated file there changes.
+.IP \(bu 3
+.BI "include_optional " path ;
+\(em the same as
+.BR include ,
+with the same patterns and limits, except that a
+.I path
+that is not there (missing, behind a missing directory or one that is no
+directory, or a dangling symbolic link, matched by a pattern or not), or a
+pattern that matches nothing, includes nothing: the set loads without it and
+a warning names the file, the line and the path or pattern. Only absence is
+forgiven: a file that is there but cannot be read, is not a regular file, is
+empty, holds a NUL byte, changes while read or has a malformed line fails the
+set as for
+.BR include .
+.B include_optional
+fails open: if the file is missing, its rules are simply absent, so a
+.B REJECT
+rule or a
+.B \-P
+policy kept there no longer applies, and connections it would have refused
+are let through. Keep the rules that matter for security in files read by a
+plain
+.BR include ,
+and use
+.B include_optional
+for parts whose absence is harmless, such as local additions that only
+.B ACCEPT
+or route through a pool.
 .IP \(bu 3
 .BI "upstream " name " {"
 \(em define an upstream pool, a set of upstream proxies that
@@ -416,8 +503,8 @@ is 1 to 64 letters, digits,
 .BR _ ", " \- " and " . ,
 .B DIRECT
 is reserved, and a name is one pool across all the files of the set; a set
-has at most 1024 pools. Blocks do not nest, an include line may not stand in
-one, and a file may not end inside one. A pool may be defined after the rules
+has at most 1024 pools. Blocks do not nest, an include or include_optional
+line may not stand in one, and a file may not end inside one. A pool may be defined after the rules
 that use it, or in another file of the set; a rule naming a pool that is not
 defined anywhere is an error. Every server is parsed and its host resolved
 when the set loads (and only then: a reload resolves it again), as
