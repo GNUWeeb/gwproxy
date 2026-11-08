@@ -111,6 +111,25 @@ struct gwp_up_table *gwp_up_table_create(void)
 	return t;
 }
 
+/*
+ * Free @s, out of its table, with whatever health it still has: none, unless
+ * server objects were leaked.
+ */
+static void state_free(struct gwp_up_state *s)
+{
+	struct gwp_up_health *h, *next;
+
+	for (h = s->health; h; h = next) {
+		next = h->next;
+		free(h);
+	}
+	pthread_mutex_destroy(&s->hlock);
+	free(s->fail_at);
+	/* The key holds a user name; leave none in freed memory. */
+	explicit_bzero(s, sizeof(*s));
+	free(s);
+}
+
 uint32_t gwp_up_table_destroy(struct gwp_up_table *t)
 {
 	struct gwp_up_state *s, *next;
@@ -122,9 +141,7 @@ uint32_t gwp_up_table_destroy(struct gwp_up_table *t)
 	for (i = 0; i < t->nr_bucket; i++) {
 		for (s = t->bucket[i]; s; s = next) {
 			next = s->next;
-			/* The key holds a user name; leave none in freed memory. */
-			explicit_bzero(s, sizeof(*s));
-			free(s);
+			state_free(s);
 		}
 	}
 	pthread_mutex_destroy(&t->lock);
@@ -163,14 +180,13 @@ struct gwp_up_state *gwp_up_state_get(struct gwp_up_table *t,
 		mem = NULL;
 	s = mem;
 	if (s) {
-		uint32_t i;
-
 		memset(s, 0, sizeof(*s));
+		if (pthread_mutex_init(&s->hlock, NULL)) {
+			free(s);
+			s = NULL;
+			goto out;
+		}
 		atomic_init(&s->nr_open, 0);
-		atomic_init(&s->fail_seq, 0);
-		for (i = 0; i < GWP_UP_EJECT_FAILS; i++)
-			atomic_init(&s->fail_at[i], 0);
-		atomic_init(&s->eject_end, 0);
 		s->ref = 1;
 		s->tab = t;
 		s->key = *key;
@@ -204,8 +220,7 @@ void gwp_up_state_put(struct gwp_up_state *s)
 	*pp = s->next;
 	t->nr--;
 	pthread_mutex_unlock(&t->lock);
-	explicit_bzero(s, sizeof(*s));
-	free(s);
+	state_free(s);
 }
 
 /* A time as stored: 0 means none, so a time that is 0 is taken as 1. */
@@ -223,45 +238,154 @@ static int32_t ms_after(uint32_t a, uint32_t b)
 	return (int32_t)(a - b);
 }
 
-bool gwp_up_state_fail(struct gwp_up_state *s, uint32_t now)
+/*
+ * Make room in @s's failure ring for the last @n failures, keeping those it
+ * has, oldest first; under @s's hlock. False without memory.
+ */
+static bool fail_ring_grow(struct gwp_up_state *s, uint32_t n)
 {
-	uint32_t seq = atomic_fetch_add(&s->fail_seq, 1);
-	uint32_t t, end, i;
+	uint32_t *v, i, k;
 
-	/*
-	 * Sequentially consistent, the store and the loads: whichever
-	 * failure stores last sees every other one's time.
-	 */
-	atomic_store(&s->fail_at[seq % GWP_UP_EJECT_FAILS], stamp(now));
-	for (i = 0; i < GWP_UP_EJECT_FAILS; i++) {
-		t = atomic_load(&s->fail_at[i]);
-		/* Another worker's clock may be a little ahead (< 0). */
-		if (!t || ms_after(now, t) > (int32_t)GWP_UP_EJECT_WINDOW_MS)
-			return false;
+	if (n <= s->fail_cap)
+		return true;
+	v = calloc(n, sizeof(*v));
+	if (!v)
+		return false;
+	for (i = 0; i < s->fail_nr; i++) {
+		k = (s->fail_next + s->fail_cap - s->fail_nr + i) % s->fail_cap;
+		v[i] = s->fail_at[k];
 	}
-
-	end = atomic_load(&s->eject_end);
-	do {
-		if (end && ms_after(end, now) > 0)
-			return false;	/* ejected already */
-	} while (!atomic_compare_exchange_weak(&s->eject_end, &end,
-					       stamp(now + GWP_UP_EJECT_MS)));
+	free(s->fail_at);
+	s->fail_at = v;
+	s->fail_cap = n;
+	s->fail_next = s->fail_nr % n;
 	return true;
 }
 
-uint32_t gwp_up_state_ejected(struct gwp_up_state *s, uint32_t now,
-			      bool *back)
+struct gwp_up_health *gwp_up_health_get(struct gwp_up_state *s,
+					const struct gwp_up_opts *o)
 {
-	uint32_t end = atomic_load_explicit(&s->eject_end,
-					    memory_order_relaxed);
+	struct gwp_up_health *h;
+
+	pthread_mutex_lock(&s->hlock);
+	for (h = s->health; h; h = h->next) {
+		if (h->max_fails == o->max_fails &&
+		    h->window_ms == o->fail_timeout_ms &&
+		    h->eject_ms == o->eject_ms) {
+			h->ref++;
+			goto out;
+		}
+	}
+	h = NULL;
+	if (!fail_ring_grow(s, o->max_fails))
+		goto out;
+	h = calloc(1, sizeof(*h));
+	if (!h)
+		goto out;
+	atomic_init(&h->eject_end, 0);
+	h->max_fails = o->max_fails;
+	h->window_ms = o->fail_timeout_ms;
+	h->eject_ms = o->eject_ms;
+	h->ref = 1;
+	h->st = s;
+	h->next = s->health;
+	s->health = h;
+out:
+	pthread_mutex_unlock(&s->hlock);
+	return h;
+}
+
+void gwp_up_health_put(struct gwp_up_health *h)
+{
+	struct gwp_up_state *s;
+	struct gwp_up_health **pp;
+
+	if (!h)
+		return;
+	s = h->st;
+	pthread_mutex_lock(&s->hlock);
+	if (--h->ref) {
+		pthread_mutex_unlock(&s->hlock);
+		return;
+	}
+	for (pp = &s->health; *pp != h; pp = &(*pp)->next)
+		;
+	*pp = h->next;
+	pthread_mutex_unlock(&s->hlock);
+	free(h);
+}
+
+/*
+ * Whether the failure just recorded in @s, at @now, ejects the server for
+ * @h: its last max_fails failures all fall within its window, and it was in
+ * service. Under @s's hlock.
+ */
+static bool health_fail(struct gwp_up_state *s, struct gwp_up_health *h,
+			uint32_t now)
+{
+	uint32_t t, end, i;
+
+	if (s->fail_nr < h->max_fails)
+		return false;
+	for (i = 1; i <= h->max_fails; i++) {
+		t = s->fail_at[(s->fail_next + s->fail_cap - i) % s->fail_cap];
+		/* Another worker's clock may be a little ahead (< 0). */
+		if (!t || ms_after(now, t) > (int32_t)h->window_ms)
+			return false;
+	}
+
+	/* The ejection is ended by picks, which take no lock. */
+	end = atomic_load(&h->eject_end);
+	do {
+		if (end && ms_after(end, now) > 0)
+			return false;	/* ejected already */
+	} while (!atomic_compare_exchange_weak(&h->eject_end, &end,
+					       stamp(now + h->eject_ms)));
+	return true;
+}
+
+bool gwp_up_state_fail(struct gwp_up_state *s, struct gwp_up_health *own,
+		       uint32_t now,
+		       void (*ejected)(void *arg, const struct gwp_up_health *h),
+		       void *arg)
+{
+	struct gwp_up_health *h;
+	bool ret = false;
+
+	pthread_mutex_lock(&s->hlock);
+	if (s->fail_cap) {
+		s->fail_at[s->fail_next] = stamp(now);
+		s->fail_next = (s->fail_next + 1) % s->fail_cap;
+		if (s->fail_nr < s->fail_cap)
+			s->fail_nr++;
+	}
+	for (h = s->health; h; h = h->next) {
+		if (!health_fail(s, h, now))
+			continue;
+		if (h == own)
+			ret = true;
+		else if (ejected)
+			ejected(arg, h);
+	}
+	pthread_mutex_unlock(&s->hlock);
+	return ret;
+}
+
+uint32_t gwp_up_health_ejected(struct gwp_up_health *h, uint32_t now,
+			       bool *back)
+{
+	uint32_t end;
 
 	if (back)
 		*back = false;
+	if (!h)
+		return 0;
+	end = atomic_load_explicit(&h->eject_end, memory_order_relaxed);
 	if (!end)
 		return 0;
 	if (ms_after(end, now) > 0)
 		return (uint32_t)ms_after(end, now);
-	if (atomic_compare_exchange_strong(&s->eject_end, &end, 0)) {
+	if (atomic_compare_exchange_strong(&h->eject_end, &end, 0)) {
 		if (back)
 			*back = true;
 		return 0;
@@ -278,23 +402,23 @@ struct pick {
 };
 
 /*
- * How long the ejection of the @i-th server (non-NULL) still runs, 0 while
- * it is in service; reads the clock only for a server that may be ejected.
+ * How long the ejection of the @i-th server still runs, 0 while it is in
+ * service; reads the clock only for a server that may be ejected.
  */
-static uint32_t pick_ejected(struct pick *c, struct gwp_up_state *s,
-			     uint32_t i)
+static uint32_t pick_ejected(struct pick *c, uint32_t i)
 {
 	const struct gwp_up_pick *pk = c->pk;
+	struct gwp_up_health *h = pk->m[i].h;
 	uint32_t left;
 	bool back;
 
-	if (!gwp_up_state_may_be_ejected(s))
+	if (!gwp_up_health_may_be_ejected(h))
 		return 0;
 	if (!c->have_now) {
 		c->now = pk->now(pk->arg);
 		c->have_now = true;
 	}
-	left = gwp_up_state_ejected(s, c->now, &back);
+	left = gwp_up_health_ejected(h, c->now, &back);
 	if (back && pk->back)
 		pk->back(pk->arg, i);
 	return left;
@@ -322,39 +446,39 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 	 * spread; else round-robin takes the next in service, and
 	 * least_conn's ties start where they would have.
 	 */
-	s = pk->st[i];
-	if (i == skip || !s || pick_ejected(&c, s, i)) {
+	s = pk->m[i].st;
+	if (i == skip || !s || pick_ejected(&c, i)) {
 		uint32_t p, j;
 
 		for (p = 0; pk->random && p < GWP_UP_PICK_PROBES; p++) {
 			/* Uniform over [0, nr), no division. */
 			j = (uint32_t)(((uint64_t)pk->random(pk->arg) * nr) >> 32);
-			s = pk->st[j];
-			if (j != skip && s && !pick_ejected(&c, s, j)) {
+			s = pk->m[j].st;
+			if (j != skip && s && !pick_ejected(&c, j)) {
 				i = j;
 				break;
 			}
 		}
 	}
 	if (!pk->least_conn) {
-		s = pk->st[i];
-		if (i != skip && s && !pick_ejected(&c, s, i))
+		s = pk->m[i].st;
+		if (i != skip && s && !pick_ejected(&c, i))
 			return i;
 	}
 
 	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
-		s = pk->st[i];
+		s = pk->m[i].st;
 		if (i == skip || !s)
 			continue;
 		if (!pk->least_conn) {
-			if (!pick_ejected(&c, s, i))
+			if (!pick_ejected(&c, i))
 				return i;
 			continue;
 		}
 		/* Not fewer than the best so far: its health does not matter. */
 		v = gwp_up_state_open(s);
 		if ((best != UINT32_MAX && v >= best_val) ||
-		    pick_ejected(&c, s, i))
+		    pick_ejected(&c, i))
 			continue;
 		best = i;
 		best_val = v;
@@ -367,10 +491,10 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 	/* All ejected: the one back soonest, ties in turn. */
 	i = pk->rr % nr;
 	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
-		s = pk->st[i];
+		s = pk->m[i].st;
 		if (!s)
 			continue;
-		v = pick_ejected(&c, s, i);
+		v = pick_ejected(&c, i);
 		/* Back meanwhile: in service again. */
 		if (!v)
 			return i;

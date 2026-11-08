@@ -166,6 +166,12 @@ struct gwp_upstream {
 	 * it now, one for each pair whose gwp_conn_pair::upstream it is.
 	 */
 	struct gwp_up_state	*state;
+	/*
+	 * Whether @state's identity is ejected, for the health settings this
+	 * server was made with (its pool's, or the defaults), held until this
+	 * one is freed; NULL when they never eject it (max_fails=0).
+	 */
+	struct gwp_up_health	*health;
 };
 
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up);

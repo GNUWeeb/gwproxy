@@ -3015,12 +3015,14 @@ struct up_srv {
 static atomic_int g_up_live;
 static int g_up_made;
 
-static int up_srv_make(void *arg, const char *url, void **out, char *why,
+static int up_srv_make(void *arg, const char *url,
+		       const struct gwp_up_opts *opts, void **out, char *why,
 		       size_t size)
 {
 	struct up_srv *s;
 
 	assert(arg == &g_up_live);
+	assert(opts);
 	if (strstr(url, "unresolvable")) {
 		snprintf(why, size, "the host does not resolve");
 		return -EINVAL;
@@ -3050,33 +3052,34 @@ static void up_srv_put(void *arg, void *srv)
 	assert(atomic_fetch_sub(&g_up_live, 1) > 0);
 }
 
-/* A pick handle: something the object holds while it lives. */
-static void *up_srv_handle(void *arg, void *srv)
+/* What a pick reads: something the object holds while it lives. */
+static void up_srv_member(void *arg, void *srv, struct gwp_up_member *m)
 {
 	struct up_srv *s = srv;
 
 	assert(arg == &g_up_live);
-	return s->url;
+	assert(!m->st && !m->h);
+	m->st = (struct gwp_up_state *)(void *)s->url;
 }
 
 static const struct gwp_acl_server_ops up_srv_ops = {
 	.make	= up_srv_make,
 	.put	= up_srv_put,
-	.handle	= up_srv_handle,
+	.member	= up_srv_member,
 	.arg	= &g_up_live,
 };
 
 /*
  * The server object @p's @i-th URL was made into, checked against it, and
- * its pick handle with it.
+ * what a pick reads of it.
  */
 static struct up_srv *up_srv_of(const struct gwp_acl_pool *p, uint32_t i)
 {
 	struct up_srv *s = gwp_acl_pool_server(p, i);
-	void *const *h = gwp_acl_pool_handles(p);
+	const struct gwp_up_member *m = gwp_acl_pool_members(p);
 
 	assert(s && !strcmp(s->url, gwp_acl_pool_server_url(p, i)));
-	assert(h && h[i] == s->url);
+	assert(m && (void *)m[i].st == s->url);
 	return s;
 }
 
@@ -3165,7 +3168,7 @@ static noinline void test_upstream_server_ops(void)
 	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
 	assert(gwp_acl_pool_server_url(req.upstream_pool, 0));
 	assert(!gwp_acl_pool_server(req.upstream_pool, 0));
-	assert(!gwp_acl_pool_handles(req.upstream_pool));
+	assert(!gwp_acl_pool_members(req.upstream_pool));
 	gwp_acl_req_release(&req);
 	gwp_acl_destroy(a);
 	assert(g_up_made == 5);

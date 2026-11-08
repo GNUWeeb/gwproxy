@@ -100,8 +100,11 @@ struct gwp_acl_pool {
 	 * reference to each, dropped with @ops->put when it is freed.
 	 */
 	void			**srv;
-	/* @ops->handle of each of @srv, NULL without @ops->handle. */
-	void			**hdl;
+	/*
+	 * What a pick reads of each of @srv (@ops->member), NULL without
+	 * @ops.
+	 */
+	struct gwp_up_member	*mem;
 	const struct gwp_acl_server_ops *ops;
 	uint8_t			method;		/* enum gwp_acl_pool_method */
 	bool			remote_dns;
@@ -1123,9 +1126,9 @@ void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i)
 	return i < p->nr_servers && p->srv ? p->srv[i] : NULL;
 }
 
-void *const *gwp_acl_pool_handles(const struct gwp_acl_pool *p)
+const struct gwp_up_member *gwp_acl_pool_members(const struct gwp_acl_pool *p)
 {
-	return p->hdl ? p->hdl : p->srv;
+	return p->mem;
 }
 
 uint32_t gwp_acl_pool_next(struct gwp_acl_pool *p)
@@ -1154,7 +1157,7 @@ void gwp_acl_pool_put(struct gwp_acl_pool *p)
 	}
 	free(p->servers);
 	free(p->srv);
-	free(p->hdl);
+	free(p->mem);
 	free(p);
 }
 
@@ -1360,8 +1363,9 @@ static int parse_pool_open(struct acl_load *ld, char **tok, int n)
 	return 0;
 }
 
-/* Add the server @url to the open pool. */
-static int pool_add_server(struct acl_load *ld, const char *url)
+/* Add the server @url to the open pool, with the options @opts. */
+static int pool_add_server(struct acl_load *ld, const char *url,
+			   const struct gwp_up_opts *opts)
 {
 	struct gwp_acl_pool *p = ld->pool;
 	uint32_t idx = p->nr_servers + 1;
@@ -1403,12 +1407,13 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 				return -ENOMEM;
 			p->srv = sv;
 		}
-		if (ld->ops && ld->ops->handle) {
-			void **hv = realloc(p->hdl, cap * sizeof(*hv));
+		if (ld->ops) {
+			struct gwp_up_member *mv;
 
-			if (!hv)
+			mv = realloc(p->mem, cap * sizeof(*mv));
+			if (!mv)
 				return -ENOMEM;
-			p->hdl = hv;
+			p->mem = mv;
 		}
 		p->cap_servers = cap;
 	}
@@ -1422,7 +1427,8 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 		void *srv = NULL;
 		int r;
 
-		r = ld->ops->make(ld->ops->arg, url, &srv, err, sizeof(err));
+		r = ld->ops->make(ld->ops->arg, url, opts, &srv, err,
+				  sizeof(err));
 		if (r) {
 			explicit_bzero(dup, strlen(dup));
 			free(dup);
@@ -1433,9 +1439,10 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 					err[0] ? err : strerror(-r));
 		}
 		p->srv[p->nr_servers] = srv;
-		if (p->hdl)
-			p->hdl[p->nr_servers] = ld->ops->handle(ld->ops->arg,
-								srv);
+		memset(&p->mem[p->nr_servers], 0, sizeof(*p->mem));
+		if (ld->ops->member)
+			ld->ops->member(ld->ops->arg, srv,
+					&p->mem[p->nr_servers]);
 	}
 	p->servers[p->nr_servers++] = dup;
 	p->remote_dns = remote_dns;
@@ -1496,9 +1503,12 @@ static int parse_pool_line(struct acl_load *ld, char **tok, int n)
 	n = w;
 
 	if (!strcmp(tok[0], "server")) {
+		struct gwp_up_opts opts;
+
 		if (n != 2)
 			return load_err(ld, "expected \"server URL;\"");
-		return pool_add_server(ld, tok[1]);
+		gwp_up_opts_default(&opts);
+		return pool_add_server(ld, tok[1], &opts);
 	}
 	if (n != 1)
 		return load_err(ld, "expected \"least_conn;\"");
