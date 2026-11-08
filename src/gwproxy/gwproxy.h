@@ -1435,9 +1435,9 @@ int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
 
 /*
- * A raw DNS lookup of @host could not be started, for reason @err: answer the
- * client as for a lookup that failed (SOCKS5 REP 0x04, HTTP 502) into
- * gcp->target.buf and log @err at debug level. Returns -EBADMSG once the
+ * A DNS lookup of @host, raw or by the system resolver, could not be started,
+ * for reason @err: answer the client as for a lookup that failed (SOCKS5 REP
+ * 0x04, HTTP 502) into gcp->target.buf and log @err at debug level. Returns -EBADMSG once the
  * reply is queued, so the caller flushes it and tears the pair down, or the
  * negative errno that kept it from being built.
  */

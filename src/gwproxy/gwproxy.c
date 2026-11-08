@@ -5144,12 +5144,12 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 }
 
 /*
- * No descriptor for the query's socket, no memory, a send refused: the name
- * was never looked up, which leaves the origin as unreachable as a lookup
- * that failed, so the client gets the same answer, host unreachable, as from
- * the system resolver and from a raw lookup that fails later. Closing the
- * connection without a word left a SOCKS5 client without its reply and an
- * HTTP client without a status.
+ * No descriptor for a raw query's socket, no memory for the query or for the
+ * system resolver's request, a send refused: the name was never looked up,
+ * which leaves the origin as unreachable as a lookup that failed, so the
+ * client gets the same answer, host unreachable, as from a lookup that fails
+ * later. Closing the connection without a word left a SOCKS5 client without
+ * its reply and an HTTP client without a status.
  */
 int gwp_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			 const char *host, int err)
@@ -5582,8 +5582,11 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 			return 0;
 		}
 
-		return queue_dns_resolution(w, gcp, host, port,
-					    r == -EHOSTUNREACH ? r : 0);
+		r = queue_dns_resolution(w, gcp, host, port,
+					 r == -EHOSTUNREACH ? r : 0);
+		if (r != -EINPROGRESS)
+			r = gwp_dns_start_failed(w, gcp, host, r);
+		return r;
 	}
 }
 
