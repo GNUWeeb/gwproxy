@@ -236,6 +236,7 @@ struct tpool {
 	struct gwp_up_state	**s;
 	struct gwp_up_health	**h;
 	struct gwp_up_member	*m;
+	struct gwp_up_plan	*plan;
 	uint32_t		nr;
 	uint32_t		clock;
 	uint32_t		clock_reads;
@@ -320,6 +321,7 @@ static void tp_free(struct tpool *p)
 	free(p->s);
 	free(p->h);
 	free(p->m);
+	free(p->plan);
 }
 
 /* Give server @i @n open pairs. */
@@ -348,7 +350,7 @@ static uint32_t tp_pick(struct tpool *p, bool least_conn, uint32_t rr,
 			uint32_t skip)
 {
 	struct gwp_up_pick pk = {
-		.m = p->m, .nr = p->nr, .least_conn = least_conn, .rr = rr,
+		.m = p->m, .nr = p->nr, .plan = p->plan, .least_conn = least_conn, .rr = rr,
 		.skip = skip, .now = tp_now, .back = tp_back, .arg = p,
 		.random = p->fake || p->xs ? tp_random : NULL,
 	};
@@ -1139,6 +1141,201 @@ static void test_pick_big(void)
 	tp_free(&p);
 }
 
+/* Give @p's servers the weights @w and plan the pool by them. */
+static void tp_weights(struct tpool *p, const uint32_t *w)
+{
+	uint32_t i;
+
+	for (i = 0; i < p->nr; i++)
+		p->m[i].weight = (uint16_t)w[i];
+	free(p->plan);
+	p->plan = gwp_up_plan_build(p->m, p->nr);
+	assert(p->plan && p->plan->nr == p->nr);
+}
+
+/*
+ * Weighted round-robin: in any 2^b turns in a row from a multiple of 2^b,
+ * with 2^b at least the weights' sum, each server gets its share within one
+ * turn; and no server waits much longer than its share between turns.
+ * Equal weights, whatever they are, are plain turns.
+ */
+static void test_weights(void)
+{
+	static const uint32_t w3[3] = { 5, 1, 1 }, eq[3] = { 7, 7, 7 };
+	static const uint32_t w4[4] = { 1, 2, 3, 1000 };
+	uint32_t hits[4], last[4], gap[4], rr, i, n;
+	struct tpool p;
+
+	tp_init(&p, 3);
+	tp_weights(&p, eq);
+	assert(!p.plan->total);
+	for (rr = 0; rr < 9; rr++)
+		assert(tp_pick(&p, false, rr, NONE) == rr % 3);
+
+	tp_weights(&p, w3);
+	assert(p.plan->total == 7);
+	assert(p.plan->cum[0] == 5 && p.plan->cum[2] == 7);
+	for (n = 8; n <= (1u << 16); n <<= 4) {
+		memset(hits, 0, sizeof(hits));
+		for (rr = 3 * n; rr < 4 * n; rr++)
+			hits[tp_pick(&p, false, rr, NONE)]++;
+		for (i = 0; i < 3; i++)
+			assert(hits[i] * 7 + 7 >= n * w3[i] &&
+			       hits[i] * 7 <= n * w3[i] + 7);
+	}
+	/* Across the cursor's wrap too. */
+	memset(hits, 0, sizeof(hits));
+	for (rr = 0u - 4096; rr != 4096; rr++)
+		hits[tp_pick(&p, false, rr, NONE)]++;
+	assert(hits[0] * 7 + 7 >= 8192 * 5 && hits[0] * 7 <= 8192 * 5 + 7);
+	/* The light ones never wait for the heavy one's turns in a burst. */
+	memset(last, 0, sizeof(last));
+	memset(gap, 0, sizeof(gap));
+	for (rr = 1; rr < 7000; rr++) {
+		i = tp_pick(&p, false, rr, NONE);
+		if (rr - last[i] > gap[i])
+			gap[i] = rr - last[i];
+		last[i] = rr;
+	}
+	assert(gap[0] <= 3 && gap[1] <= 3 * 7 && gap[2] <= 3 * 7);
+	tp_free(&p);
+
+	tp_init(&p, 4);
+	tp_weights(&p, w4);
+	memset(last, 0, sizeof(last));
+	memset(gap, 0, sizeof(gap));
+	memset(hits, 0, sizeof(hits));
+	for (rr = 1; rr <= 1u << 14; rr++) {
+		i = tp_pick(&p, false, rr, NONE);
+		hits[i]++;
+		if (rr - last[i] > gap[i])
+			gap[i] = rr - last[i];
+		last[i] = rr;
+	}
+	for (i = 0; i < 4; i++) {
+		assert(hits[i] * 1006 + 1006 >= (1u << 14) * w4[i] &&
+		       hits[i] * 1006 <= (1u << 14) * w4[i] + 2 * 1006);
+		assert(gap[i] <= 3 * 1006 / w4[i] + 1);
+	}
+
+	/* A retry: the next in pool order, weights or not. */
+	assert(tp_pick(&p, false, 5, 0) == 1);
+	assert(tp_pick(&p, false, 5, 3) == 0);
+	assert(tp_pick(&p, true, 5, 2) == 3);
+	tp_free(&p);
+}
+
+/*
+ * least_conn with weights: the fewest open for the weight, exactly; fed
+ * back, the open counts follow the weights.
+ */
+static void test_weights_least_conn(void)
+{
+	static const uint32_t w[3] = { 1, 3, 2 };
+	struct tpool p;
+	uint32_t rr;
+
+	tp_init(&p, 3);
+	tp_weights(&p, w);
+	tp_open(&p, 0, 1);
+	tp_open(&p, 1, 2);
+	tp_open(&p, 2, 1);
+	/* 2/3 < 1/2 < 1/1. */
+	assert(tp_pick(&p, true, 0, NONE) == 2);
+	tp_open(&p, 2, 2);
+	assert(tp_pick(&p, true, 0, NONE) == 1);
+	/* 3/3 = 2/2 = 1/1: ties from the cursor's turn on. */
+	tp_open(&p, 1, 3);
+	for (rr = 0; rr < 64; rr++) {
+		uint32_t t = tp_pick(&p, false, rr, NONE);
+
+		assert(tp_pick(&p, true, rr, NONE) == t);
+	}
+	/* An idle one wins at once, whatever its weight. */
+	tp_open(&p, 0, 0);
+	assert(tp_pick(&p, true, 1, NONE) == 0);
+
+	for (rr = 0; rr < 3; rr++)
+		tp_open(&p, rr, 0);
+	for (rr = 0; rr < 600; rr++)
+		gwp_up_state_take(p.s[tp_pick(&p, true, rr, NONE)]);
+	assert(gwp_up_state_open(p.s[0]) == 100);
+	assert(gwp_up_state_open(p.s[1]) == 300);
+	assert(gwp_up_state_open(p.s[2]) == 200);
+	tp_free(&p);
+}
+
+/*
+ * An ejected server's turns in a weighted pool go to the others by their
+ * weights: the probes draw by weight. (Its turns that all probes miss go
+ * to the next in pool order, (2/10)^4 of them here.)
+ */
+static void test_weights_spread(void)
+{
+	static const uint32_t w[4] = { 1, 2, 3, 4 };
+	uint32_t hits[4] = { 0 }, rr, i, want, tol;
+	struct tpool p;
+
+	tp_init(&p, 4);
+	tp_weights(&p, w);
+	p.xs = 31337;
+	tp_eject(&p, 1, 1000);
+	for (rr = 0; rr < NR_DIST_PICKS; rr++)
+		hits[tp_pick(&p, false, rr, NONE)]++;
+	assert(!hits[1]);
+	for (i = 0; i < 4; i++) {
+		if (i == 1)
+			continue;
+		want = NR_DIST_PICKS / 8 * w[i];
+		tol = want * 3 / 100;
+		if (hits[i] + tol < want || hits[i] > want + tol) {
+			fprintf(stderr, "weighted server %u: %u picks, want %u +- %u\n",
+				i, hits[i], want, tol);
+			assert(0);
+		}
+	}
+	tp_free(&p);
+}
+
+/*
+ * The largest pool, weighted: in 2^23 turns each server gets its share
+ * within a turn, the pick a binary search away.
+ */
+static void test_weights_big(void)
+{
+	static uint32_t w[NR_BIG], hits[NR_BIG];
+	struct gwp_up_pick pk;
+	struct tpool p;
+	uint64_t total = 0;
+	uint32_t rr, i;
+
+	tp_init(&p, NR_BIG);
+	for (i = 0; i < NR_BIG; i++) {
+		w[i] = i % GWP_UP_MAX_WEIGHT + 1;
+		total += w[i];
+	}
+	tp_weights(&p, w);
+	assert(p.plan->total == total);
+	memset(&pk, 0, sizeof(pk));
+	pk.m = p.m;
+	pk.nr = p.nr;
+	pk.plan = p.plan;
+	pk.skip = NONE;
+	pk.now = tp_now;
+	pk.arg = &p;
+	for (rr = 0; rr < 1u << 23; rr++) {
+		pk.rr = rr;
+		hits[gwp_up_lb_pick(&pk)]++;
+	}
+	for (i = 0; i < NR_BIG; i++) {
+		uint64_t share = (uint64_t)w[i] << 23;
+
+		assert((uint64_t)hits[i] * total + total >= share &&
+		       (uint64_t)hits[i] * total <= share + total);
+	}
+	tp_free(&p);
+}
+
 #define NR_THREADS	8
 #define NR_ROUNDS	20000
 
@@ -1282,6 +1479,10 @@ int main(void)
 	test_pick_spread_lc(3, 1, 4242);
 	test_pick_spread_lc(3, 3, 99);
 	test_pick_spread_lc(7, 3, 0x2545f491);
+	test_weights();
+	test_weights_least_conn();
+	test_weights_spread();
+	test_weights_big();
 	test_eject_threads();
 	printf("All upstream_lb tests passed.\n");
 	return 0;

@@ -120,6 +120,13 @@ void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i);
 const struct gwp_up_member *gwp_acl_pool_members(const struct gwp_acl_pool *p);
 
 /*
+ * How the pool's members' weights spread its turns (gwp_up_plan_build()),
+ * or NULL when the ACL was created without ops. Read-only, as long as the
+ * pool lives.
+ */
+const struct gwp_up_plan *gwp_acl_pool_plan(const struct gwp_acl_pool *p);
+
+/*
  * The pool's round-robin cursor: the value before this call's increment,
  * from 0 on, shared by every thread and wrapping at 2^32. A reload makes
  * new pools, whose cursors start again from 0.

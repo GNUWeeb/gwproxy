@@ -96,8 +96,13 @@ void gwp_up_key_init(struct gwp_up_key *key, enum gwp_up_scheme scheme,
 #define GWP_UP_MAX_FAILS	100u
 #define GWP_UP_MAX_TIME_MS	86400000u
 
+/* The heaviest weight a pool may give a server (weight=). */
+#define GWP_UP_MAX_WEIGHT	1000u
+
 /* What a pool sets for one of its servers. */
 struct gwp_up_opts {
+	/* Its share of the pool's connections, 1 to GWP_UP_MAX_WEIGHT. */
+	uint32_t	weight;
 	/*
 	 * The failures within @fail_timeout_ms that eject the server, for
 	 * @eject_ms; 0 (at most GWP_UP_MAX_FAILS) never ejects it. Both
@@ -111,6 +116,7 @@ struct gwp_up_opts {
 /* @o set to what a server has when its pool sets nothing. */
 static inline void gwp_up_opts_default(struct gwp_up_opts *o)
 {
+	o->weight = 1;
 	o->max_fails = GWP_UP_EJECT_FAILS;
 	o->fail_timeout_ms = GWP_UP_EJECT_WINDOW_MS;
 	o->eject_ms = GWP_UP_EJECT_MS;
@@ -307,7 +313,48 @@ uint32_t gwp_up_health_ejected(struct gwp_up_health *h, uint32_t now,
 struct gwp_up_member {
 	struct gwp_up_state	*st;
 	struct gwp_up_health	*h;
+	/* The pool's weight for it, 1 to GWP_UP_MAX_WEIGHT; 0 is taken as 1. */
+	uint16_t		weight;
 };
+
+/*
+ * How a pool whose servers' weights differ spreads its turns over them,
+ * made once from its members (gwp_up_plan_build()) and read-only after.
+ *
+ * Each server owns as many consecutive units of [0, @total) as its weight:
+ * server i those from @cum[i - 1] (0 for the first) up to @cum[i]. The
+ * cursor's turn r goes to the owner of the unit at the point r takes in
+ * the van der Corput sequence (r's 32 bits reversed, as a fraction of
+ * 2^32), scaled to @total. Every 2^b turns in a row that start at a
+ * multiple of 2^b fall on 2^b evenly spaced points, so with 2^b >= @total
+ * each server gets its weight's share of them, give or take one turn; and
+ * as the sequence fills [0, 1) evenly at every length, the turns of each
+ * server come at nearly even intervals (no gap more than about three
+ * times its share's), not in a burst. The owner of a unit is found by a
+ * binary search of @cum, narrowed first by @first: the point's top bits
+ * name one of 2^k slices of [0, 1) (2^k the pool's size or more), and
+ * @first[s] is the owner of the first unit of slice s, so the search is
+ * over the few servers that share the slice, whatever the weights: a pick
+ * costs O(1) for weights within a small factor of each other, and
+ * O(log n) of the pool's n servers at worst.
+ */
+struct gwp_up_plan {
+	/* The weights summed; 0 when all are equal: plain turns, no @cum. */
+	uint32_t	total;
+	uint32_t	nr;
+	/* 32 - k: a point's bits that do not choose its slice. */
+	uint32_t	shift;
+	/* 2^k + 1 of them; the last is the last server. */
+	const uint16_t	*first;
+	uint32_t	cum[];
+};
+
+/*
+ * The plan of the @nr (at most 65536) members @m, by their weights, or NULL
+ * without memory. Free it with free().
+ */
+struct gwp_up_plan *gwp_up_plan_build(const struct gwp_up_member *m,
+				      uint32_t nr);
 
 /*
  * What a pool's choice of a server for a connection (gwp_up_lb_pick())
@@ -320,6 +367,11 @@ struct gwp_up_pick {
 	 */
 	const struct gwp_up_member	*m;
 	uint32_t	nr;
+	/*
+	 * Made of @m by gwp_up_plan_build(), or NULL when all the weights
+	 * are equal: plain turns.
+	 */
+	const struct gwp_up_plan	*plan;
 	bool		least_conn;
 	/* The pool's round-robin cursor for this pick; unused for a retry. */
 	uint32_t	rr;
@@ -375,24 +427,27 @@ static inline uint32_t gwp_up_rand(uint32_t *state)
  * with no copy and no allocation; only servers in service are taken: those
  * their pool's settings do not have ejected (gwp_up_health_ejected()).
  *
- * Round-robin takes server @rr % @nr when it is in service: with none
- * ejected that is the cursor's server, and the pick reads one server's
- * health only. When it is ejected, the pick tries up to GWP_UP_PICK_PROBES
- * servers drawn at random (@random) and takes the first in service, so an
- * ejected server's turns are spread evenly over the rest, a run of ejected
- * servers' turns too, instead of all going to the server after them; only
- * when every probe misses does it take the next in service from the
- * cursor on, in pool order, wrapping.
+ * Round-robin takes the server whose turn the cursor @rr is when it is in
+ * service: server @rr % @nr when the weights are equal, else the plan's
+ * (struct gwp_up_plan). With none ejected that is the cursor's server, and
+ * the pick reads one server's health only. When it is ejected, the pick
+ * tries up to GWP_UP_PICK_PROBES servers drawn at random (@random; by
+ * weight when the weights differ) and takes the first in service, so an
+ * ejected server's turns are spread over the rest by their weights, a run
+ * of ejected servers' turns too, instead of all going to the server after
+ * them; only when every probe misses does it take the next in service
+ * from the cursor's server on, in pool order, wrapping.
  *
  * Least-connections (@least_conn) takes the server in service with the
- * fewest open pairs, among equals the first from the same start on, so
- * the cursor moving on rotates the ties and servers that are equally
- * loaded share the new connections. When the start's server is ejected,
- * the same probes choose another start among the servers in service, so
- * among equals an ejected server's turns are spread too; the choice of
- * the fewest stays exact. It reads every server's open count,
- * stopping at the first idle one in service (none can have fewer), and
- * the health only of a server that would be the best so far.
+ * fewest open pairs for its weight (open / weight, compared exactly),
+ * among equals the first from the cursor's server on, so the cursor moving
+ * on rotates the ties and servers that are equally loaded share the new
+ * connections. When the start's server is ejected, the same probes choose
+ * another start among the servers in service, so among equals an ejected
+ * server's turns are spread too; the choice of the fewest stays exact. It
+ * reads every server's open count, stopping at the first idle one in
+ * service (none can have fewer), and the health only of a server that
+ * would be the best so far.
  *
  * A retry (@skip) starts at the server after @skip instead of the cursor:
  * that one when it is in service, else (round-robin) the same probes and

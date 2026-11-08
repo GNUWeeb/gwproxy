@@ -3102,7 +3102,7 @@ static noinline void test_upstream_server_ops(void)
 	path = inc_write(dir, "main.acl",
 			 "upstream p {\n"
 			 " server http://u:s3cret@10.0.0.1:3128;\n"
-			 " server http://10.0.0.2:3128;\n"
+			 " server http://10.0.0.2:3128 weight=4;\n"
 			 "}\n"
 			 "upstream q {\n server socks5://10.0.0.3:1080;\n}\n"
 			 "-A OUTPUT -j UPSTREAM --to p\n");
@@ -3112,6 +3112,11 @@ static noinline void test_upstream_server_ops(void)
 	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
 	assert(up_srv_of(req.upstream_pool, 0) != up_srv_of(req.upstream_pool, 1));
 	assert(!gwp_acl_pool_server(req.upstream_pool, 2));
+	/* The weights, in the members and the plan made of them. */
+	assert(gwp_acl_pool_plan(req.upstream_pool));
+	assert(gwp_acl_pool_plan(req.upstream_pool)->total == 5);
+	assert(gwp_acl_pool_members(req.upstream_pool)[0].weight == 1);
+	assert(gwp_acl_pool_members(req.upstream_pool)[1].weight == 4);
 	/* What a connection does: keep the server, not the pool. */
 	held = up_srv_of(req.upstream_pool, 1);
 	atomic_fetch_add(&held->ref, 1);
@@ -3169,6 +3174,7 @@ static noinline void test_upstream_server_ops(void)
 	assert(gwp_acl_pool_server_url(req.upstream_pool, 0));
 	assert(!gwp_acl_pool_server(req.upstream_pool, 0));
 	assert(!gwp_acl_pool_members(req.upstream_pool));
+	assert(!gwp_acl_pool_plan(req.upstream_pool));
 	gwp_acl_req_release(&req);
 	gwp_acl_destroy(a);
 	assert(g_up_made == 5);
@@ -3488,9 +3494,12 @@ static noinline void test_upstream_server_opts(void)
 		"	server socks5h://10.0.0.3:1080 max_fails=0 ;\n"
 		"	server socks5h://10.0.0.4:1080 eject_time=1h fail_timeout=1500ms;\n"
 		"	server socks5h://10.0.0.5:1080 fail_timeout=7 eject_time=24h max_fails=100;\n"
+		"	server socks5h://10.0.0.6:1080 weight=1000;\n"
+		"	server socks5h://10.0.0.7:1080 weight=1 max_fails=1;\n"
 		"}\n"
 		"-A OUTPUT -j UPSTREAM --to p\n"));
 	o = up_opts(a, NULL, 0);
+	assert(o->weight == 1);
 	assert(o->max_fails == GWP_UP_EJECT_FAILS &&
 	       o->fail_timeout_ms == GWP_UP_EJECT_WINDOW_MS &&
 	       o->eject_ms == GWP_UP_EJECT_MS);
@@ -3505,7 +3514,11 @@ static noinline void test_upstream_server_opts(void)
 	       o->eject_ms == 3600000);
 	o = up_opts(a, NULL, 4);
 	assert(o->max_fails == 100 && o->fail_timeout_ms == 7000 &&
-	       o->eject_ms == 86400000);
+	       o->eject_ms == 86400000 && o->weight == 1);
+	o = up_opts(a, NULL, 5);
+	assert(o->weight == 1000 && o->max_fails == 3);
+	o = up_opts(a, NULL, 6);
+	assert(o->weight == 1 && o->max_fails == 1);
 	gwp_acl_destroy(a);
 
 	/* Wrong ones refuse the load, naming the server and the option. */
@@ -3514,6 +3527,12 @@ static noinline void test_upstream_server_opts(void)
 	up_refused("upstream p {\n server http://h:1;\n"
 		   " server http://u:s3cret@h:2 max_fails=1 x=s3cret;\n}\n",
 		   -EINVAL, "line 3: upstream pool p server 2: word 2 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1 weight=0;\n}\n",
+		   -EINVAL, "server 1: weight= wants a number from 1 to 1000");
+	up_refused("upstream p {\n server http://h:1 weight=1001;\n}\n",
+		   -EINVAL, "weight= wants a number from 1 to 1000");
+	up_refused("upstream p {\n server http://h:1 weight=2 weight=2;\n}\n",
+		   -EINVAL, "weight= given twice");
 	up_refused("upstream p {\n server http://h:1 max_fails;\n}\n",
 		   -EINVAL, "word 1 after the URL is not an option");
 	up_refused("upstream p {\n server http://h:1 max_fails=1 max_fails=2;\n}\n",

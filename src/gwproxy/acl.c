@@ -107,6 +107,8 @@ struct gwp_acl_pool {
 	struct gwp_up_member	*mem;
 	/* The options of each server, as written after its URL. */
 	struct gwp_up_opts	*opts;
+	/* How @mem's weights spread the turns, made when the block ends. */
+	struct gwp_up_plan	*plan;
 	const struct gwp_acl_server_ops *ops;
 	uint8_t			method;		/* enum gwp_acl_pool_method */
 	bool			remote_dns;
@@ -1139,6 +1141,11 @@ const struct gwp_up_member *gwp_acl_pool_members(const struct gwp_acl_pool *p)
 	return p->mem;
 }
 
+const struct gwp_up_plan *gwp_acl_pool_plan(const struct gwp_acl_pool *p)
+{
+	return p->plan;
+}
+
 uint32_t gwp_acl_pool_next(struct gwp_acl_pool *p)
 {
 	return atomic_fetch_add_explicit(&p->cursor, 1, memory_order_relaxed);
@@ -1167,6 +1174,7 @@ void gwp_acl_pool_put(struct gwp_acl_pool *p)
 	free(p->srv);
 	free(p->mem);
 	free(p->opts);
+	free(p->plan);
 	free(p);
 }
 
@@ -1454,6 +1462,7 @@ static int pool_add_server(struct acl_load *ld, const char *url,
 		}
 		p->srv[p->nr_servers] = srv;
 		memset(&p->mem[p->nr_servers], 0, sizeof(*p->mem));
+		p->mem[p->nr_servers].weight = (uint16_t)opts->weight;
 		if (ld->ops->member)
 			ld->ops->member(ld->ops->arg, srv,
 					&p->mem[p->nr_servers]);
@@ -1501,6 +1510,8 @@ struct srv_opt {
 };
 
 static const struct srv_opt srv_opts[] = {
+	{ "weight=", SRV_OPT_COUNT, 1, GWP_UP_MAX_WEIGHT,
+	  offsetof(struct gwp_up_opts, weight) },
 	{ "max_fails=", SRV_OPT_COUNT, 0, GWP_UP_MAX_FAILS,
 	  offsetof(struct gwp_up_opts, max_fails) },
 	{ "fail_timeout=", SRV_OPT_TIME, 1, GWP_UP_MAX_TIME_MS,
@@ -1509,7 +1520,7 @@ static const struct srv_opt srv_opts[] = {
 	  offsetof(struct gwp_up_opts, eject_ms) },
 };
 
-#define SRV_OPTS_LIST	"max_fails=, fail_timeout= or eject_time="
+#define SRV_OPTS_LIST	"weight=, max_fails=, fail_timeout= or eject_time="
 
 /*
  * A number of at most 10 digits, nothing else, into *@out; false when @s is
@@ -1621,6 +1632,11 @@ static int parse_pool_line(struct acl_load *ld, char **tok, int n)
 		if (!p->nr_servers)
 			return load_err(ld, "upstream pool %s has no server",
 					p->name);
+		if (p->mem) {
+			p->plan = gwp_up_plan_build(p->mem, p->nr_servers);
+			if (!p->plan)
+				return -ENOMEM;
+		}
 		ld->pool = NULL;
 		return 0;
 	}

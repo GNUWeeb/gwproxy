@@ -394,6 +394,120 @@ uint32_t gwp_up_health_ejected(struct gwp_up_health *h, uint32_t now,
 	return end && ms_after(end, now) > 0 ? (uint32_t)ms_after(end, now) : 0;
 }
 
+static uint32_t member_weight(const struct gwp_up_member *m)
+{
+	return m->weight ? m->weight : 1;
+}
+
+/*
+ * The server that owns the unit at the point @x (a fraction of 2^32) of
+ * the weights' sum: the first from @lo whose @cum is above it, among the
+ * @n from @lo (which hold it). A binary search without branches to
+ * mispredict, as the turns hop around the pool: the answer stays in
+ * [lo, lo + n).
+ */
+static uint32_t owner_in(const struct gwp_up_plan *pl, uint32_t x,
+			 uint32_t lo, uint32_t n)
+{
+	uint32_t u = (uint32_t)(((uint64_t)x * pl->total) >> 32), half;
+
+	while (n > 1) {
+		half = n / 2;
+		lo = pl->cum[lo + half - 1] <= u ? lo + half : lo;
+		n -= half;
+	}
+	return lo;
+}
+
+/* The server that owns the unit at the point @x, through @pl's slices. */
+static uint32_t plan_owner(const struct gwp_up_plan *pl, uint32_t x)
+{
+	uint32_t s = x >> pl->shift;
+
+	return owner_in(pl, x, pl->first[s],
+			(uint32_t)pl->first[s + 1] - pl->first[s] + 1u);
+}
+
+struct gwp_up_plan *gwp_up_plan_build(const struct gwp_up_member *m,
+				      uint32_t nr)
+{
+	uint32_t i, sum = 0, k = 1, nr_slice;
+	struct gwp_up_plan *pl;
+	bool equal = true;
+	uint16_t *first;
+	size_t size;
+
+	for (i = 1; i < nr; i++)
+		if (member_weight(&m[i]) != member_weight(&m[0]))
+			equal = false;
+	if (equal) {
+		pl = calloc(1, sizeof(*pl));
+		if (pl)
+			pl->nr = nr;
+		return pl;
+	}
+
+	/* 2^k slices, at least as many as servers (at least 2 of them). */
+	while ((1u << k) < nr)
+		k++;
+	nr_slice = 1u << k;
+	size = sizeof(*pl) + nr * sizeof(pl->cum[0]) +
+	       (nr_slice + 1) * sizeof(*first);
+	pl = calloc(1, size);
+	if (!pl)
+		return NULL;
+	/* At most 8192 servers of weight 1000 at most: no overflow. */
+	for (i = 0; i < nr; i++) {
+		sum += member_weight(&m[i]);
+		pl->cum[i] = sum;
+	}
+	pl->total = sum;
+	pl->nr = nr;
+	pl->shift = 32 - k;
+	first = (uint16_t *)(void *)&pl->cum[nr];
+	for (i = 0; i < nr_slice; i++)
+		first[i] = (uint16_t)owner_in(pl, i << pl->shift, 0, nr);
+	first[nr_slice] = (uint16_t)(nr - 1);
+	pl->first = first;
+	return pl;
+}
+
+/* @x's 32 bits in the reverse order. */
+static uint32_t bit_reverse(uint32_t x)
+{
+	x = ((x >> 1) & 0x55555555u) | ((x & 0x55555555u) << 1);
+	x = ((x >> 2) & 0x33333333u) | ((x & 0x33333333u) << 2);
+	x = ((x >> 4) & 0x0f0f0f0fu) | ((x & 0x0f0f0f0fu) << 4);
+	x = ((x >> 8) & 0x00ff00ffu) | ((x & 0x00ff00ffu) << 8);
+	return (x >> 16) | (x << 16);
+}
+
+/* Whose turn the cursor @rr is in a pool of @nr servers planned by @pl. */
+static uint32_t turn_of(const struct gwp_up_plan *pl, uint32_t nr, uint32_t rr)
+{
+	if (!pl || !pl->total)
+		return rr % nr;
+	return plan_owner(pl, bit_reverse(rr));
+}
+
+/* A server drawn by the random number @r: uniformly, or by weight. */
+static uint32_t drawn_by(const struct gwp_up_plan *pl, uint32_t nr, uint32_t r)
+{
+	/* Uniform over [0, n), no division. */
+	if (!pl || !pl->total)
+		return (uint32_t)(((uint64_t)r * nr) >> 32);
+	return plan_owner(pl, r);
+}
+
+/*
+ * Whether @v open pairs on a server of weight @w are fewer for its weight
+ * than @bv on one of weight @bw: exact, by cross-multiplying.
+ */
+static bool fewer_open(uint32_t v, uint32_t w, uint32_t bv, uint32_t bw)
+{
+	return (uint64_t)v * bw < (uint64_t)bv * w;
+}
+
 /* A pick in progress: the clock, read once when first needed. */
 struct pick {
 	const struct gwp_up_pick	*pk;
@@ -428,8 +542,9 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 {
 	struct pick c = { .pk = pk };
 	uint32_t nr = pk->nr, skip = pk->skip, best = UINT32_MAX;
-	uint32_t best_val = UINT32_MAX, i, k, v;
-	bool retry = skip < nr;
+	uint32_t best_val = UINT32_MAX, best_w = 1, i, k, v, w;
+	const struct gwp_up_plan *pl = pk->plan;
+	bool retry = skip < nr, weighted = pl && pl->total;
 	struct gwp_up_state *s;
 
 	if (!nr)
@@ -437,7 +552,7 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 	if (retry)
 		i = skip + 1 < nr ? skip + 1 : 0;
 	else
-		i = pk->rr % nr;
+		i = turn_of(pl, nr, pk->rr);
 
 	/*
 	 * The start's server is the pick (round-robin) or where the ties
@@ -451,8 +566,7 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 		uint32_t p, j;
 
 		for (p = 0; pk->random && p < GWP_UP_PICK_PROBES; p++) {
-			/* Uniform over [0, nr), no division. */
-			j = (uint32_t)(((uint64_t)pk->random(pk->arg) * nr) >> 32);
+			j = drawn_by(pl, nr, pk->random(pk->arg));
 			s = pk->m[j].st;
 			if (j != skip && s && !pick_ejected(&c, j)) {
 				i = j;
@@ -477,11 +591,13 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 		}
 		/* Not fewer than the best so far: its health does not matter. */
 		v = gwp_up_state_open(s);
-		if ((best != UINT32_MAX && v >= best_val) ||
+		w = weighted ? member_weight(&pk->m[i]) : 1;
+		if ((best != UINT32_MAX && !fewer_open(v, w, best_val, best_w)) ||
 		    pick_ejected(&c, i))
 			continue;
 		best = i;
 		best_val = v;
+		best_w = w;
 		if (!v)
 			break;
 	}
@@ -489,6 +605,7 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 		return best;
 
 	/* All ejected: the one back soonest, ties in turn. */
+	best_val = UINT32_MAX;
 	i = pk->rr % nr;
 	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
 		s = pk->m[i].st;

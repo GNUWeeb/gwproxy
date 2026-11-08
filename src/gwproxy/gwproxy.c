@@ -2963,8 +2963,9 @@ static void pool_pick_back(void *arg, uint32_t i)
 
 /*
  * Which of @pool's servers (from 0) a pair goes to, by the pool's method:
- * round-robin, the default, takes them in turn; least_conn the one with
- * the fewest open pairs, ties in round-robin order. Both turn on the
+ * round-robin, the default, takes them in turn (as many turns each as its
+ * weight=); least_conn the one with the fewest open pairs for its weight,
+ * ties in round-robin order. Both turn on the
  * pool's cursor, shared by all workers, and least_conn reads the counts
  * all workers keep (struct gwp_up_state), which carry across reloads.
  * Workers picking at the same time may see the same counts and choose the
@@ -2991,6 +2992,7 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 	struct pool_pick_env env = { .ctx = ctx, .pool = pool };
 	struct gwp_up_pick pk = {
 		.m = gwp_acl_pool_members(pool),
+		.plan = gwp_acl_pool_plan(pool),
 		.nr = gwp_acl_pool_nr_servers(pool),
 		.least_conn = gwp_acl_pool_method(pool) ==
 			      GWP_ACL_POOL_LEAST_CONN,
