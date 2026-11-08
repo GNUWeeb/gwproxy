@@ -3453,6 +3453,104 @@ static noinline void test_upstream_pick_regexp_error(void)
 #endif
 }
 
+/* The options of the @i-th server of the pool @a picks for @user. */
+static const struct gwp_up_opts *up_opts(struct gwp_acl *a, const char *user,
+					 uint32_t i)
+{
+	static struct gwp_up_opts o;
+	struct gwp_acl_req req;
+	const struct gwp_up_opts *got;
+
+	assert(up_eval(a, user, &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	got = gwp_acl_pool_server_opts(req.upstream_pool, i);
+	assert(got);
+	o = *got;
+	assert(!gwp_acl_pool_server_opts(req.upstream_pool,
+					 gwp_acl_pool_nr_servers(req.upstream_pool)));
+	gwp_acl_req_release(&req);
+	return &o;
+}
+
+/*
+ * The options after a pool server's URL: the defaults where none is given,
+ * the times in any unit, each option on its own.
+ */
+static noinline void test_upstream_server_opts(void)
+{
+	const struct gwp_up_opts *o;
+	struct gwp_acl *a;
+
+	assert(!gwp_acl_parse_str(&a,
+		"upstream p {\n"
+		"	server socks5h://u:s3cret@10.0.0.1:1080;\n"
+		"	server socks5h://10.0.0.2:1080 max_fails=5 fail_timeout=60s eject_time=10m;\n"
+		"	server socks5h://10.0.0.3:1080 max_fails=0 ;\n"
+		"	server socks5h://10.0.0.4:1080 eject_time=1h fail_timeout=1500ms;\n"
+		"	server socks5h://10.0.0.5:1080 fail_timeout=7 eject_time=24h max_fails=100;\n"
+		"}\n"
+		"-A OUTPUT -j UPSTREAM --to p\n"));
+	o = up_opts(a, NULL, 0);
+	assert(o->max_fails == GWP_UP_EJECT_FAILS &&
+	       o->fail_timeout_ms == GWP_UP_EJECT_WINDOW_MS &&
+	       o->eject_ms == GWP_UP_EJECT_MS);
+	o = up_opts(a, NULL, 1);
+	assert(o->max_fails == 5 && o->fail_timeout_ms == 60000 &&
+	       o->eject_ms == 600000);
+	o = up_opts(a, NULL, 2);
+	assert(o->max_fails == 0 && o->fail_timeout_ms == 30000 &&
+	       o->eject_ms == 300000);
+	o = up_opts(a, NULL, 3);
+	assert(o->max_fails == 3 && o->fail_timeout_ms == 1500 &&
+	       o->eject_ms == 3600000);
+	o = up_opts(a, NULL, 4);
+	assert(o->max_fails == 100 && o->fail_timeout_ms == 7000 &&
+	       o->eject_ms == 86400000);
+	gwp_acl_destroy(a);
+
+	/* Wrong ones refuse the load, naming the server and the option. */
+	up_refused("upstream p {\n server http://u:s3cret@h:1 s3cret;\n}\n",
+		   -EINVAL, "line 2: upstream pool p server 1: word 1 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1;\n"
+		   " server http://u:s3cret@h:2 max_fails=1 x=s3cret;\n}\n",
+		   -EINVAL, "line 3: upstream pool p server 2: word 2 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1 max_fails;\n}\n",
+		   -EINVAL, "word 1 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1 max_fails=1 max_fails=2;\n}\n",
+		   -EINVAL, "server 1: max_fails= given twice");
+	up_refused("upstream p {\n server http://h:1 max_fails=101;\n}\n",
+		   -EINVAL, "server 1: max_fails= wants a number from 0 to 100");
+	up_refused("upstream p {\n server http://h:1 max_fails=-1;\n}\n",
+		   -EINVAL, "max_fails= wants a number");
+	up_refused("upstream p {\n server http://h:1 max_fails=;\n}\n",
+		   -EINVAL, "max_fails= wants a number");
+	up_refused("upstream p {\n server http://h:1 max_fails=99999999999;\n}\n",
+		   -EINVAL, "max_fails= wants a number");
+	up_refused("upstream p {\n server http://h:1 fail_timeout=0;\n}\n",
+		   -EINVAL, "fail_timeout= wants a time from 1ms to 24h");
+	up_refused("upstream p {\n server http://h:1 fail_timeout=0ms;\n}\n",
+		   -EINVAL, "fail_timeout= wants a time");
+	up_refused("upstream p {\n server http://h:1 eject_time=25h;\n}\n",
+		   -EINVAL, "eject_time= wants a time");
+	up_refused("upstream p {\n server http://h:1 eject_time=86401s;\n}\n",
+		   -EINVAL, "eject_time= wants a time");
+	up_refused("upstream p {\n server http://h:1 eject_time=5d;\n}\n",
+		   -EINVAL, "eject_time= wants a time");
+	up_refused("upstream p {\n server http://h:1 eject_time=m;\n}\n",
+		   -EINVAL, "eject_time= wants a time");
+	up_refused("upstream p {\n server http://h:1 eject_time=1.5s;\n}\n",
+		   -EINVAL, "eject_time= wants a time");
+	/* The ';' ends the directive: after the URL, nothing may follow. */
+	up_refused("upstream p {\n server http://h:1; max_fails=1;\n}\n",
+		   -EINVAL, "expected \"server URL [OPTION ...];\"");
+	/* A password with a ';' in it is still a password. */
+	assert(!gwp_acl_parse_str(&a,
+		"upstream p {\n server http://u:a;b@h:1 max_fails=2;\n}\n"
+		"-A OUTPUT -j UPSTREAM --to p\n"));
+	assert(up_opts(a, NULL, 0)->max_fails == 2);
+	gwp_acl_destroy(a);
+}
+
 /* Every way the pool syntax and -j UPSTREAM can be wrong, one at a time. */
 static noinline void test_upstream_errors(void)
 {
@@ -3505,9 +3603,9 @@ static noinline void test_upstream_errors(void)
 	up_refused("upstream p {\n least_conn\n}\n", -EINVAL,
 		   "missing ';' at the end of the directive");
 	up_refused("upstream p {\n server;\n}\n", -EINVAL,
-		   "expected \"server URL;\"");
+		   "expected \"server URL [OPTION ...];\"");
 	up_refused("upstream p {\n server http://a; server http://b;\n}\n",
-		   -EINVAL, "expected \"server URL;\"");
+		   -EINVAL, "expected \"server URL [OPTION ...];\"");
 	up_refused("upstream p {\n weight 3;\n}\n", -EINVAL,
 		   "unknown directive in upstream pool p");
 	/* A URL without "server": refused without being quoted. */
@@ -3728,6 +3826,7 @@ static void run_tests(void)
 	test_include_errors();
 	test_include_reload();
 	test_upstream_errors();
+	test_upstream_server_opts();
 	test_upstream_pool_https();
 	test_upstream_index();
 	test_upstream_include();

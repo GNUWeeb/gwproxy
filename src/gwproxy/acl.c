@@ -105,6 +105,8 @@ struct gwp_acl_pool {
 	 * @ops.
 	 */
 	struct gwp_up_member	*mem;
+	/* The options of each server, as written after its URL. */
+	struct gwp_up_opts	*opts;
 	const struct gwp_acl_server_ops *ops;
 	uint8_t			method;		/* enum gwp_acl_pool_method */
 	bool			remote_dns;
@@ -1121,6 +1123,12 @@ const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i)
 	return i < p->nr_servers ? p->servers[i] : NULL;
 }
 
+const struct gwp_up_opts *gwp_acl_pool_server_opts(const struct gwp_acl_pool *p,
+						   uint32_t i)
+{
+	return i < p->nr_servers ? &p->opts[i] : NULL;
+}
+
 void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i)
 {
 	return i < p->nr_servers && p->srv ? p->srv[i] : NULL;
@@ -1158,6 +1166,7 @@ void gwp_acl_pool_put(struct gwp_acl_pool *p)
 	free(p->servers);
 	free(p->srv);
 	free(p->mem);
+	free(p->opts);
 	free(p);
 }
 
@@ -1370,6 +1379,7 @@ static int pool_add_server(struct acl_load *ld, const char *url,
 	struct gwp_acl_pool *p = ld->pool;
 	uint32_t idx = p->nr_servers + 1;
 	bool remote_dns, creds;
+	struct gwp_up_opts *ov;
 	const char *why;
 	char shown[160];
 	char **v, *dup;
@@ -1400,6 +1410,10 @@ static int pool_add_server(struct acl_load *ld, const char *url,
 		if (!v)
 			return -ENOMEM;
 		p->servers = v;
+		ov = realloc(p->opts, cap * sizeof(*ov));
+		if (!ov)
+			return -ENOMEM;
+		p->opts = ov;
 		if (ld->ops) {
 			void **sv = realloc(p->srv, cap * sizeof(*sv));
 
@@ -1444,6 +1458,7 @@ static int pool_add_server(struct acl_load *ld, const char *url,
 			ld->ops->member(ld->ops->arg, srv,
 					&p->mem[p->nr_servers]);
 	}
+	p->opts[p->nr_servers] = *opts;
 	p->servers[p->nr_servers++] = dup;
 	p->remote_dns = remote_dns;
 	if (creds)
@@ -1467,6 +1482,131 @@ static int directive_words(char **tok, int n)
 		return n;
 	}
 	return -1;
+}
+
+/*
+ * The options a pool server's URL may be followed by, nginx style: a name,
+ * '=' and a value, or a name alone for a flag.
+ */
+enum srv_opt_kind {
+	SRV_OPT_COUNT,		/* a number, from @min to @max */
+	SRV_OPT_TIME,		/* a time, from 1 ms to GWP_UP_MAX_TIME_MS */
+};
+
+struct srv_opt {
+	const char	*name;		/* with its '=' */
+	uint8_t		kind;		/* enum srv_opt_kind */
+	uint32_t	min, max;
+	size_t		off;		/* of its value in struct gwp_up_opts */
+};
+
+static const struct srv_opt srv_opts[] = {
+	{ "max_fails=", SRV_OPT_COUNT, 0, GWP_UP_MAX_FAILS,
+	  offsetof(struct gwp_up_opts, max_fails) },
+	{ "fail_timeout=", SRV_OPT_TIME, 1, GWP_UP_MAX_TIME_MS,
+	  offsetof(struct gwp_up_opts, fail_timeout_ms) },
+	{ "eject_time=", SRV_OPT_TIME, 1, GWP_UP_MAX_TIME_MS,
+	  offsetof(struct gwp_up_opts, eject_ms) },
+};
+
+#define SRV_OPTS_LIST	"max_fails=, fail_timeout= or eject_time="
+
+/*
+ * A number of at most 10 digits, nothing else, into *@out; false when @s is
+ * not one or does not fit.
+ */
+static bool srv_opt_number(const char *s, size_t len, uint64_t *out)
+{
+	uint64_t v = 0;
+	size_t i;
+
+	if (!len || len > 10)
+		return false;
+	for (i = 0; i < len; i++) {
+		if (s[i] < '0' || s[i] > '9')
+			return false;
+		v = v * 10 + (uint64_t)(s[i] - '0');
+	}
+	*out = v;
+	return true;
+}
+
+/*
+ * A time as nginx writes one: a number followed by ms, s, m or h, seconds
+ * when there is no unit; into *@ms. False when @s is not one.
+ */
+static bool srv_opt_time(const char *s, uint64_t *ms)
+{
+	static const struct {
+		const char	*unit;
+		uint32_t	ms;
+	} units[] = {
+		{ "", 1000 }, { "ms", 1 }, { "s", 1000 }, { "m", 60000 },
+		{ "h", 3600000 },
+	};
+	size_t len = strspn(s, "0123456789"), i;
+	uint64_t v;
+
+	if (!srv_opt_number(s, len, &v))
+		return false;
+	for (i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+		if (!strcmp(s + len, units[i].unit)) {
+			*ms = v * units[i].ms;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * The options after the URL of the open pool's next server: @tok, @n of
+ * them, into @o (which holds the defaults), each at most once. The words
+ * are not quoted in the messages: a line that went wrong may hold a
+ * password, if only by a space in it; an option is named only once it is
+ * known.
+ */
+static int parse_server_opts(struct acl_load *ld, char **tok, int n,
+			     struct gwp_up_opts *o)
+{
+	const struct gwp_acl_pool *p = ld->pool;
+	uint32_t idx = p->nr_servers + 1, seen = 0;
+	const struct srv_opt *so;
+	uint64_t v;
+	size_t k, len;
+	bool ok;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		for (k = 0; k < sizeof(srv_opts) / sizeof(srv_opts[0]); k++) {
+			len = strlen(srv_opts[k].name);
+			if (!strncmp(tok[i], srv_opts[k].name, len))
+				break;
+		}
+		if (k == sizeof(srv_opts) / sizeof(srv_opts[0]))
+			return load_err(ld, "upstream pool %s server %u: word %d after the URL is not an option (expected " SRV_OPTS_LIST ")",
+					p->name, idx, i + 1);
+		so = &srv_opts[k];
+		if (seen & (1u << k))
+			return load_err(ld, "upstream pool %s server %u: %s given twice",
+					p->name, idx, so->name);
+		seen |= 1u << k;
+
+		if (so->kind == SRV_OPT_TIME)
+			ok = srv_opt_time(tok[i] + len, &v);
+		else
+			ok = srv_opt_number(tok[i] + len, strlen(tok[i] + len),
+					    &v);
+		if (!ok || v < so->min || v > so->max) {
+			if (so->kind == SRV_OPT_TIME)
+				return load_err(ld, "upstream pool %s server %u: %s wants a time from 1ms to 24h (a number, then ms, s, m or h; seconds without one)",
+						p->name, idx, so->name);
+			return load_err(ld, "upstream pool %s server %u: %s wants a number from %u to %u",
+					p->name, idx, so->name, so->min,
+					so->max);
+		}
+		*(uint32_t *)(void *)((char *)o + so->off) = (uint32_t)v;
+	}
+	return 0;
 }
 
 /* A line inside "upstream NAME { ... }". */
@@ -1504,10 +1644,16 @@ static int parse_pool_line(struct acl_load *ld, char **tok, int n)
 
 	if (!strcmp(tok[0], "server")) {
 		struct gwp_up_opts opts;
+		int r;
 
-		if (n != 2)
-			return load_err(ld, "expected \"server URL;\"");
+		/* A ';' right after the URL ends the directive. */
+		if (n < 2 ||
+		    (n > 2 && tok[1][strlen(tok[1]) - 1] == ';'))
+			return load_err(ld, "expected \"server URL [OPTION ...];\"");
 		gwp_up_opts_default(&opts);
+		r = parse_server_opts(ld, tok + 2, n - 2, &opts);
+		if (r)
+			return r;
 		return pool_add_server(ld, tok[1], &opts);
 	}
 	if (n != 1)

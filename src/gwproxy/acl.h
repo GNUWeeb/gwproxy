@@ -39,7 +39,7 @@ struct gwp_acl;
  * An upstream pool, defined in the rule file by a block:
  *
  *	upstream NAME {
- *		server URL;
+ *		server URL [OPTION ...];
  *		least_conn;
  *	}
  *
@@ -96,6 +96,13 @@ uint32_t gwp_acl_pool_nr_servers(const struct gwp_acl_pool *p);
  * form instead. NULL when @i is out of range.
  */
 const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i);
+
+/*
+ * The options written after the pool's @i-th server URL (from 0), the
+ * defaults for those that were not, or NULL when @i is out of range.
+ */
+const struct gwp_up_opts *gwp_acl_pool_server_opts(const struct gwp_acl_pool *p,
+						   uint32_t i);
 
 /*
  * The object made of the pool's @i-th server URL when the rule set loaded
