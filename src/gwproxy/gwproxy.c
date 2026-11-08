@@ -5143,6 +5143,25 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	return 0;	/* plain/transparent forwarding speaks no protocol */
 }
 
+/*
+ * No descriptor for the query's socket, no memory, a send refused: the name
+ * was never looked up, which leaves the origin as unreachable as a lookup
+ * that failed, so the client gets the same answer, host unreachable, as from
+ * the system resolver and from a raw lookup that fails later. Closing the
+ * connection without a word left a SOCKS5 client without its reply and an
+ * HTTP client without a status.
+ */
+int gwp_raw_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			     const char *host, int err)
+{
+	int r;
+
+	pr_dbg(&w->ctx->lh, "DNS query could not be started: %s (%s; gcp_idx=%u)",
+	       host, strerror(-err), gcp->idx);
+	r = gwp_conn_fail_reply(w, gcp, -EHOSTUNREACH);
+	return r ? r : -EBADMSG;
+}
+
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
@@ -5531,7 +5550,11 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 			gwp_conn_set_single_candidate(gcp, &sa);
 			return 0;
 		}
-		return gwp_raw_dns_resolve(w, gcp, host, port);
+		r = gwp_raw_dns_resolve(w, gcp, host, port);
+		/* -EINVAL: a name DNS cannot carry, a malformed request. */
+		if (r != -EINPROGRESS && r != -EINVAL)
+			r = gwp_raw_dns_start_failed(w, gcp, host, r);
+		return r;
 	} else {
 		struct gwp_sockaddr addrs[GWP_MAX_CONN_CAND];
 		uint8_t nr = 0;

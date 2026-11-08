@@ -73,9 +73,16 @@ static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ev.events = EPOLLIN;
 		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_RAW_DNS_QUERY;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->gdp->fd, &ev);
+		if (likely(!r))
+			r = send_dns_payload(gcp);
+		/*
+		 * Answered as a lookup that failed, -EAGAIN from a full send
+		 * buffer included: passed on, it reads as "nothing to do yet"
+		 * to the caller, and the client, whose query never went out,
+		 * would wait for the protocol timeout.
+		 */
 		if (unlikely(r))
-			return r;
-		return send_dns_payload(gcp);
+			return gwp_raw_dns_start_failed(w, gcp, gcp->gdp->host, r);
 	}
 
 	return 0;
