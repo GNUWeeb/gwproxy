@@ -24,12 +24,14 @@ declare -a _PIDS=()
 _cleanup()
 {
 	local pid
+	local -a pids=()
+
 	for pid in "${_PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill "$pid" 2>/dev/null
+		[ -n "$pid" ] && pids+=("$pid")
 	done
-	for pid in "${_PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
-	done
+	# SIGTERM first, and time to act on it: LeakSanitizer reports when the
+	# proxy exits, and a SIGKILL right behind the SIGTERM can beat it.
+	gwp_stop_pids "${pids[@]}"
 	# Catch any proxy this test started outside gwp_start (or whose pid we
 	# lost); the runner sweeps again in case we are killed before this runs.
 	gwp_sweep -q
@@ -546,13 +548,12 @@ gwp_parallel()
 _gwp_parallel_cleanup()
 {
 	local pid
+	local -a pids=()
 
 	for pid in "${_PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill "$pid" 2>/dev/null
+		[ -n "$pid" ] && pids+=("$pid")
 	done
-	for pid in "${_PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
-	done
+	gwp_stop_pids "${pids[@]}"
 	return 0
 }
 
