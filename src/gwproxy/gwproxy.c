@@ -5291,15 +5291,15 @@ static int upstream_dst_from_hostport(const char *hostport,
 /*
  * Whether a client-requested hostname is fit for the ACL, the resolver and an
  * upstream CONNECT request: an IPv6 literal, or letters, digits, '-' and '_'
- * in non-empty dot-separated labels (which covers IPv4 literals). Anything
- * else, CR, LF and ':' in particular, would be pasted verbatim into the
- * request to an http:// upstream, which then reads a different target than
- * the one the ACL judged.
+ * in non-empty dot-separated labels of at most 63 characters (which covers
+ * IPv4 literals). Anything else, CR, LF and ':' in particular, would be
+ * pasted verbatim into the request to an http:// upstream, which then reads
+ * a different target than the one the ACL judged.
  */
 static bool req_host_valid(const char *host)
 {
-	bool label_start = true;
 	struct in6_addr a6;
+	size_t label = 0;
 	size_t n = 0;
 
 	if (inet_pton(AF_INET6, host, &a6) == 1)
@@ -5309,15 +5309,20 @@ static bool req_host_valid(const char *host)
 		unsigned char c = (unsigned char)host[n];
 
 		if (c == '.') {
-			if (label_start)
+			if (!label)
 				return false;
-			label_start = true;
+			label = 0;
 			continue;
 		}
 		if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
 		    !(c >= '0' && c <= '9') && c != '-' && c != '_')
 			return false;
-		label_start = false;
+		/*
+		 * A label's length byte leaves room for 63 octets (RFC 1035
+		 * 2.3.4): a longer one can never resolve either.
+		 */
+		if (++label > 63)
+			return false;
 	}
 
 	/*
