@@ -5800,17 +5800,21 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 		return upstream_dst_from_domain(host, port, &gcp->up_dst);
 	}
 
+	/*
+	 * An address is the target, not a name to look up, whichever resolver
+	 * is in use. A raw DNS query would tell the server where the client is
+	 * going, and its answer would choose where the tunnel goes. The system
+	 * resolver would parse it back, but getaddrinfo()'s AI_ADDRCONFIG drops
+	 * an IPv6 literal, ::1 included, on a host whose only IPv6 address is
+	 * on the loopback: the request failed as an unresolvable name before the
+	 * ACL ever saw the address, where an IPv6 SOCKS5 address went through.
+	 */
+	if (is_ip) {
+		gwp_conn_set_single_candidate(gcp, &sa);
+		return 0;
+	}
+
 	if (cfg->use_raw_dns) {
-		/*
-		 * An address is the target, not a name to ask the server about:
-		 * the query would tell the server where the client is going, and
-		 * its answer would choose where the tunnel goes. The system
-		 * resolver parses these itself.
-		 */
-		if (is_ip) {
-			gwp_conn_set_single_candidate(gcp, &sa);
-			return 0;
-		}
 		r = gwp_raw_dns_resolve(w, gcp, host, port);
 		/* -EINVAL: a name DNS cannot carry, a malformed request. */
 		if (r != -EINPROGRESS && r != -EINVAL)
