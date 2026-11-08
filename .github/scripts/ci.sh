@@ -54,6 +54,17 @@ CLANG_VERSION="23"
 # have no target libssl/libpcre2 available.
 DEB_EXTRA_PACKAGES="libssl-dev libpcre2-dev"
 
+# What a bare ubuntu container image lacks and the GitHub ubuntu-24.04 runner
+# image comes with, for a CI that runs the Ubuntu commands in a container
+# (see container-deps): make, binutils (as, ar) and the C library headers for
+# every build; wget, gnupg, lsb-release and add-apt-repository for
+# apt.llvm.org's llvm.sh; and for the test suite python3, curl, the openssl
+# CLI, iproute2 (ss, ip), procps (ps), util-linux (setsid, unshare, prlimit)
+# and strace.
+CONTAINER_PACKAGES="make binutils libc6-dev ca-certificates wget gnupg
+	lsb-release software-properties-common python3 curl openssl iproute2
+	procps util-linux strace"
+
 # Alpine/musl build dependencies, followed by what the test suite needs:
 # bash for t/*.sh, python3 for the helper servers in t/servers, curl as the
 # HTTP client the integration tests drive, the openssl CLI to mint the test
@@ -87,6 +98,9 @@ Commands:
                    Requires --arch, --cc, --cc-pkg.
   build            Run every build variant for one Ubuntu build matrix row.
                    Requires --arch, --cc, --sanitize.
+  container-deps   Install, in a bare ubuntu container, what the GitHub
+                   runner image already has and deps/build/codespell-deps
+                   need (needs root). Not used by the GitHub workflow.
   alpine-deps      Install the Alpine/musl build dependencies (needs root).
   alpine-build     Run every build variant for the Alpine/musl job.
   codespell-deps   Install codespell.
@@ -337,6 +351,14 @@ cmd_build()
 		${san[@]+"${san[@]}"}
 }
 
+cmd_container_deps()
+{
+	sudo_run apt-get update -y
+	# shellcheck disable=SC2086 # deliberate word splitting
+	sudo_run env DEBIAN_FRONTEND=noninteractive \
+		apt-get install -y --no-install-recommends ${CONTAINER_PACKAGES}
+}
+
 cmd_alpine_deps()
 {
 	# The workflow runs this step as root ("alpine.sh --root"), and the
@@ -462,6 +484,9 @@ case "${CMD}" in
 	;;
 deps)
 	cmd_deps
+	;;
+container-deps)
+	cmd_container_deps
 	;;
 build)
 	cmd_build
