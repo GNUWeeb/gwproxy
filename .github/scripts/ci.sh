@@ -100,6 +100,16 @@ Options:
   --cc-pkg=PKG     Debian package providing --cc, or the literal "clang"
                    to install clang-${CLANG_VERSION} from apt.llvm.org.
   --sanitize=0|1   Whether this row is the AddressSanitizer/UBSan row.
+  --variant=ID[,ID...]
+                   build and alpine-build only: run just the named build
+                   variants of the row instead of all of them, for a CI
+                   that has to split a row across jobs. The GitHub
+                   workflow does not use it. IDs: default, debug,
+                   io_uring, io_uring-debug, new-dns-resolver, openssl,
+                   openssl-io_uring, openssl-io_uring-pcre (build);
+                   default, debug, io_uring, io_uring-debug, openssl,
+                   pcre (alpine-build). An ID the row does not have is
+                   an error.
   -h, --help       Print this message.
 
 Environment:
@@ -171,7 +181,9 @@ enter_topdir()
 }
 
 #
-# build_variant <name> <wipe_config> <run_tests> [configure args...]
+# build_variant <id> <name> <wipe_config> <run_tests> [configure args...]
+#
+# <id> names the variant for --variant=; <name> is what the log shows.
 #
 # <wipe_config> mirrors the "rm -vf config.h config.log config.make" that
 # some -- not all -- of the old workflow steps ran before "make clean". It
@@ -184,9 +196,20 @@ enter_topdir()
 #
 build_variant()
 {
-	local name="$1" wipe_config="$2" run_tests="$3"
+	local id="$1" name="$2" wipe_config="$3" run_tests="$4"
 
-	shift 3
+	shift 4
+
+	if [ -n "${variants}" ]; then
+		case ",${variants}," in
+		*",${id},"*)
+			variants_run="${variants_run},${id}"
+			;;
+		*)
+			return 0
+			;;
+		esac
+	fi
 
 	group_begin "build: ${name}"
 	if [ "${wipe_config}" = "1" ]; then
@@ -265,20 +288,20 @@ cmd_build()
 
 	if [ "${sanitize}" = "1" ]; then
 		san=(--sanitize)
-		build_variant "default + sanitizers" 0 "${run_tests}" \
+		build_variant default "default + sanitizers" 0 "${run_tests}" \
 			"--cc=${cc}" --sanitize
 	else
-		build_variant "default" 0 "${run_tests}" \
+		build_variant default "default" 0 "${run_tests}" \
 			"--cc=${cc}"
-		build_variant "debug" 0 "${run_tests}" \
+		build_variant debug "debug" 0 "${run_tests}" \
 			"--cc=${cc}" --debug
 	fi
 
 	# NOTE: no --cc= here, on purpose. These two take the compiler from the
 	# exported CC, which is what the workflow has always done.
-	build_variant "io_uring" 1 "${run_tests}" \
+	build_variant io_uring "io_uring" 1 "${run_tests}" \
 		--use-io-uring
-	build_variant "io_uring + debug" 1 "${run_tests}" \
+	build_variant io_uring-debug "io_uring + debug" 1 "${run_tests}" \
 		--use-io-uring --debug
 
 	# libssl/libpcre2 are only installed for the native x86_64 rows (see
@@ -298,17 +321,18 @@ cmd_build()
 	# coverage that a packet parser wants; nobody has checked it builds
 	# there yet, and a matrix row that cannot compile is worse than one
 	# that is missing.
-	build_variant "new-dns-resolver" 1 "${run_tests}" \
+	build_variant new-dns-resolver "new-dns-resolver" 1 "${run_tests}" \
 		"--cc=${cc}" --use-new-dns-resolver \
 		${san[@]+"${san[@]}"}
 
-	build_variant "openssl" 1 "${run_tests}" \
+	build_variant openssl "openssl" 1 "${run_tests}" \
 		"--cc=${cc}" --use-openssl \
 		${san[@]+"${san[@]}"}
-	build_variant "openssl + io_uring" 1 "${run_tests}" \
+	build_variant openssl-io_uring "openssl + io_uring" 1 "${run_tests}" \
 		"--cc=${cc}" --use-openssl --use-io-uring \
 		${san[@]+"${san[@]}"}
-	build_variant "openssl + io_uring + pcre" 1 "${run_tests}" \
+	build_variant openssl-io_uring-pcre "openssl + io_uring + pcre" 1 \
+		"${run_tests}" \
 		"--cc=${cc}" --use-openssl --use-io-uring --use-pcre \
 		${san[@]+"${san[@]}"}
 }
@@ -333,19 +357,19 @@ cmd_alpine_build()
 
 	enter_topdir
 
-	build_variant "default" 0 "${run_tests}" \
+	build_variant default "default" 0 "${run_tests}" \
 		--cc=gcc
-	build_variant "debug" 0 "${run_tests}" \
+	build_variant debug "debug" 0 "${run_tests}" \
 		--cc=gcc --debug
-	build_variant "io_uring" 1 "${run_tests}" \
+	build_variant io_uring "io_uring" 1 "${run_tests}" \
 		--cc=gcc --use-io-uring
-	build_variant "io_uring + debug" 1 "${run_tests}" \
+	build_variant io_uring-debug "io_uring + debug" 1 "${run_tests}" \
 		--cc=gcc --use-io-uring --debug
 	# Exercise the TLS module (ssl.c) against musl.
-	build_variant "openssl" 1 "${run_tests}" \
+	build_variant openssl "openssl" 1 "${run_tests}" \
 		--cc=gcc --use-openssl
 	# Exercise the ACL PCRE2 path against musl.
-	build_variant "pcre" 1 "${run_tests}" \
+	build_variant pcre "pcre" 1 "${run_tests}" \
 		--cc=gcc --use-io-uring --use-pcre
 }
 
@@ -362,10 +386,30 @@ cmd_codespell()
 	run codespell --ignore-words=.github/actions/codespell/stopwords man/
 }
 
+# check_variants: fail when --variant= named a variant the command did not
+# have, so a misspelt or retired ID cannot turn a CI job into a no-op.
+check_variants()
+{
+	local id
+
+	[ -n "${variants}" ] || return 0
+	for id in ${variants//,/ }; do
+		case "${variants_run}," in
+		*",${id},"*)
+			;;
+		*)
+			die "command '${CMD}' has no build variant '${id}'"
+			;;
+		esac
+	done
+}
+
 arch=""
 cc=""
 cc_pkg=""
 sanitize=""
+variants=""
+variants_run=""
 
 if [ "$#" -eq 0 ]; then
 	usage >&2
@@ -389,6 +433,10 @@ for opt in "$@"; do
 	--sanitize=*)
 		sanitize="${opt#*=}"
 		;;
+	--variant=*)
+		variants="${opt#*=}"
+		need "${variants}" '--variant=ID[,ID...]'
+		;;
 	-h|--help)
 		usage
 		exit 0
@@ -400,6 +448,14 @@ for opt in "$@"; do
 done
 
 case "${CMD}" in
+build|alpine-build)
+	;;
+*)
+	[ -z "${variants}" ] || die "--variant= is for build and alpine-build only"
+	;;
+esac
+
+case "${CMD}" in
 -h|--help)
 	usage
 	exit 0
@@ -409,12 +465,14 @@ deps)
 	;;
 build)
 	cmd_build
+	check_variants
 	;;
 alpine-deps)
 	cmd_alpine_deps
 	;;
 alpine-build)
 	cmd_alpine_build
+	check_variants
 	;;
 codespell-deps)
 	cmd_codespell_deps
