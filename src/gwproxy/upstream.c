@@ -27,12 +27,6 @@
  * issues the actual send/recv with its own primitive.
  */
 
-/*
- * The longest reply a client can be owed once the tunnel is up: SOCKS5 with an
- * IPv6 bound address. An HTTP client's is 19 bytes.
- */
-#define UPSTREAM_CLIENT_REPLY_MAX	22
-
 /* The class of a handshake failure, as its log line names it. */
 static const char *fail_class(enum gwp_upstream_end end, int val)
 {
@@ -49,8 +43,9 @@ static const char *fail_class(enum gwp_upstream_end end, int val)
  */
 static uint32_t client_reply_room(const struct gwp_conn_pair *gcp)
 {
-	return gcp->prot_type == GWP_PROT_TYPE_NONE ? 0 :
-						      UPSTREAM_CLIENT_REPLY_MAX;
+	if (gcp->prot_type == GWP_PROT_TYPE_NONE)
+		return 0;
+	return GWP_UPSTREAM_CLIENT_REPLY_MAX;
 }
 
 const char *gwp_upstream_dst_str(struct gwp_conn_pair *gcp)

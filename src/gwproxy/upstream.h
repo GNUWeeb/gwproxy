@@ -22,6 +22,35 @@
 #include <string.h>
 #include <arpa/inet.h>
 
+/*
+ * target.buf holds the handshake with an upstream proxy. The longest request
+ * is an HTTP CONNECT: twice an authority of up to 261 bytes, Basic credentials
+ * of 684 and the fixed text take 1264 bytes.
+ */
+#define GWP_UPSTREAM_MIN_TARGET_BUF	1280
+
+/*
+ * The longest reply a client can be owed once the tunnel is up: SOCKS5 with an
+ * IPv6 bound address. An HTTP client's is 19 bytes. While the upstream's reply
+ * to a CONNECT is awaited, target.cap holds this much back for it.
+ */
+#define GWP_UPSTREAM_CLIENT_REPLY_MAX	22
+
+/*
+ * The longest reply a SOCKS5 upstream can send to a CONNECT: VER, REP, RSV,
+ * ATYP, a domain BND.ADDR of a length byte and up to 255 bytes, and BND.PORT.
+ */
+#define GWP_UPSTREAM_S5_REPLY_MAX	(4 + 1 + 255 + 2)
+
+/*
+ * The SOCKS5 reply parser does not check for a full buffer: with the smallest
+ * target buffer allowed, the room left while that reply is awaited must hold
+ * the longest one, or a worker could wait for bytes it has no room to read.
+ */
+_Static_assert(GWP_UPSTREAM_MIN_TARGET_BUF - GWP_UPSTREAM_CLIENT_REPLY_MAX >=
+	       GWP_UPSTREAM_S5_REPLY_MAX,
+	       "the smallest target buffer must hold the longest SOCKS5 reply");
+
 enum gwp_upstream_fail_class {
 	GWP_UPSTREAM_FAIL_NEUTRAL	= 0,	/* not counted */
 	GWP_UPSTREAM_FAIL_UPSTREAM	= 1,	/* the upstream's fault */

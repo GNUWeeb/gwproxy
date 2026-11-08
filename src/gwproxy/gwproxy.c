@@ -176,13 +176,6 @@ static const struct gwp_cfg default_opts = {
  */
 #define GWP_SOCKS5_MIN_CLIENT_BUF	513
 
-/*
- * target.buf holds the handshake with an upstream proxy. The longest request
- * is an HTTP CONNECT: twice an authority of up to 261 bytes, Basic credentials
- * of 684 and the fixed text take 1264 bytes.
- */
-#define GWP_UPSTREAM_MIN_TARGET_BUF	1280
-
 static int setskopt_int(int fd, int level, int optname, int val);
 static uint32_t cfg_dns_restyp(const struct gwp_cfg *cfg);
 
