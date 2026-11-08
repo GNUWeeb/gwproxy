@@ -1463,6 +1463,7 @@ static int pool_add_server(struct acl_load *ld, const char *url,
 		p->srv[p->nr_servers] = srv;
 		memset(&p->mem[p->nr_servers], 0, sizeof(*p->mem));
 		p->mem[p->nr_servers].weight = (uint16_t)opts->weight;
+		p->mem[p->nr_servers].max_conns = opts->max_conns;
 		if (ld->ops->member)
 			ld->ops->member(ld->ops->arg, srv,
 					&p->mem[p->nr_servers]);
@@ -1512,6 +1513,8 @@ struct srv_opt {
 static const struct srv_opt srv_opts[] = {
 	{ "weight=", SRV_OPT_COUNT, 1, GWP_UP_MAX_WEIGHT,
 	  offsetof(struct gwp_up_opts, weight) },
+	{ "max_conns=", SRV_OPT_COUNT, 0, GWP_UP_MAX_CONNS,
+	  offsetof(struct gwp_up_opts, max_conns) },
 	{ "max_fails=", SRV_OPT_COUNT, 0, GWP_UP_MAX_FAILS,
 	  offsetof(struct gwp_up_opts, max_fails) },
 	{ "fail_timeout=", SRV_OPT_TIME, 1, GWP_UP_MAX_TIME_MS,
@@ -1520,7 +1523,7 @@ static const struct srv_opt srv_opts[] = {
 	  offsetof(struct gwp_up_opts, eject_ms) },
 };
 
-#define SRV_OPTS_LIST	"weight=, max_fails=, fail_timeout= or eject_time="
+#define SRV_OPTS_LIST	"weight=, max_conns=, max_fails=, fail_timeout= or eject_time="
 
 /*
  * A number of at most 10 digits, nothing else, into *@out; false when @s is

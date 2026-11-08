@@ -499,6 +499,14 @@ static uint32_t drawn_by(const struct gwp_up_plan *pl, uint32_t nr, uint32_t r)
 	return plan_owner(pl, r);
 }
 
+/* Whether the @i-th server has as many pairs open as its pool allows. */
+static bool pick_full(const struct gwp_up_pick *pk, uint32_t i)
+{
+	const struct gwp_up_member *m = &pk->m[i];
+
+	return m->max_conns && gwp_up_state_open(m->st) >= m->max_conns;
+}
+
 /*
  * Whether @v open pairs on a server of weight @w are fewer for its weight
  * than @bv on one of weight @bw: exact, by cross-multiplying.
@@ -562,13 +570,14 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 	 * least_conn's ties start where they would have.
 	 */
 	s = pk->m[i].st;
-	if (i == skip || !s || pick_ejected(&c, i)) {
+	if (i == skip || !s || pick_full(pk, i) || pick_ejected(&c, i)) {
 		uint32_t p, j;
 
 		for (p = 0; pk->random && p < GWP_UP_PICK_PROBES; p++) {
 			j = drawn_by(pl, nr, pk->random(pk->arg));
 			s = pk->m[j].st;
-			if (j != skip && s && !pick_ejected(&c, j)) {
+			if (j != skip && s && !pick_full(pk, j) &&
+			    !pick_ejected(&c, j)) {
 				i = j;
 				break;
 			}
@@ -576,7 +585,7 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 	}
 	if (!pk->least_conn) {
 		s = pk->m[i].st;
-		if (i != skip && s && !pick_ejected(&c, i))
+		if (i != skip && s && !pick_full(pk, i) && !pick_ejected(&c, i))
 			return i;
 	}
 
@@ -585,14 +594,15 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 		if (i == skip || !s)
 			continue;
 		if (!pk->least_conn) {
-			if (!pick_ejected(&c, i))
+			if (!pick_full(pk, i) && !pick_ejected(&c, i))
 				return i;
 			continue;
 		}
 		/* Not fewer than the best so far: its health does not matter. */
 		v = gwp_up_state_open(s);
 		w = weighted ? member_weight(&pk->m[i]) : 1;
-		if ((best != UINT32_MAX && !fewer_open(v, w, best_val, best_w)) ||
+		if ((pk->m[i].max_conns && v >= pk->m[i].max_conns) ||
+		    (best != UINT32_MAX && !fewer_open(v, w, best_val, best_w)) ||
 		    pick_ejected(&c, i))
 			continue;
 		best = i;
@@ -604,12 +614,12 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 	if (best != UINT32_MAX || retry)
 		return best;
 
-	/* All ejected: the one back soonest, ties in turn. */
+	/* All ejected or full: the one back soonest, ties in turn. */
 	best_val = UINT32_MAX;
 	i = pk->rr % nr;
 	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
 		s = pk->m[i].st;
-		if (!s)
+		if (!s || pick_full(pk, i))
 			continue;
 		v = pick_ejected(&c, i);
 		/* Back meanwhile: in service again. */

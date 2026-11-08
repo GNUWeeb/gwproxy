@@ -3496,6 +3496,8 @@ static noinline void test_upstream_server_opts(void)
 		"	server socks5h://10.0.0.5:1080 fail_timeout=7 eject_time=24h max_fails=100;\n"
 		"	server socks5h://10.0.0.6:1080 weight=1000;\n"
 		"	server socks5h://10.0.0.7:1080 weight=1 max_fails=1;\n"
+		"	server socks5h://10.0.0.8:1080 max_conns=200 eject_time=10m;\n"
+		"	server socks5h://10.0.0.9:1080 max_conns=1000000;\n"
 		"}\n"
 		"-A OUTPUT -j UPSTREAM --to p\n"));
 	o = up_opts(a, NULL, 0);
@@ -3518,7 +3520,11 @@ static noinline void test_upstream_server_opts(void)
 	o = up_opts(a, NULL, 5);
 	assert(o->weight == 1000 && o->max_fails == 3);
 	o = up_opts(a, NULL, 6);
-	assert(o->weight == 1 && o->max_fails == 1);
+	assert(o->weight == 1 && o->max_fails == 1 && !o->max_conns);
+	o = up_opts(a, NULL, 7);
+	assert(o->max_conns == 200 && o->eject_ms == 600000);
+	o = up_opts(a, NULL, 8);
+	assert(o->max_conns == 1000000);
 	gwp_acl_destroy(a);
 
 	/* Wrong ones refuse the load, naming the server and the option. */
@@ -3533,6 +3539,8 @@ static noinline void test_upstream_server_opts(void)
 		   -EINVAL, "weight= wants a number from 1 to 1000");
 	up_refused("upstream p {\n server http://h:1 weight=2 weight=2;\n}\n",
 		   -EINVAL, "weight= given twice");
+	up_refused("upstream p {\n server http://h:1 max_conns=1000001;\n}\n",
+		   -EINVAL, "max_conns= wants a number from 0 to 1000000");
 	up_refused("upstream p {\n server http://h:1 max_fails;\n}\n",
 		   -EINVAL, "word 1 after the URL is not an option");
 	up_refused("upstream p {\n server http://h:1 max_fails=1 max_fails=2;\n}\n",

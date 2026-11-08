@@ -226,6 +226,7 @@ static void test_many(void)
 }
 
 #define NONE	UINT32_MAX
+#define NR_THREADS	8
 
 /*
  * A pool for the pick tests: @nr servers of distinct identities, whose open
@@ -1336,7 +1337,118 @@ static void test_weights_big(void)
 	tp_free(&p);
 }
 
-#define NR_THREADS	8
+/*
+ * max_conns: a server with as many pairs open as its cap is full, and
+ * passed over like an ejected one, by round-robin (probes included) and
+ * least_conn alike; with every server full, or full and ejected, none is
+ * taken, while ejected ones that are not full still stand in as before.
+ */
+static void test_max_conns(void)
+{
+	uint32_t vals[1];
+	struct tpool p;
+	uint32_t rr;
+
+	tp_init(&p, 4);
+	p.m[1].max_conns = 2;
+	tp_open(&p, 1, 1);
+	assert(tp_pick(&p, false, 1, NONE) == 1);
+	tp_open(&p, 1, 2);
+	assert(tp_pick(&p, false, 1, NONE) == 2);
+	assert(tp_pick(&p, false, 0, 0) == 2);
+	/* A probe that lands on it misses. */
+	vals[0] = tp_at(4, 1);
+	p.fake = vals;
+	p.nr_fake = 1;
+	assert(tp_pick(&p, false, 1, NONE) == 2);
+	assert(p.nr_random == GWP_UP_PICK_PROBES);
+	vals[0] = tp_at(4, 3);
+	assert(tp_pick(&p, false, 1, NONE) == 3);
+	p.fake = NULL;
+	/* least_conn: its 2 are the fewest, but it is full. */
+	tp_open(&p, 0, 5);
+	tp_open(&p, 2, 3);
+	tp_open(&p, 3, 4);
+	assert(tp_pick(&p, true, 1, NONE) == 2);
+	/* Over its cap (a cap lowered by a reload): still full. */
+	tp_open(&p, 1, 3);
+	assert(tp_pick(&p, true, 1, NONE) == 2);
+	assert(tp_pick(&p, false, 1, NONE) == 2);
+	tp_open(&p, 1, 1);
+	assert(tp_pick(&p, true, 1, NONE) == 1);
+
+	/* All full: none, for a first pick and a retry. */
+	for (rr = 0; rr < 4; rr++) {
+		p.m[rr].max_conns = 1;
+		tp_open(&p, rr, 1);
+	}
+	assert(tp_pick(&p, false, 0, NONE) == NONE);
+	assert(tp_pick(&p, true, 0, NONE) == NONE);
+	assert(tp_pick(&p, false, 0, 2) == NONE);
+	/* Full or ejected: the ejected one with room stands in. */
+	tp_open(&p, 2, 0);
+	tp_eject(&p, 2, 100);
+	assert(tp_pick(&p, false, 0, NONE) == 2);
+	assert(tp_pick(&p, true, 0, NONE) == 2);
+	/* Ejected and full: none again. */
+	tp_open(&p, 2, 1);
+	assert(tp_pick(&p, false, 0, NONE) == NONE);
+	/* A cap of 0 is none. */
+	p.m[3].max_conns = 0;
+	assert(tp_pick(&p, false, 0, NONE) == 3);
+	tp_free(&p);
+}
+
+#define NR_CAP		7u
+#define NR_CAP_ROUNDS	20000
+
+struct cap_race {
+	struct gwp_up_state	*s;
+	_Atomic(uint32_t)	over;
+};
+
+static void *cap_fn(void *arg)
+{
+	struct cap_race *r = arg;
+	int i;
+
+	for (i = 0; i < NR_CAP_ROUNDS; i++) {
+		if (!gwp_up_state_take_max(r->s, NR_CAP))
+			continue;
+		if (gwp_up_state_open(r->s) > NR_CAP)
+			atomic_fetch_add(&r->over, 1);
+		assert(gwp_up_state_give(r->s) != UINT32_MAX);
+	}
+	return NULL;
+}
+
+/* Taking a capped slot is exact, however many workers take at once. */
+static void test_take_max_threads(void)
+{
+	struct gwp_up_key k = key_of(GWP_UP_SCHEME_SOCKS5, "::1", 2, NULL);
+	struct gwp_up_table *t = gwp_up_table_create();
+	pthread_t th[NR_THREADS];
+	struct cap_race r;
+	int i;
+
+	assert(t);
+	r.s = gwp_up_state_get(t, &k);
+	assert(r.s);
+	atomic_init(&r.over, 0);
+	assert(gwp_up_state_take_max(r.s, 1));
+	assert(!gwp_up_state_take_max(r.s, 1));
+	assert(!gwp_up_state_take_max(r.s, 0));
+	assert(gwp_up_state_give(r.s) == 0);
+	for (i = 0; i < NR_THREADS; i++)
+		assert(!pthread_create(&th[i], NULL, cap_fn, &r));
+	for (i = 0; i < NR_THREADS; i++)
+		assert(!pthread_join(th[i], NULL));
+	assert(!atomic_load(&r.over));
+	assert(gwp_up_state_open(r.s) == 0);
+	gwp_up_state_put(r.s);
+	assert(gwp_up_table_destroy(t) == 0);
+}
+
 #define NR_ROUNDS	20000
 
 static void *thread_fn(void *arg)
@@ -1483,6 +1595,8 @@ int main(void)
 	test_weights_least_conn();
 	test_weights_spread();
 	test_weights_big();
+	test_max_conns();
+	test_take_max_threads();
 	test_eject_threads();
 	printf("All upstream_lb tests passed.\n");
 	return 0;

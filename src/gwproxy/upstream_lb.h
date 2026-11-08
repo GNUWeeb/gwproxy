@@ -99,10 +99,19 @@ void gwp_up_key_init(struct gwp_up_key *key, enum gwp_up_scheme scheme,
 /* The heaviest weight a pool may give a server (weight=). */
 #define GWP_UP_MAX_WEIGHT	1000u
 
+/* The highest cap a pool may put on a server's open pairs (max_conns=). */
+#define GWP_UP_MAX_CONNS	1000000u
+
 /* What a pool sets for one of its servers. */
 struct gwp_up_opts {
 	/* Its share of the pool's connections, 1 to GWP_UP_MAX_WEIGHT. */
 	uint32_t	weight;
+	/*
+	 * The most pairs it may have open (of its identity, through any
+	 * pool) for this pool to give it another, up to GWP_UP_MAX_CONNS;
+	 * 0 for no cap.
+	 */
+	uint32_t	max_conns;
 	/*
 	 * The failures within @fail_timeout_ms that eject the server, for
 	 * @eject_ms; 0 (at most GWP_UP_MAX_FAILS) never ejects it. Both
@@ -117,6 +126,7 @@ struct gwp_up_opts {
 static inline void gwp_up_opts_default(struct gwp_up_opts *o)
 {
 	o->weight = 1;
+	o->max_conns = 0;
 	o->max_fails = GWP_UP_EJECT_FAILS;
 	o->fail_timeout_ms = GWP_UP_EJECT_WINDOW_MS;
 	o->eject_ms = GWP_UP_EJECT_MS;
@@ -221,6 +231,24 @@ static inline uint32_t gwp_up_state_take(struct gwp_up_state *s)
 }
 
 /*
+ * A pair takes a slot of @s if fewer than @max are taken: returns whether it
+ * did. Exact under any concurrency, so @max is never passed.
+ */
+static inline bool gwp_up_state_take_max(struct gwp_up_state *s, uint32_t max)
+{
+	uint32_t old = atomic_load_explicit(&s->nr_open, memory_order_relaxed);
+
+	do {
+		if (old >= max)
+			return false;
+	} while (!atomic_compare_exchange_weak_explicit(&s->nr_open, &old,
+							old + 1,
+							memory_order_relaxed,
+							memory_order_relaxed));
+	return true;
+}
+
+/*
  * A pair gives its slot of @s back: returns the count without it, or
  * UINT32_MAX, leaving the count at 0, when there was no slot to give back
  * (a bug in the caller's accounting, for it to report).
@@ -313,6 +341,11 @@ uint32_t gwp_up_health_ejected(struct gwp_up_health *h, uint32_t now,
 struct gwp_up_member {
 	struct gwp_up_state	*st;
 	struct gwp_up_health	*h;
+	/*
+	 * The pool's cap on its open pairs (struct gwp_up_opts), 0 for
+	 * none: at the cap it is full, and not taken.
+	 */
+	uint32_t		max_conns;
 	/* The pool's weight for it, 1 to GWP_UP_MAX_WEIGHT; 0 is taken as 1. */
 	uint16_t		weight;
 };
@@ -425,7 +458,12 @@ static inline uint32_t gwp_up_rand(uint32_t *state)
 /*
  * Which of @pk's servers (from 0) the next connection goes to, read in place
  * with no copy and no allocation; only servers in service are taken: those
- * their pool's settings do not have ejected (gwp_up_health_ejected()).
+ * their pool's settings do not have ejected (gwp_up_health_ejected()), and
+ * that are not full (as many pairs open as their max_conns). Full servers
+ * are passed over as ejected ones are, probes included. The caller takes
+ * a slot of a capped server with gwp_up_state_take_max(), and picks again
+ * if that finds it full after all: picks on other threads may have filled
+ * it meanwhile.
  *
  * Round-robin takes the server whose turn the cursor @rr is when it is in
  * service: server @rr % @nr when the weights are equal, else the plan's
@@ -454,11 +492,12 @@ static inline uint32_t gwp_up_rand(uint32_t *state)
  * then the next in service in pool order (least-connections: the fewest
  * open, ties from there), never @skip itself.
  *
- * When no server may be taken: for a first pick, every server is ejected,
- * and the one whose ejection ends soonest is taken (ties from @rr % @nr
- * on), so a pool is never left without a server; for a retry, which goes
- * only to another server in service, UINT32_MAX. Also UINT32_MAX when @nr
- * is 0 or every state is NULL.
+ * When no server may be taken: for a first pick, the one whose ejection
+ * ends soonest among the ejected servers that are not full is taken (ties
+ * from @rr % @nr on), so a pool is never left without a server for its
+ * ejections alone; UINT32_MAX when they are all full. For a retry, which
+ * goes only to another server in service, UINT32_MAX. Also UINT32_MAX when
+ * @nr is 0 or every state is NULL.
  */
 uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk);
 

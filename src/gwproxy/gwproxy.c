@@ -3010,6 +3010,44 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 	return gwp_up_lb_pick(&pk);
 }
 
+/* How many times a pick may find its server filled by others meanwhile. */
+#define POOL_TAKE_TRIES	4
+
+static void conn_switch_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				 struct gwp_upstream *up, bool taken);
+
+/*
+ * Pick a server of @pool for @gcp (pool_pick_server(), @skip as there) and
+ * give it to @gcp, slot and all. A server with a cap on its open pairs
+ * (max_conns=) gets its slot only if the cap still allows it, as other
+ * workers may have filled it since the pick looked: then the pick is made
+ * again, a few times. Returns the server's place in @pool, or UINT32_MAX,
+ * with @gcp's upstream unchanged, when there was none to take.
+ */
+static uint32_t pool_take_server(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				 struct gwp_acl_pool *pool, uint32_t skip)
+{
+	const struct gwp_up_member *m = gwp_acl_pool_members(pool);
+	struct gwp_upstream *up;
+	uint32_t i, tries;
+
+	for (tries = 0; tries < POOL_TAKE_TRIES; tries++) {
+		i = pool_pick_server(ctx, pool, skip);
+		up = gwp_acl_pool_server(pool, i);
+		if (!up)
+			return UINT32_MAX;
+		if (!m[i].max_conns) {
+			conn_switch_upstream(ctx, gcp, up, false);
+			return i;
+		}
+		if (gwp_up_state_take_max(up->state, m[i].max_conns)) {
+			conn_switch_upstream(ctx, gcp, up, true);
+			return i;
+		}
+	}
+	return UINT32_MAX;
+}
+
 /* Every place in a pool fits gwp_conn_pair::up_srv. */
 _Static_assert(GWP_ACL_POOL_MAX_SERVERS - 1 <= UINT16_MAX,
 	       "gwp_conn_pair::up_srv cannot hold a pool server's place");
@@ -3022,8 +3060,10 @@ _Static_assert(GWP_ACL_POOL_MAX_SERVERS - 1 <= UINT16_MAX,
  * none). With neither @domain nor @lit there is no target at all (a UDP
  * ASSOCIATE), and a rule that tests one is not taken. Later calls change
  * nothing. Returns 0, or -EACCES when the choice cannot be told and might
- * be a pool (see gwp_acl_eval_upstream()), -EINVAL when the pool picked has
- * no server to use: the pair must then not go anywhere.
+ * be a pool (see gwp_acl_eval_upstream()), -EHOSTUNREACH when every server
+ * of the pool picked is full (max_conns=, see pool_take_server()) or out
+ * of it, -EINVAL when it has no server object: the pair must then not go
+ * anywhere.
  */
 static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			      const char *domain,
@@ -3052,16 +3092,21 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		 * The pool holds its servers, so the one picked is there; the
 		 * pair takes its own reference, and the pool's goes with @req.
 		 */
-		i = pool_pick_server(ctx, req.upstream_pool, UINT32_MAX);
-		up = gwp_acl_pool_server(req.upstream_pool, i);
-		if (unlikely(!up)) {
+		if (unlikely(!gwp_acl_pool_members(req.upstream_pool))) {
 			/* Never past the pool: refuse, not the default. */
 			pr_err(&ctx->lh, "BUG: upstream pool %s has no server object (idx=%u)",
 			       gwp_acl_pool_name(req.upstream_pool), gcp->idx);
 			r = -EINVAL;
 			break;
 		}
-		gwp_conn_set_upstream(ctx, gcp, up);
+		i = pool_take_server(ctx, gcp, req.upstream_pool, UINT32_MAX);
+		if (i == UINT32_MAX) {
+			pr_info(&ctx->lh, "Upstream pool %s has no server with room for idx=%u: all are full or out",
+				gwp_acl_pool_name(req.upstream_pool), gcp->idx);
+			r = -EHOSTUNREACH;
+			break;
+		}
+		up = gcp->upstream;
 		/* Kept for the logs and the retry, until the tunnel is up. */
 		gcp->up_pool = gwp_acl_req_take_pool(&req);
 		gcp->up_srv = (uint16_t)i;
@@ -4132,12 +4177,23 @@ static void acl_srv_member(void __unused *arg, void *srv,
 void gwp_conn_set_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			   struct gwp_upstream *up)
 {
+	conn_switch_upstream(ctx, gcp, up, false);
+}
+
+/*
+ * gwp_conn_set_upstream(), but with the slot of @up already @taken (by
+ * gwp_up_state_take_max()) when it says so.
+ */
+static void conn_switch_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				 struct gwp_upstream *up, bool taken)
+{
 	struct gwp_upstream *old = gcp->upstream;
 	uint32_t n;
 
 	if (up) {
 		gwp_upstream_get(up);
-		gwp_up_state_take(up->state);
+		if (!taken)
+			gwp_up_state_take(up->state);
 	}
 	gcp->upstream = up;
 	if (!up)
@@ -4213,17 +4269,15 @@ static bool upstream_retry(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	uint32_t i;
 
 	gcp->flags |= GWP_CONN_FLAG_UP_RETRIED;
-	i = pool_pick_server(w->ctx, gcp->up_pool, gcp->up_srv);
-	up = gwp_acl_pool_server(gcp->up_pool, i);
-	if (!up) {
+	up_desc(gcp->up_pool, gcp->up_srv, old, d_old, sizeof(d_old));
+	/* Described first: the switch drops the pair's reference to @old. */
+	i = pool_take_server(w->ctx, gcp, gcp->up_pool, gcp->up_srv);
+	if (i == UINT32_MAX) {
 		pr_dbg(&w->ctx->lh, "Upstream %s failed (idx=%u); no other server in service to retry on",
-		       up_desc(gcp->up_pool, gcp->up_srv, old, d_old,
-			       sizeof(d_old)), gcp->idx);
+		       d_old, gcp->idx);
 		return false;
 	}
-
-	up_desc(gcp->up_pool, gcp->up_srv, old, d_old, sizeof(d_old));
-	gwp_conn_set_upstream(w->ctx, gcp, up);
+	up = gcp->upstream;
 	gcp->up_srv = (uint16_t)i;
 	/* A new attempt: its failure is its own. */
 	gcp->flags &= ~GWP_CONN_FLAG_UP_FAILED;
@@ -5539,14 +5593,21 @@ static int upstream_target_init(struct gwp_ctx *ctx)
 }
 
 /*
- * A SOCKS5 or HTTP request whose upstream could not be picked: refuse it as
- * the ACL refuses a target (SOCKS5 0x02, HTTP 403). Returns -EBADMSG once
- * the reply is queued, so it goes out before the teardown.
+ * A SOCKS5 or HTTP request whose upstream could not be picked, for the
+ * reason @err (conn_pick_upstream()): refuse it as the ACL refuses a target
+ * (SOCKS5 0x02, HTTP 403), or, when its pool had no server with room
+ * (-EHOSTUNREACH), as an unreachable host (SOCKS5 0x04, HTTP 502). Returns
+ * -EBADMSG once the reply is queued, so it goes out before the teardown.
  */
-static int pick_refused(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int pick_refused(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 {
-	int r = gwp_acl_reject_reply(w, gcp);
+	int r;
 
+	if (err == -EHOSTUNREACH) {
+		r = gwp_conn_fail_reply(w, gcp, -EHOSTUNREACH);
+		return r ? r : -EBADMSG;
+	}
+	r = gwp_acl_reject_reply(w, gcp);
 	return r == -EACCES ? -EBADMSG : r;
 }
 
@@ -5590,7 +5651,7 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	/* The name decides the upstream, and the upstream how it resolves. */
 	r = conn_pick_upstream(ctx, gcp, host, is_ip ? &sa : NULL, port);
 	if (unlikely(r))
-		return pick_refused(w, gcp);
+		return pick_refused(w, gcp, r);
 
 	/*
 	 * socks5h://: don't resolve locally; hand the hostname to the upstream
@@ -5676,6 +5737,7 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_sockaddr *ta = &gcp->target_addr;
 	struct gwp_socks5_conn *sc = gcp->s5_conn;
 	struct gwp_socks5_addr *dst;
+	int r;
 
 	assert(sc);
 
@@ -5687,16 +5749,18 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ta->i4.sin_port = dst->port;
 		ta->i4.sin_family = AF_INET;
 		gwp_conn_set_single_candidate(gcp, ta);
-		if (conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port)))
-			return pick_refused(w, gcp);
+		r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
+		if (r)
+			return pick_refused(w, gcp, r);
 		return 0;
 	case GWP_SOCKS5_ATYP_IPV6:
 		memcpy(&ta->i6.sin6_addr, &dst->ip6, 16);
 		ta->i6.sin6_port = dst->port;
 		ta->i6.sin6_family = AF_INET6;
 		gwp_conn_set_single_candidate(gcp, ta);
-		if (conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port)))
-			return pick_refused(w, gcp);
+		r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
+		if (r)
+			return pick_refused(w, gcp, r);
 		return 0;
 	case GWP_SOCKS5_ATYP_DOMAIN:
 		return socks5_prepare_target_addr_domain(w, gcp);
