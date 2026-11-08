@@ -1810,12 +1810,62 @@ static int flush_early_data(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return do_splice(w, gcp, &gcp->client, &gcp->target, held, true);
 }
 
+static int handle_udp_associate(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+static bool client_reply_pending(struct gwp_conn_pair *gcp);
+static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				 struct epoll_event *ev);
+
+/*
+ * The upstream granted a UDP ASSOCIATE (GWP_CONN_FLAG_UDP_UP), and the
+ * client's reply is in target.buf. Send it, and bring the relay up. The two
+ * control connections are watched only for their end from now on: either
+ * one closing ends the association. Anything the client sent on its own
+ * meanwhile is dropped, as it would be once the association is up.
+ */
+static int udp_up_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct epoll_event ev;
+	ssize_t sr;
+	int r;
+
+	gcp->up_tx = false;
+	gcp->is_target_alive = true;
+	gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
+	gwp_conn_upstream_up(gcp);
+	gcp->client.len = 0;
+	if (gcp->client.rd_eof)
+		return -ECONNRESET;
+
+	r = upstream_arm(w, gcp, EPOLLIN | EPOLLRDHUP);
+	if (unlikely(r))
+		return r;
+
+	sr = __do_send(&gcp->target, &gcp->client);
+	if (unlikely(sr < 0))
+		return (int)sr;
+
+	/* Its handshake left the client under either tag, see client_prot_in(). */
+	gcp->client.ep_mask = EPOLLIN | EPOLLRDHUP;
+	if (client_reply_pending(gcp))
+		gcp->client.ep_mask |= EPOLLOUT;
+	ev.events = gcp->client.ep_mask;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
+	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
+	if (unlikely(r))
+		return r;
+
+	return handle_udp_associate(w, gcp);
+}
+
 /* The upstream tunnel is up (reply already spliced); start forwarding. */
 static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	ssize_t sr;
 	int r;
+
+	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
+		return udp_up_finish(w, gcp);
 
 	r = arm_idle_timer(w, gcp);
 	if (unlikely(r))
@@ -2538,6 +2588,27 @@ static int handle_ev_target_conn_err(struct gwp_wrk *w,
 	return -err;
 }
 
+/*
+ * An event on the control connection to the upstream of a UDP association. The
+ * upstream has nothing more to say on it: drop what it sends, and end the
+ * association when it closes.
+ */
+static int udp_up_ctl_event(struct gwp_conn_pair *gcp, struct epoll_event *ev)
+{
+	char buf[512];
+	ssize_t n;
+
+	if (ev->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+		return -ECONNRESET;
+
+	n = __sys_recv(gcp->target.fd, buf, sizeof(buf), MSG_NOSIGNAL);
+	if (n == 0)
+		return -ECONNRESET;
+	if (n < 0 && n != -EAGAIN && n != -EINTR)
+		return (int)n;
+	return 0;
+}
+
 static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    struct epoll_event *ev)
 {
@@ -2552,6 +2623,9 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 */
 	if (unlikely(gcp->target.fd < 0))
 		return 0;
+
+	if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE)
+		return udp_up_ctl_event(gcp, ev);
 
 	/*
 	 * Held before the upstream handshake, the target is watched only for
@@ -2695,6 +2769,18 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (unlikely(ev->events & EPOLLERR)) {
 		pr_err(&w->ctx->lh, "EPOLLERR on client connection event");
 		return -ECONNRESET;
+	}
+
+	/*
+	 * A UDP association through the upstream ends with the client's
+	 * control connection, also before it is up. Once it is, the client
+	 * may still be registered under this tag (see udp_up_finish()).
+	 */
+	if (unlikely(gcp->flags & GWP_CONN_FLAG_UDP_UP)) {
+		if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE)
+			return handle_ev_client_prot(w, gcp, ev);
+		if (ev->events & (EPOLLRDHUP | EPOLLHUP))
+			return -ECONNRESET;
 	}
 
 	if (gwp_in_upstream_hs(gcp))

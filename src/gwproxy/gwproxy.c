@@ -1311,6 +1311,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		gwp_conn_pair_drop_dns(w, gcp);
 		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
 		free(gcp->udp_peers);
+		free(gcp->udp_up);
 		gwp_conn_set_upstream(w->ctx, gcp, NULL);
 
 		/*
@@ -3094,6 +3095,14 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 	enum gwp_acl_verdict v;
 
 	/*
+	 * The control connection of a UDP association through the upstream
+	 * has no target: the OUTPUT chain judges each datagram's instead
+	 * (gwp_udp_relay_classify()).
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
+		return true;
+
+	/*
 	 * Plain and transparent forwarding pick their upstream on the first
 	 * evaluation, the one for the target as configured or redirected:
 	 * a --target name as written, else the address.
@@ -4187,6 +4196,7 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	enum gwp_upstream_fail_class cls;
 	enum gwp_upstream_end end;
 	struct gwp_upstream *up = gcp->upstream;
+	bool udp_refused;
 	unsigned int val;
 	char why[64];
 
@@ -4210,6 +4220,15 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	    (gcp->flags & GWP_CONN_FLAG_UP_RETRIED))
 		val = 1;
 	cls = gwp_upstream_fail_classify(end, (int)val);
+	/*
+	 * A server that turns a UDP ASSOCIATE down may well serve TCP: its
+	 * refusal does not count against its health, but another server of
+	 * the pool may take the association, so it is retried.
+	 */
+	udp_refused = (gcp->flags & GWP_CONN_FLAG_UDP_UP) &&
+		      end == GWP_UPSTREAM_END_S5_REP;
+	if (udp_refused)
+		cls = GWP_UPSTREAM_FAIL_NEUTRAL;
 
 	switch (end) {
 	case GWP_UPSTREAM_END_CONNECT:
@@ -4248,11 +4267,24 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				GWP_UP_EJECT_WINDOW_MS / 1000);
 	}
 
-	if (cls != GWP_UPSTREAM_FAIL_UPSTREAM || !may_retry || !gcp->up_pool ||
+	if ((cls != GWP_UPSTREAM_FAIL_UPSTREAM && !udp_refused) || !may_retry ||
+	    !gcp->up_pool ||
 	    (gcp->flags & (GWP_CONN_FLAG_UP_RETRIED | GWP_CONN_FLAG_IS_DYING |
 			   GWP_CONN_FLAG_IS_CANCEL)))
 		return false;
-	return upstream_retry(w, gcp);
+	if (!upstream_retry(w, gcp))
+		return false;
+	/*
+	 * A pool may mix socks5h:// servers with http:// and https:// ones,
+	 * which cannot carry UDP: the retry is spent, and the failure stands.
+	 */
+	if ((gcp->flags & GWP_CONN_FLAG_UDP_UP) &&
+	    gcp->upstream->type != GWP_UPSTREAM_SOCKS5) {
+		pr_dbg(&w->ctx->lh, "Upstream retry for idx=%u landed on a server that cannot carry UDP; giving up",
+		       gcp->idx);
+		return false;
+	}
+	return true;
 }
 
 void gwp_conn_upstream_up(struct gwp_conn_pair *gcp)
@@ -4632,6 +4664,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		__sys_close(gcp->udp_fd);
 	gwp_conn_close_attempts(gcp);
 	free(gcp->udp_peers);
+	free(gcp->udp_up);
 	gwp_conn_set_upstream(w->ctx, gcp, NULL);
 
 	gwp_conn_pair_drop_dns(w, gcp);
@@ -6067,6 +6100,110 @@ bool gwp_sockaddr_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr *b)
 	return false;
 }
 
+/*
+ * OUTPUT verdict for a datagram of a UDP association through the upstream to
+ * the target named @d, which the upstream resolves (socks5h://). Cached as
+ * udp_target_allowed() caches an address's.
+ */
+static bool udp_up_domain_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				  const struct gwp_socks5_addr *d)
+{
+	struct gwp_udp_up *u = gcp->udp_up;
+	struct gwp_acl_req req;
+	bool ok;
+
+	if (!ctx->acl)
+		return true;
+	if (u->valid && u->gen == gwp_acl_generation(ctx->acl) &&
+	    u->dport == d->port && !strcmp(u->dom, d->domain.str))
+		return u->ok;
+
+	acl_out_req(&req, &gcp->udp_peer, NULL, d->domain.str,
+		    gcp_req_user(gcp), GWP_ACL_PROTO_UDP);
+	req.dport = ntohs(d->port);
+	ok = gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
+	gwp_acl_req_release(&req);
+
+	u->valid = req.cacheable;
+	u->gen = req.gen;
+	u->dport = d->port;
+	memcpy(u->dom, d->domain.str, (size_t)d->domain.len + 1);
+	u->ok = ok;
+	return ok;
+}
+
+/*
+ * gwp_udp_relay_classify() for a UDP association through the upstream. The
+ * datagrams go to the upstream's relay as the client sent them, header and
+ * all, and the relay's come back to the client as they are: the upstream
+ * reaches the targets and wraps their replies. The client is pinned, and its
+ * datagrams judged by the OUTPUT chain, as for a direct relay; a domain
+ * target goes only to an upstream that resolves names (socks5h://), as
+ * gwproxy has no per-datagram lookup to resolve it for a socks5:// one. Only
+ * the upstream's relay may answer; whatever else sends to the socket, and
+ * anything sent before the client is known, is dropped.
+ */
+static enum gwp_udp_act udp_up_classify(struct gwp_wrk *w,
+					struct gwp_conn_pair *gcp,
+					unsigned char *base, size_t n,
+					const struct gwp_sockaddr *src,
+					struct gwp_udp_out *out)
+{
+	struct gwp_udp_up *u = gcp->udp_up;
+	struct gwp_socks5_addr dst;
+	struct gwp_sockaddr tsa;
+	socklen_t tslen;
+	size_t hdr_len;
+
+	if (gcp->udp_pinned) {
+		if (!gwp_sockaddr_eq(src, &gcp->udp_peer))
+			goto from_relay;
+	} else if (gwp_sockaddr_eq(src, &u->relay) ||
+		   !gwp_sockaddr_ip_eq(src, &gcp->client_addr)) {
+		return GWP_UDP_DROP;
+	}
+
+	if (gwp_socks5_udp_parse_hdr(base, n, &dst, &hdr_len))
+		return GWP_UDP_DROP;
+	if (dst.ver == GWP_SOCKS5_ATYP_DOMAIN) {
+		/* An empty name, or one a NUL would cut short for the ACL. */
+		if (!gcp->upstream->remote_dns || !dst.domain.len ||
+		    strlen(dst.domain.str) != dst.domain.len)
+			return GWP_UDP_DROP;
+	} else {
+		if (gwp_socks5_addr_to_sockaddr(&dst, src->sa.sa_family, &tsa,
+						&tslen))
+			return GWP_UDP_DROP;
+		if (!gwp_ctx_outgoing_family_ok(w->ctx, &tsa))
+			return GWP_UDP_DROP;
+	}
+	if (!gcp->udp_pinned) {
+		gcp->udp_peer = *src;
+		gcp->udp_pinned = true;
+	}
+	if (dst.ver == GWP_SOCKS5_ATYP_DOMAIN ?
+	    !udp_up_domain_allowed(w->ctx, gcp, &dst) :
+	    !udp_target_allowed(w->ctx, gcp, &tsa))
+		return GWP_UDP_DROP;
+
+	out->buf = base;
+	out->len = n;
+	out->dst = u->relay;
+	out->dstlen = u->relay_len;
+	return GWP_UDP_TO_TARGET;
+
+from_relay:
+	if (!gwp_sockaddr_eq(src, &u->relay) ||
+	    gwp_socks5_udp_parse_hdr(base, n, &dst, &hdr_len))
+		return GWP_UDP_DROP;
+	out->buf = base;
+	out->len = n;
+	out->dst = gcp->udp_peer;
+	out->dstlen = gcp->udp_peer.sa.sa_family == AF_INET ?
+		      sizeof(gcp->udp_peer.i4) : sizeof(gcp->udp_peer.i6);
+	return GWP_UDP_TO_CLIENT;
+}
+
 enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 					struct gwp_conn_pair *gcp,
 					unsigned char *base, size_t n,
@@ -6074,6 +6211,9 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 					struct gwp_udp_out *out)
 {
 	bool client_dgram;
+
+	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
+		return udp_up_classify(w, gcp, base, n, src, out);
 
 	if (gcp->udp_pinned) {
 		client_dgram = gwp_sockaddr_eq(src, &gcp->udp_peer);
@@ -6244,30 +6384,88 @@ static void udp_pin_declared(struct gwp_conn_pair *gcp, int family)
 	gcp->udp_pinned = true;
 }
 
+/*
+ * What the client is told its relay is: BND.ADDR from the control
+ * connection, the address the client reached the proxy at, and BND.PORT
+ * from the relay socket. An IPv4 client of a dual-stack listener is told an
+ * IPv4 address, not the v4-mapped form of it that getsockname() reports.
+ * @relay is the relay socket's address, or NULL to read it.
+ */
+static int udp_client_bnd(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+			  const struct gwp_sockaddr *relay,
+			  struct gwp_socks5_addr *bnd)
+{
+	struct gwp_sockaddr local, ra;
+	socklen_t slen = sizeof(local);
+	int r;
+
+	r = __sys_getsockname(gcp->client.fd, &local.sa, &slen);
+	if (r < 0) {
+		pr_err(&ctx->lh, "UDP associate: getsockname(client) failed: %s",
+			strerror(-r));
+		return r;
+	}
+	if (!relay) {
+		slen = sizeof(ra);
+		r = __sys_getsockname(gcp->udp_fd, &ra.sa, &slen);
+		if (r < 0) {
+			pr_err(&ctx->lh, "UDP associate: getsockname(relay) failed: %s",
+				strerror(-r));
+			return r;
+		}
+		relay = &ra;
+	}
+
+	gwp_socks5_reply_addr_from_sockaddr(&local, bnd);
+	bnd->port = relay->sa.sa_family == AF_INET ? relay->i4.sin_port :
+						     relay->i6.sin6_port;
+	return 0;
+}
+
+/*
+ * Whether @gcp's upstream, picked for its UDP ASSOCIATE, can carry it: a
+ * socks5:// or socks5h:// server of an ACL pool. An http:// or https:// one
+ * cannot carry UDP at all, and --upstream-proxy's is not used for UDP.
+ */
+static bool udp_up_usable(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream *up = gcp->upstream;
+
+	if (!gcp->up_pool || up->type != GWP_UPSTREAM_SOCKS5) {
+		pr_info(&ctx->lh, "UDP ASSOCIATE refused: its upstream %s cannot carry UDP (idx=%u)",
+			ip_to_str(&up->addr), gcp->idx);
+		return false;
+	}
+	/* Not on io_uring yet. */
+	if (ev_is_io_uring(&ctx->cfg))
+		return false;
+	return true;
+}
+
 int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_socks5_addr bnd;
-	struct gwp_sockaddr local, relay;
-	socklen_t slen = sizeof(local);
+	struct gwp_sockaddr relay;
+	socklen_t slen;
 	socklen_t relay_len;
 	int fd = -1, r, rep = GWP_SOCKS5_REP_SUCCESS;
 	size_t out_len;
 
 	/*
-	 * UDP ASSOCIATE is not chained through an upstream proxy: an HTTP
-	 * upstream cannot carry UDP at all, and SOCKS5 upstream UDP is not
-	 * implemented. Binding a local relay here would silently bypass the
-	 * configured chain, so refuse the command instead. The chain is the
-	 * user's own when an ACL -j UPSTREAM rule picks one, from what is
-	 * known now (the user and the client, no target): a pool is refused
-	 * like --upstream-proxy, and so is a pool rule that only its target
-	 * tests could tell, DIRECT gets the relay even past it, and no choice
-	 * leaves the default to decide.
+	 * The chain is the user's own when an ACL -j UPSTREAM rule picks one,
+	 * from what is known now (the user and the client, no target). A
+	 * socks5:// or socks5h:// server of a pool carries the association:
+	 * the relay below then talks to the server's relay rather than to the
+	 * targets. Any other upstream is refused, as binding a local relay
+	 * would silently bypass it: an HTTP upstream cannot carry UDP at all,
+	 * and --upstream-proxy is not used for UDP. So is a pool rule that
+	 * only its target tests could tell; DIRECT gets a direct relay even
+	 * past --upstream-proxy, and no choice leaves the default to decide.
 	 */
 	r = conn_pick_upstream(ctx, gcp, NULL, NULL, 0);
-	if (r || gcp->upstream) {
+	if (r || (gcp->upstream && !udp_up_usable(ctx, gcp))) {
 		rep = GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED;
 		goto reply;
 	}
@@ -6297,14 +6495,6 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * A kernel without IPv6 (ipv6.disable=1) has no such socket, and no
 	 * IPv6 targets either: use an IPv4 wildcard socket there.
 	 */
-	r = __sys_getsockname(gcp->client.fd, &local.sa, &slen);
-	if (r < 0) {
-		pr_err(&ctx->lh, "UDP associate: getsockname(client) failed: %s",
-			strerror(-r));
-		rep = GWP_SOCKS5_REP_FAILURE;
-		goto reply;
-	}
-
 	memset(&relay, 0, sizeof(relay));
 	fd = __sys_socket(AF_INET6, type, 0);
 	if (fd == -EAFNOSUPPORT) {
@@ -6345,17 +6535,39 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		rep = GWP_SOCKS5_REP_FAILURE;
 		goto reply;
 	}
-	/*
-	 * BND.ADDR from the control connection, BND.PORT from the relay socket.
-	 * An IPv4 client of a dual-stack listener is told an IPv4 address, not
-	 * the v4-mapped form of it that getsockname() reports.
-	 */
-	gwp_socks5_reply_addr_from_sockaddr(&local, &bnd);
-	bnd.port = relay.sa.sa_family == AF_INET ? relay.i4.sin_port :
-						   relay.i6.sin6_port;
+
+	r = udp_client_bnd(ctx, gcp, &relay, &bnd);
+	if (r < 0) {
+		__sys_close(fd);
+		fd = -1;
+		rep = GWP_SOCKS5_REP_FAILURE;
+		goto reply;
+	}
 
 	udp_pin_declared(gcp, relay.sa.sa_family);
 	gcp->udp_fd = fd;
+
+	if (gcp->upstream) {
+		/*
+		 * The client is answered once the upstream has answered the
+		 * UDP ASSOCIATE that the connect to it starts: the pair goes
+		 * the way of a CONNECT through it from here.
+		 */
+		gcp->udp_up = calloc(1, sizeof(*gcp->udp_up));
+		if (unlikely(!gcp->udp_up)) {
+			rep = GWP_SOCKS5_REP_FAILURE;
+			goto reply;
+		}
+		gcp->flags |= GWP_CONN_FLAG_UDP_UP;
+		gcp->conn_state = CONN_STATE_SOCKS5_CONNECT;
+		pr_info(&ctx->lh,
+			"SOCKS5 UDP ASSOCIATE through upstream %s (idx=%u, cfd=%d, ufd=%d)",
+			ip_to_str(&gcp->upstream->addr), gcp->idx,
+			gcp->client.fd, fd);
+		return 0;
+	}
+
+	gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
 	pr_info(&ctx->lh,
 		"SOCKS5 UDP ASSOCIATE relay bound (idx=%u, cfd=%d, ufd=%d)",
 		gcp->idx, gcp->client.fd, fd);
@@ -6370,6 +6582,97 @@ reply:
 	gcp->target.len += (uint32_t)out_len;
 
 	return (rep == GWP_SOCKS5_REP_SUCCESS) ? 0 : -ECONNREFUSED;
+}
+
+int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_sockaddr local, relay;
+	socklen_t slen = sizeof(local);
+	int r;
+
+	r = __sys_getsockname(gcp->target.fd, &local.sa, &slen);
+	if (r >= 0) {
+		slen = sizeof(relay);
+		r = __sys_getsockname(gcp->udp_fd, &relay.sa, &slen);
+	}
+	if (r < 0) {
+		pr_err(&w->ctx->lh, "UDP associate: getsockname failed: %s (idx=%u)",
+		       strerror(-r), gcp->idx);
+		return r;
+	}
+
+	/* An IPv4 control connection names its address as IPv4. */
+	gwp_socks5_reply_addr_from_sockaddr(&local, &gcp->up_dst);
+	gcp->up_dst.port = relay.sa.sa_family == AF_INET ? relay.i4.sin_port :
+							   relay.i6.sin6_port;
+	return 0;
+}
+
+int gwp_upstream_udp_ready(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   const struct gwp_socks5_addr *bnd)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_udp_up *u = gcp->udp_up;
+	struct gwp_socks5_addr a = *bnd, up, cb;
+	struct gwp_sockaddr relay;
+	socklen_t slen = sizeof(relay);
+	size_t out_len;
+	int r;
+
+	r = __sys_getsockname(gcp->udp_fd, &relay.sa, &slen);
+	if (r < 0) {
+		pr_err(&ctx->lh, "UDP associate: getsockname(relay) failed: %s",
+			strerror(-r));
+		return r;
+	}
+
+	/*
+	 * An unspecified BND.ADDR is the server's own address, the one the
+	 * control connection went to (a server bound to the wildcard knows
+	 * no better), with the port it gave.
+	 */
+	if (a.ver == GWP_SOCKS5_ATYP_IPV4 && !memcmp(a.ip4, "\0\0\0\0", 4)) {
+		gwp_socks5_reply_addr_from_sockaddr(&gcp->upstream->addr, &up);
+		memcpy(a.ip6, up.ip6, sizeof(a.ip6));
+		a.ver = up.ver;
+	} else if (a.ver == GWP_SOCKS5_ATYP_IPV6 &&
+		   IN6_IS_ADDR_UNSPECIFIED((const struct in6_addr *)a.ip6)) {
+		gwp_socks5_reply_addr_from_sockaddr(&gcp->upstream->addr, &up);
+		memcpy(a.ip6, up.ip6, sizeof(a.ip6));
+		a.ver = up.ver;
+	}
+
+	if (a.ver == GWP_SOCKS5_ATYP_DOMAIN || !a.port ||
+	    gwp_socks5_addr_to_sockaddr(&a, relay.sa.sa_family, &u->relay,
+					&u->relay_len)) {
+		pr_err(&ctx->lh, "Upstream %s granted the UDP ASSOCIATE with a relay address it cannot be reached at (idx=%u)",
+		       ip_to_str(&gcp->upstream->addr), gcp->idx);
+		return -EPROTO;
+	}
+	if (!gwp_ctx_outgoing_family_ok(ctx, &u->relay)) {
+		pr_info(&ctx->lh, "--outgoing-family refuses upstream UDP relay %s (idx=%u)",
+			ip_to_str(&u->relay), gcp->idx);
+		return -EPROTO;
+	}
+
+	r = udp_client_bnd(ctx, gcp, &relay, &cb);
+	if (r < 0)
+		return r;
+
+	gcp->target.len = 0;
+	gwp_conn_buf_compact(&gcp->target);
+	out_len = gcp->target.cap;
+	r = gwp_socks5_conn_cmd_udp_associate_res(gcp->s5_conn, &cb,
+						  GWP_SOCKS5_REP_SUCCESS,
+						  gcp->target.buf, &out_len);
+	if (r < 0)
+		return r;
+	gcp->target.len = (uint32_t)out_len;
+
+	pr_info(&ctx->lh, "Upstream UDP association established (idx=%u, ca=%s, up=%s, relay=%s)",
+		gcp->idx, ip_to_str(&gcp->client_addr),
+		ip_to_str(&gcp->upstream->addr), ip_to_str(&u->relay));
+	return 0;
 }
 
 int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -6440,11 +6743,11 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		/*
 		 * Bind the relay socket and queue the reply; both event loops
 		 * then arm their own relay (handle_udp_associate on epoll,
-		 * arm_udp_relay on io_uring).
+		 * arm_udp_relay on io_uring). Through an upstream, the state
+		 * is CONNECT instead: the upstream is dialled as for a CONNECT
+		 * through it, and the reply waits for its answer.
 		 */
 		r = gwp_socks5_udp_associate_setup(w, gcp);
-		if (!r)
-			gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
 	}
 
 	/*

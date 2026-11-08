@@ -494,6 +494,13 @@ enum {
 	 * it (handle_ev_client_watch()).
 	 */
 	GWP_CONN_FLAG_FIN_BOUND		= (1ull << 10ull),
+	/*
+	 * A SOCKS5 UDP ASSOCIATE that goes through the pair's upstream (a
+	 * socks5:// or socks5h:// server of an ACL pool): the target socket
+	 * is the control connection to it, and gcp->udp_up says where its
+	 * relay takes the datagrams.
+	 */
+	GWP_CONN_FLAG_UDP_UP		= (1ull << 11ull),
 };
 
 enum {
@@ -543,6 +550,23 @@ struct gwp_udp_peers {
 	uint32_t		next_seq;
 	uint8_t			nr;
 	uint8_t			last;	/* index of the last hit */
+};
+
+/*
+ * A UDP association through an upstream SOCKS5 server: where the server's
+ * relay takes the datagrams (@relay, in the family of the pair's udp_fd), and
+ * the last domain target's OUTPUT verdict, as struct gwp_udp_acl_cache keeps
+ * an address's: @ok for @dom and @dport, while @valid and the ACL is still at
+ * generation @gen.
+ */
+struct gwp_udp_up {
+	struct gwp_sockaddr	relay;
+	socklen_t		relay_len;
+	uint32_t		gen;
+	__be16			dport;
+	bool			valid;
+	bool			ok;
+	char			dom[256];
 };
 
 struct gwp_conn_pair {
@@ -598,6 +622,8 @@ struct gwp_conn_pair {
 	struct gwp_iou_udp	*udp_iou;
 	/* Targets a UDP association may hear from; NULL until it sends. */
 	struct gwp_udp_peers	*udp_peers;
+	/* A UDP association through the upstream, see GWP_CONN_FLAG_UDP_UP. */
+	struct gwp_udp_up	*udp_up;
 	/* The next pair on the epoll loop's list of pairs to free (@dead). */
 	struct gwp_conn_pair	*next_dead;
 	/*
@@ -1160,6 +1186,23 @@ void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd);
  * negative error is returned. The caller registers the fd with its event loop.
  */
 int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * A UDP ASSOCIATE through the upstream (GWP_CONN_FLAG_UDP_UP): fill
+ * gcp->up_dst with what the request to the upstream names, the address the
+ * control connection comes from and the port of the pair's relay socket,
+ * the source of the datagrams the upstream will get.
+ */
+int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * The upstream granted the UDP ASSOCIATE and takes the datagrams at @bnd
+ * (0.0.0.0 or :: meaning its own address): note where, and queue the
+ * client's success reply, naming gwproxy's own relay, in gcp->target.buf.
+ * Returns 0, or a negative errno when @bnd cannot be used.
+ */
+int gwp_upstream_udp_ready(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   const struct gwp_socks5_addr *bnd);
 
 /*
  * Convert a SOCKS5 IPv4/IPv6 target to a sockaddr for a UDP relay socket of
