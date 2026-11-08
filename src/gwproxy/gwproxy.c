@@ -5144,15 +5144,15 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 }
 
 /*
- * No descriptor for the query's socket, no memory, a send refused: the name
- * was never looked up, which leaves the origin as unreachable as a lookup
- * that failed, so the client gets the same answer, host unreachable, as from
- * the system resolver and from a raw lookup that fails later. Closing the
- * connection without a word left a SOCKS5 client without its reply and an
- * HTTP client without a status.
+ * No descriptor for a raw query's socket, no memory for the query or for the
+ * system resolver's request, a send refused: the name was never looked up,
+ * which leaves the origin as unreachable as a lookup that failed, so the
+ * client gets the same answer, host unreachable, as from a lookup that fails
+ * later. Closing the connection without a word left a SOCKS5 client without
+ * its reply and an HTTP client without a status.
  */
-int gwp_raw_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			     const char *host, int err)
+int gwp_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			 const char *host, int err)
 {
 	int r;
 
@@ -5291,15 +5291,15 @@ static int upstream_dst_from_hostport(const char *hostport,
 /*
  * Whether a client-requested hostname is fit for the ACL, the resolver and an
  * upstream CONNECT request: an IPv6 literal, or letters, digits, '-' and '_'
- * in non-empty dot-separated labels (which covers IPv4 literals). Anything
- * else, CR, LF and ':' in particular, would be pasted verbatim into the
- * request to an http:// upstream, which then reads a different target than
- * the one the ACL judged.
+ * in non-empty dot-separated labels of at most 63 characters (which covers
+ * IPv4 literals). Anything else, CR, LF and ':' in particular, would be
+ * pasted verbatim into the request to an http:// upstream, which then reads
+ * a different target than the one the ACL judged.
  */
 static bool req_host_valid(const char *host)
 {
-	bool label_start = true;
 	struct in6_addr a6;
+	size_t label = 0;
 	size_t n = 0;
 
 	if (inet_pton(AF_INET6, host, &a6) == 1)
@@ -5309,15 +5309,20 @@ static bool req_host_valid(const char *host)
 		unsigned char c = (unsigned char)host[n];
 
 		if (c == '.') {
-			if (label_start)
+			if (!label)
 				return false;
-			label_start = true;
+			label = 0;
 			continue;
 		}
 		if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
 		    !(c >= '0' && c <= '9') && c != '-' && c != '_')
 			return false;
-		label_start = false;
+		/*
+		 * A label's length byte leaves room for 63 octets (RFC 1035
+		 * 2.3.4): a longer one can never resolve either.
+		 */
+		if (++label > 63)
+			return false;
 	}
 
 	/*
@@ -5562,7 +5567,7 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 		r = gwp_raw_dns_resolve(w, gcp, host, port);
 		/* -EINVAL: a name DNS cannot carry, a malformed request. */
 		if (r != -EINPROGRESS && r != -EINVAL)
-			r = gwp_raw_dns_start_failed(w, gcp, host, r);
+			r = gwp_dns_start_failed(w, gcp, host, r);
 		return r;
 	} else {
 		struct gwp_sockaddr addrs[GWP_MAX_CONN_CAND];
@@ -5577,8 +5582,11 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 			return 0;
 		}
 
-		return queue_dns_resolution(w, gcp, host, port,
-					    r == -EHOSTUNREACH ? r : 0);
+		r = queue_dns_resolution(w, gcp, host, port,
+					 r == -EHOSTUNREACH ? r : 0);
+		if (r != -EINPROGRESS)
+			r = gwp_dns_start_failed(w, gcp, host, r);
+		return r;
 	}
 }
 
