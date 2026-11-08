@@ -361,9 +361,16 @@ if test "${use_sanitize}" = "yes"; then
 	if ! add_c_flag "-fsanitize=undefined"; then
 		fatal "ERROR: -fsanitize=undefined is not supported by your compiler";
 	fi;
-	LDFLAGS="${LDFLAGS} -fsanitize=address -fsanitize=undefined";
-	CFLAGS="${CFLAGS} -fsanitize=address -fsanitize=undefined";
-	CXXFLAGS="${CXXFLAGS} -fsanitize=address -fsanitize=undefined";
+	# UBSan only prints a report and carries on by default, so an
+	# error the test does not depend on would go unnoticed. Stop on
+	# the first one instead, as ASan does.
+	nr="-fno-sanitize-recover=undefined";
+	if ! add_c_flag "${nr}"; then
+		fatal "ERROR: ${nr} is not supported by your compiler";
+	fi;
+	LDFLAGS="${LDFLAGS} -fsanitize=address -fsanitize=undefined ${nr}";
+	CFLAGS="${CFLAGS} -fsanitize=address -fsanitize=undefined ${nr}";
+	CXXFLAGS="${CXXFLAGS} -fsanitize=address -fsanitize=undefined ${nr}";
 else
 	# The sanitizers check the same accesses, and more of them.
 	CFLAGS="${CFLAGS} -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2";
