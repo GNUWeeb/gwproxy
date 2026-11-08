@@ -16,9 +16,10 @@ a plain TCP\-to\-TCP forwarder to a fixed
 a
 .B SOCKS5
 proxy (RFC 1928) with CONNECT to IPv4, IPv6 and domain\-name targets, UDP
-ASSOCIATE relaying to IPv4/IPv6 targets (domain\-name targets and upstream\-proxy
-chaining are not supported for UDP), and optional username/password
-authentication (RFC 1929);
+ASSOCIATE relaying to IPv4/IPv6 targets (domain\-name targets only through a
+.B socks5h://
+upstream pool, and upstream chaining only through an ACL pool's SOCKS5
+servers), and optional username/password authentication (RFC 1929);
 .IP \(bu 3
 an
 .B HTTP
@@ -490,8 +491,10 @@ target's name is resolved (see
 so a
 .B \-d
 in such a rule matches only a target the client gave as an address, never one
-it named; a load warns about such a rule. It applies to TCP only: UDP never
-goes through an upstream, so a rule with
+it named; a load warns about such a rule. The choice is made for TCP: a SOCKS5
+UDP ASSOCIATE takes the pool chosen for its TCP control connection (see
+.BR "UPSTREAM CHAINING" ),
+so a rule with
 .B "\-p udp"
 or
 .B "! \-p tcp"
@@ -955,7 +958,10 @@ hostname, only the hop to the upstream itself is restricted. With
 the name is resolved locally, so the restriction does apply.
 .IP \(bu 2
 A domain target in a relayed UDP datagram is dropped for unrelated reasons
-(no per\-datagram DNS), so the family restriction never sees it.
+(no per\-datagram DNS), so the family restriction never sees it, unless it
+goes through a
+.B socks5h://
+upstream pool, which resolves it itself.
 .IP \(bu 2
 It does not touch the listener. Use
 .B \-\-bind\-ipv6\-only
@@ -1791,8 +1797,9 @@ carry (passively: gwproxy sends no probes of its own). A failure counts
 against a server only when it is the server's own: its TCP connection
 refused, reset or timed out, its TLS handshake failing (a refused
 certificate included), a SOCKS5 server that accepts none of the offered
-authentication methods, refuses the credentials or answers reply 0x07 or
-0x08, an HTTP server that answers 407, a reply that does not parse, the
+authentication methods, refuses the credentials or answers a CONNECT with
+reply 0x07 or 0x08 (a refused UDP ASSOCIATE never counts, see below), an
+HTTP server that answers 407, a reply that does not parse, the
 server hanging up, or the connect timeout running out before gwproxy has
 sent its CONNECT request (during the TCP connect, the TLS handshake or the
 SOCKS5 method and authentication exchange). A failure the server reports for
@@ -1871,18 +1878,16 @@ resolved once, when the set loads; a reload resolves it again. A reload that
 changes the pools applies to new connections; one already through a pool's
 server keeps it until it ends.
 .PP
-UDP is never sent through an upstream, and the rules do not apply to the UDP
-relay's datagrams. A SOCKS5 UDP ASSOCIATE is decided like a connection, from
-the user and the client alone, as for a TCP connection. It has no target, so
-a rule that tests one
+A SOCKS5 UDP ASSOCIATE is decided like a connection, from the user and the
+client alone, as for a TCP connection. It has no target, so a rule that tests
+one
 .RB ( \-d ", " \-\-dports " or " "\-m domain" ,
 negated or not) is never taken for it, a terminal one such as
 .B "\-d ... \-j ACCEPT"
-included. A user the rules send through a pool is refused it (reply 0x07), and
-so is one that a pool rule
+included. A user that a pool rule
 .RB ( "\-p tcp" ,
-or with no protocol) would match but for its target tests, as the rule might
-send that user's traffic through the pool; a
+or with no protocol) would match but for its target tests is refused it
+(reply 0x07), as the rule might send that user's traffic through the pool; a
 .B \-m statistic
 in such a rule counts as one that could match, and a later
 .B DIRECT
@@ -1891,10 +1896,61 @@ rule that does match does not undo the refusal. A
 rule passed over for its target tests is just passed over. Everyone else
 without a choice is refused it when
 .B \-\-upstream\-proxy
-is given, and a user the rules send
+is given, which is not used for UDP, and a user the rules send
 .B DIRECT
 gets a direct UDP relay, even past
 .BR \-\-upstream\-proxy .
+.PP
+A user the rules send through a pool has the association carried by the
+server the pool gives the connection, which must be a
+.B socks5://
+or
+.B socks5h://
+one: an
+.BR http:// " or " https://
+server cannot carry UDP, and the client is refused (reply 0x07). gwproxy
+connects to the server as for a CONNECT through it, with the same
+authentication, and asks it for a UDP ASSOCIATE of its own, naming the
+address of that connection and the port of the relay socket gwproxy sends
+the datagrams from. The client is answered only once the server has: on
+success with gwproxy's own relay address, as for a direct relay, and the
+server's relay, where gwproxy sends the datagrams, is the address the server
+replies with (or the server's own address, when the reply names 0.0.0.0 or
+::). Each datagram from the client goes to the server's relay as the client
+sent it, its SOCKS5 header included, and each from the server's relay goes
+back to the client as it came, so the server reaches the targets and wraps
+their replies; datagrams from anywhere else are dropped, as are a client's
+before it is known (see
+.BR \-\-udp\-associate ).
+The
+.B OUTPUT
+chain still judges each of the client's datagrams by its target, as for a
+direct relay; the server's replies are not judged again. A target given by
+name goes to a
+.B socks5h://
+server as it is, for the server to resolve, and is judged by
+.B \-m domain
+rules; to a
+.B socks5://
+server, which is to be sent addresses, it is dropped, as gwproxy does not
+resolve names for datagrams. Either control connection, the client's to
+gwproxy or gwproxy's to the server, closing ends the association and the
+other one.
+.PP
+The association counts as a connection through its server, for
+.B least_conn
+and in the logs, from the moment the pool gives it the server to its end. A
+failure to connect to the server or to get through its authentication counts
+against the server's health as for TCP, and is retried once on another
+server of the pool. A server that refuses the UDP ASSOCIATE itself may serve
+TCP well: its refusal never counts against its health, but it is retried
+likewise, on another server of the pool if there is one in service (only
+.BR socks5h://
+ones can take it in a pool that mixes them with
+.BR http:// " or " https://
+servers; the retry is spent when it lands on one of those). The client is then
+answered as a refused CONNECT would be: the server's reply 0x03 to 0x06 as it
+is, any other as 0x01.
 .SH TARGET ADDRESS SELECTION
 A hostname target of a SOCKS5 or HTTP request usually resolves to several
 addresses, and gwproxy tries them as a list of candidates rather than
@@ -1903,7 +1959,9 @@ literal IPv4/IPv6 target, plain
 .B \-\-target
 forwarding and transparent mode each have exactly one destination, the SOCKS5
 UDP relay takes a literal address from every datagram (a domain\-name datagram
-is dropped), and a hostname given to
+is dropped, or handed to a
+.B socks5h://
+upstream pool's server as it is), and a hostname given to
 .B \-\-target
 is resolved once at startup, to a single address \(em or, with a
 .BR socks5h:// " or " http://
