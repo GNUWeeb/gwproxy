@@ -21,6 +21,42 @@ declare -a _PIDS=()
 
 . "$T_DIR/sweep.sh"
 
+# The sanitizer reports of what a test runs must fail the test, but they end
+# up wherever the test sent that process's output: often a log nobody reads
+# once the proxy is up, or /dev/null. _san_env sends them to files of their
+# own under $WORK instead, one per process (sanitizer.<pid>), and _cleanup
+# looks for reports in every file under $WORK, which also finds those that
+# still go to the process's own output, in a log there: gcc's UBSan runtime,
+# when built in with ASan, ignores log_path. ns_inner_work() calls _san_env
+# again for its work directory. Options given from outside are kept; a later
+# log_path overrides an earlier one.
+_SAN_RE='runtime error:|ERROR: [A-Za-z]+Sanitizer'
+_san_env()
+{
+	local o="log_path=$WORK/sanitizer"
+	local u="$o:print_stacktrace=1"
+
+	export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}$o"
+	export LSAN_OPTIONS="${LSAN_OPTIONS:+$LSAN_OPTIONS:}$o"
+	export UBSAN_OPTIONS="${UBSAN_OPTIONS:+$UBSAN_OPTIONS:}$u"
+}
+_san_env
+
+# san_reports: print the sanitizer reports found under $WORK so far, and
+# return 0 when there is at least one, 1 when there is none. Binary files (the
+# payloads) and FIFOs are skipped.
+san_reports()
+{
+	local f found=1
+
+	while IFS= read -r f; do
+		found=0
+		sed -nE "/$_SAN_RE/,\$p" "$f" | head -n 100 | \
+			sed "s|^|# ${f#"$WORK"/}: |" >&2
+	done < <(grep -rlIE -D skip -- "$_SAN_RE" "$WORK" 2>/dev/null)
+	return "$found"
+}
+
 _cleanup()
 {
 	local pid
@@ -35,6 +71,14 @@ _cleanup()
 	# Catch any proxy this test started outside gwp_start (or whose pid we
 	# lost); the runner sweeps again in case we are killed before this runs.
 	gwp_sweep -q
+	# A report fails the test whatever it found itself, skips included: a
+	# sanitizer error the test does not look for is still a bug.
+	if san_reports; then
+		echo "FAIL: a process of this test made a sanitizer report" >&2
+		_release_ports
+		rm -rf "$WORK"
+		exit 1
+	fi
 	_release_ports
 	rm -rf "$WORK"
 }
@@ -131,6 +175,7 @@ ns_inner_work()
 {
 	rm -rf "$WORK"
 	WORK="$1"
+	_san_env
 }
 
 # Port reservations, shared by every test running on this host. pick_port()

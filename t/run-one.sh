@@ -176,6 +176,15 @@ integ:77) status=SKIP ;;
 *)	status=FAIL ;;
 esac
 [ ! -s "$stuck" ] || status=FAIL
+# A sanitizer report in the test's own output fails it too, as one in its
+# work directory does (see _san_env in lib.sh): a process that writes to the
+# test's stdout or stderr puts it there, and so does a unit test.
+san=0
+if [ "$status" != FAIL ] &&
+   grep -qaE 'runtime error:|ERROR: [A-Za-z]+Sanitizer' "$log" 2>/dev/null; then
+	status=FAIL
+	san=1
+fi
 
 printf '%s %s %s\n' "$status" "$elapsed" "$name" >"$res"
 
@@ -184,7 +193,8 @@ PASS)	printf 'ok    %-32s (%ss)\n' "$name" "$elapsed" ;;
 SKIP)	printf 'skip  %-32s %s\n' "$name" \
 		"$(sed -n 's/^SKIP: //p' "$log" | head -1)" ;;
 FAIL)	printf 'FAIL  %-32s (rc=%s)\n' "$name" "$rc"
-	[ ! -s "$stuck" ] || sed "s/^/# $name: /" "$stuck" ;;
+	[ ! -s "$stuck" ] || sed "s/^/# $name: /" "$stuck"
+	[ "$san" = 0 ] || echo "# $name: a sanitizer report in its log" ;;
 esac
 
 exit 0
