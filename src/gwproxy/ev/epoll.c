@@ -130,8 +130,16 @@ static int handle_raw_dns_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * in whatever protocol the client speaks (SOCKS5 REP, or HTTP 502)
 	 * and close, as the getaddrinfo path does. The error then tears
 	 * down this one pair (handle_event()).
+	 *
+	 * The client gets the reply that path gives for any failed lookup,
+	 * host unreachable (REP 0x04), whatever the reason here: NXDOMAIN,
+	 * SERVFAIL, an answer with no usable address and a malformed reply
+	 * come back as assorted errnos that would otherwise read as a
+	 * general failure (REP 0x01). The reason itself goes to the log.
 	 */
-	r = gwp_conn_fail_reply(w, gcp, (int)ret);
+	pr_dbg(&ctx->lh, "DNS query failed: %s (%s; gcp_idx=%u)",
+	       gcp->gdp->host, strerror((int)-ret), gcp->idx);
+	r = gwp_conn_fail_reply(w, gcp, -EHOSTUNREACH);
 	if (!r && gcp->target.len) {
 		ssize_t sr = __do_send(&gcp->target, &gcp->client);
 

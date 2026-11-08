@@ -123,9 +123,11 @@ typedef struct {
  * The caller may need to check for potential transaction ID collisions.
  *
  * Possible errors are:
- * - ENAMETOOLONG	name is too long.
+ * - ENAMETOOLONG	name does not fit in a query.
  * - ENOBUFS		length specified by out_len is not sufficient.
- * - EINVAL		malformed name or unsupported value of family.
+ * - EINVAL		malformed name (a label over 63 octets, or the whole
+ *			name over DOMAIN_NAME_LIMIT octets as sent), or
+ *			unsupported value of family.
  *
  * @param txid		transaction id
  * @param name		domain name
