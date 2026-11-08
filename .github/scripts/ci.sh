@@ -2,7 +2,8 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# CI driver for .github/workflows/ci.yml.
+# CI driver for .github/workflows/ci.yml, and for .gitlab-ci.yml, which runs a
+# subset of it.
 #
 # WHY THIS FILE EXISTS
 # ====================
