@@ -2622,10 +2622,7 @@ static int handle_ev_client_watch(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (!(res & POLLRDHUP))
 		return 0;
 
-	/*
-	 * The lookup is still pending. Not the pair's state: it says lookup
-	 * until the target is up, the connect that follows included.
-	 */
+	/* The lookup is still pending: do_prep_connect() bounds the FIN. */
 	if (gcp->gde) {
 		gcp->client_fin = true;
 		return 0;
@@ -3483,6 +3480,19 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 
 	gwp_dns_entry_free(gde);
 	gcp->gde = NULL;
+
+	/*
+	 * The lookup is over: the pair connects now, as one whose request
+	 * named an address does from the start, and says so, as on epoll
+	 * (handle_connect()). What asks whether a connect is under way goes
+	 * by the state: the handshake held for the client's reply
+	 * (upstream_start_held()) would never start, and a connect timeout
+	 * would be taken for the lookup's and not charged to an upstream.
+	 */
+	if (gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY)
+		gcp->conn_state = CONN_STATE_SOCKS5_CONNECT;
+	else if (gcp->conn_state == CONN_STATE_HTTP_DNS_QUERY)
+		gcp->conn_state = CONN_STATE_HTTP_CONNECT;
 	return do_prep_connect(w, gcp);
 }
 
