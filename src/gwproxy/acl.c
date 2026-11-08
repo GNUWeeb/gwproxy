@@ -21,6 +21,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <fnmatch.h>
 
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
@@ -331,6 +333,14 @@ struct gwp_acl {
 #define ACL_MAX_FILES		64
 
 /*
+ * How many directories the include patterns of one load may read (see
+ * include_glob()). A pattern with a wildcard in several components reads
+ * every directory its leading components match; this keeps one with a "*"
+ * in every component from walking a whole file system.
+ */
+#define ACL_MAX_GLOB_DIRS	256
+
+/*
  * A file a load read or tried to read: what fstat() said right before it was
  * read, or why it could not be opened (@err, a positive errno; 0 when @st is
  * valid). Recorded for the first read of a file the load reads twice.
@@ -359,6 +369,8 @@ struct acl_file_key {
  *   @path: the file whose lines are being parsed; NULL for text.
  *   @stack, @depth: the files being parsed, the top file first.
  *   @nr_loads: files read so far, see ACL_MAX_FILES.
+ *   @nr_glob_dirs: directories the include patterns read so far, see
+ *     ACL_MAX_GLOB_DIRS.
  *   @lineno: the line of @path being parsed, for the messages.
  *   @pool, @pool_line: the upstream block being parsed and the line that
  *     opened it, or NULL.
@@ -383,6 +395,7 @@ struct acl_load {
 	struct acl_file_key	stack[ACL_MAX_INCLUDE_DEPTH + 1];
 	unsigned		depth;
 	unsigned		nr_loads;
+	unsigned		nr_glob_dirs;
 	unsigned		lineno;
 	struct gwp_acl_pool	*pool;
 	unsigned		pool_line;
@@ -2035,30 +2048,475 @@ out:
 }
 
 /*
- * The path of the file that "include @inc" names in the file @parent: @inc
- * itself when absolute, else @inc in @parent's directory. Malloc'd, or NULL.
+ * ------------------------------------------------------------------------
+ * include and its patterns
+ * ------------------------------------------------------------------------
+ *
+ * The path of an include line is a pattern: '*', '?' and "[...]" match in
+ * any component, and '\' makes the character after it literal. A path with
+ * no wildcard names one file. "**" and "{a,b}" are not supported: the first
+ * is refused, the second is literal, as for glob(3) without GLOB_BRACE (musl
+ * has none). Matching is done here with fnmatch(3), a component at a time,
+ * in a way that gives the same answer on glibc and musl: no '\' inside a
+ * bracket expression (glibc reads it as an escape, musl as a character), and
+ * the leading '.' rule applied here (the two treat "\." differently under
+ * FNM_PERIOD). gwproxy never calls setlocale(), so ranges and the sort
+ * below are byte-wise.
  */
-static char *include_path(const char *parent, const char *inc)
+
+/* A growing list of malloc'd strings. */
+struct inc_list {
+	char	**v;
+	size_t	nr;
+};
+
+static void inc_list_free(struct inc_list *l)
 {
-	const char *slash = strrchr(parent, '/');
+	size_t i;
+
+	for (i = 0; i < l->nr; i++)
+		free(l->v[i]);
+	free(l->v);
+	l->v = NULL;
+	l->nr = 0;
+}
+
+/* Add @s, which the list takes over (freed on failure too). */
+static int inc_list_add(struct inc_list *l, char *s)
+{
+	char **v;
+
+	if (!s)
+		return -ENOMEM;
+	v = realloc(l->v, (l->nr + 1) * sizeof(*v));
+	if (!v) {
+		free(s);
+		return -ENOMEM;
+	}
+	l->v = v;
+	l->v[l->nr++] = s;
+	return 0;
+}
+
+static int inc_list_cmp(const void *a, const void *b)
+{
+	return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/*
+ * Check the pattern component @s of @len bytes. Returns 1 when it holds a
+ * wildcard, 0 when it names one entry, or -EINVAL with *@why set.
+ */
+static int glob_comp_check(const char *s, size_t len, const char **why)
+{
+	bool magic = false;
+	size_t i, j;
+
+	for (i = 0; i < len; i++) {
+		switch (s[i]) {
+		case '\\':
+			if (++i == len) {
+				*why = "a \\ ends a path component";
+				return -EINVAL;
+			}
+			break;
+		case '*':
+			if (i + 1 < len && s[i + 1] == '*') {
+				*why = "** is not supported";
+				return -EINVAL;
+			}
+			magic = true;
+			break;
+		case '?':
+			magic = true;
+			break;
+		case '[':
+			/* A ']' right after the '[' (or "[!", "[^") is literal. */
+			j = i + 1;
+			if (j < len && (s[j] == '!' || s[j] == '^'))
+				j++;
+			if (j < len && s[j] == ']')
+				j++;
+			for (; j < len && s[j] != ']'; j++) {
+				char c;
+
+				if (s[j] == '\\') {
+					*why = "a \\ inside [...] is not supported";
+					return -EINVAL;
+				}
+				/* [:class:], [.sym.] and [=equiv=] hold a ']'. */
+				if (s[j] != '[' || j + 1 == len ||
+				    !strchr(":.=", s[j + 1]))
+					continue;
+				c = s[j + 1];
+				for (j += 2; j + 1 < len; j++) {
+					if (s[j] == c && s[j + 1] == ']')
+						break;
+				}
+				if (j + 1 >= len) {
+					j = len;
+					break;
+				}
+				j++;
+			}
+			if (j >= len) {
+				*why = "a [ is not closed by a ] in its path component";
+				return -EINVAL;
+			}
+			i = j;
+			magic = true;
+			break;
+		}
+	}
+	return magic;
+}
+
+/*
+ * Check every component of the pattern @pat: returns 1 when one holds a
+ * wildcard, 0 when none does, or -EINVAL with *@why set.
+ */
+static int glob_check(const char *pat, const char **why)
+{
+	const char *s = pat, *slash;
+	bool magic = false;
+	int r;
+
+	for (;;) {
+		slash = strchr(s, '/');
+		r = glob_comp_check(s, slash ? (size_t)(slash - s) : strlen(s),
+				    why);
+		if (r < 0)
+			return r;
+		if (r)
+			magic = true;
+		if (!slash)
+			return magic;
+		s = slash + 1;
+	}
+}
+
+/* @s with every '\' escape taken out; malloc'd, or NULL. */
+static char *glob_unescape(const char *s)
+{
+	char *out = malloc(strlen(s) + 1), *o = out;
+
+	if (!out)
+		return NULL;
+	for (; *s; s++) {
+		if (*s == '\\' && s[1])
+			s++;
+		*o++ = *s;
+	}
+	*o = '\0';
+	return out;
+}
+
+/*
+ * The first @len bytes of @s with every character that is special in a
+ * pattern escaped, then @tail; malloc'd, or NULL.
+ */
+static char *glob_escape(const char *s, size_t len, const char *tail)
+{
+	size_t tl = strlen(tail), i;
+	char *out = malloc(2 * len + tl + 1), *o = out;
+
+	if (!out)
+		return NULL;
+	for (i = 0; i < len; i++) {
+		if (strchr("*?[\\", s[i]))
+			*o++ = '\\';
+		*o++ = s[i];
+	}
+	memcpy(o, tail, tl + 1);
+	return out;
+}
+
+/*
+ * Whether the directory entry @name matches the pattern component @pat.
+ * "." and ".." never match, and a leading '.' only a pattern that starts
+ * with one.
+ */
+static bool glob_match(const char *pat, const char *name)
+{
+	if (!strcmp(name, ".") || !strcmp(name, ".."))
+		return false;
+	if (name[0] == '.' && pat[0] != '.' &&
+	    !(pat[0] == '\\' && pat[1] == '.'))
+		return false;
+	return !fnmatch(pat, name, 0);
+}
+
+/* @name in the directory @dir ("" for the current one); malloc'd, or NULL. */
+static char *path_join(const char *dir, const char *name)
+{
 	char *path;
 
-	if (inc[0] == '/' || !slash)
-		return strdup(inc);
-	if (asprintf(&path, "%.*s/%s", (int)(slash - parent), parent, inc) < 0)
+	if (!*dir)
+		return strdup(name);
+	if (asprintf(&path, "%s%s%s", dir,
+		     dir[strlen(dir) - 1] == '/' ? "" : "/", name) < 0)
 		return NULL;
 	return path;
 }
 
 /*
+ * The pattern that "include @inc" names in the file @parent: @inc itself
+ * when absolute, else @inc in @parent's directory, whose name is escaped so
+ * that only @inc's wildcards are wildcards. Malloc'd, or NULL.
+ */
+static char *include_pattern(const char *parent, const char *inc)
+{
+	const char *slash = strrchr(parent, '/');
+
+	if (inc[0] == '/' || !slash)
+		return strdup(inc);
+	return glob_escape(parent, (size_t)(slash - parent) + 1, inc);
+}
+
+/* Fail the include line over @path, which the pattern walk met. */
+static int glob_fail(struct acl_load *ld, const char *path, int err)
+{
+	load_warn(ld, "%s: %s", path, strerror(-err));
+	ld->reported = true;
+	return err;
+}
+
+/*
+ * Add to @out the entries of the directory @dir that match the component
+ * @pat: the directories among them, unless @last, when every entry counts.
+ */
+static int glob_read_dir(struct acl_load *ld, const char *dir, const char *pat,
+			 bool last, struct inc_list *out)
+{
+	const char *open_path = *dir ? dir : ".";
+	struct dirent *e;
+	struct stat st;
+	DIR *d;
+	int fd, r = 0;
+
+	if (++ld->nr_glob_dirs > ACL_MAX_GLOB_DIRS) {
+		load_warn(ld, "the include patterns read more than %d directories",
+			  ACL_MAX_GLOB_DIRS);
+		ld->reported = true;
+		return -E2BIG;
+	}
+
+	fd = open(open_path, O_RDONLY | O_DIRECTORY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0) {
+		r = -errno;
+		/* Gone since it was matched: it holds nothing. */
+		if (r == -ENOENT || r == -ENOTDIR)
+			return 0;
+		return glob_fail(ld, open_path, r);
+	}
+	d = fdopendir(fd);
+	if (!d) {
+		r = -errno;
+		close(fd);
+		return glob_fail(ld, open_path, r);
+	}
+
+	for (;;) {
+		char *path;
+
+		errno = 0;
+		e = readdir(d);
+		if (!e) {
+			if (errno)
+				r = glob_fail(ld, open_path, -errno);
+			break;
+		}
+		if (!glob_match(pat, e->d_name))
+			continue;
+		path = path_join(dir, e->d_name);
+		if (!path) {
+			r = -ENOMEM;
+			break;
+		}
+		if (!last) {
+			/* Only a directory (or a link to one) leads further. */
+			if (stat(path, &st)) {
+				r = -errno;
+				if (r != -ENOENT && r != -ENOTDIR && r != -ELOOP) {
+					r = glob_fail(ld, path, r);
+					free(path);
+					break;
+				}
+				r = 0;
+				free(path);
+				continue;
+			}
+			if (!S_ISDIR(st.st_mode)) {
+				free(path);
+				continue;
+			}
+		}
+		r = inc_list_add(out, path);
+		if (r)
+			break;
+		if (last && out->nr > ACL_MAX_FILES) {
+			load_warn(ld, "the include pattern matches more than %d files",
+				  ACL_MAX_FILES);
+			ld->reported = true;
+			r = -E2BIG;
+			break;
+		}
+	}
+	closedir(d);
+	return r;
+}
+
+/*
+ * The same for a component @pat without a wildcard: the one entry it names,
+ * if it is there (and is a directory, unless @last).
+ */
+static int glob_literal(struct acl_load *ld, const char *dir, const char *pat,
+			bool last, struct inc_list *out)
+{
+	struct stat st;
+	char *name, *path;
+	int r;
+
+	name = glob_unescape(pat);
+	if (!name)
+		return -ENOMEM;
+	path = path_join(dir, name);
+	free(name);
+	if (!path)
+		return -ENOMEM;
+
+	/* The last one counts as an entry, even a dangling link. */
+	r = last ? lstat(path, &st) : stat(path, &st);
+	if (r) {
+		r = -errno;
+		if (r == -ENOENT || r == -ENOTDIR || (!last && r == -ELOOP))
+			r = 0;
+		else
+			r = glob_fail(ld, path, r);
+		free(path);
+		return r;
+	}
+	if (!last && !S_ISDIR(st.st_mode)) {
+		free(path);
+		return 0;
+	}
+	return inc_list_add(out, path);
+}
+
+/*
+ * The paths that the pattern @pat (with a wildcard) matches, sorted byte-wise
+ * into @res, so that first-match order does not depend on the order of the
+ * directories' entries. The components before the first wildcard are a
+ * directory taken as it is; from there on, each component is matched in the
+ * directories the ones before it matched.
+ */
+static int include_glob(struct acl_load *ld, const char *pat,
+			struct inc_list *res)
+{
+	struct inc_list cur = { 0 }, next = { 0 };
+	char *buf, *s, *comp, *prefix = NULL, *p, *q;
+	const char *why;
+	struct stat st;
+	size_t i;
+	int r;
+
+	buf = strdup(pat);
+	if (!buf)
+		return -ENOMEM;
+	s = buf;
+
+	/* The directory before the first wildcard. */
+	prefix = strdup(pat[0] == '/' ? "/" : "");
+	if (!prefix) {
+		r = -ENOMEM;
+		goto out;
+	}
+	while ((comp = strsep(&s, "/")) != NULL) {
+		if (!*comp)
+			continue;
+		if (glob_comp_check(comp, strlen(comp), &why))
+			break;
+		p = glob_unescape(comp);
+		if (!p) {
+			r = -ENOMEM;
+			goto out;
+		}
+		q = path_join(prefix, p);
+		free(p);
+		free(prefix);
+		prefix = q;
+		if (!prefix) {
+			r = -ENOMEM;
+			goto out;
+		}
+	}
+	if (*prefix && strcmp(prefix, "/")) {
+		if (stat(prefix, &st)) {
+			r = -errno;
+			if (r == -ENOENT || r == -ENOTDIR || r == -ELOOP)
+				r = 0;
+			else
+				r = glob_fail(ld, prefix, r);
+			goto out;
+		}
+		if (!S_ISDIR(st.st_mode)) {
+			r = 0;
+			goto out;
+		}
+	}
+	r = inc_list_add(&cur, prefix);
+	prefix = NULL;
+	if (r)
+		goto out;
+
+	/* @comp is the first component with a wildcard. */
+	while (comp && cur.nr) {
+		bool last, magic;
+
+		while (s && *s == '/')
+			s++;
+		last = !s || !*s;
+		magic = glob_comp_check(comp, strlen(comp), &why) > 0;
+		for (i = 0; i < cur.nr; i++) {
+			if (magic)
+				r = glob_read_dir(ld, cur.v[i], comp, last,
+						  last ? res : &next);
+			else
+				r = glob_literal(ld, cur.v[i], comp, last,
+						 last ? res : &next);
+			if (r)
+				goto out;
+		}
+		inc_list_free(&cur);
+		cur = next;
+		next.v = NULL;
+		next.nr = 0;
+		comp = last ? NULL : strsep(&s, "/");
+	}
+	if (res->nr > 1)
+		qsort(res->v, res->nr, sizeof(*res->v), inc_list_cmp);
+	r = 0;
+out:
+	inc_list_free(&cur);
+	inc_list_free(&next);
+	free(prefix);
+	free(buf);
+	return r;
+}
+
+/*
  * "include PATH;": parse the file PATH here, as if its lines stood in place
- * of this one. The ';' may also stand alone as the last word, but it must be
- * there, and PATH is one word (no quoting, no globs).
+ * of this one, or with a wildcard in PATH, every file it matches, in sorted
+ * order. The ';' may also stand alone as the last word, but it must be
+ * there, and PATH is one word (no quoting). A path must name a file, and a
+ * pattern match one at least.
  */
 static int parse_include(struct acl_load *ld, char **tok, int n)
 {
-	char *inc, *path;
-	size_t len;
+	struct inc_list res = { 0 };
+	char *inc, *pat, *path;
+	const char *why;
+	size_t len, i;
 	int r;
 
 	if (n == 3 && !strcmp(tok[2], ";")) {
@@ -2078,11 +2536,38 @@ static int parse_include(struct acl_load *ld, char **tok, int n)
 		return -EINVAL;
 	}
 
-	path = include_path(ld->path, inc);
-	if (!path)
+	r = glob_check(inc, &why);
+	if (r < 0)
+		return load_err(ld, "include %s: %s", inc, why);
+	pat = include_pattern(ld->path, inc);
+	if (!pat)
 		return -ENOMEM;
-	r = load_file(ld, path);
-	free(path);
+
+	if (!r) {
+		path = glob_unescape(pat);
+		free(pat);
+		if (!path)
+			return -ENOMEM;
+		r = load_file(ld, path);
+		free(path);
+		goto out;
+	}
+
+	r = include_glob(ld, pat, &res);
+	free(pat);
+	if (r) {
+		inc_list_free(&res);
+		return r;
+	}
+	if (!res.nr) {
+		load_warn(ld, "include %s: no file matches", inc);
+		ld->reported = true;
+		return -ENOENT;
+	}
+	for (i = 0; i < res.nr && !r; i++)
+		r = load_file(ld, res.v[i]);
+	inc_list_free(&res);
+out:
 	if (r) {
 		/* Said where in the included file; now say where it was included. */
 		ld->include_failed = true;
