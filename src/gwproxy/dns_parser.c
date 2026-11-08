@@ -350,6 +350,17 @@ ssize_t gwdns_build_query(uint16_t txid, const char *name, int family, uint8_t *
 {
 	gwdns_question_part q;
 
+	/*
+	 * A name is at most 255 octets on the wire (RFC 1035 Section
+	 * 2.3.4): its labels with a length byte each, and the root's zero.
+	 * That is two more than the text, which has no trailing dot here
+	 * (construct_qname() refuses an empty label). A longer name is
+	 * malformed, as a label over 63 is: no server can answer it, and
+	 * gwdns_check_question() would refuse the question echoed back.
+	 */
+	if (strnlen(name, DOMAIN_NAME_LIMIT) > DOMAIN_NAME_LIMIT - 2)
+		return -EINVAL;
+
 	q.domain = name;
 	q.type = family;
 	q.txid = txid;
@@ -685,11 +696,13 @@ static void test_check_question(void)
  * Names of every length, in labels of 63, up to well past what fits in a
  * query. Each is either encoded whole, followed by QTYPE, QCLASS and the OPT
  * record, or refused; nothing may be written past the end of the packet,
- * which the sanitizer builds catch.
+ * which the sanitizer builds catch. A name is refused exactly when it is over
+ * 255 octets as sent, and the question of every query built passes our own
+ * check of a reply's question.
  */
 static void test_build_long_names(void)
 {
-	uint8_t out[1024];
+	uint8_t out[1024], reply[1024];
 	char name[901];
 	size_t len, k;
 	ssize_t r;
@@ -703,14 +716,20 @@ static void test_build_long_names(void)
 			continue;
 
 		r = gwdns_build_query(0x4242, name, AF_INET, out, sizeof(out));
-		if (len > 495) {
-			assert(r < 0);
+		/* Over 255 octets as sent: the text plus two. */
+		if (len > DOMAIN_NAME_LIMIT - 2) {
+			assert(r == -EINVAL);
 			continue;
 		}
 		/* Header, length bytes and labels, root, type, class, OPT. */
 		assert(r == (ssize_t)(12 + len + 2 + 4 + 11));
 		assert(out[12] == (len < 63 ? len : 63));
 		assert(out[12 + len + 1] == 0);
+
+		/* The question echoed back is taken as ours. */
+		memcpy(reply, out, 12 + len + 2 + 4);
+		assert(!gwdns_check_question(out, (size_t)r, reply,
+					     12 + len + 2 + 4));
 	}
 }
 
