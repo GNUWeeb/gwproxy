@@ -1441,8 +1441,8 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
  * reply is queued, so the caller flushes it and tears the pair down, or the
  * negative errno that kept it from being built.
  */
-int gwp_raw_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			     const char *host, int err);
+int gwp_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			 const char *host, int err);
 int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				   int err, void *out, size_t *out_len);
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);

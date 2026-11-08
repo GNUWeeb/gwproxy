@@ -5151,8 +5151,8 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
  * connection without a word left a SOCKS5 client without its reply and an
  * HTTP client without a status.
  */
-int gwp_raw_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			     const char *host, int err)
+int gwp_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			 const char *host, int err)
 {
 	int r;
 
@@ -5567,7 +5567,7 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 		r = gwp_raw_dns_resolve(w, gcp, host, port);
 		/* -EINVAL: a name DNS cannot carry, a malformed request. */
 		if (r != -EINPROGRESS && r != -EINVAL)
-			r = gwp_raw_dns_start_failed(w, gcp, host, r);
+			r = gwp_dns_start_failed(w, gcp, host, r);
 		return r;
 	} else {
 		struct gwp_sockaddr addrs[GWP_MAX_CONN_CAND];

@@ -82,7 +82,7 @@ static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		 * would wait for the protocol timeout.
 		 */
 		if (unlikely(r))
-			return gwp_raw_dns_start_failed(w, gcp, gcp->gdp->host, r);
+			return gwp_dns_start_failed(w, gcp, gcp->gdp->host, r);
 	}
 
 	return 0;
