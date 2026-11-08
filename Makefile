@@ -8,19 +8,15 @@ USER_CXXFLAGS := $(CXXFLAGS)
 USER_LDFLAGS := $(LDFLAGS)
 USER_LIB_LDFLAGS := $(LIB_LDFLAGS)
 
-ifndef OPTIMIZE
-	OPTIMIZE = -O2
-endif
-INCLUDE_FLAGS = -I./src/
 DEPFLAGS = -MMD -MP -MF $@.d
 GWPROXY_DIR = ./src/gwproxy
 LIBURING_DIR = ./src/liburing
 
 #
-# make once took DEBUG=1, LTO=1 and STATIC=1, but config.make assigns CFLAGS
-# and LDFLAGS outright, so what they added never reached the compiler. They
-# are gone; say so instead of ignoring them. Only the top-level make warns:
-# variables from the command line reach every sub-make too.
+# make once took DEBUG=1, LTO=1, STATIC=1 and OPTIMIZE=, but config.make
+# assigns CFLAGS and LDFLAGS outright, so what they added never reached the
+# compiler. They are gone; say so instead of ignoring them. Only the top-level
+# make warns: variables from the command line reach every sub-make too.
 #
 ifeq ($(MAKELEVEL),0)
 ifeq ($(origin DEBUG),command line)
@@ -31,6 +27,9 @@ $(warning LTO= is not supported and is ignored)
 endif
 ifeq ($(origin STATIC),command line)
 $(warning STATIC= is not supported and is ignored)
+endif
+ifeq ($(origin OPTIMIZE),command line)
+$(warning OPTIMIZE= is not supported and is ignored; pass CFLAGS to ./configure)
 endif
 endif
 
