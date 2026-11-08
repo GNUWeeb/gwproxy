@@ -2070,11 +2070,36 @@ static struct io_uring_sqe *prep_upstream_recv(struct gwp_wrk *w,
 	return s;
 }
 
+static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * The upstream granted a UDP ASSOCIATE (GWP_CONN_FLAG_UDP_UP), and the
+ * client's reply is in target.buf. Send it, and bring the relay up. The two
+ * control connections are watched only for their end from now on: either one
+ * closing ends the association. A recv on the upstream's stands for that
+ * watch; the reply's send completion arms it (handle_ev_client_send()).
+ */
+static int udp_up_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	prep_timer_del_target(w, gcp);
+	prep_client_watch_del(w, gcp);
+	gcp->up_tx = false;
+	gcp->is_target_alive = true;
+	gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
+	gwp_conn_upstream_up(gcp);
+	gcp->client.len = 0;
+	prep_send_client(w, gcp);
+	return arm_udp_relay(w, gcp);
+}
+
 /* The upstream tunnel is up (reply already spliced); start forwarding. */
 static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	int r;
+
+	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
+		return udp_up_iou_finish(w, gcp);
 
 	prep_timer_del_target(w, gcp);
 	prep_client_watch_del(w, gcp);
@@ -2622,6 +2647,10 @@ static int handle_ev_client_watch(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (!(res & POLLRDHUP))
 		return 0;
 
+	/* A UDP association ends with its control connection. */
+	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
+		return -ECONNRESET;
+
 	/* The lookup is still pending: do_prep_connect() bounds the FIN. */
 	if (gcp->gde) {
 		gcp->client_fin = true;
@@ -2886,6 +2915,18 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	uint32_t from;
 
 	gcp->target_rx = false;
+
+	/*
+	 * The upstream's control connection of a UDP association: what it
+	 * sends is dropped, and its end is the association's.
+	 */
+	if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE) {
+		if (r == -EAGAIN || r == -EINTR || r > 0) {
+			prep_recv_target(w, gcp);
+			return 0;
+		}
+		return r ? r : -ECONNRESET;
+	}
 #ifdef CONFIG_HTTPS
 	if (target_is_tls(gcp))
 		return target_tls_recv(w, gcp, r);
@@ -3330,7 +3371,9 @@ static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (unlikely(!gcp->udp_iou))
 		return -ENOMEM;
 
-	if (w->ctx->cfg.protocol_timeout > 0) {
+	/* Through the upstream, the connect's timer is gone already. */
+	if (w->ctx->cfg.protocol_timeout > 0 &&
+	    !(gcp->flags & GWP_CONN_FLAG_UDP_UP)) {
 		/*
 		 * Mark the pair alive before removing the timer so a timeout
 		 * that fires in the race window is treated as benign by

@@ -58,6 +58,18 @@ const char *gwp_upstream_dst_str(struct gwp_conn_pair *gcp)
 		return buf;
 	}
 
+	/* What a UDP ASSOCIATE names: where its datagrams come from. */
+	if ((gcp->flags & GWP_CONN_FLAG_UDP_UP) && gcp->up_dst.ver) {
+		char ip[INET6_ADDRSTRLEN];
+		bool v4 = gcp->up_dst.ver == GWP_SOCKS5_ATYP_IPV4;
+
+		inet_ntop(v4 ? AF_INET : AF_INET6, gcp->up_dst.ip6, ip,
+			  sizeof(ip));
+		snprintf(buf, sizeof(buf), v4 ? "udp from %s:%u" :
+			 "udp from [%s]:%u", ip, ntohs(gcp->up_dst.port));
+		return buf;
+	}
+
 	return ip_to_str(&gcp->target_addr);
 }
 
@@ -117,14 +129,22 @@ static int build_userpass(struct gwp_conn_pair *gcp)
 	return 0;
 }
 
-/* Build the SOCKS5 CONNECT request; advance to the CONNECT-reply state. */
+/*
+ * Build the SOCKS5 CONNECT request, or the UDP ASSOCIATE of a UDP association
+ * through the upstream; advance to the state that awaits its reply.
+ */
 static int build_connect(struct gwp_conn_pair *gcp)
 {
 	size_t len = gcp->target.cap;
 	int r;
 
 	gcp->target.len = 0;
-	r = gwp_socks5_cli_build_connect(&gcp->up_dst, gcp->target.buf, &len);
+	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
+		r = gwp_socks5_cli_build_udp_associate(&gcp->up_dst,
+						       gcp->target.buf, &len);
+	else
+		r = gwp_socks5_cli_build_connect(&gcp->up_dst, gcp->target.buf,
+						 &len);
 	if (unlikely(r))
 		return r;
 
@@ -158,6 +178,39 @@ static int s5_rep_err(uint8_t rep)
 	default:
 		return -EPROTO;
 	}
+}
+
+/*
+ * The reply to the UDP ASSOCIATE of a UDP association through the upstream.
+ * A refusal fails it as a refused CONNECT would, with the same answer to the
+ * client; gwp_conn_upstream_failed() neither counts it against the server,
+ * which may serve TCP well, nor leaves it without its retry. Once granted,
+ * the client gets its own reply, and whatever followed the server's on the
+ * control connection is dropped: nothing more is to come on it.
+ */
+static int s5_parse_udp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_socks5_addr bnd;
+	size_t consumed;
+	uint8_t rep;
+	int r;
+
+	r = gwp_socks5_cli_parse_reply(gcp->target.buf, gcp->target.len, &rep,
+				       &bnd, &consumed);
+	if (r)
+		return r == -EAGAIN ? GWP_UPSTREAM_IO_RECV : r;
+
+	if (rep != GWP_SOCKS5_REP_SUCCESS) {
+		pr_err(&w->ctx->lh, "Upstream SOCKS5 UDP ASSOCIATE failed (rep=0x%02x, class=%s, idx=%u, up=%s)",
+			rep, gwp_upstream_fail_class_str(GWP_UPSTREAM_FAIL_NEUTRAL),
+			gcp->idx, ip_to_str(&gcp->upstream->addr));
+		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_S5_REP, rep);
+		return s5_rep_err(rep);
+	}
+
+	gcp->target.cap += client_reply_room(gcp);
+	r = gwp_upstream_udp_ready(w, gcp, &bnd);
+	return r ? r : GWP_UPSTREAM_IO_DONE;
 }
 
 static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -212,6 +265,9 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	case CONN_STATE_UPSTREAM_S5_CONNECT: {
 		uint8_t rep;
 		size_t consumed;
+
+		if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
+			return s5_parse_udp(w, gcp);
 
 		r = gwp_socks5_cli_parse_connect(buf, len, &rep, &consumed);
 		if (r)
@@ -334,7 +390,11 @@ static int s5_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	size_t len = gcp->target.cap;
 	int r;
 
-	r = gwp_upstream_finalize_dst(gcp);
+	/* Anew for each server: it is where the datagrams come from. */
+	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
+		r = gwp_upstream_udp_dst(w, gcp);
+	else
+		r = gwp_upstream_finalize_dst(gcp);
 	if (unlikely(r)) {
 		pr_err(&ctx->lh, "Failed to prepare upstream destination (idx=%u): %s",
 			gcp->idx, strerror(-r));
