@@ -2828,6 +2828,162 @@ static noinline void test_include_optional(void)
 }
 
 /*
+ * @acl's directories are @dir/<each of @names> ("" for @dir itself), in that
+ * order.
+ */
+static void inc_dirs(struct gwp_acl *acl, const char *dir,
+		     const char *const *names, size_t nr)
+{
+	char path[PATH_MAX];
+	size_t i;
+
+	for (i = 0; i < nr; i++) {
+		if (*names[i])
+			snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+		else
+			snprintf(path, sizeof(path), "%s", dir);
+		assert(gwp_acl_dir(acl, i));
+		if (strcmp(gwp_acl_dir(acl, i), path))
+			fprintf(stderr, "dir %zu is %s, not %s\n", i,
+				gwp_acl_dir(acl, i), path);
+		assert(!strcmp(gwp_acl_dir(acl, i), path));
+	}
+	if (gwp_acl_dir(acl, nr))
+		fprintf(stderr, "extra dir %s\n", gwp_acl_dir(acl, nr));
+	assert(!gwp_acl_dir(acl, nr));
+}
+
+/*
+ * The directories the include lines look in are listed for the watch: each
+ * directory a pattern reads or looks in, once, and the deepest one there is
+ * on the way to a missing file or pattern directory, with the names that
+ * matter in each: files to read, or directories on the way to them. A plain
+ * file whose own directory is there needs none: its watch covers it.
+ */
+static noinline void test_include_dirs(void)
+{
+	static const char *const conf[] = { "conf" };
+	static const char *const lv[] = { "lv", "lv/w", "lv/x", "lv/x/y" };
+	static const char *const top[] = { "" };
+	static const char *const in_a[] = { "a" };
+	static const char *const both[] = { "conf", "" };
+	char *dir = inc_dir(), *path;
+	struct stat st, st_conf;
+	struct gwp_acl *a;
+
+	inc_mkdir_put(dir, "conf");
+	inc_put(dir, "conf/a.conf", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
+	inc_mkdir_put(dir, "lv");
+	inc_mkdir_put(dir, "lv/x");
+	inc_mkdir_put(dir, "lv/x/y");
+	inc_mkdir_put(dir, "lv/w");
+	inc_put(dir, "lv/x/y/1.conf", "-A OUTPUT -d 192.0.2.2 -j REJECT\n");
+	inc_put(dir, "lv/file", "#\n");
+
+	/* One level: the files that match, nothing else. */
+	assert(asprintf(&path, "%s/conf", dir) > 0);
+	assert(!stat(path, &st_conf));
+	free(path);
+	path = inc_write(dir, "main.acl", "include conf/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, conf, 1);
+	assert(gwp_acl_dir_wants(a, 0, "a.conf") == GWP_ACL_DIR_FILE);
+	assert(gwp_acl_dir_wants(a, 0, "new.conf") == GWP_ACL_DIR_FILE);
+	assert(!gwp_acl_dir_wants(a, 0, "a.txt"));
+	assert(!gwp_acl_dir_wants(a, 0, ".a.conf"));
+	assert(!gwp_acl_dir_wants(a, 0, "."));
+	assert(!gwp_acl_dir_wants(a, 1, "a.conf"));
+	assert(!gwp_acl_dir_stat(a, 0, &st));
+	assert(st.st_ino == st_conf.st_ino && st.st_mtime == st_conf.st_mtime);
+	assert(gwp_acl_dir_stat(a, 1, &st) == -ENOENT);
+	gwp_acl_destroy(a);
+
+	/*
+	 * Several levels: every directory the pattern goes through, once,
+	 * in order, but not those it does not (lv/file, lv/w has no y).
+	 */
+	inc_put(dir, "main.acl", "include lv/*/y/*.conf;\n"
+				 "include lv/*/y/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, lv, 4);
+	assert(gwp_acl_dir_wants(a, 0, "x") == GWP_ACL_DIR_SUBDIR);
+	assert(gwp_acl_dir_wants(a, 0, "new") == GWP_ACL_DIR_SUBDIR);
+	assert(!gwp_acl_dir_wants(a, 0, ".h"));
+	assert(gwp_acl_dir_wants(a, 1, "y") == GWP_ACL_DIR_SUBDIR);
+	assert(!gwp_acl_dir_wants(a, 1, "z"));
+	assert(gwp_acl_dir_wants(a, 2, "y") == GWP_ACL_DIR_SUBDIR);
+	assert(gwp_acl_dir_wants(a, 3, "2.conf") == GWP_ACL_DIR_FILE);
+	gwp_acl_destroy(a);
+
+	/* A directory can matter both ways. */
+	inc_put(dir, "main.acl", "include lv/*;\ninclude_optional lv/*/q;\n");
+	assert(gwp_acl_create(&a, path) == -EINVAL);	/* lv/x: a directory */
+	inc_put(dir, "main.acl", "include lv/f*;\ninclude_optional lv/*/q;\n");
+	assert(!gwp_acl_create(&a, path));
+	assert(gwp_acl_dir_wants(a, 0, "file") ==
+	       (GWP_ACL_DIR_FILE | GWP_ACL_DIR_SUBDIR));
+	assert(gwp_acl_dir_wants(a, 0, "x") == GWP_ACL_DIR_SUBDIR);
+	gwp_acl_destroy(a);
+
+	/*
+	 * Missing: the deepest directory there is on the way, for the name
+	 * that leads on, escaped; none for a file whose directory is there.
+	 */
+	inc_put(dir, "main.acl", "include_optional no\\[1]/deeper/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, top, 1);
+	assert(gwp_acl_dir_wants(a, 0, "no[1]") == GWP_ACL_DIR_SUBDIR);
+	assert(!gwp_acl_dir_wants(a, 0, "no1"));
+	gwp_acl_destroy(a);
+	/* As a pattern, the same component reads the directory. */
+	inc_put(dir, "main.acl", "include_optional no[1]/deeper/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, top, 1);
+	assert(gwp_acl_dir_wants(a, 0, "no1") == GWP_ACL_DIR_SUBDIR);
+	assert(!gwp_acl_dir_wants(a, 0, "no[1]"));
+	gwp_acl_destroy(a);
+	inc_put(dir, "main.acl", "include_optional a/b/c.acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, top, 1);
+	assert(gwp_acl_dir_wants(a, 0, "a") == GWP_ACL_DIR_SUBDIR);
+	gwp_acl_destroy(a);
+	inc_mkdir_put(dir, "a");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, in_a, 1);
+	assert(gwp_acl_dir_wants(a, 0, "b") == GWP_ACL_DIR_SUBDIR);
+	gwp_acl_destroy(a);
+	inc_put(dir, "main.acl", "include_optional a/c.acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, NULL, 0);
+	gwp_acl_destroy(a);
+	/* A file on the way: its directory, for when it is one. */
+	inc_put(dir, "main.acl", "include_optional lv/file/c.acl;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, lv, 1);
+	assert(gwp_acl_dir_wants(a, 0, "file") == GWP_ACL_DIR_SUBDIR);
+	gwp_acl_destroy(a);
+
+	/* A strict include lists them too, and a reload follows the lines. */
+	inc_put(dir, "main.acl", "include conf/*.conf;\ninclude none/x.acl;\n");
+	assert(gwp_acl_create(&a, path) == -ENOENT);
+	inc_put(dir, "main.acl", "include conf/*.conf;\n");
+	assert(!gwp_acl_create(&a, path));
+	inc_dirs(a, dir, conf, 1);
+	inc_put(dir, "main.acl", "include conf/*.conf;\ninclude none/x.acl;\n"
+				 "include lv/x/y/*.conf;\n");
+	assert(gwp_acl_reload(a) == -ENOENT);
+	inc_dirs(a, dir, both, 2);
+	assert(gwp_acl_dir_wants(a, 1, "none") == GWP_ACL_DIR_SUBDIR);
+	inc_put(dir, "main.acl", "-P OUTPUT ACCEPT\n");
+	assert(!gwp_acl_reload(a));
+	inc_dirs(a, dir, NULL, 0);
+	gwp_acl_destroy(a);
+	free(path);
+
+	inc_rmdir(dir);
+}
+
+/*
  * ------------------------------------------------------------------------
  * Upstream pools and -j UPSTREAM
  * ------------------------------------------------------------------------
@@ -4190,6 +4346,7 @@ static void run_tests(void)
 	test_include_glob_order();
 	test_include_glob_errors();
 	test_include_optional();
+	test_include_dirs();
 	test_upstream_errors();
 	test_upstream_pool_https();
 	test_upstream_index();

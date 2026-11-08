@@ -296,6 +296,9 @@ struct gwp_acl {
 	 */
 	struct acl_file		*files;
 	size_t			nr_files;
+	/* The same for the directories; see gwp_acl_dir(). */
+	struct acl_dir		*dirs;
+	size_t			nr_dirs;
 	/* Serialises reloads; evaluations never take it. */
 	pthread_mutex_t		reload_lock;
 	/* Bumped by every successful reload; see gwp_acl_generation(). */
@@ -353,6 +356,28 @@ struct acl_file {
 	bool		warned;
 };
 
+/*
+ * A directory whose entries decide what the include lines of a load name:
+ * one a pattern read or looked in, or the deepest one that exists on the way
+ * to a missing file or pattern directory. @names: the components looked up
+ * in it, as patterns (a literal name escaped), each with @file set when it
+ * names the included files themselves, clear when it names a directory on
+ * the way to them. @err, @st: as for struct acl_file, taken before the
+ * directory was read.
+ */
+struct acl_dir_name {
+	char		*pat;
+	bool		file;
+};
+
+struct acl_dir {
+	char			*path;
+	int			err;
+	struct stat		st;
+	struct acl_dir_name	*names;
+	size_t			nr_names;
+};
+
 /* The identity of a file being parsed, for the include cycle check. */
 struct acl_file_key {
 	dev_t	dev;
@@ -366,6 +391,8 @@ struct acl_file_key {
  *     each once. Whether the load succeeds or not, a change to any of them
  *     can change the outcome of the next one (a fixed rule, a missing file
  *     created), so they are what a reload watches.
+ *   @dirs: the directories the include lines looked in (struct acl_dir),
+ *     each once; what a reload watches for files that come and go.
  *   @path: the file whose lines are being parsed; NULL for text.
  *   @stack, @depth: the files being parsed, the top file first.
  *   @nr_loads: files read so far, see ACL_MAX_FILES.
@@ -391,6 +418,8 @@ struct acl_load {
 	struct gwp_acl_ruleset	*rs;
 	struct acl_file		*files;
 	size_t			nr_files;
+	struct acl_dir		*dirs;
+	size_t			nr_dirs;
 	const char		*path;
 	struct acl_file_key	stack[ACL_MAX_INCLUDE_DEPTH + 1];
 	unsigned		depth;
@@ -2273,6 +2302,123 @@ static char *include_pattern(const char *parent, const char *inc)
 	return glob_escape(parent, (size_t)(slash - parent) + 1, inc);
 }
 
+static void dirs_free(struct acl_dir *dirs, size_t nr)
+{
+	size_t i, j;
+
+	for (i = 0; i < nr; i++) {
+		for (j = 0; j < dirs[i].nr_names; j++)
+			free(dirs[i].names[j].pat);
+		free(dirs[i].names);
+		free(dirs[i].path);
+	}
+	free(dirs);
+}
+
+/*
+ * Note that the entries of the directory @dir ("" for the current one) that
+ * match @pat decide what the line includes: files when @file, directories on
+ * the way otherwise. @st describes @dir as it was right before it was read,
+ * or NULL to stat() it now. A directory noted twice keeps its first
+ * identity and gathers the names.
+ */
+static int note_dir(struct acl_load *ld, const char *dir, const char *pat,
+		    bool file, const struct stat *st)
+{
+	const char *path = *dir ? dir : ".";
+	struct acl_dir_name *names;
+	struct acl_dir *d = NULL, *v;
+	size_t i;
+
+	for (i = 0; i < ld->nr_dirs; i++) {
+		if (!strcmp(ld->dirs[i].path, path)) {
+			d = &ld->dirs[i];
+			break;
+		}
+	}
+	if (!d) {
+		v = realloc(ld->dirs, (ld->nr_dirs + 1) * sizeof(*v));
+		if (!v)
+			return -ENOMEM;
+		ld->dirs = v;
+		d = &v[ld->nr_dirs];
+		memset(d, 0, sizeof(*d));
+		d->path = strdup(path);
+		if (!d->path)
+			return -ENOMEM;
+		ld->nr_dirs++;
+		if (st)
+			d->st = *st;
+		else if (stat(path, &d->st))
+			d->err = errno;
+	}
+
+	for (i = 0; i < d->nr_names; i++) {
+		if (d->names[i].file == file && !strcmp(d->names[i].pat, pat))
+			return 0;
+	}
+	names = realloc(d->names, (d->nr_names + 1) * sizeof(*names));
+	if (!names)
+		return -ENOMEM;
+	d->names = names;
+	names[d->nr_names].pat = strdup(pat);
+	if (!names[d->nr_names].pat)
+		return -ENOMEM;
+	names[d->nr_names++].file = file;
+	return 0;
+}
+
+/*
+ * @path is not there, or a directory on the way to it is not (or is no
+ * directory). Note the deepest directory on the way that is, for the name
+ * that leads on from it; but with @own_watched, not when that is @path's own
+ * directory: @path is a file, and the watch on that one comes with it.
+ */
+static int note_missing(struct acl_load *ld, const char *path,
+			bool own_watched)
+{
+	char *buf, *slash, *name, *pat;
+	const char *dir;
+	struct stat st;
+	bool first = true;
+	int r = 0;
+
+	buf = strdup(path);
+	if (!buf)
+		return -ENOMEM;
+	for (;;) {
+		slash = strrchr(buf, '/');
+		if (!slash) {
+			dir = "";
+			name = buf;
+		} else if (slash == buf) {
+			dir = "/";
+			name = buf + 1;
+		} else {
+			*slash = '\0';
+			dir = buf;
+			name = slash + 1;
+		}
+		if (!stat(*dir ? dir : ".", &st) && S_ISDIR(st.st_mode)) {
+			if ((first && own_watched) || !*name)
+				break;
+			pat = glob_escape(name, strlen(name), "");
+			if (!pat) {
+				r = -ENOMEM;
+				break;
+			}
+			r = note_dir(ld, dir, pat, false, &st);
+			free(pat);
+			break;
+		}
+		if (!*dir || !strcmp(dir, "/"))
+			break;
+		first = false;
+	}
+	free(buf);
+	return r;
+}
+
 /* Fail the include line over @path, which the pattern walk met. */
 static int glob_fail(struct acl_load *ld, const char *path, int err)
 {
@@ -2308,6 +2454,16 @@ static int glob_read_dir(struct acl_load *ld, const char *dir, const char *pat,
 		if (r == -ENOENT || r == -ENOTDIR)
 			return 0;
 		return glob_fail(ld, open_path, r);
+	}
+	if (fstat(fd, &st)) {
+		r = -errno;
+		close(fd);
+		return glob_fail(ld, open_path, r);
+	}
+	r = note_dir(ld, dir, pat, last, &st);
+	if (r) {
+		close(fd);
+		return r;
 	}
 	d = fdopendir(fd);
 	if (!d) {
@@ -2377,6 +2533,9 @@ static int glob_literal(struct acl_load *ld, const char *dir, const char *pat,
 	char *name, *path;
 	int r;
 
+	r = note_dir(ld, dir, pat, last, NULL);
+	if (r)
+		return r;
 	name = glob_unescape(pat);
 	if (!name)
 		return -ENOMEM;
@@ -2454,13 +2613,13 @@ static int include_glob(struct acl_load *ld, const char *pat,
 		if (stat(prefix, &st)) {
 			r = -errno;
 			if (r == -ENOENT || r == -ENOTDIR || r == -ELOOP)
-				r = 0;
+				r = note_missing(ld, prefix, false);
 			else
 				r = glob_fail(ld, prefix, r);
 			goto out;
 		}
 		if (!S_ISDIR(st.st_mode)) {
-			r = 0;
+			r = note_missing(ld, prefix, false);
 			goto out;
 		}
 	}
@@ -2488,6 +2647,10 @@ static int include_glob(struct acl_load *ld, const char *pat,
 				goto out;
 		}
 		inc_list_free(&cur);
+		/* Sorted, so the directories are listed in a fixed order. */
+		if (next.nr > 1)
+			qsort(next.v, next.nr, sizeof(*next.v),
+			      inc_list_cmp);
 		cur = next;
 		next.v = NULL;
 		next.nr = 0;
@@ -3253,6 +3416,12 @@ static int load_file(struct acl_load *ld, const char *path, bool optional)
 		r = -errno;
 		if (rec)
 			rec->err = -r;
+		if (r == -ENOENT || r == -ENOTDIR) {
+			int nr = note_missing(ld, path, true);
+
+			if (nr)
+				return nr;
+		}
 		/*
 		 * Not there: a missing file, a missing or non-directory
 		 * component on the way, or a dangling link. Not read either,
@@ -3624,11 +3793,14 @@ int gwp_acl_create_ops(struct gwp_acl **out, const char *path,
 	if (r) {
 		free(rs);
 		files_free(ld.files, ld.nr_files);
+		dirs_free(ld.dirs, ld.nr_dirs);
 		return r;
 	}
 
 	acl->files = ld.files;
 	acl->nr_files = ld.nr_files;
+	acl->dirs = ld.dirs;
+	acl->nr_dirs = ld.nr_dirs;
 	acl->ops = ops;
 	acl->path = strdup(path);
 	if (!acl->path) {
@@ -3667,10 +3839,14 @@ int gwp_acl_reload(struct gwp_acl *acl)
 	pthread_mutex_lock(&acl->reload_lock);
 	if (r == -ENOMEM) {
 		files_free(ld.files, ld.nr_files);
+		dirs_free(ld.dirs, ld.nr_dirs);
 	} else {
 		files_free(acl->files, acl->nr_files);
 		acl->files = ld.files;
 		acl->nr_files = ld.nr_files;
+		dirs_free(acl->dirs, acl->nr_dirs);
+		acl->dirs = ld.dirs;
+		acl->nr_dirs = ld.nr_dirs;
 	}
 	if (r) {
 		pthread_mutex_unlock(&acl->reload_lock);
@@ -3713,6 +3889,41 @@ int gwp_acl_file_stat(const struct gwp_acl *acl, size_t i, struct stat *st)
 	return 0;
 }
 
+const char *gwp_acl_dir(const struct gwp_acl *acl, size_t i)
+{
+	if (!acl || i >= acl->nr_dirs)
+		return NULL;
+	return acl->dirs[i].path;
+}
+
+int gwp_acl_dir_stat(const struct gwp_acl *acl, size_t i, struct stat *st)
+{
+	if (!acl || i >= acl->nr_dirs)
+		return -ENOENT;
+	if (acl->dirs[i].err)
+		return -acl->dirs[i].err;
+	*st = acl->dirs[i].st;
+	return 0;
+}
+
+unsigned gwp_acl_dir_wants(const struct gwp_acl *acl, size_t i,
+			   const char *name)
+{
+	const struct acl_dir *d;
+	unsigned wants = 0;
+	size_t j;
+
+	if (!acl || i >= acl->nr_dirs)
+		return 0;
+	d = &acl->dirs[i];
+	for (j = 0; j < d->nr_names; j++) {
+		if (glob_match(d->names[j].pat, name))
+			wants |= d->names[j].file ? GWP_ACL_DIR_FILE :
+						    GWP_ACL_DIR_SUBDIR;
+	}
+	return wants;
+}
+
 /* The caller guarantees that no evaluation is running or will start. */
 void gwp_acl_destroy(struct gwp_acl *acl)
 {
@@ -3721,6 +3932,7 @@ void gwp_acl_destroy(struct gwp_acl *acl)
 	ruleset_destroy(atomic_load_explicit(&acl->rs, memory_order_relaxed));
 	pthread_mutex_destroy(&acl->reload_lock);
 	files_free(acl->files, acl->nr_files);
+	dirs_free(acl->dirs, acl->nr_dirs);
 	free(acl->path);
 	free(acl);
 }

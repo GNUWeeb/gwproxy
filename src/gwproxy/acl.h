@@ -245,6 +245,36 @@ const char *gwp_acl_file(const struct gwp_acl *acl, size_t i);
  */
 int gwp_acl_file_stat(const struct gwp_acl *acl, size_t i, struct stat *st);
 
+/*
+ * The @i-th directory whose entries decide what the include lines of the last
+ * gwp_acl_create() or gwp_acl_reload() of @acl included: one an include
+ * pattern read or looked in, or the deepest one there is on the way to a
+ * missing file or pattern directory (a missing file's own directory is not
+ * listed: watching the file watches it). A file or directory created in one
+ * of these, or removed or renamed from one, can change what the next load
+ * reads, so they are watched as gwp_acl_file() are. NULL past the last one;
+ * the same lifetime and thread rules as gwp_acl_file(). The current
+ * directory is ".".
+ */
+const char *gwp_acl_dir(const struct gwp_acl *acl, size_t i);
+
+/*
+ * What stat() said about the @i-th directory of gwp_acl_dir() right before
+ * the load read it, as gwp_acl_file_stat() does for files.
+ */
+int gwp_acl_dir_stat(const struct gwp_acl *acl, size_t i, struct stat *st);
+
+/*
+ * Which entries of the @i-th directory of gwp_acl_dir() matter: for the entry
+ * @name, GWP_ACL_DIR_FILE when the include lines take it as a file to read,
+ * GWP_ACL_DIR_SUBDIR when they take it as a directory on the way to the files,
+ * either, both or neither (0).
+ */
+#define GWP_ACL_DIR_FILE	(1u << 0)
+#define GWP_ACL_DIR_SUBDIR	(1u << 1)
+unsigned gwp_acl_dir_wants(const struct gwp_acl *acl, size_t i,
+			   const char *name);
+
 /* Free an ACL (NULL is a no-op). */
 void gwp_acl_destroy(struct gwp_acl *acl);
 

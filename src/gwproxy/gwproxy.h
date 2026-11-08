@@ -987,11 +987,15 @@ struct gwp_reload_file {
 /*
  * One file of the ACL rule set (the --acl-file or a file it includes), as the
  * reload thread watches it. @wd: the inotify watch on its directory, -1 when
- * there is none (the periodic check still covers it).
+ * there is none (the periodic check still covers it). Or, with @dir, one of
+ * the directories the include lines looked in (gwp_acl_dir() number @idx),
+ * and @wd the watch on that directory itself.
  */
 struct gwp_reload_acl_file {
 	char			*path;
 	int			wd;
+	bool			dir;
+	size_t			idx;
 	struct gwp_reload_file	rf;
 };
 
