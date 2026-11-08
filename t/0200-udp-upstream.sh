@@ -212,4 +212,8 @@ ECHO x$i" "$out"
 
 run_loop epoll
 
+if have_io_uring; then
+	run_loop io_uring
+fi
+
 pass

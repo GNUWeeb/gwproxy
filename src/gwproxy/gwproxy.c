@@ -6436,9 +6436,6 @@ static bool udp_up_usable(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 			ip_to_str(&up->addr), gcp->idx);
 		return false;
 	}
-	/* Not on io_uring yet. */
-	if (ev_is_io_uring(&ctx->cfg))
-		return false;
 	return true;
 }
 

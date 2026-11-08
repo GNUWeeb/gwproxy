@@ -166,9 +166,6 @@ unseen()
 
 for loop in epoll io_uring; do
 	[ "$loop" = io_uring ] && ! have_io_uring && continue
-	# What a pool user's UDP ASSOCIATE gets: io_uring refuses it.
-	up_udp=1
-	[ "$loop" = io_uring ] && up_udp=7
 
 	fp="$(pick_port)"
 	gwp_start "127.0.0.1:$fp" --as-socks5=1 --event-loop="$loop" \
@@ -214,9 +211,8 @@ for loop in epoll io_uring; do
 	# A pool user's UDP ASSOCIATE goes to the pool's socks5:// server,
 	# which turns it down (REP 7, answered REP 1), DIRECT gets the relay
 	# past --upstream-proxy, and no choice leaves the default to refuse it.
-	udp_rep "[$loop]" "$fp" alice:pa "$up_udp"
+	udp_rep "[$loop]" "$fp" alice:pa 1
 	tail -n 1 "$WORK/rec.s5.log" | grep -q '^cmd=3 ' || \
-		[ "$loop" != epoll ] || \
 		fail "[$loop] alice's UDP ASSOCIATE did not reach her pool"
 	udp_rep "[$loop]" "$fp" dave:pd 0
 	udp_rep "[$loop]" "$fp" carol:pc 7
@@ -227,7 +223,7 @@ for loop in epoll io_uring; do
 	gwp_start "127.0.0.1:$fp" --as-socks5=1 --event-loop="$loop" \
 		--nr-workers=2 --auth-file="$WORK/auth" \
 		--acl-file="$d/main.acl"
-	udp_rep "[$loop no default]" "$fp" alice:pa "$up_udp"
+	udp_rep "[$loop no default]" "$fp" alice:pa 1
 	udp_rep "[$loop no default]" "$fp" dave:pd 0
 	udp_rep "[$loop no default]" "$fp" carol:pc 0
 	kill "$GWP_PID" 2>/dev/null
