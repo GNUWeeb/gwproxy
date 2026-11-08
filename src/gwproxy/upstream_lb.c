@@ -111,6 +111,25 @@ struct gwp_up_table *gwp_up_table_create(void)
 	return t;
 }
 
+/*
+ * Free @s, out of its table, with whatever health it still has: none, unless
+ * server objects were leaked.
+ */
+static void state_free(struct gwp_up_state *s)
+{
+	struct gwp_up_health *h, *next;
+
+	for (h = s->health; h; h = next) {
+		next = h->next;
+		free(h);
+	}
+	pthread_mutex_destroy(&s->hlock);
+	free(s->fail_at);
+	/* The key holds a user name; leave none in freed memory. */
+	explicit_bzero(s, sizeof(*s));
+	free(s);
+}
+
 uint32_t gwp_up_table_destroy(struct gwp_up_table *t)
 {
 	struct gwp_up_state *s, *next;
@@ -122,9 +141,7 @@ uint32_t gwp_up_table_destroy(struct gwp_up_table *t)
 	for (i = 0; i < t->nr_bucket; i++) {
 		for (s = t->bucket[i]; s; s = next) {
 			next = s->next;
-			/* The key holds a user name; leave none in freed memory. */
-			explicit_bzero(s, sizeof(*s));
-			free(s);
+			state_free(s);
 		}
 	}
 	pthread_mutex_destroy(&t->lock);
@@ -163,14 +180,13 @@ struct gwp_up_state *gwp_up_state_get(struct gwp_up_table *t,
 		mem = NULL;
 	s = mem;
 	if (s) {
-		uint32_t i;
-
 		memset(s, 0, sizeof(*s));
+		if (pthread_mutex_init(&s->hlock, NULL)) {
+			free(s);
+			s = NULL;
+			goto out;
+		}
 		atomic_init(&s->nr_open, 0);
-		atomic_init(&s->fail_seq, 0);
-		for (i = 0; i < GWP_UP_EJECT_FAILS; i++)
-			atomic_init(&s->fail_at[i], 0);
-		atomic_init(&s->eject_end, 0);
 		s->ref = 1;
 		s->tab = t;
 		s->key = *key;
@@ -204,8 +220,7 @@ void gwp_up_state_put(struct gwp_up_state *s)
 	*pp = s->next;
 	t->nr--;
 	pthread_mutex_unlock(&t->lock);
-	explicit_bzero(s, sizeof(*s));
-	free(s);
+	state_free(s);
 }
 
 /* A time as stored: 0 means none, so a time that is 0 is taken as 1. */
@@ -223,51 +238,354 @@ static int32_t ms_after(uint32_t a, uint32_t b)
 	return (int32_t)(a - b);
 }
 
-bool gwp_up_state_fail(struct gwp_up_state *s, uint32_t now)
+/*
+ * Make room in @s's failure ring for the last @n failures, keeping those it
+ * has, oldest first; under @s's hlock. False without memory.
+ */
+static bool fail_ring_grow(struct gwp_up_state *s, uint32_t n)
 {
-	uint32_t seq = atomic_fetch_add(&s->fail_seq, 1);
-	uint32_t t, end, i;
+	uint32_t *v, i, k;
 
-	/*
-	 * Sequentially consistent, the store and the loads: whichever
-	 * failure stores last sees every other one's time.
-	 */
-	atomic_store(&s->fail_at[seq % GWP_UP_EJECT_FAILS], stamp(now));
-	for (i = 0; i < GWP_UP_EJECT_FAILS; i++) {
-		t = atomic_load(&s->fail_at[i]);
-		/* Another worker's clock may be a little ahead (< 0). */
-		if (!t || ms_after(now, t) > (int32_t)GWP_UP_EJECT_WINDOW_MS)
-			return false;
+	if (n <= s->fail_cap)
+		return true;
+	v = calloc(n, sizeof(*v));
+	if (!v)
+		return false;
+	for (i = 0; i < s->fail_nr; i++) {
+		k = (s->fail_next + s->fail_cap - s->fail_nr + i) % s->fail_cap;
+		v[i] = s->fail_at[k];
 	}
-
-	end = atomic_load(&s->eject_end);
-	do {
-		if (end && ms_after(end, now) > 0)
-			return false;	/* ejected already */
-	} while (!atomic_compare_exchange_weak(&s->eject_end, &end,
-					       stamp(now + GWP_UP_EJECT_MS)));
+	free(s->fail_at);
+	s->fail_at = v;
+	s->fail_cap = n;
+	s->fail_next = s->fail_nr % n;
 	return true;
 }
 
-uint32_t gwp_up_state_ejected(struct gwp_up_state *s, uint32_t now,
-			      bool *back)
+struct gwp_up_health *gwp_up_health_get(struct gwp_up_state *s,
+					const struct gwp_up_opts *o)
 {
-	uint32_t end = atomic_load_explicit(&s->eject_end,
-					    memory_order_relaxed);
+	struct gwp_up_health *h;
+
+	pthread_mutex_lock(&s->hlock);
+	for (h = s->health; h; h = h->next) {
+		if (h->max_fails == o->max_fails &&
+		    h->window_ms == o->fail_timeout_ms &&
+		    h->eject_ms == o->eject_ms) {
+			h->ref++;
+			goto out;
+		}
+	}
+	h = NULL;
+	if (!fail_ring_grow(s, o->max_fails))
+		goto out;
+	h = calloc(1, sizeof(*h));
+	if (!h)
+		goto out;
+	atomic_init(&h->eject_end, 0);
+	h->max_fails = o->max_fails;
+	h->window_ms = o->fail_timeout_ms;
+	h->eject_ms = o->eject_ms;
+	h->ref = 1;
+	h->st = s;
+	h->next = s->health;
+	s->health = h;
+out:
+	pthread_mutex_unlock(&s->hlock);
+	return h;
+}
+
+void gwp_up_health_put(struct gwp_up_health *h)
+{
+	struct gwp_up_state *s;
+	struct gwp_up_health **pp;
+
+	if (!h)
+		return;
+	s = h->st;
+	pthread_mutex_lock(&s->hlock);
+	if (--h->ref) {
+		pthread_mutex_unlock(&s->hlock);
+		return;
+	}
+	for (pp = &s->health; *pp != h; pp = &(*pp)->next)
+		;
+	*pp = h->next;
+	pthread_mutex_unlock(&s->hlock);
+	free(h);
+}
+
+/*
+ * Whether the failure just recorded in @s, at @now, ejects the server for
+ * @h: its last max_fails failures all fall within its window, and it was in
+ * service. Under @s's hlock.
+ */
+static bool health_fail(struct gwp_up_state *s, struct gwp_up_health *h,
+			uint32_t now)
+{
+	uint32_t t, end, i;
+
+	if (s->fail_nr < h->max_fails)
+		return false;
+	for (i = 1; i <= h->max_fails; i++) {
+		t = s->fail_at[(s->fail_next + s->fail_cap - i) % s->fail_cap];
+		/* Another worker's clock may be a little ahead (< 0). */
+		if (!t || ms_after(now, t) > (int32_t)h->window_ms)
+			return false;
+	}
+
+	/* The ejection is ended by picks, which take no lock. */
+	end = atomic_load(&h->eject_end);
+	do {
+		if (end && ms_after(end, now) > 0)
+			return false;	/* ejected already */
+	} while (!atomic_compare_exchange_weak(&h->eject_end, &end,
+					       stamp(now + h->eject_ms)));
+	return true;
+}
+
+bool gwp_up_state_fail(struct gwp_up_state *s, struct gwp_up_health *own,
+		       uint32_t now,
+		       void (*ejected)(void *arg, const struct gwp_up_health *h),
+		       void *arg)
+{
+	struct gwp_up_health *h;
+	bool ret = false;
+
+	pthread_mutex_lock(&s->hlock);
+	if (s->fail_cap) {
+		s->fail_at[s->fail_next] = stamp(now);
+		s->fail_next = (s->fail_next + 1) % s->fail_cap;
+		if (s->fail_nr < s->fail_cap)
+			s->fail_nr++;
+	}
+	for (h = s->health; h; h = h->next) {
+		if (!health_fail(s, h, now))
+			continue;
+		if (h == own)
+			ret = true;
+		else if (ejected)
+			ejected(arg, h);
+	}
+	pthread_mutex_unlock(&s->hlock);
+	return ret;
+}
+
+uint32_t gwp_up_health_ejected(struct gwp_up_health *h, uint32_t now,
+			       bool *back)
+{
+	uint32_t end;
 
 	if (back)
 		*back = false;
+	if (!h)
+		return 0;
+	end = atomic_load_explicit(&h->eject_end, memory_order_relaxed);
 	if (!end)
 		return 0;
 	if (ms_after(end, now) > 0)
 		return (uint32_t)ms_after(end, now);
-	if (atomic_compare_exchange_strong(&s->eject_end, &end, 0)) {
+	if (atomic_compare_exchange_strong(&h->eject_end, &end, 0)) {
 		if (back)
 			*back = true;
 		return 0;
 	}
 	/* Ended by another caller, or ejected again meanwhile. */
 	return end && ms_after(end, now) > 0 ? (uint32_t)ms_after(end, now) : 0;
+}
+
+static uint32_t member_weight(const struct gwp_up_member *m)
+{
+	return m->weight ? m->weight : 1;
+}
+
+/* The place in the pool of the server at @p in the tier @t. */
+static uint32_t tier_member(const struct gwp_up_tier *t, uint32_t p)
+{
+	return t->idx ? t->idx[p] : p;
+}
+
+/*
+ * The position in @t of the server that owns the unit at the point @x (a
+ * fraction of 2^32) of the tier's weights: the first from @lo whose @cum
+ * is above it, among the @n from @lo (which hold it). A binary search
+ * without branches to mispredict, as the turns hop around the tier: the
+ * answer stays in [lo, lo + n).
+ */
+static uint32_t owner_in(const struct gwp_up_tier *t, uint32_t x,
+			 uint32_t lo, uint32_t n)
+{
+	uint32_t u = (uint32_t)(((uint64_t)x * t->total) >> 32), half;
+
+	while (n > 1) {
+		half = n / 2;
+		lo = t->cum[lo + half - 1] <= u ? lo + half : lo;
+		n -= half;
+	}
+	return lo;
+}
+
+/* The owner of the unit at the point @x of @t, through its slices. */
+static uint32_t tier_owner(const struct gwp_up_tier *t, uint32_t x)
+{
+	uint32_t s = x >> t->shift;
+
+	return owner_in(t, x, t->first[s],
+			(uint32_t)t->first[s + 1] - t->first[s] + 1u);
+}
+
+/* The flag bits of @m that choose its tier, 2 for none (down). */
+static uint32_t member_tier(const struct gwp_up_member *m)
+{
+	if (m->flags & GWP_UP_MEMBER_DOWN)
+		return 2;
+	return (m->flags & GWP_UP_MEMBER_BACKUP) ? 1 : 0;
+}
+
+struct gwp_up_plan *gwp_up_plan_build(const struct gwp_up_member *m,
+				      uint32_t nr)
+{
+	uint32_t n[2] = { 0, 0 }, w0[2] = { 0, 0 }, k[2] = { 0, 0 };
+	uint32_t at[2] = { 0, 0 }, i, t, p, sum;
+	bool eq[2] = { true, true }, ident;
+	struct gwp_up_plan *pl;
+	struct gwp_up_tier *tr;
+	uint16_t *pos = NULL;
+	size_t size, off;
+	char *base;
+
+	for (i = 0; i < nr; i++) {
+		t = member_tier(&m[i]);
+		if (t > 1)
+			continue;
+		if (!n[t])
+			w0[t] = member_weight(&m[i]);
+		else if (member_weight(&m[i]) != w0[t])
+			eq[t] = false;
+		n[t]++;
+	}
+	/* Every server in the main tier, in pool order: no maps needed. */
+	ident = n[0] == nr;
+
+	/* The 32-bit arrays first, then the 16-bit ones. */
+	size = sizeof(*pl);
+	for (t = 0; t < 2; t++)
+		if (!eq[t])
+			size += n[t] * sizeof(uint32_t);
+	for (t = 0; t < 2; t++) {
+		if (!ident)
+			size += n[t] * sizeof(uint16_t);
+		if (eq[t])
+			continue;
+		/* 2^k slices, at least as many as servers (2 at least). */
+		k[t] = 1;
+		while ((1u << k[t]) < n[t])
+			k[t]++;
+		size += ((1u << k[t]) + 1) * sizeof(uint16_t);
+	}
+	if (!ident)
+		size += nr * sizeof(uint16_t);
+	pl = calloc(1, size);
+	if (!pl)
+		return NULL;
+	pl->nr = nr;
+	base = (char *)pl;
+	off = sizeof(*pl);
+	for (t = 0; t < 2; t++) {
+		pl->tier[t].n = n[t];
+		if (eq[t])
+			continue;
+		pl->tier[t].cum = (uint32_t *)(void *)(base + off);
+		off += n[t] * sizeof(uint32_t);
+	}
+	for (t = 0; t < 2; t++) {
+		if (!ident) {
+			pl->tier[t].idx = (uint16_t *)(void *)(base + off);
+			off += n[t] * sizeof(uint16_t);
+		}
+		if (eq[t])
+			continue;
+		pl->tier[t].first = (uint16_t *)(void *)(base + off);
+		off += ((1u << k[t]) + 1) * sizeof(uint16_t);
+	}
+	if (!ident) {
+		pos = (uint16_t *)(void *)(base + off);
+		pl->pos = pos;
+	}
+
+	for (i = 0; !ident && i < nr; i++) {
+		t = member_tier(&m[i]);
+		if (t > 1) {
+			pos[i] = UINT16_MAX;
+			continue;
+		}
+		((uint16_t *)pl->tier[t].idx)[at[t]] = (uint16_t)i;
+		pos[i] = (uint16_t)at[t]++;
+	}
+	for (t = 0; t < 2; t++) {
+		uint16_t *first = (uint16_t *)pl->tier[t].first;
+		uint32_t *cum = (uint32_t *)pl->tier[t].cum;
+
+		tr = &pl->tier[t];
+		if (eq[t])
+			continue;
+		/* At most 8192 servers of weight 1000 at most: no overflow. */
+		for (p = 0, sum = 0; p < n[t]; p++) {
+			sum += member_weight(&m[tier_member(tr, p)]);
+			cum[p] = sum;
+		}
+		tr->total = sum;
+		tr->shift = 32 - k[t];
+		for (i = 0; i < (1u << k[t]); i++)
+			first[i] = (uint16_t)owner_in(tr, i << tr->shift, 0,
+						      n[t]);
+		first[1u << k[t]] = (uint16_t)(n[t] - 1);
+	}
+	return pl;
+}
+
+/* @x's 32 bits in the reverse order. */
+static uint32_t bit_reverse(uint32_t x)
+{
+	x = ((x >> 1) & 0x55555555u) | ((x & 0x55555555u) << 1);
+	x = ((x >> 2) & 0x33333333u) | ((x & 0x33333333u) << 2);
+	x = ((x >> 4) & 0x0f0f0f0fu) | ((x & 0x0f0f0f0fu) << 4);
+	x = ((x >> 8) & 0x00ff00ffu) | ((x & 0x00ff00ffu) << 8);
+	return (x >> 16) | (x << 16);
+}
+
+/* The position in @t whose turn the cursor @rr is. */
+static uint32_t tier_turn(const struct gwp_up_tier *t, uint32_t rr)
+{
+	if (!t->total)
+		return rr % t->n;
+	return tier_owner(t, bit_reverse(rr));
+}
+
+/* A position in @t drawn by the random number @r: uniformly, or by weight. */
+static uint32_t tier_drawn(const struct gwp_up_tier *t, uint32_t r)
+{
+	/* Uniform over [0, n), no division. */
+	if (!t->total)
+		return (uint32_t)(((uint64_t)r * t->n) >> 32);
+	return tier_owner(t, r);
+}
+
+/* Whether the @i-th server has as many pairs open as its pool allows. */
+static bool pick_full(const struct gwp_up_pick *pk, uint32_t i)
+{
+	const struct gwp_up_member *m = &pk->m[i];
+
+	return m->max_conns && gwp_up_state_open(m->st) >= m->max_conns;
+}
+
+/*
+ * Whether @v open pairs on a server of weight @w are fewer for its weight
+ * than @bv on one of weight @bw: exact, by cross-multiplying.
+ */
+static bool fewer_open(uint32_t v, uint32_t w, uint32_t bv, uint32_t bw)
+{
+	return (uint64_t)v * bw < (uint64_t)bv * w;
 }
 
 /* A pick in progress: the clock, read once when first needed. */
@@ -278,42 +596,50 @@ struct pick {
 };
 
 /*
- * How long the ejection of the @i-th server (non-NULL) still runs, 0 while
- * it is in service; reads the clock only for a server that may be ejected.
+ * How long the ejection of the @i-th server still runs, 0 while it is in
+ * service; reads the clock only for a server that may be ejected.
  */
-static uint32_t pick_ejected(struct pick *c, struct gwp_up_state *s,
-			     uint32_t i)
+static uint32_t pick_ejected(struct pick *c, uint32_t i)
 {
 	const struct gwp_up_pick *pk = c->pk;
+	struct gwp_up_health *h = pk->m[i].h;
 	uint32_t left;
 	bool back;
 
-	if (!gwp_up_state_may_be_ejected(s))
+	if (!gwp_up_health_may_be_ejected(h))
 		return 0;
 	if (!c->have_now) {
 		c->now = pk->now(pk->arg);
 		c->have_now = true;
 	}
-	left = gwp_up_state_ejected(s, c->now, &back);
+	left = gwp_up_health_ejected(h, c->now, &back);
 	if (back && pk->back)
 		pk->back(pk->arg, i);
 	return left;
 }
 
-uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
+/* Whether the @i-th server may be taken: in service, not full, not @skip. */
+static bool pick_usable(struct pick *c, uint32_t i)
 {
-	struct pick c = { .pk = pk };
-	uint32_t nr = pk->nr, skip = pk->skip, best = UINT32_MAX;
-	uint32_t best_val = UINT32_MAX, i, k, v;
-	bool retry = skip < nr;
-	struct gwp_up_state *s;
+	const struct gwp_up_pick *pk = c->pk;
 
-	if (!nr)
-		return UINT32_MAX;
-	if (retry)
-		i = skip + 1 < nr ? skip + 1 : 0;
-	else
-		i = pk->rr % nr;
+	return i != pk->skip && pk->m[i].st && !pick_full(pk, i) &&
+	       !pick_ejected(c, i);
+}
+
+/*
+ * The pick among the servers of the tier @t, from its position @p on (see
+ * gwp_up_lb_pick()): the place in the pool of the one taken, or
+ * UINT32_MAX when none may be.
+ */
+static uint32_t pick_tier(struct pick *c, const struct gwp_up_tier *t,
+			  uint32_t p)
+{
+	const struct gwp_up_pick *pk = c->pk;
+	uint32_t n = t->n, best = UINT32_MAX, best_val = UINT32_MAX;
+	uint32_t best_w = 1, i, k, v, w;
+	bool weighted = t->total != 0;
+	const struct gwp_up_member *m;
 
 	/*
 	 * The start's server is the pick (round-robin) or where the ties
@@ -322,55 +648,65 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 	 * spread; else round-robin takes the next in service, and
 	 * least_conn's ties start where they would have.
 	 */
-	s = pk->st[i];
-	if (i == skip || !s || pick_ejected(&c, s, i)) {
-		uint32_t p, j;
+	if (!pick_usable(c, tier_member(t, p))) {
+		uint32_t q, j;
 
-		for (p = 0; pk->random && p < GWP_UP_PICK_PROBES; p++) {
-			/* Uniform over [0, nr), no division. */
-			j = (uint32_t)(((uint64_t)pk->random(pk->arg) * nr) >> 32);
-			s = pk->st[j];
-			if (j != skip && s && !pick_ejected(&c, s, j)) {
-				i = j;
+		for (q = 0; pk->random && q < GWP_UP_PICK_PROBES; q++) {
+			j = tier_drawn(t, pk->random(pk->arg));
+			if (pick_usable(c, tier_member(t, j))) {
+				p = j;
 				break;
 			}
 		}
 	}
 	if (!pk->least_conn) {
-		s = pk->st[i];
-		if (i != skip && s && !pick_ejected(&c, s, i))
+		i = tier_member(t, p);
+		if (pick_usable(c, i))
 			return i;
 	}
 
-	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
-		s = pk->st[i];
-		if (i == skip || !s)
+	for (k = 0; k < n; k++, p = p + 1 < n ? p + 1 : 0) {
+		i = tier_member(t, p);
+		m = &pk->m[i];
+		if (i == pk->skip || !m->st)
 			continue;
 		if (!pk->least_conn) {
-			if (!pick_ejected(&c, s, i))
+			if (!pick_full(pk, i) && !pick_ejected(c, i))
 				return i;
 			continue;
 		}
 		/* Not fewer than the best so far: its health does not matter. */
-		v = gwp_up_state_open(s);
-		if ((best != UINT32_MAX && v >= best_val) ||
-		    pick_ejected(&c, s, i))
+		v = gwp_up_state_open(m->st);
+		w = weighted ? member_weight(m) : 1;
+		if ((m->max_conns && v >= m->max_conns) ||
+		    (best != UINT32_MAX && !fewer_open(v, w, best_val, best_w)) ||
+		    pick_ejected(c, i))
 			continue;
 		best = i;
 		best_val = v;
+		best_w = w;
 		if (!v)
 			break;
 	}
-	if (best != UINT32_MAX || retry)
-		return best;
+	return best;
+}
 
-	/* All ejected: the one back soonest, ties in turn. */
-	i = pk->rr % nr;
-	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
-		s = pk->st[i];
-		if (!s)
+/*
+ * With none in service in any tier, the server of @t, from its position
+ * @p on, whose ejection ends soonest among those that are not full; or
+ * UINT32_MAX.
+ */
+static uint32_t pick_soonest(struct pick *c, const struct gwp_up_tier *t,
+			     uint32_t p)
+{
+	const struct gwp_up_pick *pk = c->pk;
+	uint32_t best = UINT32_MAX, best_val = UINT32_MAX, i, k, v;
+
+	for (k = 0; k < t->n; k++, p = p + 1 < t->n ? p + 1 : 0) {
+		i = tier_member(t, p);
+		if (!pk->m[i].st || pick_full(pk, i))
 			continue;
-		v = pick_ejected(&c, s, i);
+		v = pick_ejected(c, i);
 		/* Back meanwhile: in service again. */
 		if (!v)
 			return i;
@@ -380,4 +716,55 @@ uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 		}
 	}
 	return best;
+}
+
+uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
+{
+	struct pick c = { .pk = pk };
+	const struct gwp_up_plan *pl = pk->plan;
+	uint32_t nr = pk->nr, skip = pk->skip, nr_tier = 2, t, p, i;
+	struct gwp_up_tier all = { .n = nr };
+	const struct gwp_up_tier *tier;
+	bool retry = skip < nr;
+
+	if (!nr)
+		return UINT32_MAX;
+	/* No plan: every server in one tier, in pool order, plain turns. */
+	if (pl) {
+		tier = pl->tier;
+	} else {
+		tier = &all;
+		nr_tier = 1;
+	}
+
+	/* The backups only when no main server may be taken. */
+	for (t = 0; t < nr_tier; t++) {
+		if (!tier[t].n)
+			continue;
+		if (!retry) {
+			p = tier_turn(&tier[t], pk->rr);
+		} else if ((pl && pl->pos ? member_tier(&pk->m[skip]) : 0) ==
+			   t) {
+			/* After the server that failed. */
+			p = pl && pl->pos ? pl->pos[skip] : skip;
+			p = p + 1 < tier[t].n ? p + 1 : 0;
+		} else {
+			p = 0;
+		}
+		i = pick_tier(&c, &tier[t], p);
+		if (i != UINT32_MAX)
+			return i;
+	}
+	if (retry)
+		return UINT32_MAX;
+
+	/* All out: the one back soonest, ties in turn, backups last. */
+	for (t = 0; t < nr_tier; t++) {
+		if (!tier[t].n)
+			continue;
+		i = pick_soonest(&c, &tier[t], pk->rr % tier[t].n);
+		if (i != UINT32_MAX)
+			return i;
+	}
+	return UINT32_MAX;
 }

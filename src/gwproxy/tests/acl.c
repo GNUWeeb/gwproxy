@@ -3015,12 +3015,14 @@ struct up_srv {
 static atomic_int g_up_live;
 static int g_up_made;
 
-static int up_srv_make(void *arg, const char *url, void **out, char *why,
+static int up_srv_make(void *arg, const char *url,
+		       const struct gwp_up_opts *opts, void **out, char *why,
 		       size_t size)
 {
 	struct up_srv *s;
 
 	assert(arg == &g_up_live);
+	assert(opts);
 	if (strstr(url, "unresolvable")) {
 		snprintf(why, size, "the host does not resolve");
 		return -EINVAL;
@@ -3050,33 +3052,34 @@ static void up_srv_put(void *arg, void *srv)
 	assert(atomic_fetch_sub(&g_up_live, 1) > 0);
 }
 
-/* A pick handle: something the object holds while it lives. */
-static void *up_srv_handle(void *arg, void *srv)
+/* What a pick reads: something the object holds while it lives. */
+static void up_srv_member(void *arg, void *srv, struct gwp_up_member *m)
 {
 	struct up_srv *s = srv;
 
 	assert(arg == &g_up_live);
-	return s->url;
+	assert(!m->st && !m->h);
+	m->st = (struct gwp_up_state *)(void *)s->url;
 }
 
 static const struct gwp_acl_server_ops up_srv_ops = {
 	.make	= up_srv_make,
 	.put	= up_srv_put,
-	.handle	= up_srv_handle,
+	.member	= up_srv_member,
 	.arg	= &g_up_live,
 };
 
 /*
  * The server object @p's @i-th URL was made into, checked against it, and
- * its pick handle with it.
+ * what a pick reads of it.
  */
 static struct up_srv *up_srv_of(const struct gwp_acl_pool *p, uint32_t i)
 {
 	struct up_srv *s = gwp_acl_pool_server(p, i);
-	void *const *h = gwp_acl_pool_handles(p);
+	const struct gwp_up_member *m = gwp_acl_pool_members(p);
 
 	assert(s && !strcmp(s->url, gwp_acl_pool_server_url(p, i)));
-	assert(h && h[i] == s->url);
+	assert(m && (void *)m[i].st == s->url);
 	return s;
 }
 
@@ -3099,7 +3102,7 @@ static noinline void test_upstream_server_ops(void)
 	path = inc_write(dir, "main.acl",
 			 "upstream p {\n"
 			 " server http://u:s3cret@10.0.0.1:3128;\n"
-			 " server http://10.0.0.2:3128;\n"
+			 " server http://10.0.0.2:3128 weight=4;\n"
 			 "}\n"
 			 "upstream q {\n server socks5://10.0.0.3:1080;\n}\n"
 			 "-A OUTPUT -j UPSTREAM --to p\n");
@@ -3109,6 +3112,11 @@ static noinline void test_upstream_server_ops(void)
 	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
 	assert(up_srv_of(req.upstream_pool, 0) != up_srv_of(req.upstream_pool, 1));
 	assert(!gwp_acl_pool_server(req.upstream_pool, 2));
+	/* The weights, in the members and the plan made of them. */
+	assert(gwp_acl_pool_plan(req.upstream_pool));
+	assert(gwp_acl_pool_plan(req.upstream_pool)->tier[0].total == 5);
+	assert(gwp_acl_pool_members(req.upstream_pool)[0].weight == 1);
+	assert(gwp_acl_pool_members(req.upstream_pool)[1].weight == 4);
 	/* What a connection does: keep the server, not the pool. */
 	held = up_srv_of(req.upstream_pool, 1);
 	atomic_fetch_add(&held->ref, 1);
@@ -3165,7 +3173,8 @@ static noinline void test_upstream_server_ops(void)
 	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
 	assert(gwp_acl_pool_server_url(req.upstream_pool, 0));
 	assert(!gwp_acl_pool_server(req.upstream_pool, 0));
-	assert(!gwp_acl_pool_handles(req.upstream_pool));
+	assert(!gwp_acl_pool_members(req.upstream_pool));
+	assert(!gwp_acl_pool_plan(req.upstream_pool));
 	gwp_acl_req_release(&req);
 	gwp_acl_destroy(a);
 	assert(g_up_made == 5);
@@ -3450,6 +3459,187 @@ static noinline void test_upstream_pick_regexp_error(void)
 #endif
 }
 
+/* The options of the @i-th server of the pool @a picks for @user. */
+static const struct gwp_up_opts *up_opts(struct gwp_acl *a, const char *user,
+					 uint32_t i)
+{
+	static struct gwp_up_opts o;
+	struct gwp_acl_req req;
+	const struct gwp_up_opts *got;
+
+	assert(up_eval(a, user, &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	got = gwp_acl_pool_server_opts(req.upstream_pool, i);
+	assert(got);
+	o = *got;
+	assert(!gwp_acl_pool_server_opts(req.upstream_pool,
+					 gwp_acl_pool_nr_servers(req.upstream_pool)));
+	gwp_acl_req_release(&req);
+	return &o;
+}
+
+/*
+ * The options after a pool server's URL: the defaults where none is given,
+ * the times in any unit, each option on its own.
+ */
+static noinline void test_upstream_server_opts(void)
+{
+	const struct gwp_up_opts *o;
+	struct gwp_acl *a;
+
+	assert(!gwp_acl_parse_str(&a,
+		"upstream p {\n"
+		"	server socks5h://u:s3cret@10.0.0.1:1080;\n"
+		"	server socks5h://10.0.0.2:1080 max_fails=5 fail_timeout=60s eject_time=10m;\n"
+		"	server socks5h://10.0.0.3:1080 max_fails=0 ;\n"
+		"	server socks5h://10.0.0.4:1080 eject_time=1h fail_timeout=1500ms;\n"
+		"	server socks5h://10.0.0.5:1080 fail_timeout=7 eject_time=24h max_fails=100;\n"
+		"	server socks5h://10.0.0.6:1080 weight=1000;\n"
+		"	server socks5h://10.0.0.7:1080 weight=1 max_fails=1;\n"
+		"	server socks5h://10.0.0.8:1080 max_conns=200 eject_time=10m;\n"
+		"	server socks5h://10.0.0.9:1080 max_conns=1000000;\n"
+		"	server socks5h://10.0.0.10:1080 backup weight=2;\n"
+		"	server socks5h://10.0.0.11:1080 down;\n"
+		"}\n"
+		"-A OUTPUT -j UPSTREAM --to p\n"));
+	o = up_opts(a, NULL, 0);
+	assert(o->weight == 1);
+	assert(o->max_fails == GWP_UP_EJECT_FAILS &&
+	       o->fail_timeout_ms == GWP_UP_EJECT_WINDOW_MS &&
+	       o->eject_ms == GWP_UP_EJECT_MS);
+	o = up_opts(a, NULL, 1);
+	assert(o->max_fails == 5 && o->fail_timeout_ms == 60000 &&
+	       o->eject_ms == 600000);
+	o = up_opts(a, NULL, 2);
+	assert(o->max_fails == 0 && o->fail_timeout_ms == 30000 &&
+	       o->eject_ms == 300000);
+	o = up_opts(a, NULL, 3);
+	assert(o->max_fails == 3 && o->fail_timeout_ms == 1500 &&
+	       o->eject_ms == 3600000);
+	o = up_opts(a, NULL, 4);
+	assert(o->max_fails == 100 && o->fail_timeout_ms == 7000 &&
+	       o->eject_ms == 86400000 && o->weight == 1);
+	o = up_opts(a, NULL, 5);
+	assert(o->weight == 1000 && o->max_fails == 3);
+	o = up_opts(a, NULL, 6);
+	assert(o->weight == 1 && o->max_fails == 1 && !o->max_conns);
+	o = up_opts(a, NULL, 7);
+	assert(o->max_conns == 200 && o->eject_ms == 600000);
+	o = up_opts(a, NULL, 8);
+	assert(o->max_conns == 1000000 && !o->backup && !o->down);
+	o = up_opts(a, NULL, 9);
+	assert(o->backup && !o->down && o->weight == 2);
+	o = up_opts(a, NULL, 10);
+	assert(!o->backup && o->down);
+	gwp_acl_destroy(a);
+
+	/* Wrong ones refuse the load, naming the server and the option. */
+	up_refused("upstream p {\n server http://u:s3cret@h:1 s3cret;\n}\n",
+		   -EINVAL, "line 2: upstream pool p server 1: word 1 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1;\n"
+		   " server http://u:s3cret@h:2 max_fails=1 x=s3cret;\n}\n",
+		   -EINVAL, "line 3: upstream pool p server 2: word 2 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1 weight=0;\n}\n",
+		   -EINVAL, "server 1: weight= wants a number from 1 to 1000");
+	up_refused("upstream p {\n server http://h:1 weight=1001;\n}\n",
+		   -EINVAL, "weight= wants a number from 1 to 1000");
+	up_refused("upstream p {\n server http://h:1 weight=2 weight=2;\n}\n",
+		   -EINVAL, "weight= given twice");
+	up_refused("upstream p {\n server http://h:1 max_conns=1000001;\n}\n",
+		   -EINVAL, "max_conns= wants a number from 0 to 1000000");
+	up_refused("upstream p {\n server http://h:1 backup down;\n}\n",
+		   -EINVAL, "line 2: upstream pool p server 1: backup and down together make no sense");
+	up_refused("upstream p {\n server http://h:1 down backup;\n}\n",
+		   -EINVAL, "backup and down together make no sense");
+	up_refused("upstream p {\n server http://h:1 down down;\n}\n",
+		   -EINVAL, "server 1: down given twice");
+	up_refused("upstream p {\n server http://h:1 backup=1;\n}\n",
+		   -EINVAL, "word 1 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1 downs;\n}\n",
+		   -EINVAL, "word 1 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1 down;\n"
+		   " server http://h:2 down;\n}\n",
+		   -EINVAL, "line 4: upstream pool p has every server down");
+	up_refused("upstream p {\n server http://h:1 max_fails;\n}\n",
+		   -EINVAL, "word 1 after the URL is not an option");
+	up_refused("upstream p {\n server http://h:1 max_fails=1 max_fails=2;\n}\n",
+		   -EINVAL, "server 1: max_fails= given twice");
+	up_refused("upstream p {\n server http://h:1 max_fails=101;\n}\n",
+		   -EINVAL, "server 1: max_fails= wants a number from 0 to 100");
+	up_refused("upstream p {\n server http://h:1 max_fails=-1;\n}\n",
+		   -EINVAL, "max_fails= wants a number");
+	up_refused("upstream p {\n server http://h:1 max_fails=;\n}\n",
+		   -EINVAL, "max_fails= wants a number");
+	up_refused("upstream p {\n server http://h:1 max_fails=99999999999;\n}\n",
+		   -EINVAL, "max_fails= wants a number");
+	up_refused("upstream p {\n server http://h:1 fail_timeout=0;\n}\n",
+		   -EINVAL, "fail_timeout= wants a time from 1ms to 24h");
+	up_refused("upstream p {\n server http://h:1 fail_timeout=0ms;\n}\n",
+		   -EINVAL, "fail_timeout= wants a time");
+	up_refused("upstream p {\n server http://h:1 eject_time=25h;\n}\n",
+		   -EINVAL, "eject_time= wants a time");
+	up_refused("upstream p {\n server http://h:1 eject_time=86401s;\n}\n",
+		   -EINVAL, "eject_time= wants a time");
+	up_refused("upstream p {\n server http://h:1 eject_time=5d;\n}\n",
+		   -EINVAL, "eject_time= wants a time");
+	up_refused("upstream p {\n server http://h:1 eject_time=m;\n}\n",
+		   -EINVAL, "eject_time= wants a time");
+	up_refused("upstream p {\n server http://h:1 eject_time=1.5s;\n}\n",
+		   -EINVAL, "eject_time= wants a time");
+	/* The ';' ends the directive: after the URL, nothing may follow. */
+	up_refused("upstream p {\n server http://h:1; max_fails=1;\n}\n",
+		   -EINVAL, "expected \"server URL [OPTION ...];\"");
+	/* A password with a ';' in it is still a password. */
+	assert(!gwp_acl_parse_str(&a,
+		"upstream p {\n server http://u:a;b@h:1 max_fails=2;\n}\n"
+		"-A OUTPUT -j UPSTREAM --to p\n"));
+	assert(up_opts(a, NULL, 0)->max_fails == 2);
+	gwp_acl_destroy(a);
+}
+
+/*
+ * What a pick reads of each server comes from its options: the weight, the
+ * cap, backup and down; and the plan sorts them into tiers.
+ */
+static noinline void test_upstream_members(void)
+{
+	char *dir = inc_dir(), *path;
+	const struct gwp_up_member *m;
+	const struct gwp_up_plan *pl;
+	struct gwp_acl_req req;
+	struct gwp_acl *a;
+
+	path = inc_write(dir, "main.acl",
+			 "upstream p {\n"
+			 " server http://10.0.0.1:3128 weight=3 max_conns=7;\n"
+			 " server http://10.0.0.2:3128 backup;\n"
+			 " server http://10.0.0.3:3128 down;\n"
+			 " server http://10.0.0.4:3128;\n"
+			 "}\n"
+			 "-A OUTPUT -j UPSTREAM --to p\n");
+	assert(!gwp_acl_create_ops(&a, path, &up_srv_ops));
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	m = gwp_acl_pool_members(req.upstream_pool);
+	pl = gwp_acl_pool_plan(req.upstream_pool);
+	assert(m && pl && pl->nr == 4);
+	assert(m[0].weight == 3 && m[0].max_conns == 7 && !m[0].flags);
+	assert(m[1].weight == 1 && !m[1].max_conns &&
+	       m[1].flags == GWP_UP_MEMBER_BACKUP);
+	assert(m[2].flags == GWP_UP_MEMBER_DOWN);
+	assert(!m[3].flags);
+	assert(pl->tier[0].n == 2 && pl->tier[0].total == 4);
+	assert(pl->tier[0].idx[0] == 0 && pl->tier[0].idx[1] == 3);
+	assert(pl->tier[1].n == 1 && pl->tier[1].idx[0] == 1);
+	/* A down server is still made, and counted. */
+	assert(gwp_acl_pool_nr_servers(req.upstream_pool) == 4);
+	assert(gwp_acl_pool_server(req.upstream_pool, 2));
+	gwp_acl_req_release(&req);
+	gwp_acl_destroy(a);
+	assert(atomic_load(&g_up_live) == 0);
+	free(path);
+	inc_rmdir(dir);
+}
+
 /* Every way the pool syntax and -j UPSTREAM can be wrong, one at a time. */
 static noinline void test_upstream_errors(void)
 {
@@ -3502,9 +3692,9 @@ static noinline void test_upstream_errors(void)
 	up_refused("upstream p {\n least_conn\n}\n", -EINVAL,
 		   "missing ';' at the end of the directive");
 	up_refused("upstream p {\n server;\n}\n", -EINVAL,
-		   "expected \"server URL;\"");
+		   "expected \"server URL [OPTION ...];\"");
 	up_refused("upstream p {\n server http://a; server http://b;\n}\n",
-		   -EINVAL, "expected \"server URL;\"");
+		   -EINVAL, "expected \"server URL [OPTION ...];\"");
 	up_refused("upstream p {\n weight 3;\n}\n", -EINVAL,
 		   "unknown directive in upstream pool p");
 	/* A URL without "server": refused without being quoted. */
@@ -3725,6 +3915,7 @@ static void run_tests(void)
 	test_include_errors();
 	test_include_reload();
 	test_upstream_errors();
+	test_upstream_server_opts();
 	test_upstream_pool_https();
 	test_upstream_index();
 	test_upstream_include();
@@ -3734,6 +3925,7 @@ static void run_tests(void)
 	test_upstream_take_pool();
 	test_upstream_reload_readers();
 	test_upstream_server_ops();
+	test_upstream_members();
 	test_upstream_pick_no_target();
 	test_upstream_pick_regexp_error();
 	test_upstream_udp_refused();

@@ -7,8 +7,9 @@
  * incoming clients (the INPUT chain) and outgoing targets (the OUTPUT chain);
  * a chain's -P policy applies when no rule matches.
  *
- * This module is self-contained (depends only on net.h types and libc) so it
- * can be unit-tested in isolation.
+ * This module is self-contained (depends only on net.h types, the upstream
+ * pool types of upstream_lb.h and libc) so it can be unit-tested in
+ * isolation.
  */
 #ifndef GWP_ACL_H
 #define GWP_ACL_H
@@ -20,6 +21,7 @@
 #include <netinet/in.h>
 #include <sys/stat.h>
 #include <gwproxy/net.h>
+#include <gwproxy/upstream_lb.h>
 
 enum gwp_acl_verdict {
 	GWP_ACL_ACCEPT	= 0,
@@ -37,7 +39,7 @@ struct gwp_acl;
  * An upstream pool, defined in the rule file by a block:
  *
  *	upstream NAME {
- *		server URL;
+ *		server URL [OPTION ...];
  *		least_conn;
  *	}
  *
@@ -96,6 +98,13 @@ uint32_t gwp_acl_pool_nr_servers(const struct gwp_acl_pool *p);
 const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i);
 
 /*
+ * The options written after the pool's @i-th server URL (from 0), the
+ * defaults for those that were not, or NULL when @i is out of range.
+ */
+const struct gwp_up_opts *gwp_acl_pool_server_opts(const struct gwp_acl_pool *p,
+						   uint32_t i);
+
+/*
  * The object made of the pool's @i-th server URL when the rule set loaded
  * (see struct gwp_acl_server_ops), or NULL when @i is out of range or the
  * ACL was created without ops. The pool holds a reference to it for as long
@@ -104,11 +113,18 @@ const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i);
 void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i);
 
 /*
- * What @ops->handle returned for each of the pool's servers, in pool order
- * (the server objects themselves without @handle), or NULL when the ACL was
- * created without ops. Read-only, as long as the pool lives.
+ * The pool's servers as a pick sees them (struct gwp_up_member), in pool
+ * order, each filled in by @ops->member (all zero without it), or NULL when
+ * the ACL was created without ops. Read-only, as long as the pool lives.
  */
-void *const *gwp_acl_pool_handles(const struct gwp_acl_pool *p);
+const struct gwp_up_member *gwp_acl_pool_members(const struct gwp_acl_pool *p);
+
+/*
+ * How the pool's members' weights spread its turns (gwp_up_plan_build()),
+ * or NULL when the ACL was created without ops. Read-only, as long as the
+ * pool lives.
+ */
+const struct gwp_up_plan *gwp_acl_pool_plan(const struct gwp_acl_pool *p);
 
 /*
  * The pool's round-robin cursor: the value before this call's increment,
@@ -188,20 +204,22 @@ int gwp_acl_create(struct gwp_acl **out, const char *path);
  * reference, stored in *@srv, and returns 0; or returns a negative errno and
  * may put the reason in @why (@size bytes), which then fails the load with
  * the file and line of the server. Neither @why nor any message may show the
- * URL's credentials. @put drops a reference @make handed out. Both get @arg,
- * and are called from the thread that loads or reloads, or (@put) from
- * whichever drops the last reference to a pool.
+ * URL's credentials. @opts are what the pool sets for the server (struct
+ * gwp_up_opts). @put drops a reference @make handed out. Both get @arg, and
+ * are called from the thread that loads or reloads, or (@put) from whichever
+ * drops the last reference to a pool.
  *
- * @handle, when set, is called once for each object @make made, with @arg,
- * and returns what the pool keeps beside the object for the caller's picks
- * (gwp_acl_pool_handles()): something the object holds for as long as it
+ * @member, when set, is called once for each object @make made, with @arg,
+ * and fills in what the pool keeps beside the object for the caller's picks
+ * (gwp_acl_pool_members()): things the object holds for as long as it
  * lives, so a pick that scans a large pool need not reach every object.
  */
 struct gwp_acl_server_ops {
-	int	(*make)(void *arg, const char *url, void **srv, char *why,
+	int	(*make)(void *arg, const char *url,
+			const struct gwp_up_opts *opts, void **srv, char *why,
 			size_t size);
 	void	(*put)(void *arg, void *srv);
-	void	*(*handle)(void *arg, void *srv);
+	void	(*member)(void *arg, void *srv, struct gwp_up_member *m);
 	void	*arg;
 };
 

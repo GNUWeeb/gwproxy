@@ -2384,10 +2384,11 @@ static const char gwp_acl_default_rules[] =
  * forwarding. With no file it applies the built-in default ACL (not reloaded),
  * unless --acl-allow-all leaves it disabled (NULL).
  */
-static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
+static int acl_srv_make(void *arg, const char *url,
+			const struct gwp_up_opts *opts, void **srv, char *why,
 			size_t size);
 static void acl_srv_put(void *arg, void *srv);
-static void *acl_srv_handle(void *arg, void *srv);
+static void acl_srv_member(void *arg, void *srv, struct gwp_up_member *m);
 
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 {
@@ -2400,7 +2401,7 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 	ctx->nr_acl_files = 0;
 	ctx->acl_srv_ops.make = acl_srv_make;
 	ctx->acl_srv_ops.put = acl_srv_put;
-	ctx->acl_srv_ops.handle = acl_srv_handle;
+	ctx->acl_srv_ops.member = acl_srv_member;
 	ctx->acl_srv_ops.arg = ctx;
 	atomic_init(&ctx->nr_acl_srv, 0);
 
@@ -2902,11 +2903,11 @@ static uint32_t up_ejected(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
 	uint32_t left;
 	bool back;
 
-	if (!gwp_up_state_may_be_ejected(up->state))
+	if (!gwp_up_health_may_be_ejected(up->health))
 		return 0;
 	if (!*now)
 		*now = gwp_now_ms();
-	left = gwp_up_state_ejected(up->state, (uint32_t)*now, &back);
+	left = gwp_up_health_ejected(up->health, (uint32_t)*now, &back);
 	if (back)
 		up_back(ctx, pool, idx, up);
 	return left;
@@ -2963,22 +2964,24 @@ static void pool_pick_back(void *arg, uint32_t i)
 
 /*
  * Which of @pool's servers (from 0) a pair goes to, by the pool's method:
- * round-robin, the default, takes them in turn; least_conn the one with
- * the fewest open pairs, ties in round-robin order. Both turn on the
+ * round-robin, the default, takes them in turn (as many turns each as its
+ * weight=); least_conn the one with the fewest open pairs for its weight,
+ * ties in round-robin order. Both turn on the
  * pool's cursor, shared by all workers, and least_conn reads the counts
  * all workers keep (struct gwp_up_state), which carry across reloads.
  * Workers picking at the same time may see the same counts and choose the
  * same server; the next picks see the result, which is close enough.
  *
- * Only servers in service are taken; with all of them ejected, the one
- * back soonest. With @skip, the server of @skip's place whose attempt
+ * Only servers in service are taken: not ejected, not full (max_conns=),
+ * not down, and a backup only when no other server may be taken; with all
+ * of them out, the one back soonest that is not full. With @skip, the server of @skip's place whose attempt
  * failed, it is a retry: another server in service, the next one after
  * @skip in pool order (least_conn: the fewest open, ties from there), or
  * UINT32_MAX for none; a retry leaves the cursor alone, so the pool's
  * turns go on as if the failed pick had worked.
  *
- * The pick reads the states in place, through the pool's handles (see
- * acl_srv_handle()), with no copy: round-robin looks at the cursor's
+ * The pick reads the states in place, through the pool's members (see
+ * acl_srv_member()), with no copy: round-robin looks at the cursor's
  * server, and only when it is ejected at a few random ones and then the
  * next ones in turn; least_conn scans
  * the open counts of the whole pool (see gwp_up_lb_pick()). UINT32_MAX,
@@ -2990,7 +2993,8 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 {
 	struct pool_pick_env env = { .ctx = ctx, .pool = pool };
 	struct gwp_up_pick pk = {
-		.st = gwp_acl_pool_handles(pool),
+		.m = gwp_acl_pool_members(pool),
+		.plan = gwp_acl_pool_plan(pool),
 		.nr = gwp_acl_pool_nr_servers(pool),
 		.least_conn = gwp_acl_pool_method(pool) ==
 			      GWP_ACL_POOL_LEAST_CONN,
@@ -3001,11 +3005,49 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 		.arg = &env,
 	};
 
-	if (unlikely(!pk.st))
+	if (unlikely(!pk.m))
 		return UINT32_MAX;
 	if (skip == UINT32_MAX)
 		pk.rr = gwp_acl_pool_next(pool);
 	return gwp_up_lb_pick(&pk);
+}
+
+/* How many times a pick may find its server filled by others meanwhile. */
+#define POOL_TAKE_TRIES	4
+
+static void conn_switch_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				 struct gwp_upstream *up, bool taken);
+
+/*
+ * Pick a server of @pool for @gcp (pool_pick_server(), @skip as there) and
+ * give it to @gcp, slot and all. A server with a cap on its open pairs
+ * (max_conns=) gets its slot only if the cap still allows it, as other
+ * workers may have filled it since the pick looked: then the pick is made
+ * again, a few times. Returns the server's place in @pool, or UINT32_MAX,
+ * with @gcp's upstream unchanged, when there was none to take.
+ */
+static uint32_t pool_take_server(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				 struct gwp_acl_pool *pool, uint32_t skip)
+{
+	const struct gwp_up_member *m = gwp_acl_pool_members(pool);
+	struct gwp_upstream *up;
+	uint32_t i, tries;
+
+	for (tries = 0; tries < POOL_TAKE_TRIES; tries++) {
+		i = pool_pick_server(ctx, pool, skip);
+		up = gwp_acl_pool_server(pool, i);
+		if (!up)
+			return UINT32_MAX;
+		if (!m[i].max_conns) {
+			conn_switch_upstream(ctx, gcp, up, false);
+			return i;
+		}
+		if (gwp_up_state_take_max(up->state, m[i].max_conns)) {
+			conn_switch_upstream(ctx, gcp, up, true);
+			return i;
+		}
+	}
+	return UINT32_MAX;
 }
 
 /* Every place in a pool fits gwp_conn_pair::up_srv. */
@@ -3020,8 +3062,10 @@ _Static_assert(GWP_ACL_POOL_MAX_SERVERS - 1 <= UINT16_MAX,
  * none). With neither @domain nor @lit there is no target at all (a UDP
  * ASSOCIATE), and a rule that tests one is not taken. Later calls change
  * nothing. Returns 0, or -EACCES when the choice cannot be told and might
- * be a pool (see gwp_acl_eval_upstream()), -EINVAL when the pool picked has
- * no server to use: the pair must then not go anywhere.
+ * be a pool (see gwp_acl_eval_upstream()), -EHOSTUNREACH when every server
+ * of the pool picked is full (max_conns=, see pool_take_server()) or out
+ * of it, -EINVAL when it has no server object: the pair must then not go
+ * anywhere.
  */
 static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			      const char *domain,
@@ -3050,16 +3094,21 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		 * The pool holds its servers, so the one picked is there; the
 		 * pair takes its own reference, and the pool's goes with @req.
 		 */
-		i = pool_pick_server(ctx, req.upstream_pool, UINT32_MAX);
-		up = gwp_acl_pool_server(req.upstream_pool, i);
-		if (unlikely(!up)) {
+		if (unlikely(!gwp_acl_pool_members(req.upstream_pool))) {
 			/* Never past the pool: refuse, not the default. */
 			pr_err(&ctx->lh, "BUG: upstream pool %s has no server object (idx=%u)",
 			       gwp_acl_pool_name(req.upstream_pool), gcp->idx);
 			r = -EINVAL;
 			break;
 		}
-		gwp_conn_set_upstream(ctx, gcp, up);
+		i = pool_take_server(ctx, gcp, req.upstream_pool, UINT32_MAX);
+		if (i == UINT32_MAX) {
+			pr_info(&ctx->lh, "Upstream pool %s has no server with room for idx=%u: all are full or out",
+				gwp_acl_pool_name(req.upstream_pool), gcp->idx);
+			r = -EHOSTUNREACH;
+			break;
+		}
+		up = gcp->upstream;
 		/* Kept for the logs and the retry, until the tunnel is up. */
 		gcp->up_pool = gwp_acl_req_take_pool(&req);
 		gcp->up_srv = (uint16_t)i;
@@ -3067,7 +3116,7 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		       gcp->idx, gwp_acl_pool_name(gcp->up_pool), i + 1,
 		       ip_to_str(&up->addr), up->host,
 		       gwp_up_state_open(up->state));
-		if (gwp_up_state_may_be_ejected(up->state))
+		if (gwp_up_health_may_be_ejected(up->health))
 			pr_dbg(&ctx->lh, "Upstream pool %s has every server ejected; idx=%u takes server %u, back soonest",
 			       gwp_acl_pool_name(gcp->up_pool), gcp->idx, i + 1);
 		break;
@@ -3854,10 +3903,12 @@ static int upstream_acl_srv_tls(struct gwp_ctx __unused *ctx,
 /*
  * Give the server @up its entry in the shared state table, by identity: the
  * URL's scheme, the address it resolved to and the user (struct
- * gwp_up_key). The last step of making a server, once all of that is set.
+ * gwp_up_key), and its ejection state for the health settings of @o. The
+ * last step of making a server, once all of that is set.
  */
 __cold
-static int upstream_attach_state(struct gwp_ctx *ctx, struct gwp_upstream *up)
+static int upstream_attach_state(struct gwp_ctx *ctx, struct gwp_upstream *up,
+				 const struct gwp_up_opts *o)
 {
 	enum gwp_up_scheme scheme;
 	struct gwp_up_key key;
@@ -3871,7 +3922,16 @@ static int upstream_attach_state(struct gwp_ctx *ctx, struct gwp_upstream *up)
 			up->has_auth ? up->ulen : 0);
 	up->state = gwp_up_state_get(ctx->up_tab, &key);
 	explicit_bzero(&key, sizeof(key));
-	return up->state ? 0 : -ENOMEM;
+	if (!up->state)
+		return -ENOMEM;
+	if (!o->max_fails)
+		return 0;
+	up->health = gwp_up_health_get(up->state, o);
+	if (up->health)
+		return 0;
+	gwp_up_state_put(up->state);
+	up->state = NULL;
+	return -ENOMEM;
 }
 
 /*
@@ -3885,6 +3945,7 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 	struct gwp_upstream_pool *pool = &ctx->upstream_pool;
 	const char *url = ctx->cfg.upstream_proxy;
 	struct gwp_upstream *up;
+	struct gwp_up_opts o;
 	size_t off, len;
 	int r;
 
@@ -3960,7 +4021,9 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 		ip_to_str(&up->addr),
 		up->remote_dns ? "remote" : "local");
 
-	r = upstream_attach_state(ctx, up);
+	/* The default upstream has the default health settings. */
+	gwp_up_opts_default(&o);
+	r = upstream_attach_state(ctx, up, &o);
 	if (r)
 		goto out_free;
 	atomic_init(&up->refcnt, 1);
@@ -4029,6 +4092,7 @@ void gwp_upstream_put(struct gwp_upstream *up)
 	if (atomic_fetch_sub_explicit(&up->refcnt, 1, memory_order_acq_rel) != 1)
 		return;
 	live = up->live;
+	gwp_up_health_put(up->health);
 	gwp_up_state_put(up->state);
 	explicit_bzero(up, sizeof(*up));
 	free(up);
@@ -4041,10 +4105,12 @@ void gwp_upstream_put(struct gwp_upstream *up)
  * (struct gwp_acl_server_ops): parsed, resolved and checked once here, so a
  * server no connection could use fails the load with its file and line,
  * and a connection only ever takes a reference. @url passed acl.c's shape
- * check; @why must not quote it, as it may hold a password.
+ * check; @why must not quote it, as it may hold a password. @opts are what
+ * the pool sets for the server.
  */
 __cold
-static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
+static int acl_srv_make(void *arg, const char *url,
+			const struct gwp_up_opts *opts, void **srv, char *why,
 			size_t size)
 {
 	struct gwp_ctx *ctx = arg;
@@ -4077,7 +4143,7 @@ static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
 		return r;
 	}
 
-	r = upstream_attach_state(ctx, up);
+	r = upstream_attach_state(ctx, up, opts);
 	if (r) {
 		snprintf(why, size, "out of memory");
 		explicit_bzero(up, sizeof(*up));
@@ -4097,15 +4163,17 @@ static void acl_srv_put(void __unused *arg, void *srv)
 }
 
 /*
- * A pool keeps each server's shared state beside it, which the server holds
- * until it is freed, so pool_pick_server() reads the states without
- * reaching every server object.
+ * A pool keeps each server's shared state and ejection state beside it,
+ * which the server holds until it is freed, so pool_pick_server() reads
+ * them without reaching every server object.
  */
-static void *acl_srv_handle(void __unused *arg, void *srv)
+static void acl_srv_member(void __unused *arg, void *srv,
+			   struct gwp_up_member *m)
 {
 	struct gwp_upstream *up = srv;
 
-	return up->state;
+	m->st = up->state;
+	m->h = up->health;
 }
 
 /*
@@ -4119,12 +4187,23 @@ static void *acl_srv_handle(void __unused *arg, void *srv)
 void gwp_conn_set_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			   struct gwp_upstream *up)
 {
+	conn_switch_upstream(ctx, gcp, up, false);
+}
+
+/*
+ * gwp_conn_set_upstream(), but with the slot of @up already @taken (by
+ * gwp_up_state_take_max()) when it says so.
+ */
+static void conn_switch_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				 struct gwp_upstream *up, bool taken)
+{
 	struct gwp_upstream *old = gcp->upstream;
 	uint32_t n;
 
 	if (up) {
 		gwp_upstream_get(up);
-		gwp_up_state_take(up->state);
+		if (!taken)
+			gwp_up_state_take(up->state);
 	}
 	gcp->upstream = up;
 	if (!up)
@@ -4156,6 +4235,38 @@ static enum gwp_upstream_end upstream_end_of(struct gwp_conn_pair *gcp,
 	return GWP_UPSTREAM_END_CONNECT;
 }
 
+/* @ms for a log line: in seconds when it is whole seconds. */
+static const char *up_ms_str(uint32_t ms, char *buf, size_t size)
+{
+	if (ms % 1000)
+		snprintf(buf, size, "%u ms", ms);
+	else
+		snprintf(buf, size, "%u s", ms / 1000);
+	return buf;
+}
+
+/* What up_ejected_other() is told. */
+struct up_fail_env {
+	struct gwp_ctx		*ctx;
+	struct gwp_upstream	*up;
+};
+
+/*
+ * A failure of the server @arg's up ejected its identity for the pools that
+ * list it with the health settings of @h, which are not its own: those
+ * pools are not known here, only the address.
+ */
+static void up_ejected_other(void *arg, const struct gwp_up_health *h)
+{
+	struct up_fail_env *env = arg;
+	struct gwp_upstream *up = env->up;
+	char e[24], w[24];
+
+	pr_warn(&env->ctx->lh, "Upstream %s ejected for %s after %u failures in %s, in the pools that list it with these settings",
+		ip_to_str(&up->addr), up_ms_str(h->eject_ms, e, sizeof(e)),
+		h->max_fails, up_ms_str(h->window_ms, w, sizeof(w)));
+}
+
 /*
  * The one retry of @gcp, whose attempt through the @gcp->up_srv-th server
  * of its pool failed: move it to the next server in service, if there is
@@ -4168,17 +4279,15 @@ static bool upstream_retry(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	uint32_t i;
 
 	gcp->flags |= GWP_CONN_FLAG_UP_RETRIED;
-	i = pool_pick_server(w->ctx, gcp->up_pool, gcp->up_srv);
-	up = gwp_acl_pool_server(gcp->up_pool, i);
-	if (!up) {
+	up_desc(gcp->up_pool, gcp->up_srv, old, d_old, sizeof(d_old));
+	/* Described first: the switch drops the pair's reference to @old. */
+	i = pool_take_server(w->ctx, gcp, gcp->up_pool, gcp->up_srv);
+	if (i == UINT32_MAX) {
 		pr_dbg(&w->ctx->lh, "Upstream %s failed (idx=%u); no other server in service to retry on",
-		       up_desc(gcp->up_pool, gcp->up_srv, old, d_old,
-			       sizeof(d_old)), gcp->idx);
+		       d_old, gcp->idx);
 		return false;
 	}
-
-	up_desc(gcp->up_pool, gcp->up_srv, old, d_old, sizeof(d_old));
-	gwp_conn_set_upstream(w->ctx, gcp, up);
+	up = gcp->upstream;
 	gcp->up_srv = (uint16_t)i;
 	/* A new attempt: its failure is its own. */
 	gcp->flags &= ~GWP_CONN_FLAG_UP_FAILED;
@@ -4254,17 +4363,21 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	/* Only the upstream's own failures count against its health. */
 	if (cls == GWP_UPSTREAM_FAIL_UPSTREAM) {
+		struct up_fail_env env = { .ctx = w->ctx, .up = up };
 		uint64_t now = gwp_now_ms();
-		char desc[320];
+		char desc[320], e[24], wd[24];
 
 		/* An ejection that ran out is ended (and logged) first. */
 		up_ejected(w->ctx, gcp->up_pool, gcp->up_srv, up, &now);
-		if (gwp_up_state_fail(up->state, (uint32_t)now))
-			pr_warn(&w->ctx->lh, "Upstream %s ejected for %u s after %u failures in %u s",
+		if (gwp_up_state_fail(up->state, up->health, (uint32_t)now,
+				      up_ejected_other, &env))
+			pr_warn(&w->ctx->lh, "Upstream %s ejected for %s after %u failures in %s",
 				up_desc(gcp->up_pool, gcp->up_srv, up, desc,
 					sizeof(desc)),
-				GWP_UP_EJECT_MS / 1000, GWP_UP_EJECT_FAILS,
-				GWP_UP_EJECT_WINDOW_MS / 1000);
+				up_ms_str(up->health->eject_ms, e, sizeof(e)),
+				up->health->max_fails,
+				up_ms_str(up->health->window_ms, wd,
+					  sizeof(wd)));
 	}
 
 	if ((cls != GWP_UPSTREAM_FAIL_UPSTREAM && !udp_refused) || !may_retry ||
@@ -5514,14 +5627,21 @@ static int upstream_target_init(struct gwp_ctx *ctx)
 }
 
 /*
- * A SOCKS5 or HTTP request whose upstream could not be picked: refuse it as
- * the ACL refuses a target (SOCKS5 0x02, HTTP 403). Returns -EBADMSG once
- * the reply is queued, so it goes out before the teardown.
+ * A SOCKS5 or HTTP request whose upstream could not be picked, for the
+ * reason @err (conn_pick_upstream()): refuse it as the ACL refuses a target
+ * (SOCKS5 0x02, HTTP 403), or, when its pool had no server with room
+ * (-EHOSTUNREACH), as an unreachable host (SOCKS5 0x04, HTTP 502). Returns
+ * -EBADMSG once the reply is queued, so it goes out before the teardown.
  */
-static int pick_refused(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int pick_refused(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 {
-	int r = gwp_acl_reject_reply(w, gcp);
+	int r;
 
+	if (err == -EHOSTUNREACH) {
+		r = gwp_conn_fail_reply(w, gcp, -EHOSTUNREACH);
+		return r ? r : -EBADMSG;
+	}
+	r = gwp_acl_reject_reply(w, gcp);
 	return r == -EACCES ? -EBADMSG : r;
 }
 
@@ -5565,7 +5685,7 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	/* The name decides the upstream, and the upstream how it resolves. */
 	r = conn_pick_upstream(ctx, gcp, host, is_ip ? &sa : NULL, port);
 	if (unlikely(r))
-		return pick_refused(w, gcp);
+		return pick_refused(w, gcp, r);
 
 	/*
 	 * socks5h://: don't resolve locally; hand the hostname to the upstream
@@ -5651,6 +5771,7 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_sockaddr *ta = &gcp->target_addr;
 	struct gwp_socks5_conn *sc = gcp->s5_conn;
 	struct gwp_socks5_addr *dst;
+	int r;
 
 	assert(sc);
 
@@ -5662,16 +5783,18 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ta->i4.sin_port = dst->port;
 		ta->i4.sin_family = AF_INET;
 		gwp_conn_set_single_candidate(gcp, ta);
-		if (conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port)))
-			return pick_refused(w, gcp);
+		r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
+		if (r)
+			return pick_refused(w, gcp, r);
 		return 0;
 	case GWP_SOCKS5_ATYP_IPV6:
 		memcpy(&ta->i6.sin6_addr, &dst->ip6, 16);
 		ta->i6.sin6_port = dst->port;
 		ta->i6.sin6_family = AF_INET6;
 		gwp_conn_set_single_candidate(gcp, ta);
-		if (conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port)))
-			return pick_refused(w, gcp);
+		r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
+		if (r)
+			return pick_refused(w, gcp, r);
 		return 0;
 	case GWP_SOCKS5_ATYP_DOMAIN:
 		return socks5_prepare_target_addr_domain(w, gcp);
