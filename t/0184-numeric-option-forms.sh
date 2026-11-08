@@ -98,11 +98,17 @@ good --dns-cache-secs=007
 good --tcp-nodelay=01
 good --mark=0
 
-# Without CAP_NET_ADMIN the --mark probe fails at startup and names the mark as
-# read: 0x10 and 0X10 are 16, and 16 stays 16. As root the probe succeeds and
-# the value cannot be seen this way, so only that it starts is checked.
+# Without CAP_NET_ADMIN or CAP_NET_RAW the --mark probe fails at startup and
+# names the mark as read: 0x10 and 0X10 are 16, and 16 stays 16. With either
+# the probe succeeds and the value cannot be seen this way, so only that it
+# starts is checked. Which of the two applies is found out with --mark=16, not
+# from the uid: root in a container may lack both capabilities, and SO_MARK
+# takes CAP_NET_RAW only on Linux 5.17 and later.
+run_opt --mark=16
+can_mark=0
+[ "$RC" = 124 ] && can_mark=1
 for v in 0x10 0X10 0x00000010 16; do
-	if [ "$(id -u)" = 0 ]; then
+	if [ "$can_mark" = 1 ]; then
 		good --mark="$v"
 	else
 		run_opt --mark="$v"
