@@ -16,15 +16,28 @@
 #   eof   wait up to 10 s for the proxy to close the control connection;
 #         print "EOF", or "OPEN" if it did not
 #   sleep:<s>  pause
-import socket, struct, sys, time
+#
+# With SOCKS5_USER and SOCKS5_PASS in the environment it authenticates with
+# them (RFC 1929) instead of offering no authentication.
+import os, socket, struct, sys, time
 
 port = int(sys.argv[1])
 steps = sys.argv[2:]
 
 c = socket.create_connection(('127.0.0.1', port), timeout=10)
-c.sendall(b'\x05\x01\x00')
-if c.recv(2) != b'\x05\x00':
-    sys.exit('method selection failed')
+user = os.environ.get('SOCKS5_USER')
+if user is None:
+    c.sendall(b'\x05\x01\x00')
+    if c.recv(2) != b'\x05\x00':
+        sys.exit('method selection failed')
+else:
+    u, p = user.encode(), os.environ.get('SOCKS5_PASS', '').encode()
+    c.sendall(b'\x05\x01\x02')
+    if c.recv(2) != b'\x05\x02':
+        sys.exit('method selection failed')
+    c.sendall(b'\x01' + bytes([len(u)]) + u + bytes([len(p)]) + p)
+    if c.recv(2) != b'\x01\x00':
+        sys.exit('authentication failed')
 c.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00')
 rep = b''
 while len(rep) < 10:

@@ -6679,6 +6679,14 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * past --upstream-proxy, and no choice leaves the default to decide.
 	 */
 	r = conn_pick_upstream(ctx, gcp, NULL, NULL, 0);
+	/*
+	 * A pool whose servers are all full (max_conns=) is answered as for
+	 * a CONNECT, as an unreachable host: the command itself is fine.
+	 */
+	if (r == -EHOSTUNREACH) {
+		rep = GWP_SOCKS5_REP_HOST_UNREACHABLE;
+		goto reply;
+	}
 	if (r || (gcp->upstream && !udp_up_usable(ctx, gcp))) {
 		rep = GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED;
 		goto reply;

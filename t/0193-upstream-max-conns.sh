@@ -5,7 +5,8 @@
 #
 #  - Tunnels held open through a pool of two servers capped at 2 and 1
 #    fill them; the next client is refused as an unreachable host (SOCKS5
-#    REP 0x04, HTTP 502), and logged, rather than overloading a server.
+#    REP 0x04, HTTP 502, also for a UDP ASSOCIATE), and logged, rather than
+#    overloading a server.
 #  - The open count is the server's: a tunnel through another pool that
 #    lists the first server with a cap of 3 still gets through (its cap
 #    allows it), and keeps the first pool full.
@@ -140,8 +141,12 @@ for loop in epoll io_uring; do
 		--proxy "http://m:p@127.0.0.1:$fp" -w '%{http_connect}' \
 		"$url" -o /dev/null)"
 	want "$loop full" "CONNECT reply" "$got" "502"
+	# A UDP ASSOCIATE through the full pool gets the same answer.
+	got="$(SOCKS5_USER=m SOCKS5_PASS=p python3 \
+		"$SERVERS_DIR/socks5_udp_up_client.py" "$fp")"
+	want "$loop full" "UDP ASSOCIATE reply" "$got" "REP 4"
 	want "$loop full" "refusals logged" \
-		"$(grep -c "Upstream pool p_m has no server with room for idx=[0-9]*: all are full or out" "$log")" 2
+		"$(grep -c "Upstream pool p_m has no server with room for idx=[0-9]*: all are full or out" "$log")" 3
 
 	# p_n's cap for g1 is 3: one more through it, and p_m stays full.
 	hold "$loop n1" n;	n1="$HELD"
@@ -156,7 +161,7 @@ for loop in epoll io_uring; do
 	got="$(picks p_m)"
 	want "$loop room" "last pick" "${got##* }" "1"
 	want "$loop room" "refusals" \
-		"$(grep -c "Upstream pool p_m has no server with room" "$log")" 3
+		"$(grep -c "Upstream pool p_m has no server with room" "$log")" 4
 
 	for pid in "$m2" "$m3" "$m4"; do
 		kill "$pid" 2>/dev/null
