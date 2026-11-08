@@ -2702,6 +2702,132 @@ static noinline void test_include_glob_errors(void)
 }
 
 /*
+ * include_optional: a file that is not there (missing, behind a missing or
+ * non-directory component, a dangling link) or a pattern that matches
+ * nothing includes nothing, with a warning that names the file, line and
+ * path; it is still listed, so a reload picks it up once it is there. Any
+ * other failure is fatal, as for include.
+ */
+static noinline void test_include_optional(void)
+{
+	static const char *const one[] = { "main.acl", "opt.acl" };
+	static const char *const two[] = {
+		"main.acl", "conf/a.conf", "conf/b.conf",
+	};
+	static const char *const none[] = { "main.acl", "none/x.acl" };
+	static const char *const on_file[] = {
+		"main.acl", "conf/a.conf/x.acl",
+	};
+	static const char *const top[] = { "main.acl" };
+	char *dir = inc_dir(), *path, *said, *want;
+	struct gwp_acl *a;
+	struct stat st;
+	int fd;
+
+	inc_mkdir_put(dir, "conf");
+	inc_put(dir, "conf/a.conf", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
+
+	/* Missing: loads, says so with the file, line and path. */
+	path = inc_write(dir, "main.acl", "-P OUTPUT ACCEPT\n"
+			 "include_optional opt.acl;\n"
+			 "-A OUTPUT -d 192.0.2.2 -j REJECT\n");
+	up_capture();
+	assert(!gwp_acl_create(&a, path));
+	said = up_captured();
+	assert(asprintf(&want, "acl: %s: line 2: warning: include_optional %s/opt.acl: No such file or directory; nothing included",
+			path, dir) > 0);
+	if (!strstr(said, want)) {
+		fprintf(stderr, "want \"%s\", it said:\n%s", want, said);
+		assert(0);
+	}
+	free(want);
+	free(said);
+	assert(inc_out(a, "192.0.2.2") == GWP_ACL_REJECT);
+	assert(inc_out(a, "192.0.2.3") == GWP_ACL_ACCEPT);
+	inc_files(a, dir, one, 2);
+	assert(gwp_acl_file_stat(a, 1, &st) == -ENOENT);
+
+	/* Once it is there, a reload includes it. */
+	inc_put(dir, "opt.acl", "-A OUTPUT -d 192.0.2.3 -j REJECT\n");
+	assert(!gwp_acl_reload(a));
+	assert(inc_out(a, "192.0.2.3") == GWP_ACL_REJECT);
+	inc_files(a, dir, one, 2);
+	assert(!gwp_acl_file_stat(a, 1, &st));
+	gwp_acl_destroy(a);
+	free(path);
+	free(inc_write(dir, "opt.acl", "-A OUTPUT -j BOGUS\n"));
+	assert(asprintf(&path, "%s/opt.acl", dir) > 0);
+	assert(!unlink(path));
+
+	/* A missing directory, a file on the way, a dangling link. */
+	a = inc_loads(dir, "include_optional none/x.acl;\n", none, 2);
+	gwp_acl_destroy(a);
+	a = inc_loads(dir, "include_optional conf/a.conf/x.acl;\n",
+		      on_file, 2);
+	gwp_acl_destroy(a);
+	assert(!symlink("nowhere.acl", path));
+	a = inc_loads(dir, "include_optional opt.acl;\n", one, 2);
+	gwp_acl_destroy(a);
+
+	/* A pattern that matches nothing; one whose match dangles. */
+	inc_refused_msg(dir, "include_optional none/*.acl;\n-A\n", -EINVAL,
+			"line 1: warning: include_optional none/*.acl: no file matches; nothing included");
+	a = inc_loads(dir, "include_optional none/*.acl;\n", top, 1);
+	gwp_acl_destroy(a);
+	a = inc_loads(dir, "include_optional conf/*.acl;\n", top, 1);
+	gwp_acl_destroy(a);
+	assert(!unlink(path));
+	assert(asprintf(&want, "%s/conf/b.conf", dir) > 0);
+	assert(!symlink("nowhere.conf", want));
+	a = inc_loads(dir, "include_optional conf/*.conf;\n", two, 3);
+	assert(inc_out(a, "192.0.2.1") == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	/* The same dangling match fails a strict include. */
+	inc_refused(dir, "include conf/*.conf;\n", -ENOENT);
+	assert(!unlink(want));
+	free(want);
+
+	/* Anything but absence is fatal. */
+	inc_refused(dir, "include_optional conf;\n", -EINVAL);
+	assert(!mkfifo(path, 0600));
+	inc_refused(dir, "include_optional opt.acl;\n", -EINVAL);
+	assert(!unlink(path));
+	inc_put(dir, "opt.acl", "");
+	inc_refused(dir, "include_optional opt.acl;\n", -ENODATA);
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, "#\n\0\n", 4) == 4);
+	close(fd);
+	inc_refused(dir, "include_optional opt.acl;\n", -EINVAL);
+	inc_put(dir, "opt.acl", "-A OUTPUT -j BOGUS\n");
+	inc_refused(dir, "include_optional opt.acl;\n", -EINVAL);
+	inc_put(dir, "opt.acl", "include_optional main.acl;\n");
+	inc_refused(dir, "include_optional opt.acl;\n", -ELOOP);
+	inc_refused(dir, "include_optional *.acl;\n", -ELOOP);
+	if (geteuid()) {
+		inc_put(dir, "opt.acl", "-P OUTPUT ACCEPT\n");
+		assert(!chmod(path, 0));
+		inc_refused(dir, "include_optional opt.acl;\n", -EACCES);
+		assert(!chmod(path, 0600));
+	}
+	assert(!unlink(path));
+	free(path);
+
+	/* The same syntax as include, and not inside an upstream block. */
+	inc_refused(dir, "include_optional opt.acl\n", -EINVAL);
+	inc_refused(dir, "include_optional ;\n", -EINVAL);
+	inc_refused(dir, "include_optional a b;\n", -EINVAL);
+	inc_refused_msg(dir, "include_optional conf/**;\n", -EINVAL,
+			"include_optional conf/**: ** is not supported");
+	inc_refused(dir, "upstream p {\ninclude_optional opt.acl;\n"
+			 "server socks5://127.0.0.1:1080;\n}\n", -EINVAL);
+	assert(gwp_acl_parse_str(&a, "include_optional /dev/null;\n") ==
+	       -EINVAL);
+
+	inc_rmdir(dir);
+}
+
+/*
  * ------------------------------------------------------------------------
  * Upstream pools and -j UPSTREAM
  * ------------------------------------------------------------------------
@@ -4063,6 +4189,7 @@ static void run_tests(void)
 	test_include_reload();
 	test_include_glob_order();
 	test_include_glob_errors();
+	test_include_optional();
 	test_upstream_errors();
 	test_upstream_pool_https();
 	test_upstream_index();

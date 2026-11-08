@@ -6,6 +6,11 @@
 # with wildcards at several levels; a SIGHUP reload matches the pattern
 # again. A pattern that matches nothing, or a match that is not a regular
 # file, refuses the set at startup, naming the file, line and pattern.
+#
+# "include_optional" is lenient about absence only: a missing file or a
+# pattern that matches nothing includes nothing, with a warning naming the
+# file, line and path, and the proxy starts; once the file is there, a
+# SIGHUP takes it in. A file that is there but broken still refuses the set.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -81,5 +86,44 @@ printf -- '%s\n' 'include conf.d/*.acl;' >"$WORK/dir/main.acl"
 refused dir "an include pattern that matches a directory"
 grep -q 'conf.d/b.acl: not a regular file' "$WORK/dir.log" || \
 	fail "the directory match was not reported"
+
+# include_optional: missing file and empty pattern start, with warnings.
+o="$WORK/opt"
+mkdir -p "$o/conf.d"
+printf -- '%s\n' 'include_optional local.acl;' \
+	'include_optional conf.d/*.acl;' "-A OUTPUT --dports $hp -j REJECT" \
+	'-P OUTPUT ACCEPT' >"$o/main.acl"
+pp="$(pick_port)"
+log="$WORK/gwp.$pp.log"
+gwp_start "127.0.0.1:$pp" --as-http=1 --nr-workers=1 --acl-file="$o/main.acl"
+grep -q "main.acl: line 1: warning: include_optional $o/local.acl: No such file or directory; nothing included" \
+	"$log" || fail "the missing optional file was not reported"
+grep -q "main.acl: line 2: warning: include_optional conf.d/\*.acl: no file matches; nothing included" \
+	"$log" || fail "the empty optional pattern was not reported"
+c="$(code "$pp" "$hp")"
+[ "$c" = 403 ] || fail "the rules after a missing optional file are gone ($c)"
+
+# Once there, a SIGHUP includes them, in order.
+printf -- '%s\n' "-A OUTPUT --dports $hp -j ACCEPT" >"$o/conf.d/b.acl"
+printf -- '%s\n' '# nothing yet' >"$o/local.acl"
+gwp_hup "$GWP_PID" "$log" 1
+c="$(code "$pp" "$hp")"
+[ "$c" = 200 ] || fail "the optional files were not taken in ($c)"
+
+# There but broken: the reload fails like any other, the rules stay.
+: >"$o/local.acl"
+gwp_hup "$GWP_PID" "$log" 1
+grep -q 'local.acl: file is empty' "$log" || \
+	fail "an empty optional file was not refused"
+grep -q 'Failed to reload ACL file' "$log" || \
+	fail "an empty optional file did not fail the reload"
+c="$(code "$pp" "$hp")"
+[ "$c" = 200 ] || fail "a failed reload dropped the rules ($c)"
+
+# And at startup, it refuses the set.
+mkdir -p "$WORK/optbad"
+printf -- '%s\n' '-A OUTPUT -j BOGUS' >"$WORK/optbad/x.acl"
+printf -- '%s\n' 'include_optional *.acl;' >"$WORK/optbad/main.acl"
+refused optbad "a broken file matched by include_optional"
 
 pass

@@ -407,7 +407,7 @@ struct acl_load {
 	bool			reported;
 };
 
-static int load_file(struct acl_load *ld, const char *path);
+static int load_file(struct acl_load *ld, const char *path, bool optional);
 
 #ifdef CONFIG_PCRE
 /*
@@ -2510,8 +2510,14 @@ out:
  * order. The ';' may also stand alone as the last word, but it must be
  * there, and PATH is one word (no quoting). A path must name a file, and a
  * pattern match one at least.
+ *
+ * "include_optional PATH;" (@optional) is the same, except that a file that
+ * is not there, or a pattern that matches nothing, includes nothing, with a
+ * warning. Only absence: a file that is there but cannot be read, or is no
+ * regular file, or is not valid, fails the load as for include.
  */
-static int parse_include(struct acl_load *ld, char **tok, int n)
+static int parse_include(struct acl_load *ld, char **tok, int n,
+			 bool optional)
 {
 	struct inc_list res = { 0 };
 	char *inc, *pat, *path;
@@ -2532,13 +2538,13 @@ static int parse_include(struct acl_load *ld, char **tok, int n)
 		return -EINVAL;
 
 	if (!ld->path) {
-		fprintf(stderr, "acl: include is only valid in a rule file\n");
+		fprintf(stderr, "acl: %s is only valid in a rule file\n", tok[0]);
 		return -EINVAL;
 	}
 
 	r = glob_check(inc, &why);
 	if (r < 0)
-		return load_err(ld, "include %s: %s", inc, why);
+		return load_err(ld, "%s %s: %s", tok[0], inc, why);
 	pat = include_pattern(ld->path, inc);
 	if (!pat)
 		return -ENOMEM;
@@ -2548,7 +2554,7 @@ static int parse_include(struct acl_load *ld, char **tok, int n)
 		free(pat);
 		if (!path)
 			return -ENOMEM;
-		r = load_file(ld, path);
+		r = load_file(ld, path, optional);
 		free(path);
 		goto out;
 	}
@@ -2560,12 +2566,17 @@ static int parse_include(struct acl_load *ld, char **tok, int n)
 		return r;
 	}
 	if (!res.nr) {
-		load_warn(ld, "include %s: no file matches", inc);
+		if (optional) {
+			load_warn(ld, "warning: %s %s: no file matches; nothing included",
+				  tok[0], inc);
+			return 0;
+		}
+		load_warn(ld, "%s %s: no file matches", tok[0], inc);
 		ld->reported = true;
 		return -ENOENT;
 	}
 	for (i = 0; i < res.nr && !r; i++)
-		r = load_file(ld, res.v[i]);
+		r = load_file(ld, res.v[i], optional);
 	inc_list_free(&res);
 out:
 	if (r) {
@@ -2607,7 +2618,9 @@ static int parse_line(struct acl_load *ld, char *line)
 	if (!strcmp(tok[0], "-A"))
 		return parse_rule(ld, tok, n);
 	if (!strcmp(tok[0], "include"))
-		return parse_include(ld, tok, n);
+		return parse_include(ld, tok, n, false);
+	if (!strcmp(tok[0], "include_optional"))
+		return parse_include(ld, tok, n, true);
 	if (!strcmp(tok[0], "upstream"))
 		return parse_pool_open(ld, tok, n);
 	return -EINVAL;
@@ -3210,8 +3223,11 @@ static void warn_creds_mode(struct acl_load *ld, const char *path,
  * Only a regular file is read. The open does not block, so a FIFO (or a
  * device) put in place of a rule file is refused instead of stopping the
  * reload, and every later one, until a writer comes along.
+ *
+ * With @optional (include_optional), a file that is not there is skipped
+ * with a warning; it is still listed, so the reload watch sees it appear.
  */
-static int load_file(struct acl_load *ld, const char *path)
+static int load_file(struct acl_load *ld, const char *path, bool optional)
 {
 	const char *parent = ld->path;
 	struct acl_file *rec;
@@ -3237,6 +3253,17 @@ static int load_file(struct acl_load *ld, const char *path)
 		r = -errno;
 		if (rec)
 			rec->err = -r;
+		/*
+		 * Not there: a missing file, a missing or non-directory
+		 * component on the way, or a dangling link. Not read either,
+		 * so not counted.
+		 */
+		if (optional && (r == -ENOENT || r == -ENOTDIR)) {
+			load_warn(ld, "warning: include_optional %s: %s; nothing included",
+				  path, strerror(-r));
+			ld->nr_loads--;
+			return 0;
+		}
 		/* The caller reports the top file, by its option. */
 		if (parent)
 			fprintf(stderr, "acl: %s: %s\n", path, strerror(-r));
@@ -3588,7 +3615,7 @@ int gwp_acl_create_ops(struct gwp_acl **out, const char *path,
 
 	load_init(&ld, rs);
 	ld.ops = ops;
-	r = load_finish(&ld, load_file(&ld, path));
+	r = load_finish(&ld, load_file(&ld, path, false));
 	if (!r) {
 		r = acl_alloc(&acl, rs);
 		if (r)
@@ -3629,7 +3656,7 @@ int gwp_acl_reload(struct gwp_acl *acl)
 
 	load_init(&ld, rs);
 	ld.ops = acl->ops;
-	r = load_finish(&ld, load_file(&ld, acl->path));
+	r = load_finish(&ld, load_file(&ld, acl->path, false));
 
 	/*
 	 * The files this attempt met replace the list even when it failed:
