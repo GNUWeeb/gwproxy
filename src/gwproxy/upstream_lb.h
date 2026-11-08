@@ -82,19 +82,27 @@ void gwp_up_key_init(struct gwp_up_key *key, enum gwp_up_scheme scheme,
 
 struct gwp_up_table;
 
+/* What false sharing is measured in. */
+#define GWP_UP_CACHELINE	64
+
 /*
  * One identity's shared state. Only @nr_open is for the caller to touch;
  * the health fields go through gwp_up_state_fail() and _ejected().
+ *
+ * @nr_open is written by every worker on every pair it opens or closes
+ * through the server, so it has a cache line of its own: a round-robin
+ * pick reads only the health fields, and they and the table's fields
+ * must not be on the line those writes keep taking from the reader.
  */
 struct gwp_up_state {
 	/*
 	 * Connection pairs that were given a server of this identity and
 	 * have not given it back yet: gwp_up_state_take() and _give().
 	 */
-	_Atomic(uint32_t)	nr_open;
+	_Alignas(GWP_UP_CACHELINE) _Atomic(uint32_t) nr_open;
 
 	/* How many failures were ever recorded; picks the slot of the next. */
-	_Atomic(uint32_t)	fail_seq;
+	_Alignas(GWP_UP_CACHELINE) _Atomic(uint32_t) fail_seq;
 	/* When the last GWP_UP_EJECT_FAILS failures were, 0 for none. */
 	_Atomic(uint32_t)	fail_at[GWP_UP_EJECT_FAILS];
 	/* When the ejection ends, 0 while the server is in service. */
@@ -102,8 +110,9 @@ struct gwp_up_state {
 
 	/* The table's own: under its lock. */
 	uint32_t		ref;
+	uint32_t		hash;		/* of @key */
 	struct gwp_up_table	*tab;
-	struct gwp_up_state	*next;
+	struct gwp_up_state	*next;		/* in its bucket */
 	struct gwp_up_key	key;
 };
 
@@ -204,26 +213,100 @@ uint32_t gwp_up_state_ejected(struct gwp_up_state *s, uint32_t now,
 			      bool *back);
 
 /*
- * Which of a pool's @nr servers (@nr > 0) the next connection goes to. @rr
- * is the pool's round-robin cursor for this pick (it advances once per
- * pick, whatever the method). @eject[] holds, per server in pool order,
- * how long its ejection still runs (gwp_up_state_ejected()), 0 while it is
- * in service (NULL: all are); the
- * pick only takes a server in service, other than @skip (UINT32_MAX for
- * none). Round-robin takes the (@rr % n)-th of the n servers it may take,
- * in pool order, so an ejected server's share is spread evenly over the
- * rest. Least-connections (@least_conn) takes the one with the fewest
- * open pairs in @open[] (one count per server, in pool order), and among
- * equals the first one from that same server on, wrapping: the cursor
- * moving on rotates the ties, so servers that are equally loaded share
- * the new connections.
- *
- * When no server may be taken: with no @skip, every server is ejected,
- * and the one whose ejection ends soonest is taken (ties from @rr % @nr
- * on), so a pool is never left without a server; with a @skip (a retry,
- * which goes only to another server in service) UINT32_MAX.
+ * What a pool's choice of a server for a connection (gwp_up_lb_pick())
+ * goes by.
  */
-uint32_t gwp_up_lb_pick(bool least_conn, uint32_t rr, const uint32_t *open,
-			const uint32_t *eject, uint32_t nr, uint32_t skip);
+struct gwp_up_pick {
+	/*
+	 * The pool's servers' states (struct gwp_up_state *), @nr of them
+	 * in pool order; a NULL one is never taken.
+	 */
+	void *const	*st;
+	uint32_t	nr;
+	bool		least_conn;
+	/* The pool's round-robin cursor for this pick; unused for a retry. */
+	uint32_t	rr;
+	/*
+	 * For a retry, the server (< @nr) whose attempt failed, never taken
+	 * again; UINT32_MAX (or any value from @nr on) for a first pick.
+	 */
+	uint32_t	skip;
+	/*
+	 * The monotonic clock in milliseconds, called at most once per pick
+	 * and only when a server it looks at may be ejected.
+	 */
+	uint32_t	(*now)(void *arg);
+	/*
+	 * When not NULL, told that the pick ended the ejection of the @i-th
+	 * server (gwp_up_state_ejected()'s *back), for the caller to log.
+	 */
+	void		(*back)(void *arg, uint32_t i);
+	/*
+	 * A uniformly distributed 32-bit random number, for the probes when
+	 * the server whose turn it is (or where least_conn's ties start) is
+	 * ejected; called at most GWP_UP_PICK_PROBES times per pick, and
+	 * never while that server is in service. NULL: no probes.
+	 */
+	uint32_t	(*random)(void *arg);
+	void		*arg;
+};
+
+/*
+ * How many random servers a pick tries when the one whose turn it is (or
+ * where least_conn's ties start) is ejected, before it falls back to the
+ * next in service after it.
+ */
+#define GWP_UP_PICK_PROBES	4u
+
+/*
+ * A small, fast generator for @random (xorshift32): advances *@state, which
+ * must not be 0, and returns the new value. Not for anything secret.
+ */
+static inline uint32_t gwp_up_rand(uint32_t *state)
+{
+	uint32_t x = *state;
+
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	*state = x;
+	return x;
+}
+
+/*
+ * Which of @pk's servers (from 0) the next connection goes to, read in place
+ * with no copy and no allocation; only servers in service are taken.
+ *
+ * Round-robin takes server @rr % @nr when it is in service: with none
+ * ejected that is the cursor's server, and the pick reads one server's
+ * health only. When it is ejected, the pick tries up to GWP_UP_PICK_PROBES
+ * servers drawn at random (@random) and takes the first in service, so an
+ * ejected server's turns are spread evenly over the rest, a run of ejected
+ * servers' turns too, instead of all going to the server after them; only
+ * when every probe misses does it take the next in service from the
+ * cursor on, in pool order, wrapping.
+ *
+ * Least-connections (@least_conn) takes the server in service with the
+ * fewest open pairs, among equals the first from the same start on, so
+ * the cursor moving on rotates the ties and servers that are equally
+ * loaded share the new connections. When the start's server is ejected,
+ * the same probes choose another start among the servers in service, so
+ * among equals an ejected server's turns are spread too; the choice of
+ * the fewest stays exact. It reads every server's open count,
+ * stopping at the first idle one in service (none can have fewer), and
+ * the health only of a server that would be the best so far.
+ *
+ * A retry (@skip) starts at the server after @skip instead of the cursor:
+ * that one when it is in service, else (round-robin) the same probes and
+ * then the next in service in pool order (least-connections: the fewest
+ * open, ties from there), never @skip itself.
+ *
+ * When no server may be taken: for a first pick, every server is ejected,
+ * and the one whose ejection ends soonest is taken (ties from @rr % @nr
+ * on), so a pool is never left without a server; for a retry, which goes
+ * only to another server in service, UINT32_MAX. Also UINT32_MAX when @nr
+ * is 0 or every state is NULL.
+ */
+uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk);
 
 #endif /* #ifndef GWP_UPSTREAM_LB_H */

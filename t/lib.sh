@@ -337,9 +337,38 @@ gwp_hup()
 	fail "gwp_hup: the reload after SIGHUP did not finish"
 }
 
+# have_bind_family <bind>: whether this host can listen on <bind>: an IPv6
+# address needs IPv6, [::1] its loopback; [::] always works (gwproxy falls
+# back to 0.0.0.0). For a test that skips only one case without IPv6.
+# require_bind_family <bind>: skip the test if this host has no IPv6 for an
+# IPv6 <bind> ("[...]:port"): none at all (a kernel booted with
+# ipv6.disable=1, with no /proc/net/if_inet6), or no ::1 for "[::1]:port"
+# (IPv6 turned off on loopback with the disable_ipv6 sysctl). The wildcard
+# "[::]" needs no IPv6: gwproxy then listens on 0.0.0.0.
+have_bind_family()
+{
+	case "$1" in
+	\[::\]:*) return 0 ;;
+	\[*) [ -e /proc/net/if_inet6 ] || return 1 ;;
+	*) return 0 ;;
+	esac
+	case "$1" in
+	\[::1\]:*)
+		grep -q '^00000000000000000000000000000001 ' /proc/net/if_inet6 \
+			|| return 1 ;;
+	esac
+	return 0
+}
+
+require_bind_family()
+{
+	have_bind_family "$1" || skip "no IPv6 for $1 on this host"
+}
+
 # gwp_start <bind> [args...]: start gwproxy bound to <bind> (e.g. "[::1]:1080"
 # or "127.0.0.1:1080") and wait until it is listening. Sets GWP_PID. The log
-# is captured under $WORK and dumped on failure.
+# is captured under $WORK and dumped on failure. A test that asks for an IPv6
+# listener the host cannot have is skipped (require_bind_family).
 #
 # gwproxy applies a built-in default ACL (blocking loopback/private targets)
 # when no --acl-file is given. The test servers live on loopback, so unless a
@@ -352,6 +381,7 @@ gwp_start()
 	local port="${bind##*:}"
 	local log="$WORK/gwp.$port.log"
 
+	require_bind_family "$bind"
 	case " $* " in
 	*" --acl-file"*|*" --acl-allow-all "*) ;;
 	*) set -- "$@" --acl-allow-all ;;
@@ -438,14 +468,15 @@ time.sleep(3600)' >"$log" 2>&1 &
 # A fixed sleep before the proxy's first query is no wait at all on a loaded
 # host, and the query then goes to a port nothing has bound yet. pick_port()
 # reserves a TCP number; another test's UDP socket may hold it, in which case
-# the responder dies on bind and another number is tried.
+# the responder dies on bind and another number is tried. The log is named
+# after the shell too: the parts of gwp_parallel() count from the same number.
 start_dns_responder()
 {
 	local mode="$1" log pid port i try
 
 	for try in 1 2 3 4 5; do
 		_DNS_N=$((${_DNS_N:-0} + 1))
-		log="$WORK/dns.$_DNS_N.log"
+		log="$WORK/dns.$BASHPID.$_DNS_N.log"
 		port="$(pick_port)"
 		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$port" \
 			"${@:2}" >"$log" 2>&1 &
@@ -469,9 +500,11 @@ start_dns_responder()
 
 # gwp_parallel <func> <arg>...: run "<func> <arg>" for every <arg> at once,
 # each in a subshell of its own, and fail once all have ended if any of them
-# failed: exited, or returned anything but 0. For a long test whose parts are independent, such as the same checks
-# on each event loop: run one after the other, they came near the time limit
-# on a loaded host.
+# failed: exited, or returned anything but 0 or the skip code. A part that
+# skips (skip(), require_bind_family(), ...) skips only itself; the test is
+# skipped only when every part was. For a long test whose parts are
+# independent, such as the same checks on each event loop: run one after the
+# other, they came near the time limit on a loaded host.
 #
 # A part must keep to files of its own (under a directory of its own in
 # $WORK, say) and may use everything set up before the call. What it starts
@@ -479,7 +512,7 @@ start_dns_responder()
 # ports it reserves are released with the test's, at its end.
 gwp_parallel()
 {
-	local f="$1" i rc=0
+	local f="$1" i rc=0 st ran=0
 	local -a pids=() args=()
 
 	shift
@@ -494,11 +527,18 @@ gwp_parallel()
 		args+=("$i")
 	done
 	for i in "${!pids[@]}"; do
-		wait "${pids[$i]}" && continue
-		rc=1
-		diag "$f ${args[$i]}: failed"
+		st=0
+		wait "${pids[$i]}" || st=$?
+		case "$st" in
+		0)	ran=$((ran + 1)) ;;
+		"$SKIP_CODE")
+			diag "$f ${args[$i]}: skipped" ;;
+		*)	rc=1
+			diag "$f ${args[$i]}: failed" ;;
+		esac
 	done
 	[ "$rc" = 0 ] || fail "$f: not every part passed"
+	[ "$ran" -gt 0 ] || skip "$f: every part skipped"
 }
 
 # Stop what one part of gwp_parallel() started, and nothing else: the test's

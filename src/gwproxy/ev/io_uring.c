@@ -812,27 +812,37 @@ static void prep_timer_del_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 /*
- * Nothing else is armed on the client's socket during the connect and the
- * upstream handshake, as what it sends stays in the socket until the target is
- * up. Without a look at it, a client that resets would not be noticed before
- * those end, which with --connect-timeout=0 may be never. Multishot, as a reset
- * can follow a FIN, and a poll armed anew would fire on that FIN at once.
- * Teardown cancels the poll along with the client's other I/O.
+ * Nothing else is armed on the client's socket during the lookup of the
+ * target's name, the connect and the upstream handshake, as what it sends stays
+ * in the socket until the target is up. Without a look at it, a client that
+ * resets would not be noticed before those end, which with --connect-timeout=0
+ * may be never, and the target would be dialled for a client that is gone.
+ * Multishot, as a reset can follow a FIN, and a poll armed anew would fire on
+ * that FIN at once. Armed once: the watch of a lookup goes on through the
+ * connect that follows it. Teardown cancels the poll along with the client's
+ * other I/O.
  */
 static void prep_client_watch(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct io_uring_sqe *s = get_sqe_nofail(w);
+	struct io_uring_sqe *s;
 
+	if (gcp->client_watch)
+		return;
+
+	s = get_sqe_nofail(w);
 	io_uring_prep_poll_multishot(s, gcp->client.fd, POLLRDHUP);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_CLIENT_WATCH;
 	get_gcp_io(gcp, s);
+	gcp->client_watch = true;
 }
 
 /* The target is up. A removal that finds the poll gone gets -ENOENT, ignored. */
 static void prep_client_watch_del(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	gcp->client_watch = false;
 
 	io_uring_prep_poll_remove(s, EV_BIT_IOU_CLIENT_WATCH | PTR_TO_U64(gcp));
 	io_uring_sqe_set_data(s, gcp);
@@ -1700,6 +1710,25 @@ static int arm_gcp_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 /*
+ * The client has half-closed while the connect runs with --connect-timeout=0:
+ * bound the rest of it with --protocol-timeout (see handle_ev_client_watch()).
+ * Once per pair.
+ */
+static void bound_fin_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int sec = w->ctx->cfg.protocol_timeout;
+
+	if (w->ctx->cfg.connect_timeout > 0 || sec <= 0 ||
+	    (gcp->flags & GWP_CONN_FLAG_FIN_BOUND))
+		return;
+
+	gcp->flags |= GWP_CONN_FLAG_FIN_BOUND;
+	pr_dbg(&w->ctx->lh, "Client half-closed during the connect, bounding it to %d s (idx=%u)",
+	       sec, gcp->idx);
+	prep_timer_target(w, gcp, sec);
+}
+
+/*
  * Start connecting to the target. Nothing but the connect itself is armed here:
  * with several attempts racing, the pair has no target fd yet, and the client
  * recv would have to be attributed to one of them. Both recvs are armed from
@@ -1735,6 +1764,9 @@ static int do_prep_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		prep_timer_del_target(w, gcp);
 	if (ctx->cfg.connect_timeout > 0)
 		prep_timer_target(w, gcp, ctx->cfg.connect_timeout);
+	/* A FIN the watch saw during the lookup; queued after the removal. */
+	if (gcp->client_fin)
+		bound_fin_connect(w, gcp);
 	prep_client_watch(w, gcp);
 
 	return 0;
@@ -2557,17 +2589,50 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 }
 
 /*
- * The client's socket during the connect or the upstream handshake. A reset ends
- * the pair. A FIN alone may come from a client that only finished sending and
- * waits for the answer, so like the epoll loop this holds on to it.
+ * The client's socket during the name lookup, the connect or the upstream
+ * handshake. A reset ends the pair. A FIN alone may come from a client that only
+ * finished sending and waits for the answer, so like the epoll loop this holds
+ * on to it.
+ *
+ * At --connect-timeout=0 nothing bounds the connect, and a half-closed client
+ * cannot end it short of a reset, so a target or an upstream proxy that never
+ * answers would hold the pair for ever. From the FIN on, --protocol-timeout
+ * bounds the rest of it, as on epoll (bound_fin_connect()). No other timer runs
+ * then: do_prep_connect() has queued the removal of the protocol timer ahead
+ * of this poll, and the removal matches the first timer it finds, so it cannot
+ * take this one. The target coming up removes it like the connect timer.
+ *
+ * A FIN during the lookup is only noted: the protocol timer still runs then and
+ * bounds the lookup, and a second timer would leave the removal at the connect
+ * two to choose from. do_prep_connect() arms the bound for it instead, right
+ * after that removal, as the poll does not report the FIN again. A report
+ * handled once the lookup is over arms it here, behind that removal too. A FIN
+ * that came before the watch was armed is reported when it is.
  */
-static int handle_ev_client_watch(struct gwp_conn_pair *gcp, int res)
+static int handle_ev_client_watch(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				  int res)
 {
 	/* Removed or refused, or the target came up as the poll fired. */
 	if (res <= 0 || gcp->is_target_alive)
 		return 0;
 
-	return (res & (POLLERR | POLLHUP)) ? -ECONNRESET : 0;
+	if (res & (POLLERR | POLLHUP))
+		return -ECONNRESET;
+
+	if (!(res & POLLRDHUP))
+		return 0;
+
+	/*
+	 * The lookup is still pending. Not the pair's state: it says lookup
+	 * until the target is up, the connect that follows included.
+	 */
+	if (gcp->gde) {
+		gcp->client_fin = true;
+		return 0;
+	}
+
+	bound_fin_connect(w, gcp);
+	return 0;
 }
 
 static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -3140,6 +3205,11 @@ static int prep_domain_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	assert(gde);
 	get_gcp(gcp);
+	/*
+	 * Nothing reads the client until the target is up, so a reset during
+	 * the lookup would only be seen once the connect is under way.
+	 */
+	prep_client_watch(w, gcp);
 	pr_dbg(&ctx->lh,
 		"Queued DNS query for domain '%s' (idx=%u, ref_cnt=%d)",
 		gde->name, gcp->idx, gcp->ref_cnt);
@@ -3467,10 +3537,13 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	if (ev_bit == EV_BIT_IOU_CLIENT_WATCH && (cqe->flags & IORING_CQE_F_MORE)) {
 		gcp = udata;
 		if (!(gcp->flags & GWP_CONN_FLAG_IS_CANCEL) &&
-		    handle_ev_client_watch(gcp, cqe->res))
+		    handle_ev_client_watch(w, gcp, cqe->res))
 			shutdown_gcp(w, gcp);
 		return 0;
 	}
+	/* Its last completion: removed, cancelled, or ended by the kernel. */
+	if (ev_bit == EV_BIT_IOU_CLIENT_WATCH)
+		((struct gwp_conn_pair *)udata)->client_watch = false;
 
 	/* I/O on one of the pair's sockets: it is no longer in flight. */
 	nr_ops = nr_ops_of(udata, ev_bit);
@@ -3594,7 +3667,7 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		break;
 	case EV_BIT_IOU_CLIENT_WATCH:
 		pr_dbg(&ctx->lh, "Handling client watch event: %d", cqe->res);
-		r = handle_ev_client_watch(udata, cqe->res);
+		r = handle_ev_client_watch(w, udata, cqe->res);
 		break;
 	case EV_BIT_IOU_CLIENT_WATCH_DEL:
 		pr_dbg(&ctx->lh, "Handling client watch removal: %d", cqe->res);

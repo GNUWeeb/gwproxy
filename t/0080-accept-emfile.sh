@@ -8,7 +8,8 @@
 # EMFILE. The worker must PAUSE accepting rather than die; once the flood is
 # released and descriptors free up, it must resume serving new connections.
 # ENFILE is handled by the very same path, so exercising EMFILE covers it too.
-# Both loops log the pause and the resumption in the same words.
+# Both loops log the pause and the resumption in the same words. A second leg
+# per loop ends the pause by raising the limit, with every client still there.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -140,6 +141,98 @@ run_leg()
 	diag "[$ev] paused on EMFILE and recovered"
 }
 
+# A pause that only time can end: every client stays connected, and the limit
+# is raised from outside instead. No descriptor comes back to the proxy, so
+# nothing but its own retry (a timer on both loops) can bring accept back, and
+# the clients left waiting in the listen backlog meanwhile must all be served
+# once it does.
+run_raise_leg()
+{
+	local ev="$1" op tp glog gwp_pid out
+
+	op="$(pick_port)"
+	tp="$(pick_port)"
+	glog="$WORK/gwp.raise.$ev.log"
+
+	python3 - "$op" >"$WORK/origin.raise.$ev.log" 2>&1 <<-'PY' &
+	import socket, sys
+	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+	s.bind(("127.0.0.1", int(sys.argv[1])))
+	s.listen(4096)
+	held = []
+	while True:
+	    c, _ = s.accept()
+	    try:
+	        c.sendall(b"R\n")
+	    except OSError:
+	        pass
+	    held.append(c)
+	PY
+	_PIDS+=("$!")
+	wait_listen "$op" "$!" || fail "[$ev raise] origin did not start"
+
+	# gwproxy raises its soft limit to the hard one at startup, so the
+	# limit is lowered once it runs, and the hard one left where it can be
+	# raised back to.
+	"$GWPROXY" --event-loop="$ev" \
+		--target="127.0.0.1:$op" --bind="127.0.0.1:$tp" \
+		--acl-allow-all --nr-workers=1 --log-level=3 >"$glog" 2>&1 &
+	gwp_pid=$!
+	_PIDS+=("$gwp_pid")
+	wait_listen "$tp" "$gwp_pid" \
+		|| { sed 's/^/# gwp: /' "$glog" >&2; fail "[$ev raise] proxy did not listen"; }
+
+	out="$(timeout 90 python3 - "$tp" "$gwp_pid" "$glog" "$FLOOD" "$FDLIMIT" <<-'PY'
+	import resource, select, socket, sys, time
+	port, pid, glog, n, lim = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+	hard = resource.prlimit(pid, resource.RLIMIT_NOFILE)[1]
+	resource.prlimit(pid, resource.RLIMIT_NOFILE, (lim, hard))
+
+	def paused():
+	    with open(glog) as f:
+	        return "Too many open files, pausing accept" in f.read()
+
+	cs = []
+	for _ in range(n):
+	    cs.append(socket.create_connection(("127.0.0.1", port), timeout=5))
+	end = time.monotonic() + 10
+	while not paused():
+	    if time.monotonic() > end:
+	        print("accept never paused; inconclusive")
+	        sys.exit(1)
+	    time.sleep(0.05)
+	# The banners that made it before the pause, to tell the waiting ones.
+	time.sleep(0.5)
+	waiting = [c for c in cs if not select.select([c], [], [], 0)[0]]
+	if not waiting:
+	    print("no client was left waiting; inconclusive")
+	    sys.exit(1)
+
+	soft = 1024 if hard == resource.RLIM_INFINITY else min(1024, hard)
+	resource.prlimit(pid, resource.RLIMIT_NOFILE, (soft, hard))
+	end = time.monotonic() + 30
+	for c in waiting:
+	    c.settimeout(max(end - time.monotonic(), 0.01))
+	    try:
+	        got = c.recv(2)
+	    except OSError as e:
+	        got = repr(e)
+	    if got != b"R\n":
+	        print("a client left waiting by the pause got %r after the "
+	              "limit was raised" % got)
+	        sys.exit(1)
+	print("%d waiting clients served" % len(waiting))
+	PY
+	)" 2>&1 || { sed 's/^/# gwp: /' "$glog" >&2; fail "[$ev raise] $out"; }
+	kill -0 "$gwp_pid" 2>/dev/null || fail "[$ev raise] proxy died"
+	grep -q "Resumed accepting new connections (tidx=0)" "$glog" \
+		|| { sed 's/^/# gwp: /' "$glog" >&2; fail "[$ev raise] the accept resumption was not logged"; }
+	diag "[$ev raise] $out"
+	kill "$gwp_pid" 2>/dev/null
+	wait "$gwp_pid" 2>/dev/null
+}
+
 # The test needs to open FLOOD descriptors of its own; skip if the harness
 # itself is too constrained to do so.
 soft="$(ulimit -Sn)"
@@ -148,9 +241,11 @@ if [ "$soft" != unlimited ] && [ "$soft" -lt $((FLOOD + 64)) ]; then
 fi
 
 run_leg epoll
+run_raise_leg epoll
 
 if grep -q 'CONFIG_IO_URING' "$ROOT/config.h" 2>/dev/null; then
 	run_leg io_uring
+	run_raise_leg io_uring
 else
 	diag "gwproxy built without io_uring; skipping that leg"
 fi

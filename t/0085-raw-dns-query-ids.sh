@@ -19,13 +19,10 @@ hp="$(pick_port)"
 make_payload "$WORK/payload.bin" 100
 start_httpd "$hp" "$WORK" "1.1"
 
-dp="$(pick_port)"
 qlog="$WORK/queries.log"
 : >"$qlog"
-python3 "$SERVERS_DIR/dns_malformed.py" good "$dp" "$WORK/nr_queries" \
-	"$qlog" 2>/dev/null &
-_PIDS+=("$!")
-sleep 0.4
+start_dns_responder good "$WORK/nr_queries" "$qlog"
+dp="$DNS_PORT"
 
 p="$(pick_port)"
 gwp_start "127.0.0.1:$p" --as-socks5=1 --raw-dns=1 \

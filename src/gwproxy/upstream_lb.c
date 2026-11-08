@@ -14,16 +14,64 @@
 #include <string.h>
 
 /*
- * A list behind one lock. Only making and freeing server objects takes it
- * (an ACL load, and the last reference to a server going), never a pick:
- * a connection reaches its entry through its server object. A few hundred
- * identities at most (pools of up to 64 servers each), so no hashing.
+ * A hash table behind one lock. Only making and freeing server objects takes
+ * it (an ACL load, and the last reference to a server going), never a pick:
+ * a connection reaches its entry through its server object. A rule set may
+ * list many thousands of identities (pools of up to 8192 servers), and a
+ * reload gets every one of them again and puts the old ones, so both are
+ * O(1) expected: chained buckets, doubled when the entries outnumber them.
+ * They never shrink; a table that once held many identities keeps the
+ * bucket array (8 bytes a bucket) until it is destroyed. The keys come from
+ * the ACL file, not from clients, so the hash need not be keyed.
  */
+#define UP_TABLE_MIN_BUCKETS	64u
+
 struct gwp_up_table {
 	pthread_mutex_t		lock;
-	struct gwp_up_state	*head;
+	struct gwp_up_state	**bucket;
+	uint32_t		nr_bucket;	/* a power of 2 */
 	uint32_t		nr;
 };
+
+/* FNV-1a over what makes @key, which is zero past it (gwp_up_key_init()). */
+static uint32_t key_hash(const struct gwp_up_key *key)
+{
+	const uint8_t *p = (const uint8_t *)key;
+	size_t len = offsetof(struct gwp_up_key, user) + key->ulen, i;
+	uint32_t h = 2166136261u;
+
+	for (i = 0; i < len; i++) {
+		h ^= p[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+/*
+ * Double @t's buckets, under its lock. Without memory the table keeps the
+ * buckets it has: longer chains, still right.
+ */
+static void table_grow(struct gwp_up_table *t)
+{
+	uint32_t n = t->nr_bucket * 2, i;
+	struct gwp_up_state **b, *s, *next;
+
+	if (n < t->nr_bucket)
+		return;
+	b = calloc(n, sizeof(*b));
+	if (!b)
+		return;
+	for (i = 0; i < t->nr_bucket; i++) {
+		for (s = t->bucket[i]; s; s = next) {
+			next = s->next;
+			s->next = b[s->hash & (n - 1)];
+			b[s->hash & (n - 1)] = s;
+		}
+	}
+	free(t->bucket);
+	t->bucket = b;
+	t->nr_bucket = n;
+}
 
 void gwp_up_key_init(struct gwp_up_key *key, enum gwp_up_scheme scheme,
 		     const struct gwp_sockaddr *addr, const char *user,
@@ -53,7 +101,10 @@ struct gwp_up_table *gwp_up_table_create(void)
 
 	if (!t)
 		return NULL;
-	if (pthread_mutex_init(&t->lock, NULL)) {
+	t->nr_bucket = UP_TABLE_MIN_BUCKETS;
+	t->bucket = calloc(t->nr_bucket, sizeof(*t->bucket));
+	if (!t->bucket || pthread_mutex_init(&t->lock, NULL)) {
+		free(t->bucket);
 		free(t);
 		return NULL;
 	}
@@ -63,18 +114,21 @@ struct gwp_up_table *gwp_up_table_create(void)
 uint32_t gwp_up_table_destroy(struct gwp_up_table *t)
 {
 	struct gwp_up_state *s, *next;
-	uint32_t left;
+	uint32_t left, i;
 
 	if (!t)
 		return 0;
 	left = t->nr;
-	for (s = t->head; s; s = next) {
-		next = s->next;
-		/* The key holds a user name; leave none in freed memory. */
-		explicit_bzero(s, sizeof(*s));
-		free(s);
+	for (i = 0; i < t->nr_bucket; i++) {
+		for (s = t->bucket[i]; s; s = next) {
+			next = s->next;
+			/* The key holds a user name; leave none in freed memory. */
+			explicit_bzero(s, sizeof(*s));
+			free(s);
+		}
 	}
 	pthread_mutex_destroy(&t->lock);
+	free(t->bucket);
 	free(t);
 	return left;
 }
@@ -92,19 +146,26 @@ uint32_t gwp_up_table_count(struct gwp_up_table *t)
 struct gwp_up_state *gwp_up_state_get(struct gwp_up_table *t,
 				      const struct gwp_up_key *key)
 {
-	struct gwp_up_state *s;
+	uint32_t h = key_hash(key);
+	struct gwp_up_state *s, **b;
+	void *mem;
 
 	pthread_mutex_lock(&t->lock);
-	for (s = t->head; s; s = s->next) {
-		if (!memcmp(&s->key, key, sizeof(*key))) {
+	b = &t->bucket[h & (t->nr_bucket - 1)];
+	for (s = *b; s; s = s->next) {
+		if (s->hash == h && !memcmp(&s->key, key, sizeof(*key))) {
 			s->ref++;
 			goto out;
 		}
 	}
-	s = calloc(1, sizeof(*s));
+	/* Aligned, for @nr_open's line to be its own. */
+	if (posix_memalign(&mem, GWP_UP_CACHELINE, sizeof(*s)))
+		mem = NULL;
+	s = mem;
 	if (s) {
 		uint32_t i;
 
+		memset(s, 0, sizeof(*s));
 		atomic_init(&s->nr_open, 0);
 		atomic_init(&s->fail_seq, 0);
 		for (i = 0; i < GWP_UP_EJECT_FAILS; i++)
@@ -113,9 +174,11 @@ struct gwp_up_state *gwp_up_state_get(struct gwp_up_table *t,
 		s->ref = 1;
 		s->tab = t;
 		s->key = *key;
-		s->next = t->head;
-		t->head = s;
-		t->nr++;
+		s->hash = h;
+		s->next = *b;
+		*b = s;
+		if (++t->nr > t->nr_bucket)
+			table_grow(t);
 	}
 out:
 	pthread_mutex_unlock(&t->lock);
@@ -135,7 +198,8 @@ void gwp_up_state_put(struct gwp_up_state *s)
 		pthread_mutex_unlock(&t->lock);
 		return;
 	}
-	for (pp = &t->head; *pp != s; pp = &(*pp)->next)
+	for (pp = &t->bucket[s->hash & (t->nr_bucket - 1)]; *pp != s;
+	     pp = &(*pp)->next)
 		;
 	*pp = s->next;
 	t->nr--;
@@ -206,52 +270,114 @@ uint32_t gwp_up_state_ejected(struct gwp_up_state *s, uint32_t now,
 	return end && ms_after(end, now) > 0 ? (uint32_t)ms_after(end, now) : 0;
 }
 
-/* Whether a pick may take server @i. */
-static bool pick_ok(const uint32_t *eject, uint32_t i, uint32_t skip)
+/* A pick in progress: the clock, read once when first needed. */
+struct pick {
+	const struct gwp_up_pick	*pk;
+	uint32_t			now;
+	bool				have_now;
+};
+
+/*
+ * How long the ejection of the @i-th server (non-NULL) still runs, 0 while
+ * it is in service; reads the clock only for a server that may be ejected.
+ */
+static uint32_t pick_ejected(struct pick *c, struct gwp_up_state *s,
+			     uint32_t i)
 {
-	return i != skip && (!eject || !eject[i]);
+	const struct gwp_up_pick *pk = c->pk;
+	uint32_t left;
+	bool back;
+
+	if (!gwp_up_state_may_be_ejected(s))
+		return 0;
+	if (!c->have_now) {
+		c->now = pk->now(pk->arg);
+		c->have_now = true;
+	}
+	left = gwp_up_state_ejected(s, c->now, &back);
+	if (back && pk->back)
+		pk->back(pk->arg, i);
+	return left;
 }
 
-uint32_t gwp_up_lb_pick(bool least_conn, uint32_t rr, const uint32_t *open,
-			const uint32_t *eject, uint32_t nr, uint32_t skip)
+uint32_t gwp_up_lb_pick(const struct gwp_up_pick *pk)
 {
-	uint32_t n = 0, start, best, i, j, k;
+	struct pick c = { .pk = pk };
+	uint32_t nr = pk->nr, skip = pk->skip, best = UINT32_MAX;
+	uint32_t best_val = UINT32_MAX, i, k, v;
+	bool retry = skip < nr;
+	struct gwp_up_state *s;
 
-	for (i = 0; i < nr; i++)
-		n += pick_ok(eject, i, skip);
+	if (!nr)
+		return UINT32_MAX;
+	if (retry)
+		i = skip + 1 < nr ? skip + 1 : 0;
+	else
+		i = pk->rr % nr;
 
-	if (!n) {
-		if (skip != UINT32_MAX || !eject)
-			return UINT32_MAX;
-		/* All ejected: the one back soonest, ties in turn. */
-		start = rr % nr;
-		best = start;
-		for (i = 1; i < nr; i++) {
-			j = start + i;
-			if (j >= nr)
-				j -= nr;
-			if (eject[j] < eject[best])
-				best = j;
+	/*
+	 * The start's server is the pick (round-robin) or where the ties
+	 * start (least_conn). When it cannot be taken, a random one in
+	 * service replaces it, if a probe finds one, so its turns are
+	 * spread; else round-robin takes the next in service, and
+	 * least_conn's ties start where they would have.
+	 */
+	s = pk->st[i];
+	if (i == skip || !s || pick_ejected(&c, s, i)) {
+		uint32_t p, j;
+
+		for (p = 0; pk->random && p < GWP_UP_PICK_PROBES; p++) {
+			/* Uniform over [0, nr), no division. */
+			j = (uint32_t)(((uint64_t)pk->random(pk->arg) * nr) >> 32);
+			s = pk->st[j];
+			if (j != skip && s && !pick_ejected(&c, s, j)) {
+				i = j;
+				break;
+			}
 		}
-		return best;
+	}
+	if (!pk->least_conn) {
+		s = pk->st[i];
+		if (i != skip && s && !pick_ejected(&c, s, i))
+			return i;
 	}
 
-	/* The (rr % n)-th server that may be taken. */
-	k = rr % n;
-	for (start = 0;; start++) {
-		if (pick_ok(eject, start, skip) && !k--)
+	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
+		s = pk->st[i];
+		if (i == skip || !s)
+			continue;
+		if (!pk->least_conn) {
+			if (!pick_ejected(&c, s, i))
+				return i;
+			continue;
+		}
+		/* Not fewer than the best so far: its health does not matter. */
+		v = gwp_up_state_open(s);
+		if ((best != UINT32_MAX && v >= best_val) ||
+		    pick_ejected(&c, s, i))
+			continue;
+		best = i;
+		best_val = v;
+		if (!v)
 			break;
 	}
-	if (!least_conn)
-		return start;
+	if (best != UINT32_MAX || retry)
+		return best;
 
-	best = start;
-	for (i = 1; i < nr; i++) {
-		j = start + i;
-		if (j >= nr)
-			j -= nr;
-		if (pick_ok(eject, j, skip) && open[j] < open[best])
-			best = j;
+	/* All ejected: the one back soonest, ties in turn. */
+	i = pk->rr % nr;
+	for (k = 0; k < nr; k++, i = i + 1 < nr ? i + 1 : 0) {
+		s = pk->st[i];
+		if (!s)
+			continue;
+		v = pick_ejected(&c, s, i);
+		/* Back meanwhile: in service again. */
+		if (!v)
+			return i;
+		if (v < best_val) {
+			best = i;
+			best_val = v;
+		}
 	}
 	return best;
 }

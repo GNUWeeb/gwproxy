@@ -79,7 +79,13 @@ enum gwp_acl_pool_method gwp_acl_pool_method(const struct gwp_acl_pool *p);
  */
 bool gwp_acl_pool_remote_dns(const struct gwp_acl_pool *p);
 
-/* How many servers the pool has: at least 1, at most 64. */
+/*
+ * The most servers a pool may have; one more is a load error. A pick reads
+ * the pool in place (see gwp_up_lb_pick()), whatever its size.
+ */
+#define GWP_ACL_POOL_MAX_SERVERS	8192u
+
+/* How many servers the pool has: at least 1, at most the above. */
 uint32_t gwp_acl_pool_nr_servers(const struct gwp_acl_pool *p);
 
 /*
@@ -96,6 +102,13 @@ const char *gwp_acl_pool_server_url(const struct gwp_acl_pool *p, uint32_t i);
  * as the pool lives; take your own to keep it longer.
  */
 void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i);
+
+/*
+ * What @ops->handle returned for each of the pool's servers, in pool order
+ * (the server objects themselves without @handle), or NULL when the ACL was
+ * created without ops. Read-only, as long as the pool lives.
+ */
+void *const *gwp_acl_pool_handles(const struct gwp_acl_pool *p);
 
 /*
  * The pool's round-robin cursor: the value before this call's increment,
@@ -178,11 +191,17 @@ int gwp_acl_create(struct gwp_acl **out, const char *path);
  * URL's credentials. @put drops a reference @make handed out. Both get @arg,
  * and are called from the thread that loads or reloads, or (@put) from
  * whichever drops the last reference to a pool.
+ *
+ * @handle, when set, is called once for each object @make made, with @arg,
+ * and returns what the pool keeps beside the object for the caller's picks
+ * (gwp_acl_pool_handles()): something the object holds for as long as it
+ * lives, so a pick that scans a large pool need not reach every object.
  */
 struct gwp_acl_server_ops {
 	int	(*make)(void *arg, const char *url, void **srv, char *why,
 			size_t size);
 	void	(*put)(void *arg, void *srv);
+	void	*(*handle)(void *arg, void *srv);
 	void	*arg;
 };
 

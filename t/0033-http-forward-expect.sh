@@ -9,6 +9,7 @@
 #       origin is contacted, so the body is never sent upstream (no wasted
 #       round-trip). The origin logs one line per request it receives, so the
 #       test can confirm a rejected request left nothing behind.
+# A run of interim responses longer than the proxy's buffer is relayed whole.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -62,6 +63,53 @@ for loop in epoll io_uring; do
 	python3 "$SERVERS_DIR/expect_client.py" "$pp" "$op" \
 		|| fail "[$loop] proxy did not relay the origin's 100 Continue"
 
+	kill "$GWP_PID" 2>/dev/null
+
+	# (d) A burst of interim responses larger than the proxy's buffer, sent
+	#     at once, reaches the client whole, followed by the final response.
+	#     A read that filled the room left for the header exactly was taken
+	#     for a header too large, and the client got a 502 instead.
+	pp="$(pick_port)"
+	gwp_start "127.0.0.1:$pp" --as-http=1 --event-loop="$loop" \
+		--nr-workers=1 --target-buf-size=1024
+	out="$(timeout 60 python3 - "$pp" <<'PY'
+import socket, sys, threading
+
+INTERIM = b"HTTP/1.1 100 Continue\r\n\r\n"
+N = 2000
+ls = socket.socket()
+ls.bind(("127.0.0.1", 0))
+ls.listen(1)
+
+
+def origin():
+    c, _ = ls.accept()
+    c.recv(65536)
+    c.sendall(INTERIM * N + b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone")
+    c.shutdown(socket.SHUT_WR)
+    try:
+        c.recv(1)
+    except OSError:
+        pass
+    c.close()
+
+
+threading.Thread(target=origin, daemon=True).start()
+c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=30)
+c.sendall(b"GET http://127.0.0.1:%d/ HTTP/1.1\r\nHost: x\r\n\r\n" % ls.getsockname()[1])
+got = b""
+while True:
+    d = c.recv(65536)
+    if not d:
+        break
+    got += d
+n = got.count(INTERIM)
+final = got[len(INTERIM) * n:]
+if n != N or not final.startswith(b"HTTP/1.1 200 OK\r\n") or not final.endswith(b"\r\n\r\ndone"):
+    print("%d of %d interim responses, then %r" % (n, N, final[:80]))
+    sys.exit(1)
+PY
+)" || fail "[$loop] interim burst: $out"
 	kill "$GWP_PID" 2>/dev/null
 done
 

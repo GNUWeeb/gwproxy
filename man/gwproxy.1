@@ -64,8 +64,16 @@ Every boolean option takes an explicit
 .B 0
 or
 .B 1
-argument. A numeric argument must be a whole decimal integer; anything else,
-or a value out of the option's range, is rejected at startup.
+argument. A numeric argument must be a whole decimal integer: decimal digits,
+after a
+.B \-
+for an option that takes negative values, and nothing else, so a
+.B +
+sign or a blank in front is refused too.
+.B \-\-mark
+alone also takes hexadecimal (see there). Anything else, or a value out of the
+option's range, is rejected at startup with exit status 22 and a message naming
+the option.
 Long options and their single\-letter equivalents are interchangeable.
 .SS General
 .TP
@@ -91,7 +99,24 @@ A port outside 0 to 65535, or one with anything behind its digits, is refused
 at startup, here and in every other address option.
 The default,
 .BR [::]:1080 ,
-listens on the dual\-stack IPv4/IPv6 wildcard. A SOCKS5 or HTTP proxy
+listens on the dual\-stack IPv4/IPv6 wildcard. On a host without IPv6 (a
+kernel booted with
+.BR ipv6.disable=1 ),
+a
+.B [::]
+bind, the default included, listens on
+.B 0.0.0.0
+instead and logs a warning saying so; with
+.B \-\-bind\-ipv6\-only=1
+it fails at startup, as does any other IPv6 address. Where IPv6 is only turned
+off with the
+.B disable_ipv6
+sysctl,
+.B [::]
+still works and an IPv6 address such as
+.B [::1]
+fails to bind, with a message that points at IPv6 being disabled.
+A SOCKS5 or HTTP proxy
 listening on anything but loopback without
 .B \-\-auth\-file
 is open to every client that can reach it; gwproxy logs a warning at startup
@@ -142,7 +167,10 @@ listener, from 1 to 1024. Default:
 Seconds allowed for a client to complete the SOCKS5/HTTP (and, if enabled, TLS)
 handshake before the connection is dropped. This includes the lookup of the
 target's name; a client whose request is waiting for one when the time runs out
-gets a SOCKS5 reply 0x06 or an HTTP 504 first. Default:
+gets a SOCKS5 reply 0x06 or an HTTP 504 first. With
+.B \-\-connect\-timeout=0
+it also bounds the connect of a client that half\-closes its connection while
+the connect is in progress (see there). Default:
 .BR 10 .
 .TP
 .BR \-c ", " \-\-connect\-timeout=\fIsec\fR
@@ -155,8 +183,14 @@ for the same name (see
 never answers after its SYN retries, but an upstream proxy that accepts and then
 says nothing is waited for as long as the client stays. A client that resets its
 connection ends the wait at once, though with io_uring on a kernel older than
-5.13 only when the connect ends. One that has sent a FIN counts as staying, as
-it may only have finished sending and be waiting for the answer.
+5.13 only when the connect ends. One that has sent a FIN may only have finished
+sending and be waiting for the answer, so its FIN is passed on once the target
+is up; but as it can no longer end the wait itself,
+.B \-\-protocol\-timeout
+bounds the rest of the connect from that FIN on (the upstream proxy handshake
+included), and the client gets a SOCKS5 reply 0x06 or an HTTP 504 when it runs
+out. With io_uring on a kernel older than 5.13 the FIN goes unnoticed and the
+wait stays unbounded.
 Default:
 .BR 5 .
 .TP
@@ -371,8 +405,8 @@ a name, an IPv4 address or a bracketed IPv6 one, an optional port), and
 (at most once) sets the method; round\-robin is the default.
 .B https://
 servers need a build with OpenSSL support; without it they fail the load.
-A pool has 1 to 64 servers, and all of them must resolve target names the
-same way:
+A pool has 1 to 8192 servers (one more fails the load), and all of them must
+resolve target names the same way:
 .B socks5://
 servers have gwproxy resolve them,
 .BR socks5h:// ", " http:// " and " https://
@@ -388,7 +422,8 @@ that use it, or in another file of the set; a rule naming a pool that is not
 defined anywhere is an error. Every server is parsed and its host resolved
 when the set loads (and only then: a reload resolves it again), as
 .B \-\-upstream\-proxy
-is at startup: a host that is neither a name nor an address, a name that does
+is at startup. Host names are resolved one by one, so a large pool of names
+loads as slowly as all its lookups in a row; an address needs no lookup. A host that is neither a name nor an address, a name that does
 not resolve, an address
 .B \-\-outgoing\-family
 forbids, or a
@@ -461,6 +496,30 @@ goes through an upstream, so a rule with
 or
 .B "! \-p tcp"
 could never take effect, and is a load error.
+.IP
+Every number in a rule \(em a port, port range or list, a prefix length, a
+.B \-\-to
+port, a mark, and the values of
+.BR \-\-every " and " \-\-packet
+\(em starts with a digit: a sign or anything else in front of the digits, as in
+.B \-\-dports +80
+or
+.BR 10.0.0.0/+8 ,
+fails the load like any malformed line. Ports and prefix lengths are
+decimal digits only. A mark and the values of
+.BR \-\-every " and " \-\-packet
+are decimal, or hexadecimal after a
+.B 0x
+(or
+.BR 0X )
+prefix; in these a decimal number other than
+.B 0
+may not start with
+.BR 0 ,
+so
+.BR 010 ,
+which an earlier version read as octal 8, fails the load rather than meaning
+10. No other base or prefix is taken.
 .IP
 .B \-j MARK
 sets the fwmark
@@ -1086,7 +1145,14 @@ Set
 (fwmark) on outgoing connections, for policy routing and iptables matching.
 The mark is a 32\-bit value, written in decimal or, with a
 .B 0x
-prefix, in hexadecimal.
+(or
+.BR 0X )
+prefix, in hexadecimal. A decimal mark other than
+.B 0
+may not start with
+.BR 0 :
+.BR \-\-mark=010 ,
+which an earlier version read as octal 8, is refused rather than taken as 10.
 Requires
 .B CAP_NET_ADMIN
 or, since Linux 5.11,
@@ -1377,9 +1443,14 @@ The credential file named by
 .B \-\-auth\-file
 holds one
 .B username:password
-entry per line. The same store backs SOCKS5 (RFC 1929) and HTTP "Basic" (RFC
-7617) authentication; whenever it is configured, clients of either protocol
-must authenticate. Credentials can be updated without a restart: edit the file
+entry per line, each part 1 to 255 bytes. Blank lines, and lines whose first
+character other than a blank is
+.BR # ,
+are skipped. A line that is no such entry, or that holds a NUL byte anywhere,
+fails the load with its line number: at startup gwproxy exits, and a reload
+keeps the current credentials. The same store backs SOCKS5 (RFC 1929) and HTTP
+"Basic" (RFC 7617) authentication; whenever it is configured, clients of either
+protocol must authenticate. Credentials can be updated without a restart: edit the file
 and send gwproxy a
 .B SIGHUP
 (see
@@ -1535,20 +1606,29 @@ and is logged with the reason, for example
 .IR "certificate verify failed: hostname mismatch" .
 .PP
 An upstream that turns the CONNECT down is answered to an HTTP client with
-"502 Bad Gateway", whatever its reason. A SOCKS5 client gets reply 0x05
-(connection refused) only when the upstream says the target could not be
-reached: a
+"502 Bad Gateway", or "504 Gateway Timeout" for a
 .B socks5://
 or
 .B socks5h://
-upstream's failed reply, or a 502 or 504 from an
+upstream's reply 0x06 (TTL expired). A SOCKS5 client is told the target's
+failure only when the upstream says the target could not be reached: a SOCKS5
+upstream's reply 0x03 (network unreachable), 0x04 (host unreachable), 0x05
+(connection refused) or 0x06 reaches the client as it is, and a 502 or 504
+from an
 .B http://
 or
 .B https://
-one. A 407, which says the upstream refused gwproxy's credentials, and any
-other status (403, 500, 503, ...) say nothing about the target and get reply
-0x01 (general failure), as does a SOCKS5 upstream that refuses the
-credentials.
+one as reply 0x05 (connection refused). Every other refusal says nothing about
+the target and gets reply 0x01 (general failure): a SOCKS5 upstream's reply
+0x01 or 0x02 (not allowed by its ruleset), 0x07 or 0x08 (the command or
+address type of gwproxy's request not supported) or any unassigned one, an
+HTTP 407, which says the upstream refused gwproxy's credentials, and any other
+status (403, 500, 503, ...), as well as a SOCKS5 upstream that refuses the
+credentials. So does an upstream that cannot be reached at all, its TCP
+connection refused, reset or unreachable: that is the upstream's failure, not
+the target's (HTTP 502). One that does not get through the handshake in time
+is answered as a target that times out is, reply 0x06 or HTTP 504 (see
+.BR \-\-connect\-timeout ).
 .PP
 The end of the upstream's stream reaches the client as a normal end of stream
 only if it is one, as for a TLS client in the other direction (see
@@ -1690,6 +1770,16 @@ on the choices made after it. A reload starts each pool's turn from its first
 server again. Workers choosing at the same moment may see the same counts and
 choose the same server; the choices after them see the result.
 .PP
+Round\-robin costs the same whatever the size of the pool: a connection looks
+only at the server whose turn it is (and, when that one is ejected, at a few
+more, see below).
+.B least_conn
+has to compare the counts of all the servers: each new connection reads the
+count of every server of its pool, stopping early only at a server with none
+open, so in a pool of thousands of busy servers every new connection costs a
+scan of thousands of counts that other workers keep changing. Prefer
+round\-robin for large pools unless the load must follow the counts.
+.PP
 A pool also keeps track of its servers' health, from the connections they
 carry (passively: gwproxy sends no probes of its own). A failure counts
 against a server only when it is the server's own: its TCP connection
@@ -1700,16 +1790,25 @@ authentication methods, refuses the credentials or answers reply 0x07 or
 server hanging up, or the connect timeout running out before gwproxy has
 sent its CONNECT request (during the TCP connect, the TLS handshake or the
 SOCKS5 method and authentication exchange). A failure the server reports for
-the target (SOCKS5 replies 0x03 to 0x06, HTTP 502 and 504) reaches the client
-as it is and never counts, and neither do ambiguous refusals (SOCKS5 replies
-0x01 and 0x02, HTTP 403, 500, 503 and any other status), the timeout running
+the target (SOCKS5 replies 0x03 to 0x06, HTTP 502 and 504) is passed on to the
+client as the target's failure and never counts, and neither do ambiguous
+refusals (SOCKS5 replies 0x01 and 0x02, HTTP 403, 500, 503 and any other status), the timeout running
 out while the server is waiting for the target to answer the CONNECT (a
 target that never answers holds a healthy server up), nor local trouble such
 as running out of descriptors. Three failures
 that count, within 30 seconds, eject the server for 5 minutes: no pool picks
-it meanwhile, and round\-robin and
+it meanwhile. When its turn comes, round\-robin tries up to 4 servers of
+the pool at random and takes the first one in service, so the turns of
+ejected servers, even of a run of them, are spread evenly over the servers
+left instead of all landing on the next one; only if all 4 tries find an
+ejected server does it take the next server in service in the block's
+order.
 .B least_conn
-alike spread its share over the servers left. As with the counts, the health
+chooses among the servers left; when the ejected server is where its turn
+would start the search among equally loaded servers, the same 4 random
+tries pick another starting point, so among servers with the same count
+the ejected server's turns are spread too. It still takes a server with the
+fewest connections. As with the counts, the health
 is the server's, not the pool's: failures through one pool eject the server
 from every pool that lists it. When every server of a pool is ejected, the
 pool takes the one whose ejection ends soonest; a pool of one server, and
@@ -1723,7 +1822,8 @@ numbers are fixed.
 .PP
 A connection that a pool's server fails in one of the ways that count is
 tried again, once, on another server of the same pool that is not ejected:
-the next one in the block's order, or with
+the next one in the block's order (when that one is ejected, one found as
+for an ejected server's turn), or with
 .B least_conn
 the least loaded one. This is safe because nothing the client sends is
 passed on before the tunnel through the upstream is up, so the retry repeats
@@ -1732,8 +1832,8 @@ nothing and loses nothing. It has what is left of the connection's
 no more: a connection that ran out of time is not retried, and when the retry
 runs out of it, that does not count against its server. With no other
 server to take, or once its retry has failed too, the client gets the reply
-it would have had without one: SOCKS5 reply 0x05 for a refused connection and
-0x01 for a failed handshake, or HTTP 502. A failure that does not count is not
+it would have had without one: SOCKS5 reply 0x01 (general failure), for a
+refused connection as for a failed handshake, or HTTP 502. A failure that does not count is not
 retried, and neither is a connection through
 .BR \-\-upstream\-proxy .
 .PP

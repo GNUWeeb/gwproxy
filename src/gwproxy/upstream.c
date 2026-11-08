@@ -140,6 +140,31 @@ static int build_connect(struct gwp_conn_pair *gcp)
 	return 0;
 }
 
+/*
+ * The error a non-zero SOCKS5 CONNECT REP from the upstream fails the attempt
+ * with. The destination's own failures, 0x03 to 0x06, keep their meaning: a
+ * SOCKS5 client gets the same REP back from the errno (an HTTP client a 502,
+ * or a 504 for the TTL expiry). The rest (0x01 and 0x02, which may be the
+ * upstream's own trouble or policy, 0x07 and 0x08, which are about our
+ * request, and anything unassigned) say nothing about the destination: the
+ * chain failed, REP 0x01.
+ */
+static int s5_rep_err(uint8_t rep)
+{
+	switch (rep) {
+	case 0x03:
+		return -ENETUNREACH;
+	case 0x04:
+		return -EHOSTUNREACH;
+	case 0x05:
+		return -ECONNREFUSED;
+	case 0x06:
+		return -ETIMEDOUT;
+	default:
+		return -EPROTO;
+	}
+}
+
 static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
@@ -202,7 +227,7 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 				rep, fail_class(GWP_UPSTREAM_END_S5_REP, rep),
 				gcp->idx, gwp_upstream_dst_str(gcp));
 			gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_S5_REP, rep);
-			return -ECONNREFUSED;
+			return s5_rep_err(rep);
 		}
 		r = gwp_upstream_splice_reply(w, gcp, consumed);
 		return r ? r : GWP_UPSTREAM_IO_DONE;
@@ -273,13 +298,16 @@ int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	gwp_conn_buf_compact(&gcp->target);
 
 	/*
-	 * Only a refused CONNECT (SOCKS5 REP non-zero, HTTP 502 or 504) says
-	 * something about the destination. An upstream that turned down our
-	 * credentials (SOCKS5 auth, HTTP 407), or answered something we
-	 * cannot use, or hung up, is a failure of the proxy chain: REP 0x01,
-	 * not the 0x02 "not allowed by ruleset" that -EACCES would map to.
+	 * Only a CONNECT the upstream says failed at the destination (SOCKS5
+	 * REP 0x03 to 0x06, HTTP 502 or 504) says something about it, and
+	 * its error (s5_rep_err(), http_parse()) goes on to the client. An
+	 * upstream that turned down our credentials (SOCKS5 auth, HTTP 407),
+	 * or answered something we cannot use, or hung up, is a failure of
+	 * the proxy chain: REP 0x01, not the 0x02 "not allowed by ruleset"
+	 * that -EACCES would map to, nor whatever an errno of the upstream's
+	 * own socket would.
 	 */
-	if (err != -ECONNREFUSED)
+	if (!gwp_upstream_dst_failed(gcp))
 		err = -EPROTO;
 
 	r = gwp_conn_fail_reply(w, gcp, err);

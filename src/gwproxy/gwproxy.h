@@ -488,6 +488,12 @@ enum {
 	 * (gwp_conn_upstream_failed()).
 	 */
 	GWP_CONN_FLAG_UP_RETRIED	= (1ull << 8ull),
+	/*
+	 * io_uring: the client half-closed during the connect at
+	 * --connect-timeout=0, and --protocol-timeout now bounds the rest of
+	 * it (handle_ev_client_watch()).
+	 */
+	GWP_CONN_FLAG_FIN_BOUND		= (1ull << 10ull),
 };
 
 enum {
@@ -721,8 +727,9 @@ struct gwp_conn_pair {
 	 * (gwp_upstream_note_end()).
 	 */
 	uint16_t		up_val;
+	/* @upstream's place in @up_pool: under GWP_ACL_POOL_MAX_SERVERS. */
+	uint16_t		up_srv;
 	uint8_t			up_end;
-	uint8_t			up_srv;
 
 	/* One-byte scalars last, so they pack instead of each opening a hole. */
 	bool			is_target_alive;
@@ -765,6 +772,10 @@ struct gwp_conn_pair {
 	bool			client_tx;
 	/* A recv of the target's data is in flight. */
 	bool			target_rx;
+	/* The client watch (multishot poll, see prep_client_watch()) is armed. */
+	bool			client_watch;
+	/* The client watch saw a FIN during the lookup (do_prep_connect()). */
+	bool			client_fin;
 #endif
 };
 
@@ -1089,6 +1100,19 @@ static inline void gwp_upstream_note_end(struct gwp_conn_pair *gcp,
 		return;
 	gcp->up_end = (uint8_t)end + 1;
 	gcp->up_val = (uint16_t)(val < 0 ? 0 : val > 0xffff ? 0xffff : val);
+}
+
+/*
+ * Whether the upstream said the attempt failed at the destination (a SOCKS5
+ * REP 0x03 to 0x06, an HTTP 502 or 504): the one kind of upstream failure a
+ * client can be told about as the destination's.
+ */
+static inline bool gwp_upstream_dst_failed(const struct gwp_conn_pair *gcp)
+{
+	return gcp->up_end &&
+	       gwp_upstream_fail_classify((enum gwp_upstream_end)(gcp->up_end - 1),
+					  gcp->up_val) ==
+	       GWP_UPSTREAM_FAIL_DESTINATION;
 }
 
 /*

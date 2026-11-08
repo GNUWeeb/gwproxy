@@ -19,10 +19,8 @@ require python3
 grep -q 'CONFIG_NEW_DNS_RESOLVER' "$ROOT/config.h" 2>/dev/null || \
 	skip "gwproxy built without the raw DNS resolver (--use-new-dns-resolver)"
 
-dp="$(pick_port)"
-python3 "$SERVERS_DIR/dns_malformed.py" slow "$dp" 2>/dev/null &
-_PIDS+=("$!")
-sleep 0.4
+start_dns_responder slow
+dp="$DNS_PORT"
 
 p="$(pick_port)"
 gwp_start "127.0.0.1:$p" --as-socks5=1 --as-http=1 --raw-dns=1 \

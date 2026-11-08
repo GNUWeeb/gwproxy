@@ -77,7 +77,6 @@ struct gwp_acl_dnat {
 
 /* Limits of the upstream pools of one rule set. */
 #define ACL_POOL_NAME_MAX	64
-#define ACL_POOL_MAX_SERVERS	64
 #define ACL_MAX_POOLS		1024
 /* What gwp_parse_upstream() takes after the scheme, NUL included. */
 #define ACL_URL_REST_MAX	512
@@ -92,6 +91,8 @@ struct gwp_acl_pool {
 	/* gwp_acl_pool_next(): the one thing in a pool that changes. */
 	_Atomic(uint32_t)	cursor;
 	uint32_t		nr_servers;
+	/* What @servers and @srv have room for (pool_add_server()). */
+	uint32_t		cap_servers;
 	/* The server URLs as written, credentials included. */
 	char			**servers;
 	/*
@@ -99,6 +100,8 @@ struct gwp_acl_pool {
 	 * reference to each, dropped with @ops->put when it is freed.
 	 */
 	void			**srv;
+	/* @ops->handle of each of @srv, NULL without @ops->handle. */
+	void			**hdl;
 	const struct gwp_acl_server_ops *ops;
 	uint8_t			method;		/* enum gwp_acl_pool_method */
 	bool			remote_dns;
@@ -599,6 +602,50 @@ static void mask_addr(uint8_t *addr, uint8_t bits, size_t len)
 		addr[i] = 0;
 }
 
+/*
+ * Parse all of @s as an unsigned number of at most @max into @out; -1 if it is
+ * not one. It is decimal digits, or with @hex also "0x" (or "0X") and
+ * hexadecimal digits; nothing else. strtoul() is not used: it also takes
+ * leading blanks and a sign, and negates a "-" value in unsigned arithmetic, so
+ * "-18446744073709551535" would wrap around to 81, and " 80" and "+80" would
+ * pass for 80; with base 0 it reads "010" as octal 8, and a newer C library
+ * "0b10" as binary 2. Where @hex allows a prefix, a decimal number may not
+ * start with 0, so "010", which meant 8 before, is refused rather than quietly
+ * read as 10; without @hex it is plain decimal and "010" is 10, as it always
+ * was.
+ */
+static int parse_num(const char *s, bool hex, unsigned long max,
+		     unsigned long *out)
+{
+	unsigned long v = 0, d, base = 10;
+
+	if (*s < '0' || *s > '9')
+		return -1;
+	if (hex && s[0] == '0' && s[1]) {
+		if (s[1] != 'x' && s[1] != 'X')
+			return -1;
+		base = 16;
+		s += 2;
+		if (!*s)
+			return -1;
+	}
+	for (; *s; s++) {
+		if (*s >= '0' && *s <= '9')
+			d = (unsigned long)(*s - '0');
+		else if (base == 16 && *s >= 'a' && *s <= 'f')
+			d = (unsigned long)(*s - 'a' + 10);
+		else if (base == 16 && *s >= 'A' && *s <= 'F')
+			d = (unsigned long)(*s - 'A' + 10);
+		else
+			return -1;
+		if (d > max || v > (max - d) / base)
+			return -1;
+		v = v * base + d;
+	}
+	*out = v;
+	return 0;
+}
+
 /* Parse "IP" or "IP/prefixlen" into a canonicalised prefix. */
 static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 {
@@ -629,16 +676,8 @@ static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 		return -EINVAL;
 	}
 
-	if (slash) {
-		char *end;
-
-		errno = 0;
-		bits = strtoul(slash + 1, &end, 10);
-		if (errno || *end || slash[1] == '\0')
-			return -EINVAL;
-		if (bits > (c->is_v4 ? 32u : 128u))
-			return -EINVAL;
-	}
+	if (slash && parse_num(slash + 1, false, c->is_v4 ? 32 : 128, &bits))
+		return -EINVAL;
 
 	/*
 	 * cidr_match() folds a v4-mapped target (::ffff:a.b.c.d) into IPv4, so
@@ -689,21 +728,16 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 	for (tok = strtok_r(buf, ",", &save); tok;
 	     tok = strtok_r(NULL, ",", &save)) {
 		unsigned long lo, hi;
-		char *dash, *end;
+		char *dash;
 
 		dash = strchr(tok, '-');
 		if (dash)
 			*dash = '\0';
 
-		errno = 0;
-		lo = strtoul(tok, &end, 10);
-		if (errno || *end || tok[0] == '\0' || lo > 65535)
+		if (parse_num(tok, false, 65535, &lo))
 			goto einval;
 		if (dash) {
-			errno = 0;
-			hi = strtoul(dash + 1, &end, 10);
-			if (errno || *end || dash[1] == '\0' || hi > 65535 ||
-			    hi < lo)
+			if (parse_num(dash + 1, false, 65535, &hi) || hi < lo)
 				goto einval;
 		} else {
 			hi = lo;
@@ -795,12 +829,9 @@ static int parse_dnat(const char *s, struct gwp_acl_dnat *d)
 
 	if (have_port) {
 		unsigned long port;
-		char *end;
 
 		*colon = '\0';
-		errno = 0;
-		port = strtoul(colon + 1, &end, 10);
-		if (errno || *end || colon[1] == '\0' || port > 65535)
+		if (parse_num(colon + 1, false, 65535, &port))
 			return -EINVAL;
 		d->port = (uint16_t)port;
 		d->set_port = true;
@@ -908,17 +939,15 @@ static bool eq(const char *a, const char *b1, const char *b2)
 	return !strcmp(a, b1) || (b2 && !strcmp(a, b2));
 }
 
-/* Parse a 32-bit unsigned value (decimal, or 0x hex) into @out; -1 on error. */
+/*
+ * Parse a 32-bit unsigned value (decimal without a leading 0, or 0x hex) into
+ * @out; -1 on error.
+ */
 static int parse_u32(const char *s, uint32_t *out)
 {
 	unsigned long v;
-	char *end;
 
-	if (!*s)
-		return -1;
-	errno = 0;
-	v = strtoul(s, &end, 0);
-	if (errno || *end || v > 0xffffffffUL)
+	if (parse_num(s, true, 0xffffffffUL, &v))
 		return -1;
 	*out = (uint32_t)v;
 	return 0;
@@ -928,18 +957,8 @@ static int parse_u32(const char *s, uint32_t *out)
 static int parse_port_num(const char *s, uint16_t *out)
 {
 	unsigned long v;
-	char *end;
 
-	/*
-	 * Digits only: strtoul() also takes leading blanks and a sign, and
-	 * negates a "-" value in unsigned arithmetic: "-18446744073709551535"
-	 * wraps around to port 81, and " 80" and "+80" pass for 80.
-	 */
-	if (*s < '0' || *s > '9')
-		return -1;
-	errno = 0;
-	v = strtoul(s, &end, 10);
-	if (errno || *end || v > 65535)
+	if (parse_num(s, false, 65535, &v))
 		return -1;
 	*out = (uint16_t)v;
 	return 0;
@@ -1104,6 +1123,11 @@ void *gwp_acl_pool_server(const struct gwp_acl_pool *p, uint32_t i)
 	return i < p->nr_servers && p->srv ? p->srv[i] : NULL;
 }
 
+void *const *gwp_acl_pool_handles(const struct gwp_acl_pool *p)
+{
+	return p->hdl ? p->hdl : p->srv;
+}
+
 uint32_t gwp_acl_pool_next(struct gwp_acl_pool *p)
 {
 	return atomic_fetch_add_explicit(&p->cursor, 1, memory_order_relaxed);
@@ -1130,6 +1154,7 @@ void gwp_acl_pool_put(struct gwp_acl_pool *p)
 	}
 	free(p->servers);
 	free(p->srv);
+	free(p->hdl);
 	free(p);
 }
 
@@ -1345,9 +1370,9 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 	char shown[160];
 	char **v, *dup;
 
-	if (p->nr_servers == ACL_POOL_MAX_SERVERS)
-		return load_err(ld, "upstream pool %s has more than %d servers",
-				p->name, ACL_POOL_MAX_SERVERS);
+	if (p->nr_servers == GWP_ACL_POOL_MAX_SERVERS)
+		return load_err(ld, "upstream pool %s has more than %u servers",
+				p->name, GWP_ACL_POOL_MAX_SERVERS);
 	if (check_server_url(url, &remote_dns, &creds, &why))
 		return load_err(ld, "upstream pool %s server %u: %s", p->name,
 				idx, why);
@@ -1358,18 +1383,37 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 				remote_dns ? "remotely" : "locally",
 				p->remote_dns ? "remotely" : "locally");
 
-	v = realloc(p->servers, (p->nr_servers + 1) * sizeof(*v));
-	if (!v)
-		return -ENOMEM;
-	p->servers = v;
-	if (ld->ops) {
-		void **sv = realloc(p->srv, (p->nr_servers + 1) * sizeof(*sv));
+	/*
+	 * Room for one more, doubling: a pool may have thousands of servers,
+	 * and growing by one would copy the arrays once per server.
+	 */
+	if (p->nr_servers == p->cap_servers) {
+		uint32_t cap = p->cap_servers ? p->cap_servers * 2 : 4;
 
-		if (!sv)
+		if (cap > GWP_ACL_POOL_MAX_SERVERS)
+			cap = GWP_ACL_POOL_MAX_SERVERS;
+		v = realloc(p->servers, cap * sizeof(*v));
+		if (!v)
 			return -ENOMEM;
-		p->srv = sv;
-		p->ops = ld->ops;
+		p->servers = v;
+		if (ld->ops) {
+			void **sv = realloc(p->srv, cap * sizeof(*sv));
+
+			if (!sv)
+				return -ENOMEM;
+			p->srv = sv;
+		}
+		if (ld->ops && ld->ops->handle) {
+			void **hv = realloc(p->hdl, cap * sizeof(*hv));
+
+			if (!hv)
+				return -ENOMEM;
+			p->hdl = hv;
+		}
+		p->cap_servers = cap;
 	}
+	if (ld->ops)
+		p->ops = ld->ops;
 	dup = strdup(url);
 	if (!dup)
 		return -ENOMEM;
@@ -1389,6 +1433,9 @@ static int pool_add_server(struct acl_load *ld, const char *url)
 					err[0] ? err : strerror(-r));
 		}
 		p->srv[p->nr_servers] = srv;
+		if (p->hdl)
+			p->hdl[p->nr_servers] = ld->ops->handle(ld->ops->arg,
+								srv);
 	}
 	p->servers[p->nr_servers++] = dup;
 	p->remote_dns = remote_dns;

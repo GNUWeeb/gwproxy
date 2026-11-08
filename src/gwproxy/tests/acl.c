@@ -746,6 +746,61 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT -d 999.0.0.1 -j REJECT\n",	    /* bad CIDR */
 		"-A OUTPUT -d 1.2.3.4/33 -j REJECT\n",	    /* bad prefix */
 		"-A OUTPUT --dports 70000 -j REJECT\n",	    /* port range */
+		/*
+		 * Every number starts with a digit: strtoul() alone takes a
+		 * sign, and wraps a "-" value around, so the last --dports
+		 * here would load as 80-81.
+		 */
+		"-A OUTPUT --dports +80 -j REJECT\n",	    /* port sign */
+		"-A OUTPUT --dports -80 -j REJECT\n",	    /* empty lo */
+		"-A OUTPUT --sports +80 -j REJECT\n",	    /* port sign */
+		"-A OUTPUT --dports 80,+443 -j REJECT\n",	    /* sign in list */
+		"-A OUTPUT --dports 80-+90 -j REJECT\n",	    /* sign on hi */
+		"-A OUTPUT --dports 80--18446744073709551535 -j REJECT\n", /* 80-81 */
+		"-A OUTPUT -d 10.0.0.0/+8 -j REJECT\n",	    /* prefix sign */
+		"-A OUTPUT -s 10.0.0.0/-0 -j REJECT\n",	    /* prefix sign */
+		"-A OUTPUT -d ::/+64 -j REJECT\n",		    /* v6 prefix sign */
+		"-A OUTPUT -d 10.0.0.0/ -j REJECT\n",	    /* empty prefix */
+		"-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:+80\n",	    /* DNAT sign */
+		"-A OUTPUT -d 1.2.3.4 -j DNAT --to :+80\n",		    /* DNAT sign */
+		"-A OUTPUT -d 1.2.3.4 -j DNAT --to [::1]:+80\n",	    /* DNAT sign */
+		"-A OUTPUT -d 1.2.3.4 -j DNAT --to :-18446744073709551535\n", /* 81 */
+		"-A OUTPUT -j MARK --set-mark +5\n",		    /* mark sign */
+		"-A OUTPUT -j MARK --set-mark -1\n",		    /* mark wraps */
+		"-A OUTPUT -j MARK --set-mark 0x\n",		    /* empty hex */
+		"-A OUTPUT -m statistic --mode nth --every +2 -j ACCEPT\n",	      /* --every sign */
+		"-A OUTPUT -m statistic --mode nth --every 2 --packet +1 -j ACCEPT\n", /* --packet sign */
+		"-A OUTPUT -m statistic --mode nth --every 2 --packet -0 -j ACCEPT\n", /* --packet sign */
+		/*
+		 * A mark, --every and --packet are decimal or 0x hexadecimal,
+		 * and nothing else: strtoul() with base 0 read "010" as octal
+		 * 8, so a leading 0 before a decimal digit is refused rather
+		 * than read differently now; so are other prefixes, a second
+		 * "0x" and overflow.
+		 */
+		"-A OUTPUT -j MARK --set-mark 010\n",		    /* was octal */
+		"-A OUTPUT -j MARK --set-mark 00\n",		    /* was octal */
+		"-A OUTPUT -j MARK --set-mark 08\n",		    /* leading 0 */
+		"-A OUTPUT -j MARK --set-mark 0b1\n",		    /* binary */
+		"-A OUTPUT -j MARK --set-mark 0o7\n",		    /* octal */
+		"-A OUTPUT -j MARK --set-mark 0x0x10\n",	    /* two prefixes */
+		"-A OUTPUT -j MARK --set-mark 0x+1\n",		    /* sign after 0x */
+		"-A OUTPUT -j MARK --set-mark 0x-1\n",		    /* sign after 0x */
+		"-A OUTPUT -j MARK --set-mark 0xg\n",		    /* not hex */
+		"-A OUTPUT -j MARK --set-mark 0x1g\n",		    /* hex junk */
+		"-A OUTPUT -j MARK --set-mark 12a\n",		    /* hex w/o 0x */
+		"-A OUTPUT -j MARK --set-mark 0x100000000\n",	    /* > 32 bits */
+		"-A OUTPUT -j MARK --set-mark 4294967296\n",	    /* > 32 bits */
+		"-A OUTPUT -j MARK --set-mark 0x10000000000000000\n", /* > 64 bits */
+		"-A OUTPUT -j MARK --set-mark 18446744073709551616\n", /* > 64 bits */
+		"-A OUTPUT -m statistic --mode nth --every 010 -j ACCEPT\n",	      /* was octal */
+		"-A OUTPUT -m statistic --mode nth --every 9 --packet 07 -j ACCEPT\n", /* was octal */
+		"-A OUTPUT -m statistic --mode nth --every 0x -j ACCEPT\n",	      /* empty hex */
+		"-A OUTPUT -m statistic --mode nth --every 4294967296 -j ACCEPT\n",  /* > 32 bits */
+		/* Ports and prefixes are decimal only: no 0x. */
+		"-A OUTPUT --dports 0x50 -j REJECT\n",	    /* hex port */
+		"-A OUTPUT -d 10.0.0.0/0x8 -j REJECT\n",	    /* hex prefix */
+		"-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:0x50\n", /* hex DNAT port */
 		"-A WEIRD -d 1.2.3.4 -j REJECT\n",	    /* bad chain */
 		"garbage line\n",			    /* not -P/-A */
 	};
@@ -1241,6 +1296,104 @@ static noinline void test_domain_only_target_criteria(void)
 		"-P OUTPUT ACCEPT\n"));
 	assert(out(a, NULL, "internal.corp", 0, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	assert(out(a, NULL, "other.com", 0, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+}
+
+/* Load "-j MARK --set-mark @v" and return the mark an evaluation sets. */
+static noinline uint32_t mark_of(const char *v)
+{
+	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
+	struct gwp_acl *a = NULL;
+	struct gwp_acl_req req;
+	char *rules;
+
+	assert(asprintf(&rules, "-A OUTPUT -j MARK --set-mark %s\n"
+			"-P OUTPUT ACCEPT\n", v) > 0);
+	assert(!gwp_acl_parse_str(&a, rules));
+	free(rules);
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.mark_set);
+	gwp_acl_destroy(a);
+	return req.mark;
+}
+
+/*
+ * Load "-m statistic --mode nth --every @every [--packet @packet]" and return
+ * which of the first 64 evaluations it selects, one bit each.
+ */
+static noinline uint64_t nth_hits(const char *every, const char *packet)
+{
+	struct gwp_sockaddr t = sa4("1.2.3.4", 443);
+	struct gwp_acl *a = NULL;
+	uint64_t hits = 0;
+	char *rules;
+	int i;
+
+	assert(asprintf(&rules,
+			"-A OUTPUT -m statistic --mode nth --every %s%s%s -j REJECT\n"
+			"-P OUTPUT ACCEPT\n", every, packet ? " --packet " : "",
+			packet ? packet : "") > 0);
+	assert(!gwp_acl_parse_str(&a, rules));
+	free(rules);
+	for (i = 0; i < 64; i++)
+		if (out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT)
+			hits |= (uint64_t)1 << i;
+	gwp_acl_destroy(a);
+	return hits;
+}
+
+/* The bits nth_hits() should return for --every @n --packet @p. */
+static uint64_t nth_mask(int n, int p)
+{
+	uint64_t m = 0;
+	int i;
+
+	for (i = 0; i < 64; i++)
+		if (i % n == p)
+			m |= (uint64_t)1 << i;
+	return m;
+}
+
+/*
+ * Numbers in a rule: a mark, --every and --packet are decimal or 0x
+ * hexadecimal (either case), a lone 0 included; ports and prefix lengths are
+ * decimal, where a leading 0 never meant octal and still reads as decimal. The
+ * forms refused are in test_parse_errors().
+ */
+static noinline void test_number_bases(void)
+{
+	struct gwp_sockaddr t = sa4("10.1.2.3", 80);
+	struct gwp_acl *a = NULL;
+
+	assert(mark_of("0") == 0);
+	assert(mark_of("9") == 9);
+	assert(mark_of("10") == 10);
+	assert(mark_of("0x10") == 16);
+	assert(mark_of("0X1f") == 31);
+	assert(mark_of("0x0") == 0);
+	assert(mark_of("0x00000010") == 16);
+	assert(mark_of("0xDeadBeef") == 0xdeadbeef);
+	assert(mark_of("4294967295") == 0xffffffff);
+	assert(mark_of("0xffffffff") == 0xffffffff);
+
+	/* --every 10 is ten, not octal 8; 0x10 is sixteen. */
+	assert(nth_hits("10", NULL) == nth_mask(10, 0));
+	assert(nth_hits("0x10", NULL) == nth_mask(16, 0));
+	assert(nth_hits("0x10", "0x0f") == nth_mask(16, 15));
+	assert(nth_hits("0XA", "9") == nth_mask(10, 9));
+	assert(nth_hits("0x1", "0") == ~(uint64_t)0);
+
+	/* Decimal-only fields keep reading a leading 0 as decimal. */
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 10.0.0.0/08 --dports 080,0443-00444 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, &t, NULL, 444, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, &t, NULL, 64, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	t = sa4("11.1.2.3", 80);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 }
 
@@ -2897,18 +3050,33 @@ static void up_srv_put(void *arg, void *srv)
 	assert(atomic_fetch_sub(&g_up_live, 1) > 0);
 }
 
+/* A pick handle: something the object holds while it lives. */
+static void *up_srv_handle(void *arg, void *srv)
+{
+	struct up_srv *s = srv;
+
+	assert(arg == &g_up_live);
+	return s->url;
+}
+
 static const struct gwp_acl_server_ops up_srv_ops = {
 	.make	= up_srv_make,
 	.put	= up_srv_put,
+	.handle	= up_srv_handle,
 	.arg	= &g_up_live,
 };
 
-/* The server object @p's @i-th URL was made into, checked against it. */
+/*
+ * The server object @p's @i-th URL was made into, checked against it, and
+ * its pick handle with it.
+ */
 static struct up_srv *up_srv_of(const struct gwp_acl_pool *p, uint32_t i)
 {
 	struct up_srv *s = gwp_acl_pool_server(p, i);
+	void *const *h = gwp_acl_pool_handles(p);
 
 	assert(s && !strcmp(s->url, gwp_acl_pool_server_url(p, i)));
+	assert(h && h[i] == s->url);
 	return s;
 }
 
@@ -2997,6 +3165,7 @@ static noinline void test_upstream_server_ops(void)
 	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
 	assert(gwp_acl_pool_server_url(req.upstream_pool, 0));
 	assert(!gwp_acl_pool_server(req.upstream_pool, 0));
+	assert(!gwp_acl_pool_handles(req.upstream_pool));
 	gwp_acl_req_release(&req);
 	gwp_acl_destroy(a);
 	assert(g_up_made == 5);
@@ -3286,6 +3455,7 @@ static noinline void test_upstream_errors(void)
 {
 	static const char srv[] = " server http://10.0.0.1:1;\n";
 	char name[80], *text, *p;
+	struct gwp_acl_req req;
 	struct gwp_acl *a;
 	int i;
 
@@ -3421,14 +3591,27 @@ static noinline void test_upstream_errors(void)
 		   " server socks5://h:1;\n}\n", -EINVAL,
 		   "server 2 (socks5://h:1): resolves names locally, the servers before it remotely");
 
-	/* The limits: 64 servers a pool, 1024 pools a set. */
-	text = malloc(1100 * 64);
+	/* The limits: 8192 servers a pool, 1024 pools a set. */
+	assert(GWP_ACL_POOL_MAX_SERVERS == 8192);
+	text = malloc(64 * 8200);
 	assert(text);
-	up_pool_text(text, "p", 64);
+	p = up_pool_text(text, "p", 8192);
+	sprintf(p, "-A OUTPUT -j UPSTREAM --to p\n");
 	assert(!gwp_acl_parse_str(&a, text));
+	assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+	assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+	assert(gwp_acl_pool_nr_servers(req.upstream_pool) == 8192);
+	assert(!strcmp(gwp_acl_pool_server_url(req.upstream_pool, 0),
+		       "socks5h://10.0.0.1:1080"));
+	assert(!strcmp(gwp_acl_pool_server_url(req.upstream_pool, 4097),
+		       "socks5h://10.0.16.98:1080"));
+	assert(!strcmp(gwp_acl_pool_server_url(req.upstream_pool, 8191),
+		       "socks5h://10.0.32.192:1080"));
+	assert(!gwp_acl_pool_server_url(req.upstream_pool, 8192));
+	gwp_acl_req_release(&req);
 	gwp_acl_destroy(a);
-	up_pool_text(text, "p", 65);
-	up_refused(text, -EINVAL, "line 66: upstream pool p has more than 64 servers");
+	up_pool_text(text, "p", 8193);
+	up_refused(text, -EINVAL, "line 8194: upstream pool p has more than 8192 servers");
 	for (p = text, i = 0; i < 1024; i++) {
 		snprintf(name, sizeof(name), "p%d", i);
 		p = up_pool_text(p, name, 1);
@@ -3571,6 +3754,7 @@ static void run_tests(void)
 		test_memo();
 		test_comments_and_default_policy();
 		test_statistic_nth();
+		test_number_bases();
 		test_statistic_counts_only_matches();
 		test_statistic_load_balance();
 		test_statistic_equal_every_is_uneven();

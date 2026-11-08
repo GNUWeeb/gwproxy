@@ -530,3 +530,5 @@ loops=1
 grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && loops=2
 want "upstreams" "g1's connections" "$(wc -l <"$WORK/rec.g1.log")" $((loops * 18))
 want "upstreams" "g2's connections" "$(wc -l <"$WORK/rec.g2.log")" $((loops * 4))
+
+pass

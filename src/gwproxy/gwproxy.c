@@ -38,6 +38,9 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#ifdef CONFIG_HAVE_GETRANDOM
+#include <sys/random.h>
+#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -342,26 +345,68 @@ static const char *opt_name(int c)
 }
 
 /*
- * Parse the argument of option @c as a whole integer in [@min, @max], in
- * @base as for strtoll(). atoi() took "abc" or "5s" for a number, quietly
- * turned "0x10" into 0 and had undefined behaviour on overflow, so a typo
- * started the proxy with some other setting than the one asked for.
+ * Parse the argument of option @c as a whole integer in [@min, @max] (@max at
+ * least 0): decimal digits, after a "-" when @min is negative, or with @hex
+ * also "0x" (or "0X") and hexadecimal digits. atoi() took "abc" or "5s" for a
+ * number, quietly turned "0x10" into 0 and had undefined behaviour on
+ * overflow, so a typo started the proxy with some other setting than the one
+ * asked for. strtoll() is not used either: it takes leading blanks and a "+",
+ * which no option documents, and in base 0 reads "010" as octal 8. Where @hex
+ * allows a prefix, a decimal number may not start with 0, so "010" is refused
+ * rather than read as 10 now; without @hex, "010" is decimal 10, as it was.
  */
 static int opt_num(int c, const char *arg, long long min, long long max,
-		   int base, long long *out)
+		   bool hex, long long *out)
 {
-	char *end;
-	long long v;
+	unsigned long long v = 0, d, lim = (unsigned long long)max, base = 10;
+	const char *p = arg, *why = "";
+	bool neg = false;
 
-	errno = 0;
-	v = strtoll(arg, &end, base);
-	if (!*arg || *end || errno || v < min || v > max) {
-		fprintf(stderr, "Error: --%s: '%s' is not an integer in the range %lld..%lld\n",
-			opt_name(c), arg, min, max);
-		return -EINVAL;
+	if (*p == '-' && min < 0) {
+		neg = true;
+		lim = -(unsigned long long)min;
+		p++;
 	}
-	*out = v;
+	if (*p < '0' || *p > '9')
+		goto bad;
+	if (hex && p[0] == '0' && p[1]) {
+		if (p[1] != 'x' && p[1] != 'X') {
+			if (p[1] >= '0' && p[1] <= '9')
+				why = " (no leading 0: it once meant octal)";
+			goto bad;
+		}
+		base = 16;
+		p += 2;
+		if (!*p)
+			goto bad;
+	}
+	for (; *p; p++) {
+		if (*p >= '0' && *p <= '9')
+			d = (unsigned long long)(*p - '0');
+		else if (base == 16 && *p >= 'a' && *p <= 'f')
+			d = (unsigned long long)(*p - 'a' + 10);
+		else if (base == 16 && *p >= 'A' && *p <= 'F')
+			d = (unsigned long long)(*p - 'A' + 10);
+		else
+			goto bad;
+		if (d > lim || v > (lim - d) / base)
+			goto bad;
+		v = v * base + d;
+	}
+	if (neg) {
+		/* v is at most -@min, so -v fits even for LLONG_MIN. */
+		*out = v ? -(long long)(v - 1) - 1 : 0;
+	} else {
+		*out = (long long)v;
+		if (*out < min)
+			goto bad;
+	}
 	return 0;
+bad:
+	fprintf(stderr, "Error: --%s: '%s' is not a %sinteger in the range %lld..%lld%s\n",
+		opt_name(c), arg, hex ? "decimal or 0x hexadecimal " : "decimal ",
+		min, max, why);
+	return -EINVAL;
 }
 
 static int opt_int(int c, const char *arg, int min, int max, int *out)
@@ -369,7 +414,7 @@ static int opt_int(int c, const char *arg, int min, int max, int *out)
 	long long v;
 	int r;
 
-	r = opt_num(c, arg, min, max, 10, &v);
+	r = opt_num(c, arg, min, max, false, &v);
 	if (!r)
 		*out = (int)v;
 	return r;
@@ -381,7 +426,7 @@ static int opt_bool(int c, const char *arg, bool *out)
 	long long v;
 	int r;
 
-	r = opt_num(c, arg, INT_MIN, INT_MAX, 10, &v);
+	r = opt_num(c, arg, INT_MIN, INT_MAX, false, &v);
 	if (!r)
 		*out = !!v;
 	return r;
@@ -564,7 +609,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->upstream_auth_file = optarg;
 			break;
 		case 'M':
-			if (opt_num(c, optarg, 0, UINT32_MAX, 0, &v))
+			if (opt_num(c, optarg, 0, UINT32_MAX, true, &v))
 				goto einval;
 			cfg->mark = (uint32_t)v;
 			break;
@@ -1041,7 +1086,11 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 
 	r = __sys_bind(fd, (struct sockaddr *)ba, slen);
 	if (r < 0) {
-		pr_err(&w->ctx->lh, "Failed to bind socket: %s", strerror(-r));
+		/* What an IPv6 address gets on a host with IPv6 turned off. */
+		pr_err(&w->ctx->lh, "Failed to bind %s: %s%s", ip_to_str(ba),
+		       strerror(-r),
+		       ba->sa.sa_family == AF_INET6 && r == -EADDRNOTAVAIL ?
+		       " (is IPv6 disabled on this host?)" : "");
 		goto out_close;
 	}
 
@@ -1061,7 +1110,7 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 
 	w->tcp_fd = fd;
 	pr_info(&w->ctx->lh, "Worker %u is listening on %s (fd=%d)", w->idx,
-		cfg->bind, fd);
+		ip_to_str(&w->listen_addr), fd);
 	return 0;
 
 out_close:
@@ -1372,6 +1421,53 @@ static void gwp_ctx_warn_open_proxy(struct gwp_ctx *ctx,
 		ip_to_str(addr));
 }
 
+/*
+ * A kernel without IPv6 (booted with ipv6.disable=1) refuses every AF_INET6
+ * socket. The wildcard [::] -- the default --bind among others -- asks for
+ * every address the host has, which there are the IPv4 ones: listen on
+ * 0.0.0.0 instead, and say so, rather than refuse to start. Not with
+ * --bind-ipv6-only=1, which asks for IPv6 alone. Any other IPv6 address
+ * cannot be listened on at all, and the error says why.
+ *
+ * A host that has IPv6 but turned it off with the disable_ipv6 sysctl still
+ * creates the socket, and a [::] bind there works and takes IPv4 clients;
+ * a bind to an IPv6 address then fails, see gwp_ctx_init_thread_sock().
+ */
+__cold
+static int gwp_ctx_check_bind_family(struct gwp_ctx *ctx,
+				     struct gwp_sockaddr *addr)
+{
+	uint16_t port = addr->i6.sin6_port;
+	int fd;
+
+	if (addr->sa.sa_family != AF_INET6)
+		return 0;
+
+	fd = __sys_socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd >= 0) {
+		__sys_close(fd);
+		return 0;
+	}
+	/* Anything else is for the listener's own setup to report. */
+	if (fd != -EAFNOSUPPORT)
+		return 0;
+
+	if (!IN6_IS_ADDR_UNSPECIFIED(&addr->i6.sin6_addr) ||
+	    ctx->cfg.bind_ipv6_only) {
+		pr_err(&ctx->lh, "Cannot listen on %s: IPv6 is not available on this host",
+		       ip_to_str(addr));
+		return -EAFNOSUPPORT;
+	}
+
+	memset(addr, 0, sizeof(*addr));
+	addr->i4.sin_family = AF_INET;
+	addr->i4.sin_addr.s_addr = htonl(INADDR_ANY);
+	addr->i4.sin_port = port;
+	pr_warn(&ctx->lh, "IPv6 is not available on this host: listening on %s, IPv4 only, instead of %s",
+		ip_to_str(addr), ctx->cfg.bind);
+	return 0;
+}
+
 __cold
 static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 {
@@ -1390,6 +1486,9 @@ static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 		pr_err(&ctx->lh, "Invalid bind address '%s'", cfg->bind);
 		return r;
 	}
+	r = gwp_ctx_check_bind_family(ctx, &bind_addr);
+	if (r)
+		return r;
 	gwp_ctx_warn_open_proxy(ctx, &bind_addr);
 
 	if (posix_memalign((void **)&workers, GWP_CACHELINE,
@@ -2294,6 +2393,7 @@ static const char gwp_acl_default_rules[] =
 static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
 			size_t size);
 static void acl_srv_put(void *arg, void *srv);
+static void *acl_srv_handle(void *arg, void *srv);
 
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 {
@@ -2306,6 +2406,7 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 	ctx->nr_acl_files = 0;
 	ctx->acl_srv_ops.make = acl_srv_make;
 	ctx->acl_srv_ops.put = acl_srv_put;
+	ctx->acl_srv_ops.handle = acl_srv_handle;
 	ctx->acl_srv_ops.arg = ctx;
 	atomic_init(&ctx->nr_acl_srv, 0);
 
@@ -2783,6 +2884,16 @@ static const char *up_desc(const struct gwp_acl_pool *pool, uint32_t idx,
 	return buf;
 }
 
+/* Log that @up, the @idx-th server of @pool (or the default), is back. */
+static void up_back(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
+		    uint32_t idx, struct gwp_upstream *up)
+{
+	char desc[320];
+
+	pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
+		up_desc(pool, idx, up, desc, sizeof(desc)));
+}
+
 /*
  * How many milliseconds the ejection of @up (the @idx-th server of @pool,
  * or the default upstream) still runs, 0 while it is in service. Reads the
@@ -2794,7 +2905,6 @@ static const char *up_desc(const struct gwp_acl_pool *pool, uint32_t idx,
 static uint32_t up_ejected(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
 			   uint32_t idx, struct gwp_upstream *up, uint64_t *now)
 {
-	char desc[320];
 	uint32_t left;
 	bool back;
 
@@ -2804,9 +2914,57 @@ static uint32_t up_ejected(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
 		*now = gwp_now_ms();
 	left = gwp_up_state_ejected(up->state, (uint32_t)*now, &back);
 	if (back)
-		pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
-			up_desc(pool, idx, up, desc, sizeof(desc)));
+		up_back(ctx, pool, idx, up);
 	return left;
+}
+
+/* What pool_pick_server()'s callbacks need. */
+struct pool_pick_env {
+	struct gwp_ctx		*ctx;
+	struct gwp_acl_pool	*pool;
+};
+
+static uint32_t pool_pick_now(void __unused *arg)
+{
+	return (uint32_t)gwp_now_ms();
+}
+
+/*
+ * Round-robin's probes (gwp_up_pick::random): a generator per thread, so
+ * no lock and no shared line; seeded on its first use, the only time it
+ * may make a syscall, from getrandom() or else the clock and the thread's
+ * own address. Not secret: it only spreads an ejected server's turns.
+ */
+static __thread uint32_t pool_pick_rnd;
+
+static uint32_t pool_pick_random(void __unused *arg)
+{
+	if (unlikely(!pool_pick_rnd)) {
+		struct timespec ts;
+		uint32_t seed = 0;
+
+#ifdef CONFIG_HAVE_GETRANDOM
+		if (getrandom(&seed, sizeof(seed), GRND_NONBLOCK) !=
+		    (ssize_t)sizeof(seed))
+			seed = 0;
+#endif
+		if (!seed) {
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			seed = (uint32_t)ts.tv_nsec ^ (uint32_t)ts.tv_sec;
+			seed ^= (uint32_t)(uintptr_t)&pool_pick_rnd * 2654435761u;
+		}
+		pool_pick_rnd = seed ? seed : 1;
+	}
+	return gwp_up_rand(&pool_pick_rnd);
+}
+
+static void pool_pick_back(void *arg, uint32_t i)
+{
+	struct pool_pick_env *env = arg;
+	struct gwp_upstream *up = gwp_acl_pool_server(env->pool, i);
+
+	if (up)
+		up_back(env->ctx, env->pool, i, up);
 }
 
 /*
@@ -2824,39 +2982,41 @@ static uint32_t up_ejected(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
  * @skip in pool order (least_conn: the fewest open, ties from there), or
  * UINT32_MAX for none; a retry leaves the cursor alone, so the pool's
  * turns go on as if the failed pick had worked.
+ *
+ * The pick reads the states in place, through the pool's handles (see
+ * acl_srv_handle()), with no copy: round-robin looks at the cursor's
+ * server, and only when it is ejected at a few random ones and then the
+ * next ones in turn; least_conn scans
+ * the open counts of the whole pool (see gwp_up_lb_pick()). UINT32_MAX,
+ * when the pool has no server object at all, is a bug conn_pick_upstream()
+ * reports.
  */
 static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 				 uint32_t skip)
 {
-	uint32_t nr = gwp_acl_pool_nr_servers(pool), open[64], eject[64], i, rr;
-	bool lc = gwp_acl_pool_method(pool) == GWP_ACL_POOL_LEAST_CONN;
-	uint64_t now = 0;
-	struct gwp_upstream *up;
-	bool any = false;
+	struct pool_pick_env env = { .ctx = ctx, .pool = pool };
+	struct gwp_up_pick pk = {
+		.st = gwp_acl_pool_handles(pool),
+		.nr = gwp_acl_pool_nr_servers(pool),
+		.least_conn = gwp_acl_pool_method(pool) ==
+			      GWP_ACL_POOL_LEAST_CONN,
+		.skip = skip,
+		.now = pool_pick_now,
+		.back = pool_pick_back,
+		.random = pool_pick_random,
+		.arg = &env,
+	};
 
-	/* None is a bug conn_pick_upstream() reports. */
-	if (unlikely(!nr))
-		return 0;
-	/* acl.c allows 64; past that, the first 64 are all it can pick. */
-	if (unlikely(nr > sizeof(open) / sizeof(open[0])))
-		nr = sizeof(open) / sizeof(open[0]);
-	for (i = 0; i < nr; i++) {
-		up = gwp_acl_pool_server(pool, i);
-		if (unlikely(!up)) {
-			/* Likewise; never pick it. */
-			open[i] = UINT32_MAX;
-			eject[i] = UINT32_MAX;
-			any = true;
-			continue;
-		}
-		if (lc)
-			open[i] = gwp_up_state_open(up->state);
-		eject[i] = up_ejected(ctx, pool, i, up, &now);
-		any |= eject[i] != 0;
-	}
-	rr = skip == UINT32_MAX ? gwp_acl_pool_next(pool) : skip;
-	return gwp_up_lb_pick(lc, rr, open, any ? eject : NULL, nr, skip);
+	if (unlikely(!pk.st))
+		return UINT32_MAX;
+	if (skip == UINT32_MAX)
+		pk.rr = gwp_acl_pool_next(pool);
+	return gwp_up_lb_pick(&pk);
 }
+
+/* Every place in a pool fits gwp_conn_pair::up_srv. */
+_Static_assert(GWP_ACL_POOL_MAX_SERVERS - 1 <= UINT16_MAX,
+	       "gwp_conn_pair::up_srv cannot hold a pool server's place");
 
 /*
  * Decide, once per pair and before its target's name is resolved, which
@@ -2908,7 +3068,7 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		gwp_conn_set_upstream(ctx, gcp, up);
 		/* Kept for the logs and the retry, until the tunnel is up. */
 		gcp->up_pool = gwp_acl_req_take_pool(&req);
-		gcp->up_srv = (uint8_t)i;
+		gcp->up_srv = (uint16_t)i;
 		pr_dbg(&ctx->lh, "Upstream for idx=%u: pool %s server %u, %s (%s), %u open",
 		       gcp->idx, gwp_acl_pool_name(gcp->up_pool), i + 1,
 		       ip_to_str(&up->addr), up->host,
@@ -3935,6 +4095,18 @@ static void acl_srv_put(void __unused *arg, void *srv)
 }
 
 /*
+ * A pool keeps each server's shared state beside it, which the server holds
+ * until it is freed, so pool_pick_server() reads the states without
+ * reaching every server object.
+ */
+static void *acl_srv_handle(void __unused *arg, void *srv)
+{
+	struct gwp_upstream *up = srv;
+
+	return up->state;
+}
+
+/*
  * The one place a pair's upstream changes, so the open-pair count of each
  * server identity (struct gwp_up_state) follows the pairs that hold one of
  * its servers: a pair takes a slot with the server, when it is given it,
@@ -4005,7 +4177,7 @@ static bool upstream_retry(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	up_desc(gcp->up_pool, gcp->up_srv, old, d_old, sizeof(d_old));
 	gwp_conn_set_upstream(w->ctx, gcp, up);
-	gcp->up_srv = (uint8_t)i;
+	gcp->up_srv = (uint16_t)i;
 	/* A new attempt: its failure is its own. */
 	gcp->flags &= ~GWP_CONN_FLAG_UP_FAILED;
 	gcp->up_end = 0;
@@ -4940,6 +5112,22 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
 	if (timed_out)
 		err = -ETIMEDOUT;
+
+	/*
+	 * Through an upstream proxy, a connect that failed was to the proxy,
+	 * not to the destination: a proxy that refused it, reset it or could
+	 * not be reached says nothing about the destination, so it is the
+	 * chain's failure, REP 0x01, as a failed handshake with the proxy is
+	 * (gwp_upstream_fail_reply(), which has noted how the handshake
+	 * ended). These are the errnos that count against the proxy's
+	 * health. Anything else keeps its answer: a destination of a family
+	 * --outgoing-family forbids (REP 0x08), local trouble (0x01), and a
+	 * timeout, which still says that time ran out.
+	 */
+	if (!timed_out && gcp->upstream &&
+	    (gcp->flags & GWP_CONN_FLAG_UP_FAILED) && !gcp->up_end &&
+	    gwp_upstream_connect_class(err) == GWP_UPSTREAM_FAIL_UPSTREAM)
+		err = -EPROTO;
 
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5)
 		return gwp_socks5_prep_connect_reply(w, gcp, err);
@@ -6421,9 +6609,14 @@ static int http_fwd_target_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * into, so that what is held back, what is still queued for the
 	 * client (an interim response) and the next read can never add up to
 	 * more than the rewritten header and the body behind it can occupy.
+	 *
+	 * Filling that room exactly is fine: a run of interim responses that
+	 * comes in one full read leaves no room, and the loop then reads no
+	 * more until the client has taken some of them. Only more than that
+	 * is too much, which a header that grew in the rewrite can be.
 	 */
 	pending = gwp_http_fwd_res_pending(hc);
-	if (t->len + pending + HTTP_FWD_RES_SLACK >= cap)
+	if (t->len + pending + HTTP_FWD_RES_SLACK > cap)
 		return http_fwd_res_fail(w, gcp, from, -E2BIG);
 	t->cap = cap - HTTP_FWD_RES_SLACK - (uint32_t)pending;
 	return 0;
