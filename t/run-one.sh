@@ -96,8 +96,7 @@ sess_kill()
 # the background, setsid is not a process group leader and calls setsid() in
 # place, so $! is both the test's PID and its session ID.
 if [ "$kind" = unit ]; then
-	setsid env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$ROOT" "$cmd" \
-		>"$log" 2>&1 &
+	setsid "$cmd" >"$log" 2>&1 &
 else
 	setsid env GWPROXY="$GWPROXY" bash "$cmd" >"$log" 2>&1 &
 fi
