@@ -1064,9 +1064,15 @@ event loop; combining it with
 .B \-\-event\-loop=io_uring
 or with
 .B \-\-dns\-cache\-secs
-is rejected at startup. It yields a single address per name, so multi\-address
-fallback and racing do not apply (see
+is rejected at startup. It asks for one address family at a time, so the
+addresses of a name all come from one family; up to four of them are tried and
+raced as with the system resolver (see
 .BR "TARGET ADDRESS SELECTION" ).
+A name that does not resolve gets the same answer as with the system resolver:
+SOCKS5 reply
+.B 0x04
+(host unreachable), HTTP
+.BR 502 .
 Default:
 .BR 0 .
 .SS Upstream proxy chaining
@@ -2004,10 +2010,16 @@ loop does not need; size the descriptor limit accordingly, or set
 .B \-\-connect\-attempt\-delay=0
 to keep a single attempt in flight.
 .PP
-.B \-\-raw\-dns
-defeats all of this: the built\-in raw resolver yields a single address per name
-(it queries one record type at a time and tries the other only when the first
-yields nothing), so there is nothing to fall back to and nothing to race.
+With
+.BR \-\-raw\-dns ,
+the built\-in raw resolver asks for one record type at a time: the preferred
+family's first (with
+.BR \-\-outgoing\-family ,
+the only one asked for), and the other's only when that lookup fails. The
+candidates of a name therefore all come from one answer, of one family, in the
+order the server gave them, and are not interleaved by family. Fallback and
+racing apply to them as described above: up to the first four addresses of the
+answer are tried, and race on the same terms.
 .SH EVENT LOOPS
 Each worker uses one event loop, selected with
 .BR \-\-event\-loop .
