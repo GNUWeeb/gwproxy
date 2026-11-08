@@ -118,7 +118,7 @@ T=4096
 SIZES="4070 4077 4078 4080 4086 4096 6000"
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	for scheme in socks5 http; do
 		up="$(pick_port)"

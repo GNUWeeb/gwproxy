@@ -27,7 +27,7 @@ printf 'user:pass\n' >"$WORK/auth"
 make_payload "$WORK/body.bin" 8000	# large enough that curl uses Expect
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	pp="$(pick_port)"
 	gwp_start "127.0.0.1:$pp" --as-http=1 --auth-file="$WORK/auth" \

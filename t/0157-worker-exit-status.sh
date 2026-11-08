@@ -41,7 +41,7 @@ start_traced()
 
 for loop in epoll io_uring; do
 	if [ "$loop" = io_uring ]; then
-		grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null || continue
+		have_io_uring || continue
 		sc=io_uring_enter
 	else
 		sc=epoll_wait,epoll_pwait

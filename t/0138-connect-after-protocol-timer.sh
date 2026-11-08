@@ -246,7 +246,7 @@ pids=""
 clients=""
 names=""
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	for case in longer unlimited idle; do
 		case "$case" in

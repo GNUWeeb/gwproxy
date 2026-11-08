@@ -188,7 +188,7 @@ combo()
 }
 
 combos="epoll/socks5h epoll/http"
-grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && \
+have_io_uring && \
 	combos="$combos io_uring/socks5h io_uring/http"
 gwp_parallel combo $combos
 

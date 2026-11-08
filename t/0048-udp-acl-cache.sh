@@ -17,7 +17,7 @@ e2="$UDP_ECHO_PORT"
 steps="$SERVERS_DIR/socks5_udp_steps.py"
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	# (a) + (b): e2 is denied, e1 allowed until the reload denies it too.
 	printf -- '%s\n' "-A OUTPUT -p udp --dports $e2 -j REJECT" \

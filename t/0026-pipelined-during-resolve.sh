@@ -39,7 +39,7 @@ start_httpd "$hp" "$DOC"
 ROUNDS=60
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	p="$(pick_port)"
 	gwp_start "127.0.0.1:$p" --target="127.0.0.1:$hp" --as-socks5=1 \

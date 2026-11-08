@@ -300,7 +300,7 @@ plain()
 }
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	write_acl "$dead1" "$g1"
 	fp="$(pick_port)"
@@ -527,7 +527,7 @@ done
 # connections of p_tcp and the 3 of p_dst per loop, never the ones they
 # were not picked or retried for.
 loops=1
-grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && loops=2
+have_io_uring && loops=2
 want "upstreams" "g1's connections" "$(wc -l <"$WORK/rec.g1.log")" $((loops * 18))
 want "upstreams" "g2's connections" "$(wc -l <"$WORK/rec.g2.log")" $((loops * 4))
 

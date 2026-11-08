@@ -101,11 +101,43 @@ require()
 	command -v "$1" >/dev/null 2>&1 || skip "missing tool: $1"
 }
 
-# Skip unless gwproxy was built with io_uring support.
+# have_io_uring: whether the io_uring event loop can run here, i.e. gwproxy was
+# built with it AND the kernel lets this process set up a ring. Inside a
+# container under Docker's default seccomp profile, for one, io_uring_setup()
+# fails with EPERM, so gwproxy --event-loop=io_uring cannot start whatever the
+# code under test does; the io_uring runs are then left out like on a build
+# without io_uring, with a note in the test's log. Only an outright refusal
+# counts (see t/servers/iou_probe.py): anywhere a ring can be set up, the
+# io_uring runs go ahead and fail as they always did. The answer is kept for
+# the rest of the test, subshells included.
+_IOU_STATE=""
+have_io_uring()
+{
+	local why rc=0
+
+	if [ -z "$_IOU_STATE" ]; then
+		_IOU_STATE=on
+		if ! grep -q 'CONFIG_IO_URING' "$ROOT/config.h" 2>/dev/null; then
+			_IOU_STATE=off
+		elif command -v python3 >/dev/null 2>&1; then
+			why="$(python3 "$SERVERS_DIR/iou_probe.py")" || rc=$?
+		fi
+		if [ "$rc" = "$SKIP_CODE" ]; then
+			_IOU_STATE=refused
+			diag "built with io_uring, but $why;" \
+			     "leaving the io_uring runs out"
+		fi
+	fi
+	[ "$_IOU_STATE" = on ]
+}
+
+# Skip unless the io_uring event loop can run here (see have_io_uring).
 require_io_uring()
 {
-	grep -q 'CONFIG_IO_URING' "$ROOT/config.h" 2>/dev/null || \
-		skip "gwproxy built without io_uring"
+	have_io_uring && return 0
+	[ "$_IOU_STATE" = refused ] && \
+		skip "io_uring_setup() is refused on this host"
+	skip "gwproxy built without io_uring"
 }
 
 # Skip unless gwproxy was built with PCRE2 support (--use-pcre), needed by the

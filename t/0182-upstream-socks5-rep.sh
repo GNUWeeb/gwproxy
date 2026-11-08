@@ -109,7 +109,7 @@ dead="$CLOSED_PORT"
 
 reps="rep_01 rep_02 rep_03 rep_04 rep_05 rep_06 rep_07 rep_08 rep_09"
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	pp="$(pick_port)"
 	gwp_start "127.0.0.1:$pp" --as-socks5=1 --as-http=1 --event-loop="$loop" \

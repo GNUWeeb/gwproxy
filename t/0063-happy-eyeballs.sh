@@ -132,7 +132,7 @@ print('%s %.2f' % (p.stdout.strip() or '000', time.time() - t0))" "$1" "$2" "$op
 }
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	# (a) Fallback past a refused address.
 	if [ "$(order_of he-refused | cut -d' ' -f1)" = "127.0.0.7" ]; then

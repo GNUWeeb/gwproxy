@@ -85,7 +85,7 @@ stop_priv()
 }
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	# Per-rule -j MARK: the outgoing connection carries the fwmark and the
 	# iptables mark counter moves. No global --mark is set.

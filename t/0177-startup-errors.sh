@@ -115,7 +115,7 @@ os.execvp(sys.argv[1], sys.argv[1:])' \
 
 if command -v strace >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
 	for loop in epoll io_uring; do
-		[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+		[ "$loop" = io_uring ] && ! have_io_uring && continue
 		early_stop "$loop" TERM
 		early_stop "$loop" INT
 	done
