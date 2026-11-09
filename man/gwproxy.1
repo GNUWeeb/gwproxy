@@ -495,6 +495,7 @@ after it, the pool's options for it, as nginx writes them:
 .BI max_fails= n\fR,
 .BI fail_timeout= time\fR,
 .BI eject_time= time\fR,
+.BI slow_start= time\fR,
 .B backup
 and
 .B down
@@ -1598,7 +1599,11 @@ connections use the new pools; one already through a pool's server keeps that
 server until it ends. The servers' health, an ejection included, carries over
 as their counts do, an ejection as long as the pool's
 .BR max_fails= ", " fail_timeout= " and " eject_time=
-for the server stay the same.
+for the server stay the same, and so does a slow start under way
+.RB ( slow_start= ),
+while its
+.B slow_start=
+stays the same too.
 .PP
 The auth file, like the ACL files, must be a regular file. A FIFO or a device
 put in its place is refused, not waited on: the reload
@@ -1967,6 +1972,35 @@ How long the server then stays out. Default 5m. Unlike nginx's,
 is only the window the failures must fall in, and this how long an ejection
 lasts.
 .TP
+.BI slow_start= time
+How long the server takes to get its full share back when it comes back
+into service: over this time its weight grows evenly from next to nothing to
+its
+.B weight=
+(1 without one), so that a server just back is not handed its whole share of
+the new connections at once. From 0 to 1h; default 0, no slow start. It runs
+when an ejection ends (an ejection during it starts it again once that one
+is over), and when a reload brings the server into service in a pool: a
+server new to the pool, one no longer
+.BR down ,
+or one whose
+.BR max_fails= ", " fail_timeout= ", " eject_time= " or " slow_start=
+changed, unless another pool already lists it in service with the same
+numbers. The first load starts none. With round\-robin, a server at a
+fraction of its weight takes each of its turns with that chance, and the
+turns it lets pass go to the other servers by their weights, as an ejected
+server's do, so its share follows the ramp (somewhat below it when most of a
+pool ramps at once). With
+.BR least_conn ,
+its connections open count against that fraction of its weight, so it is
+busier for its weight than its count says and takes new connections only as
+the ramp lets it. A server with
+.B max_fails=0
+still ramps after a reload brings it in. Each start is logged, at info level,
+as
+.I "Upstream ADDRESS comes into service on a slow start of 60 s"
+for a reload, and with the return after an ejection.
+.TP
 .BI max_conns= n
 The most connections the server may have open for the pool to give it
 another: 0 to 1000000, default 0 for no limit. The count is the server's, of
@@ -1994,17 +2028,20 @@ A
 .I time
 is a number followed by
 .BR ms ", " s ", " m " or " h ,
-or a number of seconds, from 1ms to 24h. The numbers are the pool's: a
+or a number of seconds, from 1ms to 24h
+.RB ( slow_start= :
+0 to 1h). The numbers are the pool's: a
 server that two pools list with different ones is ejected by each when its
 failures, wherever they came from, meet that pool's numbers, and for that
 pool's time, so it may be out of one pool and still in service in another;
-pools that list it with the same numbers share one ejection. For example:
+pools that list it with the same numbers share one ejection, and one slow
+start. For example:
 .PP
 .RS
 .EX
 upstream rotating {
     server socks5h://u:p@10.0.0.1:1080 weight=3 max_fails=1 eject_time=10m;
-    server socks5h://u:p@10.0.0.2:1080 max_conns=200;
+    server socks5h://u:p@10.0.0.2:1080 max_conns=200 slow_start=30s;
     server socks5h://u:p@10.0.0.3:1080 backup;
     server socks5h://u:p@10.0.0.4:1080 down;
 }
@@ -2020,7 +2057,8 @@ for every one of 10.0.0.2 and leaves it for 10 minutes at its first failure,
 but stays in
 .I patient
 until ten failures within a minute; 10.0.0.2 never carries more than 200
-connections at once; 10.0.0.3 carries connections only while neither of the
+connections at once, and after an ejection gets its full share back over 30
+seconds; 10.0.0.3 carries connections only while neither of the
 first two may; 10.0.0.4 none.
 .PP
 A connection that a pool's server fails in one of the ways that count is
@@ -2043,9 +2081,10 @@ retried, and neither is a connection through
 A reload keeps what is known of each server that the new pools still list,
 as it keeps the counts: its failures, and its ejection from the pools that
 still list it with the same
-.BR max_fails= ", " fail_timeout= " and " eject_time= ;
-a pool whose numbers for it change starts it in service, its failures so far
-counting toward its next ejection. The other options of the new pools apply
+.BR max_fails= ", " fail_timeout= ", " eject_time= " and " slow_start= ,
+and its slow start likewise;
+a pool whose numbers for it change starts it in service (on a slow start, if
+it has one), its failures so far counting toward its next ejection. The other options of the new pools apply
 at once. A server that the reload takes out
 of every pool is remembered only while connections opened before it still use
 that server; once they are gone it is forgotten, and a later reload that
