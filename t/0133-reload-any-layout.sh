@@ -116,7 +116,7 @@ paths=()
 pids=()
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	for how in target_inplace target_rename data_swap dir_swap unlink_link; do
 		d="$WORK/$loop.$how"

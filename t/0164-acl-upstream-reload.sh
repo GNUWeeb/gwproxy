@@ -107,7 +107,7 @@ for host in - 999.999.1.1 no-such-host.invalid; do
 done
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	printf -- '%s\n' 'upstream p {' "	server socks5h://127.0.0.1:$ro;" \
 		'}' '-A OUTPUT -m user --user alice -j UPSTREAM --to p' \

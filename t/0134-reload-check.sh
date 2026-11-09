@@ -318,7 +318,7 @@ scenario_fds()
 # and the proxy it leaves is swept when the test exits.
 jobs=()
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	for scenario in idle missing malformed fifo inplace inplace_acl fds; do
 		name="$loop/$scenario"

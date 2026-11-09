@@ -21,11 +21,23 @@ client() {
 import socket, struct, sys, threading, time
 port, scen, uport = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 
+# Whether the proxy closes @c within @secs. When it does not, @late says
+# when the wait ended, to line up with the proxy's log.
+#
+# An idle pair is closed within 4 s of its last activity at
+# --idle-timeout=2 (the check runs on whole seconds); WAIT leaves 4 s on
+# top for a loaded machine, where the proxy may not get to run for a few
+# seconds. For a pair idle from the start it stays short of the 10 s
+# protocol timeout, which must not be what closes it.
+WAIT = 8
+late = ""
 def closed_within(c, secs):
+    global late
     c.settimeout(secs)
     try:
         return c.recv(64) == b""
     except socket.timeout:
+        late = " (gave up at %s)" % time.strftime("%H:%M:%S")
         return False
     except ConnectionResetError:
         return True
@@ -46,7 +58,7 @@ if scen == "udp":
     u.sendto(hdr + b"ping", relay)
     if not u.recv(256).endswith(b"ping"):
         print("no UDP echo"); sys.exit(0)
-    print("ok" if closed_within(c, 6) else "UDP association still open after idling")
+    print("ok" if closed_within(c, WAIT) else "UDP association still open after idling" + late)
     sys.exit(0)
 
 lsock = socket.socket()
@@ -72,7 +84,7 @@ if rep[1] != 0:
     print("CONNECT refused: %r" % rep); sys.exit(0)
 
 if scen == "idle":
-    print("ok" if closed_within(c, 6) else "idle tunnel still open after 6 s")
+    print("ok" if closed_within(c, WAIT) else "idle tunnel still open after %d s%s" % (WAIT, late))
 elif scen == "busy":
     c.settimeout(3)
     for i in range(6):
@@ -80,7 +92,7 @@ elif scen == "busy":
         c.sendall(b"x")
         if c.recv(1) != b"x":
             print("busy tunnel closed after %d s" % (i + 1)); sys.exit(0)
-    print("ok" if closed_within(c, 6) else "tunnel still open once it went idle")
+    print("ok" if closed_within(c, WAIT) else "tunnel still open once it went idle" + late)
 elif scen == "gap":
     # The timeout is counted in whole seconds. Connect just after a second
     # starts, so the idle check falls just after a second two later, and
@@ -123,14 +135,18 @@ PY
 }
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	p="$(pick_port)"
 	gwp_start "127.0.0.1:$p" --as-socks5=1 --event-loop="$loop" \
 		--nr-workers=1 --idle-timeout=2
 	for scen in idle busy gap udp; do
 		got="$(client "$p" "$scen" "$uport")"
-		[ "$got" = ok ] || fail "[$loop] $scen: $got"
+		if [ "$got" != ok ]; then
+			# What the proxy last did, and when, for the record.
+			tail -n 15 "$WORK/gwp.$p.log" | sed 's/^/# gwp: /' >&2
+			fail "[$loop] $scen: $got"
+		fi
 	done
 	grep -q 'Idle timeout' "$WORK/gwp.$p.log" \
 		|| fail "[$loop] the idle timeout was not logged"

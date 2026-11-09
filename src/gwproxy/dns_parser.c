@@ -298,8 +298,12 @@ static ssize_t construct_question(gwdns_question_part *question)
 	/*
 	* pkt.body is interpreted as question section
 	* for layout and format, see RFC 1035 4.1.2. Question section format
+	*
+	* The name is followed by five bytes written below before any bound
+	* is checked: the root label's zero, QTYPE and QCLASS. Keep room for
+	* them.
 	*/
-	bw = construct_qname(pkt.body, sizeof(pkt.body) - 3, question->domain);
+	bw = construct_qname(pkt.body, sizeof(pkt.body) - 5, question->domain);
 	if (bw < 0)
 		return bw;
 
@@ -345,6 +349,17 @@ static ssize_t construct_question(gwdns_question_part *question)
 ssize_t gwdns_build_query(uint16_t txid, const char *name, int family, uint8_t *out, size_t out_len)
 {
 	gwdns_question_part q;
+
+	/*
+	 * A name is at most 255 octets on the wire (RFC 1035 Section
+	 * 2.3.4): its labels with a length byte each, and the root's zero.
+	 * That is two more than the text, which has no trailing dot here
+	 * (construct_qname() refuses an empty label). A longer name is
+	 * malformed, as a label over 63 is: no server can answer it, and
+	 * gwdns_check_question() would refuse the question echoed back.
+	 */
+	if (strnlen(name, DOMAIN_NAME_LIMIT) > DOMAIN_NAME_LIMIT - 2)
+		return -EINVAL;
 
 	q.domain = name;
 	q.type = family;
@@ -677,6 +692,47 @@ static void test_check_question(void)
 		assert(gwdns_check_question(query, (size_t)qlen, reply, rlen));
 }
 
+/*
+ * Names of every length, in labels of 63, up to well past what fits in a
+ * query. Each is either encoded whole, followed by QTYPE, QCLASS and the OPT
+ * record, or refused; nothing may be written past the end of the packet,
+ * which the sanitizer builds catch. A name is refused exactly when it is over
+ * 255 octets as sent, and the question of every query built passes our own
+ * check of a reply's question.
+ */
+static void test_build_long_names(void)
+{
+	uint8_t out[1024], reply[1024];
+	char name[901];
+	size_t len, k;
+	ssize_t r;
+
+	for (len = 1; len < sizeof(name); len++) {
+		for (k = 0; k < len; k++)
+			name[k] = (k % 64 == 63) ? '.' : 'a';
+		name[len] = '\0';
+		/* A trailing dot is not ours to send; skip that length. */
+		if (name[len - 1] == '.')
+			continue;
+
+		r = gwdns_build_query(0x4242, name, AF_INET, out, sizeof(out));
+		/* Over 255 octets as sent: the text plus two. */
+		if (len > DOMAIN_NAME_LIMIT - 2) {
+			assert(r == -EINVAL);
+			continue;
+		}
+		/* Header, length bytes and labels, root, type, class, OPT. */
+		assert(r == (ssize_t)(12 + len + 2 + 4 + 11));
+		assert(out[12] == (len < 63 ? len : 63));
+		assert(out[12 + len + 1] == 0);
+
+		/* The question echoed back is taken as ours. */
+		memcpy(reply, out, 12 + len + 2 + 4);
+		assert(!gwdns_check_question(out, (size_t)r, reply,
+					     12 + len + 2 + 4));
+	}
+}
+
 static void run_all_tests(void)
 {
 	/*
@@ -696,6 +752,7 @@ static void run_all_tests(void)
 	test_parse_cap_and_truncation();
 	test_parse_other_types();
 	test_check_question();
+	test_build_long_names();
 	fprintf(stderr, "all tests passed!\n");
 }
 

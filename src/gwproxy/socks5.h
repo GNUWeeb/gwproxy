@@ -302,10 +302,26 @@ int gwp_socks5_cli_build_connect(const struct gwp_socks5_addr *dst,
 				 void *buf, size_t *len);
 
 /**
+ * Build a UDP ASSOCIATE request (RFC 1928 section 7) naming @dst, the address
+ * and port the datagrams will be sent from.
+ */
+int gwp_socks5_cli_build_udp_associate(const struct gwp_socks5_addr *dst,
+				       void *buf, size_t *len);
+
+/**
  * Parse a CONNECT reply. On success @rep is set to the reply code
  * (0x00 = succeeded) and @consumed to the total reply length in bytes.
  */
 int gwp_socks5_cli_parse_connect(const void *buf, size_t len,
 				 uint8_t *rep, size_t *consumed);
+
+/**
+ * Parse the reply to any request, CONNECT or UDP ASSOCIATE, as
+ * gwp_socks5_cli_parse_connect() does, and also return its BND.ADDR and
+ * BND.PORT in @bnd (when not NULL): for a UDP ASSOCIATE, where the server
+ * takes the datagrams.
+ */
+int gwp_socks5_cli_parse_reply(const void *buf, size_t len, uint8_t *rep,
+			       struct gwp_socks5_addr *bnd, size_t *consumed);
 
 #endif /* #ifndef GWP_SOCKS5_H */

@@ -326,7 +326,12 @@ add_c_flag "-Wunsafe-loop-optimizations";
 add_c_flag "-Wno-format-truncation";
 
 printf "\n%s:\n" "-f flags";
-# Hardening: none of it is left to the toolchain's defaults, which differ.
+# Hardening is asked for explicitly: the toolchain's defaults differ between
+# distributions. PIE is the exception. The objects are built with -fPIC, but
+# nothing passes -pie, so the executable is position independent, and ASLR
+# moves its code and data, only where the compiler links PIE by default: gcc
+# built with --enable-default-pie, as most distributions ship it, and clang 15
+# and later on Linux.
 add_c_flag "-fstack-protector-strong";
 add_c_flag "-fstack-clash-protection";
 add_c_flag "-fcf-protection";
@@ -361,9 +366,16 @@ if test "${use_sanitize}" = "yes"; then
 	if ! add_c_flag "-fsanitize=undefined"; then
 		fatal "ERROR: -fsanitize=undefined is not supported by your compiler";
 	fi;
-	LDFLAGS="${LDFLAGS} -fsanitize=address -fsanitize=undefined";
-	CFLAGS="${CFLAGS} -fsanitize=address -fsanitize=undefined";
-	CXXFLAGS="${CXXFLAGS} -fsanitize=address -fsanitize=undefined";
+	# UBSan only prints a report and carries on by default, so an
+	# error the test does not depend on would go unnoticed. Stop on
+	# the first one instead, as ASan does.
+	nr="-fno-sanitize-recover=undefined";
+	if ! add_c_flag "${nr}"; then
+		fatal "ERROR: ${nr} is not supported by your compiler";
+	fi;
+	LDFLAGS="${LDFLAGS} -fsanitize=address -fsanitize=undefined ${nr}";
+	CFLAGS="${CFLAGS} -fsanitize=address -fsanitize=undefined ${nr}";
+	CXXFLAGS="${CXXFLAGS} -fsanitize=address -fsanitize=undefined ${nr}";
 else
 	# The sanitizers check the same accesses, and more of them.
 	CFLAGS="${CFLAGS} -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2";

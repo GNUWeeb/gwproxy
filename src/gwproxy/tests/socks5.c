@@ -1231,6 +1231,81 @@ static void test_udp_hdr_codec(void)
 	assert(r == -ENOBUFS);
 }
 
+/* The client side's UDP ASSOCIATE request and the reply's BND.ADDR:PORT. */
+static void test_cli_udp_associate(void)
+{
+	struct gwp_socks5_addr a, bnd;
+	uint8_t buf[300];
+	size_t len, used;
+	uint8_t rep;
+	int r;
+
+	memset(&a, 0, sizeof(a));
+	a.ver = GWP_SOCKS5_ATYP_IPV4;
+	memcpy(a.ip4, "\x7f\x00\x00\x01", 4);
+	memcpy(&a.port, "\x12\x34", 2);
+	len = sizeof(buf);
+	r = gwp_socks5_cli_build_udp_associate(&a, buf, &len);
+	assert(!r && len == 10);
+	assert(!memcmp(buf, "\x05\x03\x00\x01\x7f\x00\x00\x01\x12\x34", 10));
+
+	/* CONNECT is the same request with its own command. */
+	len = sizeof(buf);
+	r = gwp_socks5_cli_build_connect(&a, buf, &len);
+	assert(!r && len == 10 && buf[1] == 0x01);
+
+	len = 9;
+	r = gwp_socks5_cli_build_udp_associate(&a, buf, &len);
+	assert(r == -ENOBUFS && len == 10);
+
+	/* An IPv4 BND, with a byte of something else behind it. */
+	memcpy(buf, "\x05\x00\x00\x01\x0a\x00\x00\x02\x30\x39\xff", 11);
+	for (len = 0; len < 10; len++) {
+		r = gwp_socks5_cli_parse_reply(buf, len, &rep, &bnd, &used);
+		assert(r == -EAGAIN);
+	}
+	r = gwp_socks5_cli_parse_reply(buf, 11, &rep, &bnd, &used);
+	assert(!r && rep == 0 && used == 10);
+	assert(bnd.ver == GWP_SOCKS5_ATYP_IPV4);
+	assert(!memcmp(bnd.ip4, "\x0a\x00\x00\x02", 4));
+	assert(!memcmp(&bnd.port, "\x30\x39", 2));
+	r = gwp_socks5_cli_parse_connect(buf, 11, &rep, &used);
+	assert(!r && rep == 0 && used == 10);
+
+	/* An IPv6 one, refused. */
+	memset(buf, 0, sizeof(buf));
+	memcpy(buf, "\x05\x07\x00\x04", 4);
+	buf[19] = 1;
+	memcpy(buf + 20, "\x00\x35", 2);
+	r = gwp_socks5_cli_parse_reply(buf, 21, &rep, &bnd, &used);
+	assert(r == -EAGAIN);
+	r = gwp_socks5_cli_parse_reply(buf, 22, &rep, &bnd, &used);
+	assert(!r && rep == 0x07 && used == 22);
+	assert(bnd.ver == GWP_SOCKS5_ATYP_IPV6 && bnd.ip6[15] == 1);
+	assert(!memcmp(&bnd.port, "\x00\x35", 2));
+
+	/* A domain one. */
+	memcpy(buf, "\x05\x00\x00\x03\x04host\x00\x50", 11);
+	r = gwp_socks5_cli_parse_reply(buf, 4, &rep, &bnd, &used);
+	assert(r == -EAGAIN);
+	r = gwp_socks5_cli_parse_reply(buf, 10, &rep, &bnd, &used);
+	assert(r == -EAGAIN);
+	r = gwp_socks5_cli_parse_reply(buf, 11, &rep, &bnd, &used);
+	assert(!r && used == 11 && bnd.ver == GWP_SOCKS5_ATYP_DOMAIN);
+	assert(bnd.domain.len == 4 && !strcmp(bnd.domain.str, "host"));
+	assert(!memcmp(&bnd.port, "\x00\x50", 2));
+	r = gwp_socks5_cli_parse_reply(buf, 11, &rep, NULL, &used);
+	assert(!r && used == 11);
+
+	/* Not SOCKS5, or an address type there is none of. */
+	buf[0] = 0x04;
+	r = gwp_socks5_cli_parse_reply(buf, 11, &rep, &bnd, &used);
+	assert(r == -EINVAL);
+	memcpy(buf, "\x05\x00\x00\x02", 4);
+	r = gwp_socks5_cli_parse_reply(buf, 11, &rep, &bnd, &used);
+	assert(r == -EINVAL);
+}
+
 static void gwp_socks5_run_tests(void)
 {
 	size_t i;
@@ -1243,6 +1318,7 @@ static void gwp_socks5_run_tests(void)
 	for (i = 0; i < 5000; i++) {
 		test_udp_associate();
 		test_udp_hdr_codec();
+		test_cli_udp_associate();
 		test_connect_ipv4();
 		test_connect_ipv6();
 		test_connect_domain();

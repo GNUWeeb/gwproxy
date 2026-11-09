@@ -243,11 +243,11 @@ fi
 run_leg epoll
 run_raise_leg epoll
 
-if grep -q 'CONFIG_IO_URING' "$ROOT/config.h" 2>/dev/null; then
+if have_io_uring; then
 	run_leg io_uring
 	run_raise_leg io_uring
 else
-	diag "gwproxy built without io_uring; skipping that leg"
+	diag "no usable io_uring here; skipping that leg"
 fi
 
 pass

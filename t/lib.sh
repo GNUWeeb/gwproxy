@@ -21,18 +21,64 @@ declare -a _PIDS=()
 
 . "$T_DIR/sweep.sh"
 
+# The sanitizer reports of what a test runs must fail the test, but they end
+# up wherever the test sent that process's output: often a log nobody reads
+# once the proxy is up, or /dev/null. _san_env sends them to files of their
+# own under $WORK instead, one per process (sanitizer.<pid>), and _cleanup
+# looks for reports in every file under $WORK, which also finds those that
+# still go to the process's own output, in a log there: gcc's UBSan runtime,
+# when built in with ASan, ignores log_path. ns_inner_work() calls _san_env
+# again for its work directory. Options given from outside are kept; a later
+# log_path overrides an earlier one.
+_SAN_RE='runtime error:|ERROR: [A-Za-z]+Sanitizer'
+_san_env()
+{
+	local o="log_path=$WORK/sanitizer"
+	local u="$o:print_stacktrace=1"
+
+	export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}$o"
+	export LSAN_OPTIONS="${LSAN_OPTIONS:+$LSAN_OPTIONS:}$o"
+	export UBSAN_OPTIONS="${UBSAN_OPTIONS:+$UBSAN_OPTIONS:}$u"
+}
+_san_env
+
+# san_reports: print the sanitizer reports found under $WORK so far, and
+# return 0 when there is at least one, 1 when there is none. Binary files (the
+# payloads) and FIFOs are skipped.
+san_reports()
+{
+	local f found=1
+
+	while IFS= read -r f; do
+		found=0
+		sed -nE "/$_SAN_RE/,\$p" "$f" | head -n 100 | \
+			sed "s|^|# ${f#"$WORK"/}: |" >&2
+	done < <(grep -rlIE -D skip -- "$_SAN_RE" "$WORK" 2>/dev/null)
+	return "$found"
+}
+
 _cleanup()
 {
 	local pid
+	local -a pids=()
+
 	for pid in "${_PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill "$pid" 2>/dev/null
+		[ -n "$pid" ] && pids+=("$pid")
 	done
-	for pid in "${_PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
-	done
+	# SIGTERM first, and time to act on it: LeakSanitizer reports when the
+	# proxy exits, and a SIGKILL right behind the SIGTERM can beat it.
+	gwp_stop_pids "${pids[@]}"
 	# Catch any proxy this test started outside gwp_start (or whose pid we
 	# lost); the runner sweeps again in case we are killed before this runs.
 	gwp_sweep -q
+	# A report fails the test whatever it found itself, skips included: a
+	# sanitizer error the test does not look for is still a bug.
+	if san_reports; then
+		echo "FAIL: a process of this test made a sanitizer report" >&2
+		_release_ports
+		rm -rf "$WORK"
+		exit 1
+	fi
 	_release_ports
 	rm -rf "$WORK"
 }
@@ -55,11 +101,43 @@ require()
 	command -v "$1" >/dev/null 2>&1 || skip "missing tool: $1"
 }
 
-# Skip unless gwproxy was built with io_uring support.
+# have_io_uring: whether the io_uring event loop can run here, i.e. gwproxy was
+# built with it AND the kernel lets this process set up a ring. Inside a
+# container under Docker's default seccomp profile, for one, io_uring_setup()
+# fails with EPERM, so gwproxy --event-loop=io_uring cannot start whatever the
+# code under test does; the io_uring runs are then left out like on a build
+# without io_uring, with a note in the test's log. Only an outright refusal
+# counts (see t/servers/iou_probe.py): anywhere a ring can be set up, the
+# io_uring runs go ahead and fail as they always did. The answer is kept for
+# the rest of the test, subshells included.
+_IOU_STATE=""
+have_io_uring()
+{
+	local why rc=0
+
+	if [ -z "$_IOU_STATE" ]; then
+		_IOU_STATE=on
+		if ! grep -q 'CONFIG_IO_URING' "$ROOT/config.h" 2>/dev/null; then
+			_IOU_STATE=off
+		elif command -v python3 >/dev/null 2>&1; then
+			why="$(python3 "$SERVERS_DIR/iou_probe.py")" || rc=$?
+		fi
+		if [ "$rc" = "$SKIP_CODE" ]; then
+			_IOU_STATE=refused
+			diag "built with io_uring, but $why;" \
+			     "leaving the io_uring runs out"
+		fi
+	fi
+	[ "$_IOU_STATE" = on ]
+}
+
+# Skip unless the io_uring event loop can run here (see have_io_uring).
 require_io_uring()
 {
-	grep -q 'CONFIG_IO_URING' "$ROOT/config.h" 2>/dev/null || \
-		skip "gwproxy built without io_uring"
+	have_io_uring && return 0
+	[ "$_IOU_STATE" = refused ] && \
+		skip "io_uring_setup() is refused on this host"
+	skip "gwproxy built without io_uring"
 }
 
 # Skip unless gwproxy was built with PCRE2 support (--use-pcre), needed by the
@@ -129,6 +207,7 @@ ns_inner_work()
 {
 	rm -rf "$WORK"
 	WORK="$1"
+	_san_env
 }
 
 # Port reservations, shared by every test running on this host. pick_port()
@@ -546,13 +625,12 @@ gwp_parallel()
 _gwp_parallel_cleanup()
 {
 	local pid
+	local -a pids=()
 
 	for pid in "${_PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill "$pid" 2>/dev/null
+		[ -n "$pid" ] && pids+=("$pid")
 	done
-	for pid in "${_PIDS[@]:-}"; do
-		[ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
-	done
+	gwp_stop_pids "${pids[@]}"
 	return 0
 }
 

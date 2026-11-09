@@ -105,6 +105,12 @@ def handle_socks5(c):
         c.close()
         return
     dport = struct.unpack('!H', recv_exactly(c, 2))[0]
+    if hdr[1] != 1:			# CONNECT only
+        record('cmd=%d atyp=%d addr=%s port=%d%s' %
+               (hdr[1], atyp, addr, dport, creds))
+        c.sendall(b'\x05\x07\x00\x01' + b'\x00' * 6)	# not supported
+        c.close()
+        return
     record('atyp=%d addr=%s port=%d%s' % (atyp, addr, dport, creds))
 
     try:

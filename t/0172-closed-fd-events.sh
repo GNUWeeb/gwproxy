@@ -175,7 +175,7 @@ print("%d and %d ticks while idle" % (u1, u2))
 PY
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	# Clients that hang up.
 	hold_start "$loop/hangup" --log-level=3 --acl-allow-all --as-socks5=1 \

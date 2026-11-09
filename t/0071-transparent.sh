@@ -86,7 +86,7 @@ PRIV_PID=""
 # each new connection does the same, until descriptors run out. It must be
 # refused and closed instead.
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	dp="$(pick_port)"
 	$SUDO "$GWPROXY" --as-transparent=1 --bind="127.0.0.1:$dp" \

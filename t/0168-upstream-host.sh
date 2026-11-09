@@ -7,6 +7,12 @@
 # ("127.1") work, and tunnel to the upstream. A host that is neither a name
 # nor an address ("-", "999.999.1.1") is refused without a lookup, and a
 # name that does not resolve is refused saying so.
+#
+# glibc and musl look "localhost." up in DNS, not in /etc/hosts, which knows
+# "localhost" only, and the test must not depend on what a DNS server says.
+# So the trailing-dot cases run gwproxy in a private user+mount namespace with
+# a hosts file bind-mounted over the real one that has "localhost." too; where
+# there is no such namespace, they run only if /etc/hosts has the name itself.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -66,13 +72,41 @@ refused()
 d="$WORK/acl"
 mkdir -p "$d"
 
+# The gwproxy that resolves "localhost." from a hosts file, or nothing.
+dot_gwp=""
+ns_drop_setup
+printf '127.0.0.1 localhost.\n::1 localhost.\n' >"$WORK/hosts"
+cat /etc/hosts >>"$WORK/hosts"
+if $NS_DROP unshare -rm sh -c 'mount --bind "$1" /etc/hosts' sh \
+	"$WORK/hosts" 2>/dev/null; then
+	dot_gwp="$WORK/gwproxy-hosts"
+	cat >"$dot_gwp" <<-SH
+	#!/bin/sh
+	exec $NS_DROP unshare -rm sh -c 'mount --bind "\$0" /etc/hosts && exec "\$@"' \\
+		"$WORK/hosts" "$GWPROXY" "\$@"
+	SH
+	chmod +x "$dot_gwp"
+elif getent -s files ahosts localhost. >/dev/null 2>&1; then
+	dot_gwp="$GWPROXY"
+else
+	diag "no user+mount namespace and no \"localhost.\" in /etc/hosts:" \
+	     "the trailing-dot name is not checked"
+fi
+
+real_gwp="$GWPROXY"
 for host in 127.1 localhost.; do
+	if [ "$host" = localhost. ]; then
+		[ -n "$dot_gwp" ] || continue
+		GWPROXY="$dot_gwp"
+	fi
+
 	through "[cli $host]" --acl-allow-all \
 		--upstream-proxy="socks5h://$host:$rp"
 
 	printf -- '%s\n' 'upstream p {' "	server socks5h://$host:$rp;" '}' \
 		'-A OUTPUT -j UPSTREAM --to p' >"$d/p.acl"
 	through "[pool $host]" --acl-file="$d/p.acl"
+	GWPROXY="$real_gwp"
 done
 
 for host in - 999.999.1.1; do

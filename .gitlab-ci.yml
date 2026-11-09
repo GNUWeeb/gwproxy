@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# GitLab CI for the project's GitLab mirrors. A subset of
+# .github/workflows/ci.yml, running the same .github/scripts/ci.sh commands so
+# that the two cannot drift apart; see that script for what each one does.
+#
+# Differences from the GitHub workflow, and why:
+#
+#  - Only the pushed tip is tested, not every commit of the push: one shared
+#    runner cannot take GitHub's fan-out of 16 jobs per commit.
+#  - Each job builds ONE variant of a matrix row and runs the test suite on it
+#    (ci.sh build --variant=...). A whole row runs the suite up to eight times
+#    over, most of an hour on a small runner. Only the variants that add the
+#    most are tested; GitHub still runs them all.
+#  - The jobs run in containers: ci.sh container-deps first installs what the
+#    GitHub runner image already has.
+#  - Under Docker's default seccomp profile io_uring_setup() fails with EPERM,
+#    so the tests leave their io_uring runs out (t/lib.sh have_io_uring) and
+#    the io_uring builds are only compiled; GitHub tests them. The tests that
+#    need privilege (iptables, namespaces) skip as well.
+
+workflow:
+  rules:
+    # One pipeline per push: a branch with an open merge request gets the
+    # merge request pipeline only.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  # src/liburing is a submodule.
+  GIT_SUBMODULE_STRATEGY: recursive
+  DEBIAN_FRONTEND: noninteractive
+  # Parallelism for make and for the test suite. The runner's CPU count is
+  # unknown and nproc in a container may report the whole host; the suite
+  # mostly waits on timers, so 4 is fine on a small runner too. Override it as
+  # a CI/CD variable if the runner says otherwise.
+  JOBS: "4"
+
+stages:
+  - test
+
+default:
+  # The instance runner takes only jobs tagged "shared".
+  tags:
+    - shared
+  interruptible: true
+  # Three times what a job takes, so a hung test fails its job early; the
+  # runner itself allows an hour.
+  timeout: 15m
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - api_failure
+
+# What a failing test leaves behind: its own log under .test-out, and the
+# config of the variant it ran in.
+.test-logs:
+  artifacts:
+    when: on_failure
+    expire_in: 14 days
+    paths:
+      - .test-out/
+      - config.make
+      - config.h
+
+.ubuntu:
+  extends: .test-logs
+  image: ubuntu:24.04
+  before_script:
+    - ./.github/scripts/ci.sh container-deps
+    - ./.github/scripts/ci.sh deps
+        --arch="$ARCH" --cc="$BUILD_CC" --cc-pkg="$CC_PKG"
+  script:
+    - ./.github/scripts/ci.sh build
+        --arch="$ARCH" --cc="$BUILD_CC" --sanitize="$SANITIZE"
+        --variant="$VARIANT"
+
+# One job per variant, each with the whole test suite. default and debug are
+# the plain epoll builds, new-dns-resolver the only one that runs the raw DNS
+# tests, and openssl-io_uring-pcre the only one that runs the TLS and PCRE
+# tests, with every feature compiled in.
+x86_64-gcc:
+  extends: .ubuntu
+  variables:
+    ARCH: x86_64
+    CC_PKG: gcc-x86-64-linux-gnu
+    BUILD_CC: x86_64-linux-gnu-gcc
+    SANITIZE: "0"
+  parallel:
+    matrix:
+      - VARIANT:
+          - default
+          - debug
+          - new-dns-resolver
+          - openssl-io_uring-pcre
+
+# Installs clang from apt.llvm.org like the GitHub workflow, which costs a
+# couple of minutes per job, so only the two widest variants.
+x86_64-clang:
+  extends: .ubuntu
+  variables:
+    ARCH: x86_64
+    CC_PKG: clang
+    BUILD_CC: clang
+    SANITIZE: "0"
+  parallel:
+    matrix:
+      - VARIANT:
+          - default
+          - openssl-io_uring-pcre
+
+# AddressSanitizer and UBSan, with gcc.
+x86_64-gcc-sanitize:
+  extends: .ubuntu
+  variables:
+    ARCH: x86_64
+    CC_PKG: gcc-x86-64-linux-gnu
+    BUILD_CC: x86_64-linux-gnu-gcc
+    SANITIZE: "1"
+  parallel:
+    matrix:
+      - VARIANT:
+          - default
+          - new-dns-resolver
+          - openssl-io_uring-pcre
+
+# A 32-bit cross build: every variant of the row, compiled only.
+i686-gcc:
+  extends: .test-logs
+  image: ubuntu:24.04
+  before_script:
+    - ./.github/scripts/ci.sh container-deps
+    - ./.github/scripts/ci.sh deps
+        --arch=i686 --cc=i686-linux-gnu-gcc --cc-pkg=gcc-i686-linux-gnu
+  script:
+    - ./.github/scripts/ci.sh build
+        --arch=i686 --cc=i686-linux-gnu-gcc --sanitize=0
+
+# musl. The same Alpine release as the GitHub workflow.
+alpine-musl:
+  extends: .test-logs
+  image: alpine:3.15
+  before_script:
+    # Bootstrap only: ci.sh installs the rest.
+    - apk add --no-cache bash
+    - cat /etc/alpine-release
+    - ./.github/scripts/ci.sh alpine-deps
+  script:
+    - ./.github/scripts/ci.sh alpine-build --variant="$VARIANT"
+  parallel:
+    matrix:
+      - VARIANT:
+          - default
+          - openssl
+          - pcre
+
+codespell:
+  image: ubuntu:24.04
+  script:
+    - ./.github/scripts/ci.sh codespell-deps
+    - ./.github/scripts/ci.sh codespell

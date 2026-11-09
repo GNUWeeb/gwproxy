@@ -11,8 +11,8 @@
 # before the name is resolved, so -d picks a pool for a target given as an
 # address, not for one given by name, and a user keeps a pool even when a
 # default-deny set lets targets through by -d alone. Plain --target
-# forwarding goes through a pool too. A UDP ASSOCIATE is refused to a user
-# the rules send through a pool, and granted to one they send DIRECT, past
+# forwarding goes through a pool too. A UDP ASSOCIATE goes to the pool of a
+# user the rules send through one, and is granted to one they send DIRECT, past
 # --upstream-proxy; it has no target, so a rule that tests one is not taken
 # in either polarity, and a pool rule passed over that way refuses it.
 # On every available event loop.
@@ -165,7 +165,7 @@ unseen()
 }
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	fp="$(pick_port)"
 	gwp_start "127.0.0.1:$fp" --as-socks5=1 --event-loop="$loop" \
@@ -208,10 +208,12 @@ for loop in epoll io_uring; do
 	! grep -q "a_pw\|b_pw\|c_pw" "$log" || \
 		fail "[$loop] an upstream password was logged"
 
-	# UDP is never sent through an upstream: a pool user is refused the
-	# relay (REP 7), DIRECT gets it past --upstream-proxy, and no choice
-	# leaves the default to refuse it.
-	udp_rep "[$loop]" "$fp" alice:pa 7
+	# A pool user's UDP ASSOCIATE goes to the pool's socks5:// server,
+	# which turns it down (REP 7, answered REP 1), DIRECT gets the relay
+	# past --upstream-proxy, and no choice leaves the default to refuse it.
+	udp_rep "[$loop]" "$fp" alice:pa 1
+	tail -n 1 "$WORK/rec.s5.log" | grep -q '^cmd=3 ' || \
+		fail "[$loop] alice's UDP ASSOCIATE did not reach her pool"
 	udp_rep "[$loop]" "$fp" dave:pd 0
 	udp_rep "[$loop]" "$fp" carol:pc 7
 	kill "$GWP_PID" 2>/dev/null
@@ -221,7 +223,7 @@ for loop in epoll io_uring; do
 	gwp_start "127.0.0.1:$fp" --as-socks5=1 --event-loop="$loop" \
 		--nr-workers=2 --auth-file="$WORK/auth" \
 		--acl-file="$d/main.acl"
-	udp_rep "[$loop no default]" "$fp" alice:pa 7
+	udp_rep "[$loop no default]" "$fp" alice:pa 1
 	udp_rep "[$loop no default]" "$fp" dave:pd 0
 	udp_rep "[$loop no default]" "$fp" carol:pc 0
 	kill "$GWP_PID" 2>/dev/null

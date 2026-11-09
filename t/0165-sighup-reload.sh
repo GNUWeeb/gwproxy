@@ -83,7 +83,7 @@ wait_exit()
 	|| fail "--help does not show --watch-files"
 
 for loop in epoll io_uring; do
-	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
 	d="$WORK/$loop"
 	mkdir -p "$d"

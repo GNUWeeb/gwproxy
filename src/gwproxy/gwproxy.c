@@ -176,13 +176,6 @@ static const struct gwp_cfg default_opts = {
  */
 #define GWP_SOCKS5_MIN_CLIENT_BUF	513
 
-/*
- * target.buf holds the handshake with an upstream proxy. The longest request
- * is an HTTP CONNECT: twice an authority of up to 261 bytes, Basic credentials
- * of 684 and the fixed text take 1264 bytes.
- */
-#define GWP_UPSTREAM_MIN_TARGET_BUF	1280
-
 static int setskopt_int(int fd, int level, int optname, int val);
 static uint32_t cfg_dns_restyp(const struct gwp_cfg *cfg);
 
@@ -1318,6 +1311,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		gwp_conn_pair_drop_dns(w, gcp);
 		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
 		free(gcp->udp_peers);
+		free(gcp->udp_up);
 		gwp_conn_set_upstream(w->ctx, gcp, NULL);
 
 		/*
@@ -1584,6 +1578,19 @@ static const char *path_basename(const char *path)
 }
 
 /*
+ * What the watches ask for. A file is ready once written (IN_CLOSE_WRITE) or
+ * renamed into place (IN_MOVED_TO), and that is all a watch for a file needs;
+ * one for the entries an include pattern looks for also needs them to come
+ * and go. inotify keeps one mask per directory, and a directory can be
+ * watched both ways, so every watch is added with IN_MASK_ADD: the mask only
+ * grows until the watch is removed, and gwp_reload_events() picks out what
+ * each wants from the records.
+ */
+#define GWP_INO_FILE_MASK	(IN_CLOSE_WRITE | IN_MOVED_TO)
+#define GWP_INO_DIR_MASK	(GWP_INO_FILE_MASK | IN_CREATE | IN_DELETE | \
+				 IN_MOVED_FROM)
+
+/*
  * Add an inotify watch that survives an atomic replace of `path`. We watch the
  * *parent directory*, not the file: an inode watch is silently dropped the
  * moment an editor, `install`, or `mv` swaps the file via rename, and never
@@ -1612,8 +1619,25 @@ static int add_reload_watch(int ino_fd, const char *path)
 		dir[n] = '\0';
 	}
 
-	r = inotify_add_watch(ino_fd, dir, IN_CLOSE_WRITE | IN_MOVED_TO);
+	r = inotify_add_watch(ino_fd, dir, GWP_INO_FILE_MASK | IN_MASK_ADD);
 	return (r < 0) ? -errno : r;
+}
+
+/* Watch the directory @path itself (see gwp_acl_dir()). */
+static int add_reload_dir_watch(int ino_fd, const char *path)
+{
+	int r = inotify_add_watch(ino_fd, path,
+				  GWP_INO_DIR_MASK | IN_MASK_ADD | IN_ONLYDIR);
+
+	return (r < 0) ? -errno : r;
+}
+
+/* Watch @f: its directory for a file, itself for a directory. */
+static int add_reload_acl_watch(int ino_fd, const struct gwp_reload_acl_file *f)
+{
+	if (f->dir)
+		return add_reload_dir_watch(ino_fd, f->path);
+	return add_reload_watch(ino_fd, f->path);
 }
 
 /*
@@ -1621,7 +1645,9 @@ static int add_reload_watch(int ino_fd, const char *path)
  * @err (a positive errno; @st is not read then). Beyond a FIFO's or a device's
  * identity nothing is compared: writing to it is not a new version of it. The
  * ctime is what catches a rewrite that restores the mtime, at the price of a
- * harmless reload after a chmod or a new hard link.
+ * harmless reload after a chmod or a new hard link. A directory's times change
+ * as entries come and go, which is what matters in the ones an include
+ * pattern reads.
  */
 static void gwp_file_id_from_stat(const struct stat *st, int err,
 				  struct gwp_file_id *id)
@@ -1634,7 +1660,7 @@ static void gwp_file_id_from_stat(const struct stat *st, int err,
 	id->dev = (uint64_t)st->st_dev;
 	id->ino = (uint64_t)st->st_ino;
 	id->mode = (uint64_t)(st->st_mode & S_IFMT);
-	if (!S_ISREG(st->st_mode))
+	if (!S_ISREG(st->st_mode) && !S_ISDIR(st->st_mode))
 		return;
 	id->size = (uint64_t)st->st_size;
 	id->mtime_sec = (uint64_t)st->st_mtim.tv_sec;
@@ -1676,25 +1702,42 @@ static void gwp_acl_files_free(struct gwp_reload_acl_file *v, size_t nr)
 }
 
 /*
+ * The @i-th entry of the ACL's watch list: its files (gwp_acl_file()), then
+ * its directories (gwp_acl_dir()); @nr_files is how many files there are.
+ */
+static const char *gwp_acl_watch_path(struct gwp_ctx *ctx, size_t nr_files,
+				      size_t i, bool *dir, size_t *idx)
+{
+	*dir = i >= nr_files;
+	*idx = *dir ? i - nr_files : i;
+	return *dir ? gwp_acl_dir(ctx->acl, *idx) : gwp_acl_file(ctx->acl, i);
+}
+
+/*
  * Make ctx->acl_files follow the files of the ACL's last load or reload (see
- * gwp_acl_file()), which change as includes are added or dropped. A file that
+ * gwp_acl_file()), which change as includes are added or dropped, and the
+ * directories their include lines looked in (gwp_acl_dir()). A file that
  * stays keeps its state, and so the identity taken before it was read; so does
  * a new one, from what the load saw right before reading it. A stat() taken
  * now could already see a change made since, which would then never be
  * reloaded, as no watch on a new directory existed yet to report it. With
- * @watch, a new file's directory gets a watch, and a watch that neither the
- * new set nor the auth file needs any more is removed. On failure (out of
- * memory) the set stays as it was.
+ * @watch, a new file's directory gets a watch, a new directory one of its own,
+ * and a watch that neither the new set nor the auth file needs any more is
+ * removed. On failure (out of memory) the set stays as it was.
  */
 static int gwp_acl_files_sync(struct gwp_ctx *ctx, bool watch)
 {
 	struct gwp_reload_acl_file *old = ctx->acl_files, *nv;
-	size_t nr_old = ctx->nr_acl_files, nr = 0, i, j;
+	size_t nr_old = ctx->nr_acl_files, nr = 0, nr_files, i, j, idx;
 	struct stat st;
 	ssize_t *from;
+	bool dir;
 	int r = 0;
 
 	while (gwp_acl_file(ctx->acl, nr))
+		nr++;
+	nr_files = nr;
+	while (gwp_acl_dir(ctx->acl, nr - nr_files))
 		nr++;
 	nv = calloc(nr ? nr : 1, sizeof(*nv));
 	from = calloc(nr ? nr : 1, sizeof(*from));
@@ -1705,11 +1748,12 @@ static int gwp_acl_files_sync(struct gwp_ctx *ctx, bool watch)
 
 	/* Everything that can fail first, so a failure changes nothing. */
 	for (i = 0; i < nr; i++) {
-		const char *path = gwp_acl_file(ctx->acl, i);
+		const char *path = gwp_acl_watch_path(ctx, nr_files, i, &dir,
+						      &idx);
 
 		from[i] = -1;
 		for (j = 0; j < nr_old; j++) {
-			if (!strcmp(old[j].path, path)) {
+			if (old[j].dir == dir && !strcmp(old[j].path, path)) {
 				from[i] = (ssize_t)j;
 				break;
 			}
@@ -1728,21 +1772,33 @@ static int gwp_acl_files_sync(struct gwp_ctx *ctx, bool watch)
 	for (i = 0; i < nr; i++) {
 		int sr, wd;
 
+		gwp_acl_watch_path(ctx, nr_files, i, &dir, &idx);
 		if (from[i] >= 0) {
 			nv[i] = old[from[i]];
+			nv[i].idx = idx;
 			old[from[i]].path = NULL;
 			continue;
 		}
 		nv[i].wd = -1;
-		sr = gwp_acl_file_stat(ctx->acl, i, &st);
+		nv[i].dir = dir;
+		nv[i].idx = idx;
+		if (dir)
+			sr = gwp_acl_dir_stat(ctx->acl, idx, &st);
+		else
+			sr = gwp_acl_file_stat(ctx->acl, idx, &st);
 		gwp_file_id_from_stat(&st, sr < 0 ? -sr : 0, &nv[i].rf.id);
 		if (!watch)
 			continue;
-		wd = add_reload_watch(ctx->ino_fd, nv[i].path);
-		if (wd < 0)
+		wd = add_reload_acl_watch(ctx->ino_fd, &nv[i]);
+		/*
+		 * A file whose directory is missing is covered by the watch on
+		 * the deepest directory there is on the way (gwp_acl_dir()),
+		 * and a directory gone since the load by the next reload.
+		 */
+		if (wd < 0 && wd != -ENOENT && wd != -ENOTDIR)
 			pr_warn(&ctx->lh, "Failed to add inotify watch for '%s', checking it every second only: %s",
 				nv[i].path, strerror(-wd));
-		else
+		else if (wd >= 0)
 			nv[i].wd = wd;
 	}
 
@@ -1776,7 +1832,8 @@ out:
  * until the path leads to something else.
  */
 static bool gwp_reload_check_file(struct gwp_ctx *ctx, const char *path,
-				  struct gwp_reload_file *rf, uint64_t now)
+				  struct gwp_reload_file *rf, bool dir,
+				  uint64_t now)
 {
 	if (gwp_file_id_changed(path, &rf->id)) {
 		rf->settle_at = now + GWP_RELOAD_SETTLE_MS;
@@ -1786,7 +1843,8 @@ static bool gwp_reload_check_file(struct gwp_ctx *ctx, const char *path,
 		return rf->retry;
 	if (now < rf->settle_at)
 		return false;
-	if (rf->id.err || rf->id.mode == S_IFREG)
+	/* A directory is only read, opened without blocking, whatever it is. */
+	if (rf->id.err || rf->id.mode == S_IFREG || dir)
 		return true;
 
 	rf->settle_at = 0;
@@ -1803,12 +1861,12 @@ static unsigned gwp_reload_check(struct gwp_ctx *ctx, uint64_t now)
 	size_t i;
 
 	if (ctx->auth && gwp_reload_check_file(ctx, ctx->cfg.auth_file,
-					       &ctx->auth_reload, now))
+					       &ctx->auth_reload, false, now))
 		flags |= GWP_RELOAD_AUTH;
 	for (i = 0; ctx->acl_watched && i < ctx->nr_acl_files; i++) {
 		struct gwp_reload_acl_file *f = &ctx->acl_files[i];
 
-		if (gwp_reload_check_file(ctx, f->path, &f->rf, now))
+		if (gwp_reload_check_file(ctx, f->path, &f->rf, f->dir, now))
 			flags |= GWP_RELOAD_ACL;
 	}
 	return flags;
@@ -1839,10 +1897,36 @@ static bool gwp_reload_end(struct gwp_reload_file *rf, int r)
 	return r && !(was_retry && rf->retry);
 }
 
-/* True when inotify record @e names the basename of @path (NULL: never). */
+/*
+ * True when inotify record @e says that the file @path (NULL: never) is ready:
+ * written, or renamed into place.
+ */
 static bool inotify_names(const struct inotify_event *e, const char *path)
 {
-	return path && e->len && !strcmp(e->name, path_basename(path));
+	return path && e->len && (e->mask & GWP_INO_FILE_MASK) &&
+	       !strcmp(e->name, path_basename(path));
+}
+
+/*
+ * True when inotify record @e, from the watch on the ACL directory @f, says
+ * that an entry the include lines look for there came, went, or was written.
+ * A new file is taken once written or renamed into place, not when created
+ * (empty, or half written); a new directory as soon as it is there.
+ */
+static bool inotify_dir_names(const struct gwp_ctx *ctx,
+			      const struct inotify_event *e,
+			      const struct gwp_reload_acl_file *f)
+{
+	unsigned wants;
+
+	if (e->wd != f->wd || !e->len)
+		return false;
+	wants = gwp_acl_dir_wants(ctx->acl, f->idx, e->name);
+	if ((wants & GWP_ACL_DIR_FILE) &&
+	    (e->mask & (GWP_INO_FILE_MASK | IN_DELETE | IN_MOVED_FROM)))
+		return true;
+	return (wants & GWP_ACL_DIR_SUBDIR) &&
+	       (e->mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO));
 }
 
 /*
@@ -1882,7 +1966,8 @@ static unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
 			 * Files of the set can share a basename, so the
 			 * directory the record came from must match too.
 			 */
-			if (e->wd == f->wd && inotify_names(e, f->path)) {
+			if (f->dir ? inotify_dir_names(ctx, e, f) :
+			    (e->wd == f->wd && inotify_names(e, f->path))) {
 				flags |= GWP_RELOAD_ACL;
 				break;
 			}
@@ -2147,7 +2232,10 @@ static int gwp_ctx_init_watch(struct gwp_ctx *ctx)
 	for (i = 0; ctx->acl_watched && i < ctx->nr_acl_files; i++) {
 		struct gwp_reload_acl_file *f = &ctx->acl_files[i];
 
-		r = add_reload_watch(ctx->ino_fd, f->path);
+		r = add_reload_acl_watch(ctx->ino_fd, f);
+		/* Not there (include_optional): see gwp_acl_files_sync(). */
+		if (r == -ENOENT || r == -ENOTDIR)
+			continue;
 		if (r < 0) {
 			pr_err(&ctx->lh, "Failed to add inotify watch for '%s': %s",
 				f->path, strerror(-r));
@@ -2390,10 +2478,11 @@ static const char gwp_acl_default_rules[] =
  * forwarding. With no file it applies the built-in default ACL (not reloaded),
  * unless --acl-allow-all leaves it disabled (NULL).
  */
-static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
+static int acl_srv_make(void *arg, const char *url,
+			const struct gwp_up_opts *opts, void **srv, char *why,
 			size_t size);
 static void acl_srv_put(void *arg, void *srv);
-static void *acl_srv_handle(void *arg, void *srv);
+static void acl_srv_member(void *arg, void *srv, struct gwp_up_member *m);
 
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 {
@@ -2406,7 +2495,7 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 	ctx->nr_acl_files = 0;
 	ctx->acl_srv_ops.make = acl_srv_make;
 	ctx->acl_srv_ops.put = acl_srv_put;
-	ctx->acl_srv_ops.handle = acl_srv_handle;
+	ctx->acl_srv_ops.member = acl_srv_member;
 	ctx->acl_srv_ops.arg = ctx;
 	atomic_init(&ctx->nr_acl_srv, 0);
 
@@ -2884,14 +2973,32 @@ static const char *up_desc(const struct gwp_acl_pool *pool, uint32_t idx,
 	return buf;
 }
 
-/* Log that @up, the @idx-th server of @pool (or the default), is back. */
+/* @ms for a log line: in seconds when it is whole seconds. */
+static const char *up_ms_str(uint32_t ms, char *buf, size_t size)
+{
+	if (ms % 1000)
+		snprintf(buf, size, "%u ms", ms);
+	else
+		snprintf(buf, size, "%u s", ms / 1000);
+	return buf;
+}
+
+/*
+ * Log that @up, the @idx-th server of @pool (or the default), is back, and
+ * on what slow start.
+ */
 static void up_back(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
 		    uint32_t idx, struct gwp_upstream *up)
 {
-	char desc[320];
+	char desc[320], ss[24];
 
-	pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
-		up_desc(pool, idx, up, desc, sizeof(desc)));
+	if (up->health && up->health->slow_ms)
+		pr_info(&ctx->lh, "Upstream %s is back in service after its ejection, on a slow start of %s",
+			up_desc(pool, idx, up, desc, sizeof(desc)),
+			up_ms_str(up->health->slow_ms, ss, sizeof(ss)));
+	else
+		pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
+			up_desc(pool, idx, up, desc, sizeof(desc)));
 }
 
 /*
@@ -2908,11 +3015,11 @@ static uint32_t up_ejected(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
 	uint32_t left;
 	bool back;
 
-	if (!gwp_up_state_may_be_ejected(up->state))
+	if (!gwp_up_health_may_be_ejected(up->health))
 		return 0;
 	if (!*now)
 		*now = gwp_now_ms();
-	left = gwp_up_state_ejected(up->state, (uint32_t)*now, &back);
+	left = gwp_up_health_ejected(up->health, (uint32_t)*now, &back);
 	if (back)
 		up_back(ctx, pool, idx, up);
 	return left;
@@ -2969,25 +3076,31 @@ static void pool_pick_back(void *arg, uint32_t i)
 
 /*
  * Which of @pool's servers (from 0) a pair goes to, by the pool's method:
- * round-robin, the default, takes them in turn; least_conn the one with
- * the fewest open pairs, ties in round-robin order. Both turn on the
- * pool's cursor, shared by all workers, and least_conn reads the counts
- * all workers keep (struct gwp_up_state), which carry across reloads.
- * Workers picking at the same time may see the same counts and choose the
- * same server; the next picks see the result, which is close enough.
+ * round-robin, the default, takes them in turn (as many turns each as its
+ * weight=); least_conn the one with the fewest open pairs for its weight,
+ * ties in round-robin order; random one drawn by weight, and random two
+ * the one with fewer open pairs for its weight of two drawn so. The first
+ * two turn on the pool's cursor, shared by all workers; the random ones
+ * leave it alone, one line less that every worker writes. least_conn and
+ * random two read the counts all workers keep (struct gwp_up_state), which
+ * carry across reloads. Workers picking at the same time may see the same
+ * counts and choose the same server; the next picks see the result, which
+ * is close enough.
  *
- * Only servers in service are taken; with all of them ejected, the one
- * back soonest. With @skip, the server of @skip's place whose attempt
+ * Only servers in service are taken: not ejected, not full (max_conns=),
+ * not down, and a backup only when no other server may be taken; with all
+ * of them out, the one back soonest that is not full. With @skip, the server of @skip's place whose attempt
  * failed, it is a retry: another server in service, the next one after
- * @skip in pool order (least_conn: the fewest open, ties from there), or
+ * @skip in pool order (least_conn: the fewest open, ties from there; the
+ * random ones: drawn as usual, never @skip), or
  * UINT32_MAX for none; a retry leaves the cursor alone, so the pool's
  * turns go on as if the failed pick had worked.
  *
- * The pick reads the states in place, through the pool's handles (see
- * acl_srv_handle()), with no copy: round-robin looks at the cursor's
+ * The pick reads the states in place, through the pool's members (see
+ * acl_srv_member()), with no copy: round-robin looks at the cursor's
  * server, and only when it is ejected at a few random ones and then the
- * next ones in turn; least_conn scans
- * the open counts of the whole pool (see gwp_up_lb_pick()). UINT32_MAX,
+ * next ones in turn; the random ones at the servers they draw; least_conn
+ * scans the open counts of the whole pool (see gwp_up_lb_pick()). UINT32_MAX,
  * when the pool has no server object at all, is a bug conn_pick_upstream()
  * reports.
  */
@@ -2996,10 +3109,10 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 {
 	struct pool_pick_env env = { .ctx = ctx, .pool = pool };
 	struct gwp_up_pick pk = {
-		.st = gwp_acl_pool_handles(pool),
+		.m = gwp_acl_pool_members(pool),
+		.plan = gwp_acl_pool_plan(pool),
 		.nr = gwp_acl_pool_nr_servers(pool),
-		.least_conn = gwp_acl_pool_method(pool) ==
-			      GWP_ACL_POOL_LEAST_CONN,
+		.method = (uint8_t)gwp_acl_pool_method(pool),
 		.skip = skip,
 		.now = pool_pick_now,
 		.back = pool_pick_back,
@@ -3007,11 +3120,51 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 		.arg = &env,
 	};
 
-	if (unlikely(!pk.st))
+	if (unlikely(!pk.m))
 		return UINT32_MAX;
-	if (skip == UINT32_MAX)
+	/* The random methods draw: no cursor, so no line shared to write. */
+	if (skip == UINT32_MAX && pk.method != GWP_UP_METHOD_RANDOM &&
+	    pk.method != GWP_UP_METHOD_RANDOM_TWO)
 		pk.rr = gwp_acl_pool_next(pool);
 	return gwp_up_lb_pick(&pk);
+}
+
+/* How many times a pick may find its server filled by others meanwhile. */
+#define POOL_TAKE_TRIES	4
+
+static void conn_switch_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				 struct gwp_upstream *up, bool taken);
+
+/*
+ * Pick a server of @pool for @gcp (pool_pick_server(), @skip as there) and
+ * give it to @gcp, slot and all. A server with a cap on its open pairs
+ * (max_conns=) gets its slot only if the cap still allows it, as other
+ * workers may have filled it since the pick looked: then the pick is made
+ * again, a few times. Returns the server's place in @pool, or UINT32_MAX,
+ * with @gcp's upstream unchanged, when there was none to take.
+ */
+static uint32_t pool_take_server(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				 struct gwp_acl_pool *pool, uint32_t skip)
+{
+	const struct gwp_up_member *m = gwp_acl_pool_members(pool);
+	struct gwp_upstream *up;
+	uint32_t i, tries;
+
+	for (tries = 0; tries < POOL_TAKE_TRIES; tries++) {
+		i = pool_pick_server(ctx, pool, skip);
+		up = gwp_acl_pool_server(pool, i);
+		if (!up)
+			return UINT32_MAX;
+		if (!m[i].max_conns) {
+			conn_switch_upstream(ctx, gcp, up, false);
+			return i;
+		}
+		if (gwp_up_state_take_max(up->state, m[i].max_conns)) {
+			conn_switch_upstream(ctx, gcp, up, true);
+			return i;
+		}
+	}
+	return UINT32_MAX;
 }
 
 /* Every place in a pool fits gwp_conn_pair::up_srv. */
@@ -3026,8 +3179,10 @@ _Static_assert(GWP_ACL_POOL_MAX_SERVERS - 1 <= UINT16_MAX,
  * none). With neither @domain nor @lit there is no target at all (a UDP
  * ASSOCIATE), and a rule that tests one is not taken. Later calls change
  * nothing. Returns 0, or -EACCES when the choice cannot be told and might
- * be a pool (see gwp_acl_eval_upstream()), -EINVAL when the pool picked has
- * no server to use: the pair must then not go anywhere.
+ * be a pool (see gwp_acl_eval_upstream()), -EHOSTUNREACH when every server
+ * of the pool picked is full (max_conns=, see pool_take_server()) or out
+ * of it, -EINVAL when it has no server object: the pair must then not go
+ * anywhere.
  */
 static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			      const char *domain,
@@ -3056,16 +3211,21 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		 * The pool holds its servers, so the one picked is there; the
 		 * pair takes its own reference, and the pool's goes with @req.
 		 */
-		i = pool_pick_server(ctx, req.upstream_pool, UINT32_MAX);
-		up = gwp_acl_pool_server(req.upstream_pool, i);
-		if (unlikely(!up)) {
+		if (unlikely(!gwp_acl_pool_members(req.upstream_pool))) {
 			/* Never past the pool: refuse, not the default. */
 			pr_err(&ctx->lh, "BUG: upstream pool %s has no server object (idx=%u)",
 			       gwp_acl_pool_name(req.upstream_pool), gcp->idx);
 			r = -EINVAL;
 			break;
 		}
-		gwp_conn_set_upstream(ctx, gcp, up);
+		i = pool_take_server(ctx, gcp, req.upstream_pool, UINT32_MAX);
+		if (i == UINT32_MAX) {
+			pr_info(&ctx->lh, "Upstream pool %s has no server with room for idx=%u: all are full or out",
+				gwp_acl_pool_name(req.upstream_pool), gcp->idx);
+			r = -EHOSTUNREACH;
+			break;
+		}
+		up = gcp->upstream;
 		/* Kept for the logs and the retry, until the tunnel is up. */
 		gcp->up_pool = gwp_acl_req_take_pool(&req);
 		gcp->up_srv = (uint16_t)i;
@@ -3073,7 +3233,7 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		       gcp->idx, gwp_acl_pool_name(gcp->up_pool), i + 1,
 		       ip_to_str(&up->addr), up->host,
 		       gwp_up_state_open(up->state));
-		if (gwp_up_state_may_be_ejected(up->state))
+		if (gwp_up_health_may_be_ejected(up->health))
 			pr_dbg(&ctx->lh, "Upstream pool %s has every server ejected; idx=%u takes server %u, back soonest",
 			       gwp_acl_pool_name(gcp->up_pool), gcp->idx, i + 1);
 		break;
@@ -3099,6 +3259,14 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 	uint16_t dport = 0, dnat_port = 0;
 	bool dnat = false;
 	enum gwp_acl_verdict v;
+
+	/*
+	 * The control connection of a UDP association through the upstream
+	 * has no target: the OUTPUT chain judges each datagram's instead
+	 * (gwp_udp_relay_classify()).
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
+		return true;
 
 	/*
 	 * Plain and transparent forwarding pick their upstream on the first
@@ -3852,10 +4020,12 @@ static int upstream_acl_srv_tls(struct gwp_ctx __unused *ctx,
 /*
  * Give the server @up its entry in the shared state table, by identity: the
  * URL's scheme, the address it resolved to and the user (struct
- * gwp_up_key). The last step of making a server, once all of that is set.
+ * gwp_up_key), and its ejection state for the health settings of @o. The
+ * last step of making a server, once all of that is set.
  */
 __cold
-static int upstream_attach_state(struct gwp_ctx *ctx, struct gwp_upstream *up)
+static int upstream_attach_state(struct gwp_ctx *ctx, struct gwp_upstream *up,
+				 const struct gwp_up_opts *o)
 {
 	enum gwp_up_scheme scheme;
 	struct gwp_up_key key;
@@ -3869,7 +4039,16 @@ static int upstream_attach_state(struct gwp_ctx *ctx, struct gwp_upstream *up)
 			up->has_auth ? up->ulen : 0);
 	up->state = gwp_up_state_get(ctx->up_tab, &key);
 	explicit_bzero(&key, sizeof(key));
-	return up->state ? 0 : -ENOMEM;
+	if (!up->state)
+		return -ENOMEM;
+	if (!o->max_fails && !o->slow_start_ms)
+		return 0;
+	up->health = gwp_up_health_get(up->state, o);
+	if (up->health)
+		return 0;
+	gwp_up_state_put(up->state);
+	up->state = NULL;
+	return -ENOMEM;
 }
 
 /*
@@ -3883,6 +4062,7 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 	struct gwp_upstream_pool *pool = &ctx->upstream_pool;
 	const char *url = ctx->cfg.upstream_proxy;
 	struct gwp_upstream *up;
+	struct gwp_up_opts o;
 	size_t off, len;
 	int r;
 
@@ -3958,7 +4138,9 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 		ip_to_str(&up->addr),
 		up->remote_dns ? "remote" : "local");
 
-	r = upstream_attach_state(ctx, up);
+	/* The default upstream has the default health settings. */
+	gwp_up_opts_default(&o);
+	r = upstream_attach_state(ctx, up, &o);
 	if (r)
 		goto out_free;
 	atomic_init(&up->refcnt, 1);
@@ -4027,6 +4209,7 @@ void gwp_upstream_put(struct gwp_upstream *up)
 	if (atomic_fetch_sub_explicit(&up->refcnt, 1, memory_order_acq_rel) != 1)
 		return;
 	live = up->live;
+	gwp_up_health_put(up->health);
 	gwp_up_state_put(up->state);
 	explicit_bzero(up, sizeof(*up));
 	free(up);
@@ -4039,10 +4222,12 @@ void gwp_upstream_put(struct gwp_upstream *up)
  * (struct gwp_acl_server_ops): parsed, resolved and checked once here, so a
  * server no connection could use fails the load with its file and line,
  * and a connection only ever takes a reference. @url passed acl.c's shape
- * check; @why must not quote it, as it may hold a password.
+ * check; @why must not quote it, as it may hold a password. @opts are what
+ * the pool sets for the server.
  */
 __cold
-static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
+static int acl_srv_make(void *arg, const char *url,
+			const struct gwp_up_opts *opts, void **srv, char *why,
 			size_t size)
 {
 	struct gwp_ctx *ctx = arg;
@@ -4075,12 +4260,33 @@ static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
 		return r;
 	}
 
-	r = upstream_attach_state(ctx, up);
+	r = upstream_attach_state(ctx, up, opts);
 	if (r) {
 		snprintf(why, size, "out of memory");
 		explicit_bzero(up, sizeof(*up));
 		free(up);
 		return r;
+	}
+	/*
+	 * In service in this pool: a reload (an ACL is in place already)
+	 * that brings the server into service for its settings starts its
+	 * slow start, unless another pool already has it in service.
+	 */
+	if (!opts->down && up->health && up->health->slow_ms) {
+		uint32_t now = 0;
+		char ss[24];
+
+		/* 0 says a first load. */
+		if (ctx->acl) {
+			now = (uint32_t)gwp_now_ms();
+			if (!now)
+				now = 1;
+		}
+		if (gwp_up_health_join(up->health, now))
+			pr_info(&ctx->lh, "Upstream %s comes into service on a slow start of %s",
+				ip_to_str(&up->addr),
+				up_ms_str(up->health->slow_ms, ss, sizeof(ss)));
+		up->joined = true;
 	}
 	atomic_init(&up->refcnt, 1);
 	up->live = &ctx->nr_acl_srv;
@@ -4089,21 +4295,28 @@ static int acl_srv_make(void *arg, const char *url, void **srv, char *why,
 	return 0;
 }
 
+/* The pool's reference: it no longer lists the server once it is freed. */
 static void acl_srv_put(void __unused *arg, void *srv)
-{
-	gwp_upstream_put(srv);
-}
-
-/*
- * A pool keeps each server's shared state beside it, which the server holds
- * until it is freed, so pool_pick_server() reads the states without
- * reaching every server object.
- */
-static void *acl_srv_handle(void __unused *arg, void *srv)
 {
 	struct gwp_upstream *up = srv;
 
-	return up->state;
+	if (up->joined)
+		gwp_up_health_leave(up->health);
+	gwp_upstream_put(up);
+}
+
+/*
+ * A pool keeps each server's shared state and ejection state beside it,
+ * which the server holds until it is freed, so pool_pick_server() reads
+ * them without reaching every server object.
+ */
+static void acl_srv_member(void __unused *arg, void *srv,
+			   struct gwp_up_member *m)
+{
+	struct gwp_upstream *up = srv;
+
+	m->st = up->state;
+	m->h = up->health;
 }
 
 /*
@@ -4117,12 +4330,23 @@ static void *acl_srv_handle(void __unused *arg, void *srv)
 void gwp_conn_set_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			   struct gwp_upstream *up)
 {
+	conn_switch_upstream(ctx, gcp, up, false);
+}
+
+/*
+ * gwp_conn_set_upstream(), but with the slot of @up already @taken (by
+ * gwp_up_state_take_max()) when it says so.
+ */
+static void conn_switch_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				 struct gwp_upstream *up, bool taken)
+{
 	struct gwp_upstream *old = gcp->upstream;
 	uint32_t n;
 
 	if (up) {
 		gwp_upstream_get(up);
-		gwp_up_state_take(up->state);
+		if (!taken)
+			gwp_up_state_take(up->state);
 	}
 	gcp->upstream = up;
 	if (!up)
@@ -4154,6 +4378,28 @@ static enum gwp_upstream_end upstream_end_of(struct gwp_conn_pair *gcp,
 	return GWP_UPSTREAM_END_CONNECT;
 }
 
+/* What up_ejected_other() is told. */
+struct up_fail_env {
+	struct gwp_ctx		*ctx;
+	struct gwp_upstream	*up;
+};
+
+/*
+ * A failure of the server @arg's up ejected its identity for the pools that
+ * list it with the health settings of @h, which are not its own: those
+ * pools are not known here, only the address.
+ */
+static void up_ejected_other(void *arg, const struct gwp_up_health *h)
+{
+	struct up_fail_env *env = arg;
+	struct gwp_upstream *up = env->up;
+	char e[24], w[24];
+
+	pr_warn(&env->ctx->lh, "Upstream %s ejected for %s after %u failures in %s, in the pools that list it with these settings",
+		ip_to_str(&up->addr), up_ms_str(h->eject_ms, e, sizeof(e)),
+		h->max_fails, up_ms_str(h->window_ms, w, sizeof(w)));
+}
+
 /*
  * The one retry of @gcp, whose attempt through the @gcp->up_srv-th server
  * of its pool failed: move it to the next server in service, if there is
@@ -4166,17 +4412,15 @@ static bool upstream_retry(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	uint32_t i;
 
 	gcp->flags |= GWP_CONN_FLAG_UP_RETRIED;
-	i = pool_pick_server(w->ctx, gcp->up_pool, gcp->up_srv);
-	up = gwp_acl_pool_server(gcp->up_pool, i);
-	if (!up) {
+	up_desc(gcp->up_pool, gcp->up_srv, old, d_old, sizeof(d_old));
+	/* Described first: the switch drops the pair's reference to @old. */
+	i = pool_take_server(w->ctx, gcp, gcp->up_pool, gcp->up_srv);
+	if (i == UINT32_MAX) {
 		pr_dbg(&w->ctx->lh, "Upstream %s failed (idx=%u); no other server in service to retry on",
-		       up_desc(gcp->up_pool, gcp->up_srv, old, d_old,
-			       sizeof(d_old)), gcp->idx);
+		       d_old, gcp->idx);
 		return false;
 	}
-
-	up_desc(gcp->up_pool, gcp->up_srv, old, d_old, sizeof(d_old));
-	gwp_conn_set_upstream(w->ctx, gcp, up);
+	up = gcp->upstream;
 	gcp->up_srv = (uint16_t)i;
 	/* A new attempt: its failure is its own. */
 	gcp->flags &= ~GWP_CONN_FLAG_UP_FAILED;
@@ -4194,6 +4438,7 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	enum gwp_upstream_fail_class cls;
 	enum gwp_upstream_end end;
 	struct gwp_upstream *up = gcp->upstream;
+	bool udp_refused;
 	unsigned int val;
 	char why[64];
 
@@ -4217,6 +4462,15 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	    (gcp->flags & GWP_CONN_FLAG_UP_RETRIED))
 		val = 1;
 	cls = gwp_upstream_fail_classify(end, (int)val);
+	/*
+	 * A server that turns a UDP ASSOCIATE down may well serve TCP: its
+	 * refusal does not count against its health, but another server of
+	 * the pool may take the association, so it is retried.
+	 */
+	udp_refused = (gcp->flags & GWP_CONN_FLAG_UDP_UP) &&
+		      end == GWP_UPSTREAM_END_S5_REP;
+	if (udp_refused)
+		cls = GWP_UPSTREAM_FAIL_NEUTRAL;
 
 	switch (end) {
 	case GWP_UPSTREAM_END_CONNECT:
@@ -4242,24 +4496,41 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	/* Only the upstream's own failures count against its health. */
 	if (cls == GWP_UPSTREAM_FAIL_UPSTREAM) {
+		struct up_fail_env env = { .ctx = w->ctx, .up = up };
 		uint64_t now = gwp_now_ms();
-		char desc[320];
+		char desc[320], e[24], wd[24];
 
 		/* An ejection that ran out is ended (and logged) first. */
 		up_ejected(w->ctx, gcp->up_pool, gcp->up_srv, up, &now);
-		if (gwp_up_state_fail(up->state, (uint32_t)now))
-			pr_warn(&w->ctx->lh, "Upstream %s ejected for %u s after %u failures in %u s",
+		if (gwp_up_state_fail(up->state, up->health, (uint32_t)now,
+				      up_ejected_other, &env))
+			pr_warn(&w->ctx->lh, "Upstream %s ejected for %s after %u failures in %s",
 				up_desc(gcp->up_pool, gcp->up_srv, up, desc,
 					sizeof(desc)),
-				GWP_UP_EJECT_MS / 1000, GWP_UP_EJECT_FAILS,
-				GWP_UP_EJECT_WINDOW_MS / 1000);
+				up_ms_str(up->health->eject_ms, e, sizeof(e)),
+				up->health->max_fails,
+				up_ms_str(up->health->window_ms, wd,
+					  sizeof(wd)));
 	}
 
-	if (cls != GWP_UPSTREAM_FAIL_UPSTREAM || !may_retry || !gcp->up_pool ||
+	if ((cls != GWP_UPSTREAM_FAIL_UPSTREAM && !udp_refused) || !may_retry ||
+	    !gcp->up_pool ||
 	    (gcp->flags & (GWP_CONN_FLAG_UP_RETRIED | GWP_CONN_FLAG_IS_DYING |
 			   GWP_CONN_FLAG_IS_CANCEL)))
 		return false;
-	return upstream_retry(w, gcp);
+	if (!upstream_retry(w, gcp))
+		return false;
+	/*
+	 * A pool may mix socks5h:// servers with http:// and https:// ones,
+	 * which cannot carry UDP: the retry is spent, and the failure stands.
+	 */
+	if ((gcp->flags & GWP_CONN_FLAG_UDP_UP) &&
+	    gcp->upstream->type != GWP_UPSTREAM_SOCKS5) {
+		pr_dbg(&w->ctx->lh, "Upstream retry for idx=%u landed on a server that cannot carry UDP; giving up",
+		       gcp->idx);
+		return false;
+	}
+	return true;
 }
 
 void gwp_conn_upstream_up(struct gwp_conn_pair *gcp)
@@ -4639,6 +4910,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		__sys_close(gcp->udp_fd);
 	gwp_conn_close_attempts(gcp);
 	free(gcp->udp_peers);
+	free(gcp->udp_up);
 	gwp_conn_set_upstream(w->ctx, gcp, NULL);
 
 	gwp_conn_pair_drop_dns(w, gcp);
@@ -5150,6 +5422,25 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	return 0;	/* plain/transparent forwarding speaks no protocol */
 }
 
+/*
+ * No descriptor for a raw query's socket, no memory for the query or for the
+ * system resolver's request, a send refused: the name was never looked up,
+ * which leaves the origin as unreachable as a lookup that failed, so the
+ * client gets the same answer, host unreachable, as from a lookup that fails
+ * later. Closing the connection without a word left a SOCKS5 client without
+ * its reply and an HTTP client without a status.
+ */
+int gwp_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			 const char *host, int err)
+{
+	int r;
+
+	pr_dbg(&w->ctx->lh, "DNS query could not be started: %s (%s; gcp_idx=%u)",
+	       host, strerror(-err), gcp->idx);
+	r = gwp_conn_fail_reply(w, gcp, -EHOSTUNREACH);
+	return r ? r : -EBADMSG;
+}
+
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
@@ -5279,15 +5570,15 @@ static int upstream_dst_from_hostport(const char *hostport,
 /*
  * Whether a client-requested hostname is fit for the ACL, the resolver and an
  * upstream CONNECT request: an IPv6 literal, or letters, digits, '-' and '_'
- * in non-empty dot-separated labels (which covers IPv4 literals). Anything
- * else, CR, LF and ':' in particular, would be pasted verbatim into the
- * request to an http:// upstream, which then reads a different target than
- * the one the ACL judged.
+ * in non-empty dot-separated labels of at most 63 characters (which covers
+ * IPv4 literals). Anything else, CR, LF and ':' in particular, would be
+ * pasted verbatim into the request to an http:// upstream, which then reads
+ * a different target than the one the ACL judged.
  */
 static bool req_host_valid(const char *host)
 {
-	bool label_start = true;
 	struct in6_addr a6;
+	size_t label = 0;
 	size_t n = 0;
 
 	if (inet_pton(AF_INET6, host, &a6) == 1)
@@ -5297,18 +5588,32 @@ static bool req_host_valid(const char *host)
 		unsigned char c = (unsigned char)host[n];
 
 		if (c == '.') {
-			if (label_start)
+			if (!label)
 				return false;
-			label_start = true;
+			label = 0;
 			continue;
 		}
 		if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
 		    !(c >= '0' && c <= '9') && c != '-' && c != '_')
 			return false;
-		label_start = false;
+		/*
+		 * A label's length byte leaves room for 63 octets (RFC 1035
+		 * 2.3.4): a longer one can never resolve either.
+		 */
+		if (++label > 63)
+			return false;
 	}
 
-	return n > 0 && n <= 255;
+	/*
+	 * At most 253 characters, 254 with the root's dot: on the wire a name
+	 * takes a length byte per label and the root's zero, two more than its
+	 * text without that dot, and may not exceed 255 octets (RFC 1035
+	 * 2.3.4). A longer one can never resolve, so it is malformed, whichever
+	 * resolver would look it up.
+	 */
+	if (n && host[n - 1] == '.')
+		n--;
+	return n > 0 && n <= 253;
 }
 
 /*
@@ -5455,14 +5760,21 @@ static int upstream_target_init(struct gwp_ctx *ctx)
 }
 
 /*
- * A SOCKS5 or HTTP request whose upstream could not be picked: refuse it as
- * the ACL refuses a target (SOCKS5 0x02, HTTP 403). Returns -EBADMSG once
- * the reply is queued, so it goes out before the teardown.
+ * A SOCKS5 or HTTP request whose upstream could not be picked, for the
+ * reason @err (conn_pick_upstream()): refuse it as the ACL refuses a target
+ * (SOCKS5 0x02, HTTP 403), or, when its pool had no server with room
+ * (-EHOSTUNREACH), as an unreachable host (SOCKS5 0x04, HTTP 502). Returns
+ * -EBADMSG once the reply is queued, so it goes out before the teardown.
  */
-static int pick_refused(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int pick_refused(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 {
-	int r = gwp_acl_reject_reply(w, gcp);
+	int r;
 
+	if (err == -EHOSTUNREACH) {
+		r = gwp_conn_fail_reply(w, gcp, -EHOSTUNREACH);
+		return r ? r : -EBADMSG;
+	}
+	r = gwp_acl_reject_reply(w, gcp);
 	return r == -EACCES ? -EBADMSG : r;
 }
 
@@ -5506,7 +5818,7 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	/* The name decides the upstream, and the upstream how it resolves. */
 	r = conn_pick_upstream(ctx, gcp, host, is_ip ? &sa : NULL, port);
 	if (unlikely(r))
-		return pick_refused(w, gcp);
+		return pick_refused(w, gcp, r);
 
 	/*
 	 * socks5h://: don't resolve locally; hand the hostname to the upstream
@@ -5527,18 +5839,26 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 		return upstream_dst_from_domain(host, port, &gcp->up_dst);
 	}
 
+	/*
+	 * An address is the target, not a name to look up, whichever resolver
+	 * is in use. A raw DNS query would tell the server where the client is
+	 * going, and its answer would choose where the tunnel goes. The system
+	 * resolver would parse it back, but getaddrinfo()'s AI_ADDRCONFIG drops
+	 * an IPv6 literal, ::1 included, on a host whose only IPv6 address is
+	 * on the loopback: the request failed as an unresolvable name before the
+	 * ACL ever saw the address, where an IPv6 SOCKS5 address went through.
+	 */
+	if (is_ip) {
+		gwp_conn_set_single_candidate(gcp, &sa);
+		return 0;
+	}
+
 	if (cfg->use_raw_dns) {
-		/*
-		 * An address is the target, not a name to ask the server about:
-		 * the query would tell the server where the client is going, and
-		 * its answer would choose where the tunnel goes. The system
-		 * resolver parses these itself.
-		 */
-		if (is_ip) {
-			gwp_conn_set_single_candidate(gcp, &sa);
-			return 0;
-		}
-		return gwp_raw_dns_resolve(w, gcp, host, port);
+		r = gwp_raw_dns_resolve(w, gcp, host, port);
+		/* -EINVAL: a name DNS cannot carry, a malformed request. */
+		if (r != -EINPROGRESS && r != -EINVAL)
+			r = gwp_dns_start_failed(w, gcp, host, r);
+		return r;
 	} else {
 		struct gwp_sockaddr addrs[GWP_MAX_CONN_CAND];
 		uint8_t nr = 0;
@@ -5552,8 +5872,11 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 			return 0;
 		}
 
-		return queue_dns_resolution(w, gcp, host, port,
-					    r == -EHOSTUNREACH ? r : 0);
+		r = queue_dns_resolution(w, gcp, host, port,
+					 r == -EHOSTUNREACH ? r : 0);
+		if (r != -EINPROGRESS)
+			r = gwp_dns_start_failed(w, gcp, host, r);
+		return r;
 	}
 }
 
@@ -5585,6 +5908,7 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_sockaddr *ta = &gcp->target_addr;
 	struct gwp_socks5_conn *sc = gcp->s5_conn;
 	struct gwp_socks5_addr *dst;
+	int r;
 
 	assert(sc);
 
@@ -5596,16 +5920,18 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ta->i4.sin_port = dst->port;
 		ta->i4.sin_family = AF_INET;
 		gwp_conn_set_single_candidate(gcp, ta);
-		if (conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port)))
-			return pick_refused(w, gcp);
+		r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
+		if (r)
+			return pick_refused(w, gcp, r);
 		return 0;
 	case GWP_SOCKS5_ATYP_IPV6:
 		memcpy(&ta->i6.sin6_addr, &dst->ip6, 16);
 		ta->i6.sin6_port = dst->port;
 		ta->i6.sin6_family = AF_INET6;
 		gwp_conn_set_single_candidate(gcp, ta);
-		if (conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port)))
-			return pick_refused(w, gcp);
+		r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
+		if (r)
+			return pick_refused(w, gcp, r);
 		return 0;
 	case GWP_SOCKS5_ATYP_DOMAIN:
 		return socks5_prepare_target_addr_domain(w, gcp);
@@ -6034,6 +6360,110 @@ bool gwp_sockaddr_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr *b)
 	return false;
 }
 
+/*
+ * OUTPUT verdict for a datagram of a UDP association through the upstream to
+ * the target named @d, which the upstream resolves (socks5h://). Cached as
+ * udp_target_allowed() caches an address's.
+ */
+static bool udp_up_domain_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+				  const struct gwp_socks5_addr *d)
+{
+	struct gwp_udp_up *u = gcp->udp_up;
+	struct gwp_acl_req req;
+	bool ok;
+
+	if (!ctx->acl)
+		return true;
+	if (u->valid && u->gen == gwp_acl_generation(ctx->acl) &&
+	    u->dport == d->port && !strcmp(u->dom, d->domain.str))
+		return u->ok;
+
+	acl_out_req(&req, &gcp->udp_peer, NULL, d->domain.str,
+		    gcp_req_user(gcp), GWP_ACL_PROTO_UDP);
+	req.dport = ntohs(d->port);
+	ok = gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
+	gwp_acl_req_release(&req);
+
+	u->valid = req.cacheable;
+	u->gen = req.gen;
+	u->dport = d->port;
+	memcpy(u->dom, d->domain.str, (size_t)d->domain.len + 1);
+	u->ok = ok;
+	return ok;
+}
+
+/*
+ * gwp_udp_relay_classify() for a UDP association through the upstream. The
+ * datagrams go to the upstream's relay as the client sent them, header and
+ * all, and the relay's come back to the client as they are: the upstream
+ * reaches the targets and wraps their replies. The client is pinned, and its
+ * datagrams judged by the OUTPUT chain, as for a direct relay; a domain
+ * target goes only to an upstream that resolves names (socks5h://), as
+ * gwproxy has no per-datagram lookup to resolve it for a socks5:// one. Only
+ * the upstream's relay may answer; whatever else sends to the socket, and
+ * anything sent before the client is known, is dropped.
+ */
+static enum gwp_udp_act udp_up_classify(struct gwp_wrk *w,
+					struct gwp_conn_pair *gcp,
+					unsigned char *base, size_t n,
+					const struct gwp_sockaddr *src,
+					struct gwp_udp_out *out)
+{
+	struct gwp_udp_up *u = gcp->udp_up;
+	struct gwp_socks5_addr dst;
+	struct gwp_sockaddr tsa;
+	socklen_t tslen;
+	size_t hdr_len;
+
+	if (gcp->udp_pinned) {
+		if (!gwp_sockaddr_eq(src, &gcp->udp_peer))
+			goto from_relay;
+	} else if (gwp_sockaddr_eq(src, &u->relay) ||
+		   !gwp_sockaddr_ip_eq(src, &gcp->client_addr)) {
+		return GWP_UDP_DROP;
+	}
+
+	if (gwp_socks5_udp_parse_hdr(base, n, &dst, &hdr_len))
+		return GWP_UDP_DROP;
+	if (dst.ver == GWP_SOCKS5_ATYP_DOMAIN) {
+		/* An empty name, or one a NUL would cut short for the ACL. */
+		if (!gcp->upstream->remote_dns || !dst.domain.len ||
+		    strlen(dst.domain.str) != dst.domain.len)
+			return GWP_UDP_DROP;
+	} else {
+		if (gwp_socks5_addr_to_sockaddr(&dst, src->sa.sa_family, &tsa,
+						&tslen))
+			return GWP_UDP_DROP;
+		if (!gwp_ctx_outgoing_family_ok(w->ctx, &tsa))
+			return GWP_UDP_DROP;
+	}
+	if (!gcp->udp_pinned) {
+		gcp->udp_peer = *src;
+		gcp->udp_pinned = true;
+	}
+	if (dst.ver == GWP_SOCKS5_ATYP_DOMAIN ?
+	    !udp_up_domain_allowed(w->ctx, gcp, &dst) :
+	    !udp_target_allowed(w->ctx, gcp, &tsa))
+		return GWP_UDP_DROP;
+
+	out->buf = base;
+	out->len = n;
+	out->dst = u->relay;
+	out->dstlen = u->relay_len;
+	return GWP_UDP_TO_TARGET;
+
+from_relay:
+	if (!gwp_sockaddr_eq(src, &u->relay) ||
+	    gwp_socks5_udp_parse_hdr(base, n, &dst, &hdr_len))
+		return GWP_UDP_DROP;
+	out->buf = base;
+	out->len = n;
+	out->dst = gcp->udp_peer;
+	out->dstlen = gcp->udp_peer.sa.sa_family == AF_INET ?
+		      sizeof(gcp->udp_peer.i4) : sizeof(gcp->udp_peer.i6);
+	return GWP_UDP_TO_CLIENT;
+}
+
 enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 					struct gwp_conn_pair *gcp,
 					unsigned char *base, size_t n,
@@ -6041,6 +6471,9 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 					struct gwp_udp_out *out)
 {
 	bool client_dgram;
+
+	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
+		return udp_up_classify(w, gcp, base, n, src, out);
 
 	if (gcp->udp_pinned) {
 		client_dgram = gwp_sockaddr_eq(src, &gcp->udp_peer);
@@ -6211,30 +6644,93 @@ static void udp_pin_declared(struct gwp_conn_pair *gcp, int family)
 	gcp->udp_pinned = true;
 }
 
+/*
+ * What the client is told its relay is: BND.ADDR from the control
+ * connection, the address the client reached the proxy at, and BND.PORT
+ * from the relay socket. An IPv4 client of a dual-stack listener is told an
+ * IPv4 address, not the v4-mapped form of it that getsockname() reports.
+ * @relay is the relay socket's address, or NULL to read it.
+ */
+static int udp_client_bnd(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+			  const struct gwp_sockaddr *relay,
+			  struct gwp_socks5_addr *bnd)
+{
+	struct gwp_sockaddr local, ra;
+	socklen_t slen = sizeof(local);
+	int r;
+
+	r = __sys_getsockname(gcp->client.fd, &local.sa, &slen);
+	if (r < 0) {
+		pr_err(&ctx->lh, "UDP associate: getsockname(client) failed: %s",
+			strerror(-r));
+		return r;
+	}
+	if (!relay) {
+		slen = sizeof(ra);
+		r = __sys_getsockname(gcp->udp_fd, &ra.sa, &slen);
+		if (r < 0) {
+			pr_err(&ctx->lh, "UDP associate: getsockname(relay) failed: %s",
+				strerror(-r));
+			return r;
+		}
+		relay = &ra;
+	}
+
+	gwp_socks5_reply_addr_from_sockaddr(&local, bnd);
+	bnd->port = relay->sa.sa_family == AF_INET ? relay->i4.sin_port :
+						     relay->i6.sin6_port;
+	return 0;
+}
+
+/*
+ * Whether @gcp's upstream, picked for its UDP ASSOCIATE, can carry it: a
+ * socks5:// or socks5h:// server of an ACL pool. An http:// or https:// one
+ * cannot carry UDP at all, and --upstream-proxy's is not used for UDP.
+ */
+static bool udp_up_usable(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream *up = gcp->upstream;
+
+	if (!gcp->up_pool || up->type != GWP_UPSTREAM_SOCKS5) {
+		pr_info(&ctx->lh, "UDP ASSOCIATE refused: its upstream %s cannot carry UDP (idx=%u)",
+			ip_to_str(&up->addr), gcp->idx);
+		return false;
+	}
+	return true;
+}
+
 int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_socks5_addr bnd;
-	struct gwp_sockaddr local, relay;
-	socklen_t slen = sizeof(local);
+	struct gwp_sockaddr relay;
+	socklen_t slen;
 	socklen_t relay_len;
 	int fd = -1, r, rep = GWP_SOCKS5_REP_SUCCESS;
 	size_t out_len;
 
 	/*
-	 * UDP ASSOCIATE is not chained through an upstream proxy: an HTTP
-	 * upstream cannot carry UDP at all, and SOCKS5 upstream UDP is not
-	 * implemented. Binding a local relay here would silently bypass the
-	 * configured chain, so refuse the command instead. The chain is the
-	 * user's own when an ACL -j UPSTREAM rule picks one, from what is
-	 * known now (the user and the client, no target): a pool is refused
-	 * like --upstream-proxy, and so is a pool rule that only its target
-	 * tests could tell, DIRECT gets the relay even past it, and no choice
-	 * leaves the default to decide.
+	 * The chain is the user's own when an ACL -j UPSTREAM rule picks one,
+	 * from what is known now (the user and the client, no target). A
+	 * socks5:// or socks5h:// server of a pool carries the association:
+	 * the relay below then talks to the server's relay rather than to the
+	 * targets. Any other upstream is refused, as binding a local relay
+	 * would silently bypass it: an HTTP upstream cannot carry UDP at all,
+	 * and --upstream-proxy is not used for UDP. So is a pool rule that
+	 * only its target tests could tell; DIRECT gets a direct relay even
+	 * past --upstream-proxy, and no choice leaves the default to decide.
 	 */
 	r = conn_pick_upstream(ctx, gcp, NULL, NULL, 0);
-	if (r || gcp->upstream) {
+	/*
+	 * A pool whose servers are all full (max_conns=) is answered as for
+	 * a CONNECT, as an unreachable host: the command itself is fine.
+	 */
+	if (r == -EHOSTUNREACH) {
+		rep = GWP_SOCKS5_REP_HOST_UNREACHABLE;
+		goto reply;
+	}
+	if (r || (gcp->upstream && !udp_up_usable(ctx, gcp))) {
 		rep = GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED;
 		goto reply;
 	}
@@ -6264,14 +6760,6 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * A kernel without IPv6 (ipv6.disable=1) has no such socket, and no
 	 * IPv6 targets either: use an IPv4 wildcard socket there.
 	 */
-	r = __sys_getsockname(gcp->client.fd, &local.sa, &slen);
-	if (r < 0) {
-		pr_err(&ctx->lh, "UDP associate: getsockname(client) failed: %s",
-			strerror(-r));
-		rep = GWP_SOCKS5_REP_FAILURE;
-		goto reply;
-	}
-
 	memset(&relay, 0, sizeof(relay));
 	fd = __sys_socket(AF_INET6, type, 0);
 	if (fd == -EAFNOSUPPORT) {
@@ -6312,17 +6800,39 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		rep = GWP_SOCKS5_REP_FAILURE;
 		goto reply;
 	}
-	/*
-	 * BND.ADDR from the control connection, BND.PORT from the relay socket.
-	 * An IPv4 client of a dual-stack listener is told an IPv4 address, not
-	 * the v4-mapped form of it that getsockname() reports.
-	 */
-	gwp_socks5_reply_addr_from_sockaddr(&local, &bnd);
-	bnd.port = relay.sa.sa_family == AF_INET ? relay.i4.sin_port :
-						   relay.i6.sin6_port;
+
+	r = udp_client_bnd(ctx, gcp, &relay, &bnd);
+	if (r < 0) {
+		__sys_close(fd);
+		fd = -1;
+		rep = GWP_SOCKS5_REP_FAILURE;
+		goto reply;
+	}
 
 	udp_pin_declared(gcp, relay.sa.sa_family);
 	gcp->udp_fd = fd;
+
+	if (gcp->upstream) {
+		/*
+		 * The client is answered once the upstream has answered the
+		 * UDP ASSOCIATE that the connect to it starts: the pair goes
+		 * the way of a CONNECT through it from here.
+		 */
+		gcp->udp_up = calloc(1, sizeof(*gcp->udp_up));
+		if (unlikely(!gcp->udp_up)) {
+			rep = GWP_SOCKS5_REP_FAILURE;
+			goto reply;
+		}
+		gcp->flags |= GWP_CONN_FLAG_UDP_UP;
+		gcp->conn_state = CONN_STATE_SOCKS5_CONNECT;
+		pr_info(&ctx->lh,
+			"SOCKS5 UDP ASSOCIATE through upstream %s (idx=%u, cfd=%d, ufd=%d)",
+			ip_to_str(&gcp->upstream->addr), gcp->idx,
+			gcp->client.fd, fd);
+		return 0;
+	}
+
+	gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
 	pr_info(&ctx->lh,
 		"SOCKS5 UDP ASSOCIATE relay bound (idx=%u, cfd=%d, ufd=%d)",
 		gcp->idx, gcp->client.fd, fd);
@@ -6337,6 +6847,97 @@ reply:
 	gcp->target.len += (uint32_t)out_len;
 
 	return (rep == GWP_SOCKS5_REP_SUCCESS) ? 0 : -ECONNREFUSED;
+}
+
+int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_sockaddr local, relay;
+	socklen_t slen = sizeof(local);
+	int r;
+
+	r = __sys_getsockname(gcp->target.fd, &local.sa, &slen);
+	if (r >= 0) {
+		slen = sizeof(relay);
+		r = __sys_getsockname(gcp->udp_fd, &relay.sa, &slen);
+	}
+	if (r < 0) {
+		pr_err(&w->ctx->lh, "UDP associate: getsockname failed: %s (idx=%u)",
+		       strerror(-r), gcp->idx);
+		return r;
+	}
+
+	/* An IPv4 control connection names its address as IPv4. */
+	gwp_socks5_reply_addr_from_sockaddr(&local, &gcp->up_dst);
+	gcp->up_dst.port = relay.sa.sa_family == AF_INET ? relay.i4.sin_port :
+							   relay.i6.sin6_port;
+	return 0;
+}
+
+int gwp_upstream_udp_ready(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   const struct gwp_socks5_addr *bnd)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_udp_up *u = gcp->udp_up;
+	struct gwp_socks5_addr a = *bnd, up, cb;
+	struct gwp_sockaddr relay;
+	socklen_t slen = sizeof(relay);
+	size_t out_len;
+	int r;
+
+	r = __sys_getsockname(gcp->udp_fd, &relay.sa, &slen);
+	if (r < 0) {
+		pr_err(&ctx->lh, "UDP associate: getsockname(relay) failed: %s",
+			strerror(-r));
+		return r;
+	}
+
+	/*
+	 * An unspecified BND.ADDR is the server's own address, the one the
+	 * control connection went to (a server bound to the wildcard knows
+	 * no better), with the port it gave.
+	 */
+	if (a.ver == GWP_SOCKS5_ATYP_IPV4 && !memcmp(a.ip4, "\0\0\0\0", 4)) {
+		gwp_socks5_reply_addr_from_sockaddr(&gcp->upstream->addr, &up);
+		memcpy(a.ip6, up.ip6, sizeof(a.ip6));
+		a.ver = up.ver;
+	} else if (a.ver == GWP_SOCKS5_ATYP_IPV6 &&
+		   IN6_IS_ADDR_UNSPECIFIED((const struct in6_addr *)a.ip6)) {
+		gwp_socks5_reply_addr_from_sockaddr(&gcp->upstream->addr, &up);
+		memcpy(a.ip6, up.ip6, sizeof(a.ip6));
+		a.ver = up.ver;
+	}
+
+	if (a.ver == GWP_SOCKS5_ATYP_DOMAIN || !a.port ||
+	    gwp_socks5_addr_to_sockaddr(&a, relay.sa.sa_family, &u->relay,
+					&u->relay_len)) {
+		pr_err(&ctx->lh, "Upstream %s granted the UDP ASSOCIATE with a relay address it cannot be reached at (idx=%u)",
+		       ip_to_str(&gcp->upstream->addr), gcp->idx);
+		return -EPROTO;
+	}
+	if (!gwp_ctx_outgoing_family_ok(ctx, &u->relay)) {
+		pr_info(&ctx->lh, "--outgoing-family refuses upstream UDP relay %s (idx=%u)",
+			ip_to_str(&u->relay), gcp->idx);
+		return -EPROTO;
+	}
+
+	r = udp_client_bnd(ctx, gcp, &relay, &cb);
+	if (r < 0)
+		return r;
+
+	gcp->target.len = 0;
+	gwp_conn_buf_compact(&gcp->target);
+	out_len = gcp->target.cap;
+	r = gwp_socks5_conn_cmd_udp_associate_res(gcp->s5_conn, &cb,
+						  GWP_SOCKS5_REP_SUCCESS,
+						  gcp->target.buf, &out_len);
+	if (r < 0)
+		return r;
+	gcp->target.len = (uint32_t)out_len;
+
+	pr_info(&ctx->lh, "Upstream UDP association established (idx=%u, ca=%s, up=%s, relay=%s)",
+		gcp->idx, ip_to_str(&gcp->client_addr),
+		ip_to_str(&gcp->upstream->addr), ip_to_str(&u->relay));
+	return 0;
 }
 
 int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -6407,11 +7008,11 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		/*
 		 * Bind the relay socket and queue the reply; both event loops
 		 * then arm their own relay (handle_udp_associate on epoll,
-		 * arm_udp_relay on io_uring).
+		 * arm_udp_relay on io_uring). Through an upstream, the state
+		 * is CONNECT instead: the upstream is dialled as for a CONNECT
+		 * through it, and the reply waits for its answer.
 		 */
 		r = gwp_socks5_udp_associate_setup(w, gcp);
-		if (!r)
-			gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
 	}
 
 	/*

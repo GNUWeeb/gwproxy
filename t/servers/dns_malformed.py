@@ -74,6 +74,13 @@ while True:
         resp = txid + struct.pack("!HHHHH", 0x8180, 1, len(rrs), 0, 0) \
             + question + b"".join(rrs)
 
+    elif mode in ("nxdomain", "servfail"):
+        # A well-formed failure: the question echoed, no answer, and the
+        # RCODE saying the name does not exist (3) or the server failed (2).
+        rcode = 3 if mode == "nxdomain" else 2
+        resp = txid + struct.pack("!HHHHH", 0x8180 | rcode, 1, 0, 0, 0) \
+            + question
+
     elif mode == "uncompressed-name":
         # A perfectly legal answer whose owner NAME is a literal label rather
         # than a compression pointer. RFC 1035 permits this.
