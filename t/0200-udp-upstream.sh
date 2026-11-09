@@ -145,11 +145,16 @@ NONE" "$out"
 		"$FP" "$ep")"
 	expect "[$loop socks5h stranger]" DROPPED "$r"
 
-	# The upstream closing ends the client's association.
-	out="$(client "$FP" send:127.0.0.1:9:bye eof)"
+	# The upstream closing ends the client's association. The datagram
+	# that makes it close is not echoed (see the stand-in), but it has to
+	# have reached it.
+	out="$(client "$FP" send:127.0.0.1:9:hi send:127.0.0.1:9:bye eof)"
 	expect "[$loop socks5h bye]" "REP 0
-ECHO bye
+ECHO hi
+NONE
 EOF" "$out"
+	grep -q 'dst=127.0.0.1:9 len=13$' "$WORK/h.log" || \
+		fail "[$loop socks5h bye] the closing datagram did not arrive"
 	kill "$GWP_PID" 2>/dev/null
 
 	# A socks5:// pool: gwproxy resolves names, and has no lookup for

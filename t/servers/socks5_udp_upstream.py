@@ -14,7 +14,9 @@
 # That socket sends every datagram back to where it came from as it is,
 # SOCKS5 header and all, as if the target had answered at once. A payload
 # ending in "stray" also gets a datagram from another socket, which the
-# proxy must not pass on; one ending in "bye" closes the control connection.
+# proxy must not pass on. One ending in "bye" is not sent back: it closes
+# the control connection instead, as a datagram sent just before would race
+# the close to the proxy, which may drop it with the association.
 # The log gets a line per request and per datagram:
 #   assoc dst=<addr>:<port>
 #   dgram from=<ip>:<port> atyp=<n> dst=<addr>:<port> len=<n>
@@ -93,9 +95,10 @@ def relay(u, c):
             (src[0], src[1], atyp, a, p, len(d)))
         if d.endswith(b'stray'):
             stray.sendto(d[:-5] + b'STRAY', src)
-        u.sendto(d, src)
         if d.endswith(b'bye'):
             c.shutdown(socket.SHUT_RDWR)
+        else:
+            u.sendto(d, src)
 
 
 def serve(c):
