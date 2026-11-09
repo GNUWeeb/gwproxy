@@ -347,20 +347,25 @@ static void tp_eject(struct tpool *p, uint32_t i, uint32_t left)
 	assert(gwp_up_health_ejected(p->h[i], p->clock, NULL) == left);
 }
 
-static uint32_t tp_pick(struct tpool *p, bool least_conn, uint32_t rr,
+/*
+ * A pick by @method (enum gwp_up_method: false is round-robin, true
+ * least_conn).
+ */
+static uint32_t tp_pick(struct tpool *p, uint32_t method, uint32_t rr,
 			uint32_t skip)
 {
 	struct gwp_up_pick pk = {
-		.m = p->m, .nr = p->nr, .plan = p->plan, .least_conn = least_conn, .rr = rr,
+		.m = p->m, .nr = p->nr, .plan = p->plan,
+		.method = (uint8_t)method, .rr = rr,
 		.skip = skip, .now = tp_now, .back = tp_back, .arg = p,
 		.random = p->fake || p->xs ? tp_random : NULL,
 	};
 	uint32_t before = p->clock_reads, rnd = p->nr_random, i;
 
 	i = gwp_up_lb_pick(&pk);
-	/* The clock: once at most; probes: a few. */
+	/* The clock: once at most; probes: a few in each tier. */
 	assert(p->clock_reads - before <= 1);
-	assert(p->nr_random - rnd <= GWP_UP_PICK_MAX_RANDOM);
+	assert(p->nr_random - rnd <= 2 * GWP_UP_PICK_MAX_RANDOM);
 	return i;
 }
 
@@ -1834,6 +1839,306 @@ static void test_slow_pick(void)
 	tp_free(&p);
 }
 
+#define RND	GWP_UP_METHOD_RANDOM
+#define RND2	GWP_UP_METHOD_RANDOM_TWO
+
+/*
+ * "random" by a real generator: each server in service gets the share of
+ * its weight (scaled by a slow start's ramp) within 3%; servers ejected,
+ * full or down are never taken; the cursor makes no difference.
+ */
+static void test_random_spread(const uint32_t *w, uint32_t nr, uint32_t seed,
+			       uint32_t eject, uint32_t full, uint32_t ramp)
+{
+	uint32_t hits[8] = { 0 }, rr, i;
+	uint64_t sum = 0, sw[8];
+	struct tpool p;
+
+	assert(nr <= 8);
+	tp_init(&p, nr);
+	p.xs = seed;
+	if (w)
+		tp_weights(&p, w);
+	if (eject < nr)
+		tp_eject(&p, eject, 1000);
+	if (full < nr) {
+		p.m[full].max_conns = 2;
+		tp_open(&p, full, 2);
+	}
+	if (ramp < nr)
+		tp_ramp(&p, ramp, 80000, 4, 8);
+	for (i = 0; i < nr; i++) {
+		sw[i] = i == eject || i == full ? 0 :
+			(uint64_t)(w ? w[i] : 1) * (i == ramp ? 4 : 8);
+		sum += sw[i];
+	}
+	for (rr = 0; rr < NR_DIST_PICKS; rr++)
+		hits[tp_pick(&p, RND, rr * 7919, NONE)]++;
+	for (i = 0; i < nr; i++) {
+		uint64_t want = NR_DIST_PICKS * sw[i] / sum;
+		uint64_t tol = NR_DIST_PICKS * 3 / 100;
+
+		if (!sw[i]) {
+			assert(!hits[i]);
+			continue;
+		}
+		if (hits[i] + tol < want || hits[i] > want + tol) {
+			fprintf(stderr, "random server %u: %u picks, want %llu +- %llu\n",
+				i, hits[i], (unsigned long long)want,
+				(unsigned long long)tol);
+			assert(0);
+		}
+	}
+	if (ramp < nr)
+		tp_unramp(&p, ramp);
+	tp_open(&p, full < nr ? full : 0, 0);
+	tp_free(&p);
+}
+
+/*
+ * "random" and "random two" one pick at a time, by a fake random source:
+ * the draws, the better of two, ties to the first, the same server or one
+ * that cannot be taken drawn again, the budget of draws and the fallback,
+ * a retry, the backups.
+ */
+static void test_random_pick(void)
+{
+	uint32_t vals[GWP_UP_PICK_MAX_RANDOM];
+	static const uint32_t w[4] = { 1, 1, 1, 3 };
+	static const uint8_t f[5] = { 0, 0, 0, GWP_UP_MEMBER_BACKUP,
+				      GWP_UP_MEMBER_BACKUP };
+	struct tpool p;
+	uint32_t i, n;
+
+	tp_init(&p, 4);
+	p.fake = vals;
+
+	/* random: the one drawn, whatever the counts and the cursor. */
+	vals[0] = tp_at(4, 2);
+	p.nr_fake = 1;
+	tp_open(&p, 2, 9);
+	for (i = 0; i < 3; i++) {
+		p.ifake = 0;
+		n = p.nr_random;
+		assert(tp_pick(&p, RND, i * 1000, NONE) == 2);
+		assert(p.nr_random - n == 1);
+	}
+	/* random two: the fewer open of the two drawn; ties to the first. */
+	vals[0] = tp_at(4, 2);
+	vals[1] = tp_at(4, 1);
+	p.nr_fake = 2;
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 1);
+	assert(p.nr_random == 5);
+	tp_open(&p, 1, 9);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 2);
+	tp_open(&p, 1, 10);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 2);
+	/* The same one twice: drawn again. */
+	vals[0] = vals[1] = tp_at(4, 1);
+	vals[2] = tp_at(4, 3);
+	p.nr_fake = 3;
+	p.ifake = 0;
+	n = p.nr_random;
+	assert(tp_pick(&p, RND2, 0, NONE) == 3);
+	assert(p.nr_random - n == 3);
+	/* One that cannot be taken (ejected, full): drawn again. */
+	tp_eject(&p, 3, 100);
+	p.m[0].max_conns = 1;
+	tp_open(&p, 0, 1);
+	vals[0] = tp_at(4, 3);
+	vals[1] = tp_at(4, 0);
+	vals[2] = tp_at(4, 2);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND, 0, NONE) == 2);
+	vals[3] = tp_at(4, 1);
+	p.nr_fake = 4;
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 2);
+	/*
+	 * With weights: 10 open on weight 3 are fewer per weight than 9 on
+	 * 1, more than 2 on 1.
+	 */
+	p.m[0].max_conns = 0;
+	tp_weights(&p, w);
+	vals[0] = tp_at(6, 0);		/* by weight: 0 1 2 3 3 3 */
+	vals[1] = tp_at(6, 1);
+	p.nr_fake = 2;
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 0);
+	p.ifake = 0;
+	tp_open(&p, 0, 0);
+	tp_open(&p, 2, 2);
+	assert(tp_pick(&p, RND2, 0, NONE) == 0);
+	gwp_up_health_ejected(p.h[3], p.clock + 100, NULL);
+	tp_open(&p, 3, 10);
+	tp_open(&p, 1, 9);
+	vals[0] = tp_at(6, 1);
+	vals[1] = tp_at(6, 4);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 3);
+	vals[0] = tp_at(6, 2);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 2);
+	tp_free(&p);
+
+	/*
+	 * The budget: two draws and GWP_UP_PICK_PROBES more. Every one on
+	 * a server out: the next in service from the first one drawn; one
+	 * good one for random two: that one.
+	 */
+	tp_init(&p, 6);
+	p.fake = vals;
+	tp_eject(&p, 1, 100);
+	tp_eject(&p, 2, 100);
+	tp_eject(&p, 4, 100);
+	for (i = 0; i < 2 + GWP_UP_PICK_PROBES; i++)
+		vals[i] = tp_at(6, i % 2 ? 2 : 1);
+	p.nr_fake = 2 + GWP_UP_PICK_PROBES;
+	p.ifake = 0;
+	n = p.nr_random;
+	assert(tp_pick(&p, RND2, 0, NONE) == 3);
+	assert(p.nr_random - n == 2 + GWP_UP_PICK_PROBES);
+	p.ifake = 0;
+	n = p.nr_random;
+	assert(tp_pick(&p, RND, 4, NONE) == 3);
+	assert(p.nr_random - n == 1 + GWP_UP_PICK_PROBES);
+	vals[0] = tp_at(6, 4);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND, 0, NONE) == 5);
+	vals[3] = tp_at(6, 0);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 0);
+	/* The fallback prefers a server in no slow start. */
+	tp_ramp(&p, 5, 80000, 1, 8);
+	for (i = 0; i < 2 + GWP_UP_PICK_PROBES; i++)
+		vals[i] = tp_at(6, 4);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND, 0, NONE) == 0);
+	tp_unramp(&p, 5);
+	/* A server in its slow start, drawn, passed by its chance. */
+	tp_ramp(&p, 0, 80000, 2, 8);
+	vals[0] = tp_at(6, 0);
+	vals[1] = 0x40000000u;		/* over a quarter: passed */
+	vals[2] = tp_at(6, 0);
+	vals[3] = 0x3fff0000u;		/* under it: taken */
+	p.nr_fake = 4;
+	p.ifake = 0;
+	n = p.nr_random;
+	assert(tp_pick(&p, RND, 0, NONE) == 0);
+	assert(p.nr_random - n == 4);
+	/* random two: compared at its scaled weight, 1 open as 4. */
+	tp_open(&p, 0, 1);
+	tp_open(&p, 3, 3);
+	vals[0] = tp_at(6, 3);
+	vals[1] = tp_at(6, 0);
+	vals[2] = 0;
+	p.nr_fake = 3;
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 3);
+	tp_open(&p, 3, 4);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 3);
+	tp_open(&p, 3, 5);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 0);
+	tp_unramp(&p, 0);
+	tp_open(&p, 0, 0);
+	tp_open(&p, 3, 0);
+
+	/* A retry: never the failed one, though drawn. */
+	vals[0] = tp_at(6, 3);
+	vals[1] = tp_at(6, 5);
+	p.nr_fake = 2;
+	p.ifake = 0;
+	assert(tp_pick(&p, RND, 0, 3) == 5);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, 3) == 5);
+	/* Drawn every time: the next in service after it. */
+	p.nr_fake = 1;
+	p.ifake = 0;
+	assert(tp_pick(&p, RND, 0, 3) == 5);
+	/* One other drawn, every time: that one. */
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, 5) == 3);
+	/* With every other one out: none for a retry. */
+	tp_eject(&p, 0, 100);
+	tp_eject(&p, 5, 100);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, 3) == NONE);
+	/* For a first pick, all out: the one back soonest, as ever. */
+	tp_eject(&p, 3, 50);
+	p.ifake = 0;
+	assert(tp_pick(&p, RND2, 0, NONE) == 3);
+	/* No random source: from the cursor, the next in service. */
+	tp_free(&p);
+	tp_init(&p, 4);
+	tp_eject(&p, 1, 100);
+	assert(tp_pick(&p, RND, 1, NONE) == 2);
+	assert(tp_pick(&p, RND2, 0, NONE) == 0);
+	tp_free(&p);
+
+	/* The backups: drawn only when no main server may be taken. */
+	tp_init(&p, 5);
+	tp_flags(&p, f);
+	p.xs = 99;
+	for (i = 0; i < 1000; i++)
+		assert(tp_pick(&p, i % 2 ? RND : RND2, 0, NONE) < 3);
+	tp_eject(&p, 0, 100);
+	tp_eject(&p, 1, 100);
+	tp_eject(&p, 2, 100);
+	for (i = 0; i < 1000; i++) {
+		n = tp_pick(&p, i % 2 ? RND : RND2, 0, NONE);
+		assert(n == 3 || n == 4);
+	}
+	assert(tp_pick(&p, RND2, 0, 3) == 4);
+	tp_free(&p);
+}
+
+/*
+ * "random two" fed back (each pick opens a pair, some close): the open
+ * counts stay within a few of each other, as least_conn's would, where
+ * "random" lets them drift apart by the hundreds.
+ */
+static void test_random_two_balance(void)
+{
+	uint32_t open[16], k, i, lo, hi, d[2];
+	struct tpool p;
+	int two;
+
+	for (two = 0; two < 2; two++) {
+		tp_init(&p, 16);
+		p.xs = 0x1234567;
+		memset(open, 0, sizeof(open));
+		for (k = 0; k < 64000; k++) {
+			i = tp_pick(&p, two ? RND2 : RND, 0, NONE);
+			gwp_up_state_take(p.s[i]);
+			/* A random one closes, half the time. */
+			if (k % 2) {
+				i = gwp_up_rand(&p.xs) % 16;
+				if (gwp_up_state_open(p.s[i]))
+					gwp_up_state_give(p.s[i]);
+			}
+		}
+		lo = UINT32_MAX;
+		hi = 0;
+		for (i = 0; i < 16; i++) {
+			open[i] = gwp_up_state_open(p.s[i]);
+			lo = open[i] < lo ? open[i] : lo;
+			hi = open[i] > hi ? open[i] : hi;
+		}
+		d[two] = hi - lo;
+		tp_free(&p);
+	}
+	if (d[1] > 8 || d[0] < 4 * d[1]) {
+		fprintf(stderr, "random two: spread %u, random: %u\n", d[1],
+			d[0]);
+		assert(0);
+	}
+}
+
 #define NR_CAP		7u
 #define NR_CAP_ROUNDS	20000
 
@@ -2050,6 +2355,17 @@ int main(void)
 		test_slow_rr(w, two, 3, 0xdeadbeef);
 		test_slow_rr(w, last, 3, 1234567);
 	}
+	{
+		static const uint32_t w[3] = { 1, 3, 2 };
+
+		test_random_spread(NULL, 4, 1, NONE, NONE, NONE);
+		test_random_spread(w, 3, 2, NONE, NONE, NONE);
+		test_random_spread(NULL, 5, 3, 1, 3, NONE);
+		test_random_spread(w, 3, 4, NONE, NONE, 1);
+		test_random_spread(NULL, 4, 5, 3, NONE, 0);
+	}
+	test_random_pick();
+	test_random_two_balance();
 	printf("All upstream_lb tests passed.\n");
 	return 0;
 }

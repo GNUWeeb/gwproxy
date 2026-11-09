@@ -838,6 +838,56 @@ static uint32_t pick_lc(struct pick *c, const struct gwp_up_tier *t,
 }
 
 /*
+ * Whether the @a-th server has fewer open pairs for its weight, scaled by
+ * its ramp, than the @b-th, both in the tier @t.
+ */
+static bool pick_fewer(struct pick *c, const struct gwp_up_tier *t,
+		       uint32_t a, uint32_t b)
+{
+	const struct gwp_up_member *m = c->pk->m;
+	uint64_t wa = t->total ? member_weight(&m[a]) : 1;
+	uint64_t wb = t->total ? member_weight(&m[b]) : 1;
+
+	/* At most 1000 * 2^16 each: fits, times a count, in 64 bits. */
+	wa *= pick_ramp(c, a);
+	wb *= pick_ramp(c, b);
+	return fewer_open(gwp_up_state_open(m[a].st), (uint32_t)wa,
+			  gwp_up_state_open(m[b].st), (uint32_t)wb);
+}
+
+/*
+ * "random" (@two false) or "random two" among the servers of the tier @t
+ * (see gwp_up_lb_pick()), falling back to the next in service from the
+ * first one drawn, or from its position @p with no draw: the place in the
+ * pool of the one taken, or UINT32_MAX when none may be.
+ */
+static uint32_t pick_random(struct pick *c, const struct gwp_up_tier *t,
+			    uint32_t p, bool two)
+{
+	const struct gwp_up_pick *pk = c->pk;
+	uint32_t want = two ? 2 : 1, got = 0, first = UINT32_MAX, q, j, i;
+	uint32_t a = UINT32_MAX;
+
+	for (q = 0; pk->random && q < want + GWP_UP_PICK_PROBES; q++) {
+		j = tier_drawn(t, pk->random(pk->arg));
+		i = tier_member(t, j);
+		if (first == UINT32_MAX && pk->skip >= pk->nr)
+			first = j;
+		if (i == a || !pick_usable(c, i) || !pick_turn_taken(c, i))
+			continue;
+		if (++got == want)
+			break;
+		a = i;
+	}
+	/* Of two, the second only when it has fewer; ties to the first. */
+	if (got == want)
+		return two && !pick_fewer(c, t, i, a) ? a : i;
+	if (got)
+		return a;
+	return pick_next(c, t, first != UINT32_MAX ? first : p);
+}
+
+/*
  * The pick among the servers of the tier @t, from its position @p on (see
  * gwp_up_lb_pick()): the place in the pool of the one taken, or
  * UINT32_MAX when none may be.
@@ -845,9 +895,16 @@ static uint32_t pick_lc(struct pick *c, const struct gwp_up_tier *t,
 static uint32_t pick_tier(struct pick *c, const struct gwp_up_tier *t,
 			  uint32_t p)
 {
-	if (c->pk->least_conn)
+	switch (c->pk->method) {
+	case GWP_UP_METHOD_LEAST_CONN:
 		return pick_lc(c, t, p);
-	return pick_rr(c, t, p);
+	case GWP_UP_METHOD_RANDOM:
+		return pick_random(c, t, p, false);
+	case GWP_UP_METHOD_RANDOM_TWO:
+		return pick_random(c, t, p, true);
+	default:
+		return pick_rr(c, t, p);
+	}
 }
 
 /*

@@ -491,6 +491,14 @@ struct gwp_up_plan {
 struct gwp_up_plan *gwp_up_plan_build(const struct gwp_up_member *m,
 				      uint32_t nr);
 
+/* How a pool chooses among its servers (gwp_up_lb_pick()). */
+enum gwp_up_method {
+	GWP_UP_METHOD_RR		= 0,	/* round-robin, by weight */
+	GWP_UP_METHOD_LEAST_CONN	= 1,	/* the fewest open per weight */
+	GWP_UP_METHOD_RANDOM		= 2,	/* one drawn by weight */
+	GWP_UP_METHOD_RANDOM_TWO	= 3,	/* the fewer open of two drawn */
+};
+
 /*
  * What a pool's choice of a server for a connection (gwp_up_lb_pick())
  * goes by.
@@ -507,8 +515,13 @@ struct gwp_up_pick {
 	 * main tier, all weights equal (plain turns), whatever @m says.
 	 */
 	const struct gwp_up_plan	*plan;
-	bool		least_conn;
-	/* The pool's round-robin cursor for this pick; unused for a retry. */
+	/* enum gwp_up_method. */
+	uint8_t		method;
+	/*
+	 * The pool's round-robin cursor for this pick; unused for a retry,
+	 * and by the random methods, but where they fall back to with no
+	 * @random.
+	 */
 	uint32_t	rr;
 	/*
 	 * For a retry, the server (< @nr) whose attempt failed, never taken
@@ -529,10 +542,13 @@ struct gwp_up_pick {
 	/*
 	 * A uniformly distributed 32-bit random number, for the probes when
 	 * the server whose turn it is (or where least_conn's ties start) is
-	 * ejected, and for the turns of servers in their slow start; called
-	 * at most GWP_UP_PICK_MAX_RANDOM times per pick, and never when the
-	 * server whose turn it is is in service and in no slow start. NULL:
-	 * no probes, and round-robin gives no thought to slow starts.
+	 * ejected, for the turns of servers in their slow start, and for the
+	 * random methods' draws; called at most GWP_UP_PICK_MAX_RANDOM times
+	 * per tier a pick looks at, and by round-robin and least_conn never
+	 * when the server whose turn it is is in service and in no slow
+	 * start. NULL: no probes, no draws (the random methods then take the
+	 * next server in service from @rr on), and round-robin and the random
+	 * methods give no thought to slow starts.
 	 */
 	uint32_t	(*random)(void *arg);
 	void		*arg;
@@ -545,8 +561,12 @@ struct gwp_up_pick {
  */
 #define GWP_UP_PICK_PROBES	4u
 
-/* The most random numbers a pick asks for (gwp_up_pick::random). */
-#define GWP_UP_PICK_MAX_RANDOM	(2u * GWP_UP_PICK_PROBES + 1u)
+/*
+ * The most random numbers a pick asks for in a tier (gwp_up_pick::random):
+ * a draw and a slow start's chance for each of "random two"'s two draws and
+ * GWP_UP_PICK_PROBES more; round-robin asks for fewer.
+ */
+#define GWP_UP_PICK_MAX_RANDOM	(2u * (GWP_UP_PICK_PROBES + 2u))
 
 /*
  * A small, fast generator for @random (xorshift32): advances *@state, which
@@ -577,10 +597,11 @@ static inline uint32_t gwp_up_rand(uint32_t *state)
  * there may be taken, in its backup tier, in the same way; a server that
  * is down is in neither. Within a tier, in its servers' order (pool order):
  *
- * Round-robin takes the server whose turn the cursor @rr is when it is in
- * service: the tier's server @rr % n when the weights are equal, else the
- * tier's turns by weight (struct gwp_up_tier). With none ejected that is the cursor's server, and
- * the pick reads one server's health only. When it is ejected, the pick
+ * Round-robin (GWP_UP_METHOD_RR) takes the server whose turn the cursor
+ * @rr is when it is in service: the tier's server @rr % n when the weights
+ * are equal, else the tier's turns by weight (struct gwp_up_tier). With
+ * none ejected that is the cursor's server, and the pick reads one
+ * server's health only. When it is ejected, the pick
  * tries up to GWP_UP_PICK_PROBES servers drawn at random (@random; by
  * weight when the weights differ) and takes the first in service, so an
  * ejected server's turns are spread over the rest by their weights, a run
@@ -599,23 +620,38 @@ static inline uint32_t gwp_up_rand(uint32_t *state)
  * in a slow start, this costs one more load of a line the pick reads
  * anyway.
  *
- * Least-connections (@least_conn) takes the server in service with the
- * fewest open pairs for its weight (open / weight, compared exactly; a
- * server in its slow start by its weight scaled by its ramp, so it counts
- * as busier, and takes about f of what it would), among equals the first
- * from the cursor's server on, so the cursor moving
- * on rotates the ties and servers that are equally loaded share the new
- * connections. When the start's server is ejected, the same probes choose
+ * Least-connections (GWP_UP_METHOD_LEAST_CONN) takes the server in service
+ * with the fewest open pairs for its weight (open / weight, compared
+ * exactly; a server in its slow start by its weight scaled by its ramp, so
+ * it counts as busier, and takes about f of what it would), among equals
+ * the first from the cursor's server on, so the cursor moving on rotates
+ * the ties and servers that are equally loaded share the new connections. When the start's server is ejected, the same probes choose
  * another start among the servers in service, so among equals an ejected
  * server's turns are spread too; the choice of the fewest stays exact. It
  * reads every server's open count, stopping at the first idle one in
  * service (none can have fewer), and the health only of a server that
  * would be the best so far.
  *
+ * Random (GWP_UP_METHOD_RANDOM) draws a server by weight (@random, as the
+ * probes are drawn) and takes it when it may be taken; "random two"
+ * (GWP_UP_METHOD_RANDOM_TWO) draws two different ones so and takes the one
+ * with fewer open pairs for its weight (compared as least_conn does), the
+ * first among equals. A server in its slow start is taken when drawn with
+ * the chance its ramp has reached, as round-robin offers it a turn, and
+ * compared at its scaled weight. A draw that cannot be taken is made
+ * again, up to GWP_UP_PICK_PROBES extra draws in all; when they run out
+ * with one server drawn, that one is taken, with none, the next in service
+ * from the first one drawn on, in pool order, preferring one in no slow
+ * start, as round-robin's fallback. Neither reads the cursor (the caller
+ * need not advance it), nor more than the two servers drawn while those
+ * may be taken: O(1) for equal weights, the same search as weighted
+ * round-robin's turns otherwise.
+ *
  * A retry (@skip) starts at the server after @skip in its tier instead of
  * the cursor (at the tier's first in another tier): that one when it is in
  * service, else (round-robin) the same probes and then the next in service
- * in pool order (least-connections: the fewest open, ties from there),
+ * in pool order (least-connections: the fewest open, ties from there; the
+ * random methods: their draws, then the next in service from there),
  * never @skip itself.
  *
  * When no server may be taken: for a first pick, the one whose ejection
