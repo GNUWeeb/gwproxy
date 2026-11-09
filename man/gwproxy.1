@@ -495,14 +495,19 @@ after it, the pool's options for it, as nginx writes them:
 .BI max_fails= n\fR,
 .BI fail_timeout= time\fR,
 .BI eject_time= time\fR,
+.BI slow_start= time\fR,
 .B backup
 and
 .B down
 (see
 .BR "UPSTREAM CHAINING" ),
-each at most once; and
+each at most once; and a line
 .B least_conn;
-(at most once) sets the method; round\-robin is the default.
+(or
+.B random;
+or
+.BR "random two;" )
+sets the method, one such line at most; round\-robin is the default.
 .B https://
 servers need a build with OpenSSL support; without it they fail the load.
 A pool has 1 to 8192 servers (one more fails the load), and all of them must
@@ -1598,7 +1603,11 @@ connections use the new pools; one already through a pool's server keeps that
 server until it ends. The servers' health, an ejection included, carries over
 as their counts do, an ejection as long as the pool's
 .BR max_fails= ", " fail_timeout= " and " eject_time=
-for the server stay the same.
+for the server stay the same, and so does a slow start under way
+.RB ( slow_start= ),
+while its
+.B slow_start=
+stays the same too.
 .PP
 The auth file, like the ACL files, must be a regular file. A FIFO or a device
 put in its place is refused, not waited on: the reload
@@ -1886,7 +1895,16 @@ turns for every one of a server of weight 1, spread out rather than in a row
 (each run of turns as long as the weights' sum, or the next power of two,
 gives each server its share give or take one turn), and
 .B least_conn
-compares the connections open divided by the weight (exactly, not rounded). A connection counts against its server
+compares the connections open divided by the weight (exactly, not rounded).
+With
+.BR random ,
+a connection goes to a server drawn at random, each with the chance of its
+weight; with
+.BR "random two" ,
+two different servers are drawn so and the connection goes to the one with
+fewer connections open for its weight (compared as
+.B least_conn
+does), the first one drawn when they are equal. A connection counts against its server
 from the moment it is given it, before it connects, until it ends, however it
 ends: closed by either side, refused, failed to connect or in the handshake,
 or timed out. The counts belong to the server, not to the pool: a server,
@@ -1906,8 +1924,21 @@ size.
 has to compare the counts of all the servers: each new connection reads the
 count of every server of its pool, stopping early only at a server with none
 open, so in a pool of thousands of busy servers every new connection costs a
-scan of thousands of counts that other workers keep changing. Prefer
-round\-robin for large pools unless the load must follow the counts.
+scan of thousands of counts that other workers keep changing. The random
+methods cost about what round\-robin does whatever the size of the pool:
+.B random
+looks at the one server it draws,
+.B "random two"
+at two and their counts, and neither moves a turn that all workers share.
+.B "random two"
+keeps the counts of a large pool nearly as even as
+.B least_conn
+does (two draws are enough to steer clear of the busy servers), so prefer it
+to
+.B least_conn
+for pools of more than a few dozen servers, and round\-robin or
+.B random
+when the load need not follow the counts.
 .PP
 A pool also keeps track of its servers' health, from the connections they
 carry (passively: gwproxy sends no probes of its own). A failure counts
@@ -1940,7 +1971,12 @@ tries pick another starting point, so among servers with the same count
 the ejected server's turns are spread too. It still takes a server with the
 fewest connections. As with the counts, the failures
 are the server's, not the pool's: those through one pool count in every pool
-that lists the server. When every server of a pool is ejected, the
+that lists the server. The random methods draw again when a draw lands on an
+ejected or full server, up to 4 more draws in all
+.RB ( "random two" :
+until it has its two, or the draws run out, and then takes the one it has);
+when every draw misses, the pool takes the next server in service after the
+first one drawn, in the block's order. When every server of a pool is ejected, the
 pool takes the one whose ejection ends soonest; a pool of one server, and
 .BR \-\-upstream\-proxy ,
 keep using theirs, so for them an ejection shows only in the log. A server
@@ -1967,6 +2003,38 @@ How long the server then stays out. Default 5m. Unlike nginx's,
 is only the window the failures must fall in, and this how long an ejection
 lasts.
 .TP
+.BI slow_start= time
+How long the server takes to get its full share back when it comes back
+into service: over this time its weight grows evenly from next to nothing to
+its
+.B weight=
+(1 without one), so that a server just back is not handed its whole share of
+the new connections at once. From 0 to 1h; default 0, no slow start. It runs
+when an ejection ends (an ejection during it starts it again once that one
+is over), and when a reload brings the server into service in a pool: a
+server new to the pool, one no longer
+.BR down ,
+or one whose
+.BR max_fails= ", " fail_timeout= ", " eject_time= " or " slow_start=
+changed, unless another pool already lists it in service with the same
+numbers. The first load starts none. With round\-robin, a server at a
+fraction of its weight takes each of its turns with that chance, and the
+turns it lets pass go to the other servers by their weights, as an ejected
+server's do, so its share follows the ramp (somewhat below it when most of a
+pool ramps at once); the random methods take it with that chance when they
+draw it, and draw again otherwise. With
+.BR least_conn
+(and between the two servers of
+.BR "random two" ),
+its connections open count against that fraction of its weight, so it is
+busier for its weight than its count says and takes new connections only as
+the ramp lets it. A server with
+.B max_fails=0
+still ramps after a reload brings it in. Each start is logged, at info level,
+as
+.I "Upstream ADDRESS comes into service on a slow start of 60 s"
+for a reload, and with the return after an ejection.
+.TP
 .BI max_conns= n
 The most connections the server may have open for the pool to give it
 another: 0 to 1000000, default 0 for no limit. The count is the server's, of
@@ -1981,7 +2049,8 @@ in when all are ejected, as above).
 .B backup
 The server is used only when no other server of the pool may be: all of
 them ejected, full or down. The backups share the connections among
-themselves by the pool's method and their weights; with everything out, the
+themselves by the pool's method and their weights (the random methods draw
+among them); with everything out, the
 pool takes the main server whose ejection ends soonest, a backup only when
 every main server is full.
 .TP
@@ -1994,17 +2063,20 @@ A
 .I time
 is a number followed by
 .BR ms ", " s ", " m " or " h ,
-or a number of seconds, from 1ms to 24h. The numbers are the pool's: a
+or a number of seconds, from 1ms to 24h
+.RB ( slow_start= :
+0 to 1h). The numbers are the pool's: a
 server that two pools list with different ones is ejected by each when its
 failures, wherever they came from, meet that pool's numbers, and for that
 pool's time, so it may be out of one pool and still in service in another;
-pools that list it with the same numbers share one ejection. For example:
+pools that list it with the same numbers share one ejection, and one slow
+start. For example:
 .PP
 .RS
 .EX
 upstream rotating {
     server socks5h://u:p@10.0.0.1:1080 weight=3 max_fails=1 eject_time=10m;
-    server socks5h://u:p@10.0.0.2:1080 max_conns=200;
+    server socks5h://u:p@10.0.0.2:1080 max_conns=200 slow_start=30s;
     server socks5h://u:p@10.0.0.3:1080 backup;
     server socks5h://u:p@10.0.0.4:1080 down;
 }
@@ -2020,15 +2092,17 @@ for every one of 10.0.0.2 and leaves it for 10 minutes at its first failure,
 but stays in
 .I patient
 until ten failures within a minute; 10.0.0.2 never carries more than 200
-connections at once; 10.0.0.3 carries connections only while neither of the
+connections at once, and after an ejection gets its full share back over 30
+seconds; 10.0.0.3 carries connections only while neither of the
 first two may; 10.0.0.4 none.
 .PP
 A connection that a pool's server fails in one of the ways that count is
 tried again, once, on another server of the same pool that is in service (not
 ejected, full or down): the next one in the block's order (when that one is
-out, one found as for an ejected server's turn), or with
+out, one found as for an ejected server's turn), with
 .B least_conn
-the least loaded one; a backup only when no other main server is in service. This is safe because nothing the client sends is
+the least loaded one, with the random methods one drawn as for any
+connection, never the server that failed; a backup only when no other main server is in service. This is safe because nothing the client sends is
 passed on before the tunnel through the upstream is up, so the retry repeats
 nothing and loses nothing. It has what is left of the connection's
 .BR \-\-connect\-timeout ,
@@ -2043,9 +2117,10 @@ retried, and neither is a connection through
 A reload keeps what is known of each server that the new pools still list,
 as it keeps the counts: its failures, and its ejection from the pools that
 still list it with the same
-.BR max_fails= ", " fail_timeout= " and " eject_time= ;
-a pool whose numbers for it change starts it in service, its failures so far
-counting toward its next ejection. The other options of the new pools apply
+.BR max_fails= ", " fail_timeout= ", " eject_time= " and " slow_start= ,
+and its slow start likewise;
+a pool whose numbers for it change starts it in service (on a slow start, if
+it has one), its failures so far counting toward its next ejection. The other options of the new pools apply
 at once. A server that the reload takes out
 of every pool is remembered only while connections opened before it still use
 that server; once they are gone it is forgotten, and a later reload that

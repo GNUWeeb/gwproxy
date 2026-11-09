@@ -99,6 +99,9 @@ void gwp_up_key_init(struct gwp_up_key *key, enum gwp_up_scheme scheme,
 /* The heaviest weight a pool may give a server (weight=). */
 #define GWP_UP_MAX_WEIGHT	1000u
 
+/* The longest ramp a pool may give a server back in service (slow_start=). */
+#define GWP_UP_MAX_SLOW_START_MS	3600000u
+
 /* The highest cap a pool may put on a server's open pairs (max_conns=). */
 #define GWP_UP_MAX_CONNS	1000000u
 
@@ -124,6 +127,12 @@ struct gwp_up_opts {
 	uint32_t	max_fails;
 	uint32_t	fail_timeout_ms;
 	uint32_t	eject_ms;
+	/*
+	 * How long, up to GWP_UP_MAX_SLOW_START_MS, the server takes to grow
+	 * from next to nothing to its full weight when it comes back into
+	 * service (struct gwp_up_health); 0 for no ramp.
+	 */
+	uint32_t	slow_start_ms;
 };
 
 /* @o set to what a server has when its pool sets nothing. */
@@ -136,6 +145,7 @@ static inline void gwp_up_opts_default(struct gwp_up_opts *o)
 	o->max_fails = GWP_UP_EJECT_FAILS;
 	o->fail_timeout_ms = GWP_UP_EJECT_WINDOW_MS;
 	o->eject_ms = GWP_UP_EJECT_MS;
+	o->slow_start_ms = 0;
 }
 
 struct gwp_up_table;
@@ -185,18 +195,34 @@ struct gwp_up_state {
 };
 
 /*
- * Whether an identity is ejected, for the pools that list it with one set
- * of health settings (max_fails >= 1). Only @eject_end changes once it is
- * made; it is read by every pick that looks at the server.
+ * Whether an identity is ejected, and how far it is in its slow start, for
+ * the pools that list it with one set of health settings (max_fails >= 1
+ * or slow_start_ms >= 1). Only @eject_end and @ramp_end change once it is
+ * made; they are read by every pick that looks at the server, side by side.
+ *
+ * The slow start: when the server comes back into service for these
+ * settings, its weight grows linearly from next to nothing to the full
+ * weight over @slow_ms (gwp_up_health_ramp()), so that it is not handed a
+ * whole share of the new connections at once. It comes back so when an
+ * ejection ends: the ramp is set to run from the end of the ejection when
+ * the ejection is made, so an ejection during a ramp starts it again after
+ * it. And when a pool comes to list it in service with these settings while
+ * no other pool did (gwp_up_health_join()): a reload that adds it, or that
+ * takes it out of down.
  */
 struct gwp_up_health {
 	/* When the ejection ends, 0 while the server is in service. */
 	_Atomic(uint32_t)	eject_end;
+	/* When the slow start ends, 0 when there is none to run. */
+	_Atomic(uint32_t)	ramp_end;
 	uint32_t		max_fails;
 	uint32_t		window_ms;
 	uint32_t		eject_ms;
+	uint32_t		slow_ms;
 	/* Under @st's hlock. */
 	uint32_t		ref;
+	/* Of @ref, those held for pools that list the server in service. */
+	uint32_t		nr_joined;
 	struct gwp_up_state	*st;
 	struct gwp_up_health	*next;		/* in @st's list */
 };
@@ -274,18 +300,57 @@ static inline uint32_t gwp_up_state_give(struct gwp_up_state *s)
 }
 
 /*
- * The ejection state of @s for the settings @o (whose max_fails is at least
- * 1), shared with every other server object of @s's identity listed with the
- * same max_fails, fail_timeout and eject_time, made in service if there is
- * none yet, with a reference taken for the caller; NULL without memory. It
- * is valid while the caller holds both that reference and its reference to
- * @s. Any thread.
+ * The ejection state of @s for the settings @o (whose max_fails or
+ * slow_start_ms is at least 1), shared with every other server object of
+ * @s's identity listed with the same max_fails, fail_timeout, eject_time
+ * and slow_start, made in service (and with no ramp) if there is none yet,
+ * with a reference taken for the caller; NULL without memory. It is valid
+ * while the caller holds both that reference and its reference to @s. Any
+ * thread.
  */
 struct gwp_up_health *gwp_up_health_get(struct gwp_up_state *s,
 					const struct gwp_up_opts *o);
 
 /* Drop a reference gwp_up_health_get() took; NULL is a no-op. Any thread. */
 void gwp_up_health_put(struct gwp_up_health *h);
+
+/*
+ * A pool now lists @h's server in service (not down) with @h's settings:
+ * count it, for as long as that pool lives (gwp_up_health_leave()). When no
+ * pool did before and @now is not 0, the server comes into service for @h
+ * at @now and starts its slow start, if @h has one: returns whether it
+ * did. A first load passes 0, as nothing was in service before it to
+ * protect the newcomer from; a reload its clock. A ramp under way is left
+ * as it is. NULL is a no-op returning false. Any thread.
+ */
+bool gwp_up_health_join(struct gwp_up_health *h, uint32_t now);
+
+/* Undo one gwp_up_health_join(); NULL is a no-op. Any thread. */
+void gwp_up_health_leave(struct gwp_up_health *h);
+
+/* The full weight in gwp_up_health_ramp()'s units. */
+#define GWP_UP_RAMP_ONE		65536u
+
+/*
+ * Whether @h may be in a slow start, without a clock: false means it is
+ * not (never with no @h), true that gwp_up_health_ramp() has to tell.
+ */
+static inline bool gwp_up_health_may_ramp(struct gwp_up_health *h)
+{
+	return h && atomic_load_explicit(&h->ramp_end,
+					 memory_order_relaxed) != 0;
+}
+
+/*
+ * How much of its weight @h's server has at @now, in 1/GWP_UP_RAMP_ONE:
+ * GWP_UP_RAMP_ONE with no slow start running (always with no @h), else
+ * the time the ramp has run over its length, linearly, at least 1 (also
+ * before it starts, while the ejection it follows still runs). A ramp that
+ * has run out by @now is ended here. Any thread, no lock. A ramp nobody
+ * looked at for 2^31 ms or more may read as running again, for at most its
+ * length.
+ */
+uint32_t gwp_up_health_ramp(struct gwp_up_health *h, uint32_t now);
 
 /*
  * Record an upstream-side failure of @s at @now, and decide for each of its
@@ -426,6 +491,14 @@ struct gwp_up_plan {
 struct gwp_up_plan *gwp_up_plan_build(const struct gwp_up_member *m,
 				      uint32_t nr);
 
+/* How a pool chooses among its servers (gwp_up_lb_pick()). */
+enum gwp_up_method {
+	GWP_UP_METHOD_RR		= 0,	/* round-robin, by weight */
+	GWP_UP_METHOD_LEAST_CONN	= 1,	/* the fewest open per weight */
+	GWP_UP_METHOD_RANDOM		= 2,	/* one drawn by weight */
+	GWP_UP_METHOD_RANDOM_TWO	= 3,	/* the fewer open of two drawn */
+};
+
 /*
  * What a pool's choice of a server for a connection (gwp_up_lb_pick())
  * goes by.
@@ -442,8 +515,13 @@ struct gwp_up_pick {
 	 * main tier, all weights equal (plain turns), whatever @m says.
 	 */
 	const struct gwp_up_plan	*plan;
-	bool		least_conn;
-	/* The pool's round-robin cursor for this pick; unused for a retry. */
+	/* enum gwp_up_method. */
+	uint8_t		method;
+	/*
+	 * The pool's round-robin cursor for this pick; unused for a retry,
+	 * and by the random methods, but where they fall back to with no
+	 * @random.
+	 */
 	uint32_t	rr;
 	/*
 	 * For a retry, the server (< @nr) whose attempt failed, never taken
@@ -452,7 +530,8 @@ struct gwp_up_pick {
 	uint32_t	skip;
 	/*
 	 * The monotonic clock in milliseconds, called at most once per pick
-	 * and only when a server it looks at may be ejected.
+	 * and only when a server it looks at may be ejected or in its slow
+	 * start.
 	 */
 	uint32_t	(*now)(void *arg);
 	/*
@@ -463,8 +542,13 @@ struct gwp_up_pick {
 	/*
 	 * A uniformly distributed 32-bit random number, for the probes when
 	 * the server whose turn it is (or where least_conn's ties start) is
-	 * ejected; called at most GWP_UP_PICK_PROBES times per pick, and
-	 * never while that server is in service. NULL: no probes.
+	 * ejected, for the turns of servers in their slow start, and for the
+	 * random methods' draws; called at most GWP_UP_PICK_MAX_RANDOM times
+	 * per tier a pick looks at, and by round-robin and least_conn never
+	 * when the server whose turn it is is in service and in no slow
+	 * start. NULL: no probes, no draws (the random methods then take the
+	 * next server in service from @rr on), and round-robin and the random
+	 * methods give no thought to slow starts.
 	 */
 	uint32_t	(*random)(void *arg);
 	void		*arg;
@@ -476,6 +560,13 @@ struct gwp_up_pick {
  * next in service after it.
  */
 #define GWP_UP_PICK_PROBES	4u
+
+/*
+ * The most random numbers a pick asks for in a tier (gwp_up_pick::random):
+ * a draw and a slow start's chance for each of "random two"'s two draws and
+ * GWP_UP_PICK_PROBES more; round-robin asks for fewer.
+ */
+#define GWP_UP_PICK_MAX_RANDOM	(2u * (GWP_UP_PICK_PROBES + 2u))
 
 /*
  * A small, fast generator for @random (xorshift32): advances *@state, which
@@ -506,32 +597,61 @@ static inline uint32_t gwp_up_rand(uint32_t *state)
  * there may be taken, in its backup tier, in the same way; a server that
  * is down is in neither. Within a tier, in its servers' order (pool order):
  *
- * Round-robin takes the server whose turn the cursor @rr is when it is in
- * service: the tier's server @rr % n when the weights are equal, else the
- * tier's turns by weight (struct gwp_up_tier). With none ejected that is the cursor's server, and
- * the pick reads one server's health only. When it is ejected, the pick
+ * Round-robin (GWP_UP_METHOD_RR) takes the server whose turn the cursor
+ * @rr is when it is in service: the tier's server @rr % n when the weights
+ * are equal, else the tier's turns by weight (struct gwp_up_tier). With
+ * none ejected that is the cursor's server, and the pick reads one
+ * server's health only. When it is ejected, the pick
  * tries up to GWP_UP_PICK_PROBES servers drawn at random (@random; by
  * weight when the weights differ) and takes the first in service, so an
  * ejected server's turns are spread over the rest by their weights, a run
  * of ejected servers' turns too, instead of all going to the server after
  * them; only when every probe misses does it take the next in service
- * from the cursor's server on, in pool order, wrapping.
+ * from the cursor's server on, in pool order, wrapping, preferring one in
+ * no slow start.
  *
- * Least-connections (@least_conn) takes the server in service with the
- * fewest open pairs for its weight (open / weight, compared exactly),
- * among equals the first from the cursor's server on, so the cursor moving
- * on rotates the ties and servers that are equally loaded share the new
- * connections. When the start's server is ejected, the same probes choose
+ * A server in its slow start, with a fraction f of its weight
+ * (gwp_up_health_ramp()), takes a turn, its own or a probe's, only with
+ * the chance f (@random); a turn it lets pass goes on as an ejected
+ * server's does, so a probe lands on a server by its weight scaled by its
+ * ramp, and the server takes about f of its share. Somewhat less when
+ * much of the tier ramps at once: the turns that every probe lets pass,
+ * too, go to the next server in service in no slow start. With no server
+ * in a slow start, this costs one more load of a line the pick reads
+ * anyway.
+ *
+ * Least-connections (GWP_UP_METHOD_LEAST_CONN) takes the server in service
+ * with the fewest open pairs for its weight (open / weight, compared
+ * exactly; a server in its slow start by its weight scaled by its ramp, so
+ * it counts as busier, and takes about f of what it would), among equals
+ * the first from the cursor's server on, so the cursor moving on rotates
+ * the ties and servers that are equally loaded share the new connections. When the start's server is ejected, the same probes choose
  * another start among the servers in service, so among equals an ejected
  * server's turns are spread too; the choice of the fewest stays exact. It
  * reads every server's open count, stopping at the first idle one in
  * service (none can have fewer), and the health only of a server that
  * would be the best so far.
  *
+ * Random (GWP_UP_METHOD_RANDOM) draws a server by weight (@random, as the
+ * probes are drawn) and takes it when it may be taken; "random two"
+ * (GWP_UP_METHOD_RANDOM_TWO) draws two different ones so and takes the one
+ * with fewer open pairs for its weight (compared as least_conn does), the
+ * first among equals. A server in its slow start is taken when drawn with
+ * the chance its ramp has reached, as round-robin offers it a turn, and
+ * compared at its scaled weight. A draw that cannot be taken is made
+ * again, up to GWP_UP_PICK_PROBES extra draws in all; when they run out
+ * with one server drawn, that one is taken, with none, the next in service
+ * from the first one drawn on, in pool order, preferring one in no slow
+ * start, as round-robin's fallback. Neither reads the cursor (the caller
+ * need not advance it), nor more than the two servers drawn while those
+ * may be taken: O(1) for equal weights, the same search as weighted
+ * round-robin's turns otherwise.
+ *
  * A retry (@skip) starts at the server after @skip in its tier instead of
  * the cursor (at the tier's first in another tier): that one when it is in
  * service, else (round-robin) the same probes and then the next in service
- * in pool order (least-connections: the fewest open, ties from there),
+ * in pool order (least-connections: the fewest open, ties from there; the
+ * random methods: their draws, then the next in service from there),
  * never @skip itself.
  *
  * When no server may be taken: for a first pick, the one whose ejection

@@ -169,9 +169,15 @@ struct gwp_upstream {
 	/*
 	 * Whether @state's identity is ejected, for the health settings this
 	 * server was made with (its pool's, or the defaults), held until this
-	 * one is freed; NULL when they never eject it (max_fails=0).
+	 * one is freed; NULL when they never eject it (max_fails=0) and it
+	 * has no slow start.
 	 */
 	struct gwp_up_health	*health;
+	/*
+	 * Whether its pool counts it in service with @health
+	 * (gwp_up_health_join()), until the pool drops it.
+	 */
+	bool			joined;
 };
 
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up);

@@ -4097,6 +4097,40 @@ static const struct gwp_up_opts *up_opts(struct gwp_acl *a, const char *user,
 	return &o;
 }
 
+/* The method directives: none, least_conn, random and random two. */
+static noinline void test_upstream_methods(void)
+{
+	static const struct {
+		const char			*line;
+		enum gwp_acl_pool_method	m;
+	} c[] = {
+		{ "", GWP_ACL_POOL_ROUND_ROBIN },
+		{ " least_conn;\n", GWP_ACL_POOL_LEAST_CONN },
+		{ " random;\n", GWP_ACL_POOL_RANDOM },
+		{ "\trandom ;\n", GWP_ACL_POOL_RANDOM },
+		{ " random two;\n", GWP_ACL_POOL_RANDOM_TWO },
+		{ " random  two ;  # by load\n", GWP_ACL_POOL_RANDOM_TWO },
+	};
+	struct gwp_acl_req req;
+	struct gwp_acl *a;
+	char text[256];
+	size_t i;
+
+	for (i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+		snprintf(text, sizeof(text),
+			 "upstream p {\n server http://h:1;\n%s"
+			 " server http://h:2 weight=2;\n}\n"
+			 "-A OUTPUT -j UPSTREAM --to p\n", c[i].line);
+		assert(!gwp_acl_parse_str(&a, text));
+		assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+		assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+		assert(gwp_acl_pool_method(req.upstream_pool) == c[i].m);
+		assert(gwp_acl_pool_nr_servers(req.upstream_pool) == 2);
+		gwp_acl_req_release(&req);
+		gwp_acl_destroy(a);
+	}
+}
+
 /*
  * The options after a pool server's URL: the defaults where none is given,
  * the times in any unit, each option on its own.
@@ -4119,10 +4153,14 @@ static noinline void test_upstream_server_opts(void)
 		"	server socks5h://10.0.0.9:1080 max_conns=1000000;\n"
 		"	server socks5h://10.0.0.10:1080 backup weight=2;\n"
 		"	server socks5h://10.0.0.11:1080 down;\n"
+		"	server socks5h://10.0.0.12:1080 slow_start=30s weight=4;\n"
+		"	server socks5h://10.0.0.13:1080 max_fails=0 slow_start=1h;\n"
+		"	server socks5h://10.0.0.14:1080 slow_start=0;\n"
+		"	server socks5h://10.0.0.15:1080 slow_start=1500ms backup;\n"
 		"}\n"
 		"-A OUTPUT -j UPSTREAM --to p\n"));
 	o = up_opts(a, NULL, 0);
-	assert(o->weight == 1);
+	assert(o->weight == 1 && !o->slow_start_ms);
 	assert(o->max_fails == GWP_UP_EJECT_FAILS &&
 	       o->fail_timeout_ms == GWP_UP_EJECT_WINDOW_MS &&
 	       o->eject_ms == GWP_UP_EJECT_MS);
@@ -4150,6 +4188,15 @@ static noinline void test_upstream_server_opts(void)
 	assert(o->backup && !o->down && o->weight == 2);
 	o = up_opts(a, NULL, 10);
 	assert(!o->backup && o->down);
+	o = up_opts(a, NULL, 11);
+	assert(o->slow_start_ms == 30000 && o->weight == 4 &&
+	       o->max_fails == 3);
+	o = up_opts(a, NULL, 12);
+	assert(o->slow_start_ms == 3600000 && !o->max_fails);
+	o = up_opts(a, NULL, 13);
+	assert(!o->slow_start_ms);
+	o = up_opts(a, NULL, 14);
+	assert(o->slow_start_ms == 1500 && o->backup);
 	gwp_acl_destroy(a);
 
 	/* Wrong ones refuse the load, naming the server and the option. */
@@ -4205,6 +4252,18 @@ static noinline void test_upstream_server_opts(void)
 		   -EINVAL, "eject_time= wants a time");
 	up_refused("upstream p {\n server http://h:1 eject_time=1.5s;\n}\n",
 		   -EINVAL, "eject_time= wants a time");
+	up_refused("upstream p {\n server http://h:1 slow_start=61m;\n}\n",
+		   -EINVAL, "server 1: slow_start= wants a time from 0 to 1h (a number");
+	up_refused("upstream p {\n server http://h:1 slow_start=3600001ms;\n}\n",
+		   -EINVAL, "slow_start= wants a time from 0 to 1h");
+	up_refused("upstream p {\n server http://h:1 slow_start=;\n}\n",
+		   -EINVAL, "slow_start= wants a time");
+	up_refused("upstream p {\n server http://h:1 slow_start=-1s;\n}\n",
+		   -EINVAL, "slow_start= wants a time");
+	up_refused("upstream p {\n server http://h:1 slow_start=10s slow_start=10s;\n}\n",
+		   -EINVAL, "slow_start= given twice");
+	up_refused("upstream p {\n server http://h:1 slow_start;\n}\n",
+		   -EINVAL, "word 1 after the URL is not an option (expected weight=, max_conns=, max_fails=, fail_timeout=, eject_time=, slow_start=, backup or down)");
 	/* The ';' ends the directive: after the URL, nothing may follow. */
 	up_refused("upstream p {\n server http://h:1; max_fails=1;\n}\n",
 		   -EINVAL, "expected \"server URL [OPTION ...];\"");
@@ -4303,7 +4362,24 @@ static noinline void test_upstream_errors(void)
 		   "\"}\" must stand alone on its line");
 	up_refused("upstream p {\n server http://h;\n least_conn;\n"
 		   " least_conn;\n}\n", -EINVAL,
-		   "line 4: least_conn given twice");
+		   "line 4: least_conn given in upstream pool p, which has its method already (least_conn, random or random two: one at most)");
+	up_refused("upstream p {\n server http://h;\n random;\n"
+		   " least_conn;\n}\n", -EINVAL,
+		   "line 4: least_conn given in upstream pool p, which has its method already");
+	up_refused("upstream p {\n least_conn;\n server http://h;\n"
+		   " random two;\n}\n", -EINVAL,
+		   "line 4: random two given in upstream pool p, which has its method");
+	up_refused("upstream p {\n server http://h;\n random two;\n"
+		   " random;\n}\n", -EINVAL,
+		   "line 4: random given in upstream pool p, which has its method");
+	up_refused("upstream p {\n server http://h;\n random three;\n}\n",
+		   -EINVAL, "line 3: expected \"random;\" or \"random two;\"");
+	up_refused("upstream p {\n server http://h;\n random two two;\n}\n",
+		   -EINVAL, "expected \"random;\" or \"random two;\"");
+	up_refused("upstream p {\n server http://h;\n random two\n}\n",
+		   -EINVAL, "missing ';' at the end of the directive");
+	up_refused("upstream p {\n server http://h;\n randomly;\n}\n",
+		   -EINVAL, "unknown directive in upstream pool p (expected server, least_conn, random or \"}\")");
 	up_refused("upstream p {\n server http://h;\n least_conn x;\n}\n",
 		   -EINVAL, "expected \"least_conn;\"");
 	up_refused("upstream p {\n server http://h\n}\n", -EINVAL,
@@ -4539,6 +4615,7 @@ static void run_tests(void)
 	test_include_dirs();
 	test_upstream_errors();
 	test_upstream_server_opts();
+	test_upstream_methods();
 	test_upstream_pool_https();
 	test_upstream_index();
 	test_upstream_include();

@@ -2973,14 +2973,32 @@ static const char *up_desc(const struct gwp_acl_pool *pool, uint32_t idx,
 	return buf;
 }
 
-/* Log that @up, the @idx-th server of @pool (or the default), is back. */
+/* @ms for a log line: in seconds when it is whole seconds. */
+static const char *up_ms_str(uint32_t ms, char *buf, size_t size)
+{
+	if (ms % 1000)
+		snprintf(buf, size, "%u ms", ms);
+	else
+		snprintf(buf, size, "%u s", ms / 1000);
+	return buf;
+}
+
+/*
+ * Log that @up, the @idx-th server of @pool (or the default), is back, and
+ * on what slow start.
+ */
 static void up_back(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
 		    uint32_t idx, struct gwp_upstream *up)
 {
-	char desc[320];
+	char desc[320], ss[24];
 
-	pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
-		up_desc(pool, idx, up, desc, sizeof(desc)));
+	if (up->health && up->health->slow_ms)
+		pr_info(&ctx->lh, "Upstream %s is back in service after its ejection, on a slow start of %s",
+			up_desc(pool, idx, up, desc, sizeof(desc)),
+			up_ms_str(up->health->slow_ms, ss, sizeof(ss)));
+	else
+		pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
+			up_desc(pool, idx, up, desc, sizeof(desc)));
 }
 
 /*
@@ -3060,25 +3078,29 @@ static void pool_pick_back(void *arg, uint32_t i)
  * Which of @pool's servers (from 0) a pair goes to, by the pool's method:
  * round-robin, the default, takes them in turn (as many turns each as its
  * weight=); least_conn the one with the fewest open pairs for its weight,
- * ties in round-robin order. Both turn on the
- * pool's cursor, shared by all workers, and least_conn reads the counts
- * all workers keep (struct gwp_up_state), which carry across reloads.
- * Workers picking at the same time may see the same counts and choose the
- * same server; the next picks see the result, which is close enough.
+ * ties in round-robin order; random one drawn by weight, and random two
+ * the one with fewer open pairs for its weight of two drawn so. The first
+ * two turn on the pool's cursor, shared by all workers; the random ones
+ * leave it alone, one line less that every worker writes. least_conn and
+ * random two read the counts all workers keep (struct gwp_up_state), which
+ * carry across reloads. Workers picking at the same time may see the same
+ * counts and choose the same server; the next picks see the result, which
+ * is close enough.
  *
  * Only servers in service are taken: not ejected, not full (max_conns=),
  * not down, and a backup only when no other server may be taken; with all
  * of them out, the one back soonest that is not full. With @skip, the server of @skip's place whose attempt
  * failed, it is a retry: another server in service, the next one after
- * @skip in pool order (least_conn: the fewest open, ties from there), or
+ * @skip in pool order (least_conn: the fewest open, ties from there; the
+ * random ones: drawn as usual, never @skip), or
  * UINT32_MAX for none; a retry leaves the cursor alone, so the pool's
  * turns go on as if the failed pick had worked.
  *
  * The pick reads the states in place, through the pool's members (see
  * acl_srv_member()), with no copy: round-robin looks at the cursor's
  * server, and only when it is ejected at a few random ones and then the
- * next ones in turn; least_conn scans
- * the open counts of the whole pool (see gwp_up_lb_pick()). UINT32_MAX,
+ * next ones in turn; the random ones at the servers they draw; least_conn
+ * scans the open counts of the whole pool (see gwp_up_lb_pick()). UINT32_MAX,
  * when the pool has no server object at all, is a bug conn_pick_upstream()
  * reports.
  */
@@ -3090,8 +3112,7 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 		.m = gwp_acl_pool_members(pool),
 		.plan = gwp_acl_pool_plan(pool),
 		.nr = gwp_acl_pool_nr_servers(pool),
-		.least_conn = gwp_acl_pool_method(pool) ==
-			      GWP_ACL_POOL_LEAST_CONN,
+		.method = (uint8_t)gwp_acl_pool_method(pool),
 		.skip = skip,
 		.now = pool_pick_now,
 		.back = pool_pick_back,
@@ -3101,7 +3122,9 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 
 	if (unlikely(!pk.m))
 		return UINT32_MAX;
-	if (skip == UINT32_MAX)
+	/* The random methods draw: no cursor, so no line shared to write. */
+	if (skip == UINT32_MAX && pk.method != GWP_UP_METHOD_RANDOM &&
+	    pk.method != GWP_UP_METHOD_RANDOM_TWO)
 		pk.rr = gwp_acl_pool_next(pool);
 	return gwp_up_lb_pick(&pk);
 }
@@ -4018,7 +4041,7 @@ static int upstream_attach_state(struct gwp_ctx *ctx, struct gwp_upstream *up,
 	explicit_bzero(&key, sizeof(key));
 	if (!up->state)
 		return -ENOMEM;
-	if (!o->max_fails)
+	if (!o->max_fails && !o->slow_start_ms)
 		return 0;
 	up->health = gwp_up_health_get(up->state, o);
 	if (up->health)
@@ -4244,6 +4267,27 @@ static int acl_srv_make(void *arg, const char *url,
 		free(up);
 		return r;
 	}
+	/*
+	 * In service in this pool: a reload (an ACL is in place already)
+	 * that brings the server into service for its settings starts its
+	 * slow start, unless another pool already has it in service.
+	 */
+	if (!opts->down && up->health && up->health->slow_ms) {
+		uint32_t now = 0;
+		char ss[24];
+
+		/* 0 says a first load. */
+		if (ctx->acl) {
+			now = (uint32_t)gwp_now_ms();
+			if (!now)
+				now = 1;
+		}
+		if (gwp_up_health_join(up->health, now))
+			pr_info(&ctx->lh, "Upstream %s comes into service on a slow start of %s",
+				ip_to_str(&up->addr),
+				up_ms_str(up->health->slow_ms, ss, sizeof(ss)));
+		up->joined = true;
+	}
 	atomic_init(&up->refcnt, 1);
 	up->live = &ctx->nr_acl_srv;
 	atomic_fetch_add_explicit(&ctx->nr_acl_srv, 1, memory_order_relaxed);
@@ -4251,9 +4295,14 @@ static int acl_srv_make(void *arg, const char *url,
 	return 0;
 }
 
+/* The pool's reference: it no longer lists the server once it is freed. */
 static void acl_srv_put(void __unused *arg, void *srv)
 {
-	gwp_upstream_put(srv);
+	struct gwp_upstream *up = srv;
+
+	if (up->joined)
+		gwp_up_health_leave(up->health);
+	gwp_upstream_put(up);
 }
 
 /*
@@ -4327,16 +4376,6 @@ static enum gwp_upstream_end upstream_end_of(struct gwp_conn_pair *gcp,
 	    (err == -ECONNRESET || err == -EPIPE || err == -ECONNABORTED))
 		return GWP_UPSTREAM_END_HUP;
 	return GWP_UPSTREAM_END_CONNECT;
-}
-
-/* @ms for a log line: in seconds when it is whole seconds. */
-static const char *up_ms_str(uint32_t ms, char *buf, size_t size)
-{
-	if (ms % 1000)
-		snprintf(buf, size, "%u ms", ms);
-	else
-		snprintf(buf, size, "%u s", ms / 1000);
-	return buf;
 }
 
 /* What up_ejected_other() is told. */
