@@ -200,8 +200,9 @@ Close an established tunnel, or a SOCKS5 UDP association, once no data has
 moved in either direction for this many seconds. Any traffic restarts the
 count, so a tunnel that keeps moving data is never closed, however long it
 lives; a UDP association counts as active while datagrams go either way.
-The check runs on a coarse per\-worker clock, so a pair can outlive the timeout
-by up to about a second.
+The check runs on a coarse per\-worker clock, compares whole seconds and runs
+about once a second, so a pair can outlive the timeout by up to about two
+seconds.
 .B 0
 (or a negative value) never closes an idle connection, which keeps long quiet
 tunnels such as SSH sessions working. Default:
