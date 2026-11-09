@@ -2973,14 +2973,32 @@ static const char *up_desc(const struct gwp_acl_pool *pool, uint32_t idx,
 	return buf;
 }
 
-/* Log that @up, the @idx-th server of @pool (or the default), is back. */
+/* @ms for a log line: in seconds when it is whole seconds. */
+static const char *up_ms_str(uint32_t ms, char *buf, size_t size)
+{
+	if (ms % 1000)
+		snprintf(buf, size, "%u ms", ms);
+	else
+		snprintf(buf, size, "%u s", ms / 1000);
+	return buf;
+}
+
+/*
+ * Log that @up, the @idx-th server of @pool (or the default), is back, and
+ * on what slow start.
+ */
 static void up_back(struct gwp_ctx *ctx, const struct gwp_acl_pool *pool,
 		    uint32_t idx, struct gwp_upstream *up)
 {
-	char desc[320];
+	char desc[320], ss[24];
 
-	pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
-		up_desc(pool, idx, up, desc, sizeof(desc)));
+	if (up->health && up->health->slow_ms)
+		pr_info(&ctx->lh, "Upstream %s is back in service after its ejection, on a slow start of %s",
+			up_desc(pool, idx, up, desc, sizeof(desc)),
+			up_ms_str(up->health->slow_ms, ss, sizeof(ss)));
+	else
+		pr_info(&ctx->lh, "Upstream %s is back in service after its ejection",
+			up_desc(pool, idx, up, desc, sizeof(desc)));
 }
 
 /*
@@ -4018,7 +4036,7 @@ static int upstream_attach_state(struct gwp_ctx *ctx, struct gwp_upstream *up,
 	explicit_bzero(&key, sizeof(key));
 	if (!up->state)
 		return -ENOMEM;
-	if (!o->max_fails)
+	if (!o->max_fails && !o->slow_start_ms)
 		return 0;
 	up->health = gwp_up_health_get(up->state, o);
 	if (up->health)
@@ -4244,6 +4262,27 @@ static int acl_srv_make(void *arg, const char *url,
 		free(up);
 		return r;
 	}
+	/*
+	 * In service in this pool: a reload (an ACL is in place already)
+	 * that brings the server into service for its settings starts its
+	 * slow start, unless another pool already has it in service.
+	 */
+	if (!opts->down && up->health && up->health->slow_ms) {
+		uint32_t now = 0;
+		char ss[24];
+
+		/* 0 says a first load. */
+		if (ctx->acl) {
+			now = (uint32_t)gwp_now_ms();
+			if (!now)
+				now = 1;
+		}
+		if (gwp_up_health_join(up->health, now))
+			pr_info(&ctx->lh, "Upstream %s comes into service on a slow start of %s",
+				ip_to_str(&up->addr),
+				up_ms_str(up->health->slow_ms, ss, sizeof(ss)));
+		up->joined = true;
+	}
 	atomic_init(&up->refcnt, 1);
 	up->live = &ctx->nr_acl_srv;
 	atomic_fetch_add_explicit(&ctx->nr_acl_srv, 1, memory_order_relaxed);
@@ -4251,9 +4290,14 @@ static int acl_srv_make(void *arg, const char *url,
 	return 0;
 }
 
+/* The pool's reference: it no longer lists the server once it is freed. */
 static void acl_srv_put(void __unused *arg, void *srv)
 {
-	gwp_upstream_put(srv);
+	struct gwp_upstream *up = srv;
+
+	if (up->joined)
+		gwp_up_health_leave(up->health);
+	gwp_upstream_put(up);
 }
 
 /*
@@ -4327,16 +4371,6 @@ static enum gwp_upstream_end upstream_end_of(struct gwp_conn_pair *gcp,
 	    (err == -ECONNRESET || err == -EPIPE || err == -ECONNABORTED))
 		return GWP_UPSTREAM_END_HUP;
 	return GWP_UPSTREAM_END_CONNECT;
-}
-
-/* @ms for a log line: in seconds when it is whole seconds. */
-static const char *up_ms_str(uint32_t ms, char *buf, size_t size)
-{
-	if (ms % 1000)
-		snprintf(buf, size, "%u ms", ms);
-	else
-		snprintf(buf, size, "%u s", ms / 1000);
-	return buf;
 }
 
 /* What up_ejected_other() is told. */

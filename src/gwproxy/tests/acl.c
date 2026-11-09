@@ -4119,10 +4119,14 @@ static noinline void test_upstream_server_opts(void)
 		"	server socks5h://10.0.0.9:1080 max_conns=1000000;\n"
 		"	server socks5h://10.0.0.10:1080 backup weight=2;\n"
 		"	server socks5h://10.0.0.11:1080 down;\n"
+		"	server socks5h://10.0.0.12:1080 slow_start=30s weight=4;\n"
+		"	server socks5h://10.0.0.13:1080 max_fails=0 slow_start=1h;\n"
+		"	server socks5h://10.0.0.14:1080 slow_start=0;\n"
+		"	server socks5h://10.0.0.15:1080 slow_start=1500ms backup;\n"
 		"}\n"
 		"-A OUTPUT -j UPSTREAM --to p\n"));
 	o = up_opts(a, NULL, 0);
-	assert(o->weight == 1);
+	assert(o->weight == 1 && !o->slow_start_ms);
 	assert(o->max_fails == GWP_UP_EJECT_FAILS &&
 	       o->fail_timeout_ms == GWP_UP_EJECT_WINDOW_MS &&
 	       o->eject_ms == GWP_UP_EJECT_MS);
@@ -4150,6 +4154,15 @@ static noinline void test_upstream_server_opts(void)
 	assert(o->backup && !o->down && o->weight == 2);
 	o = up_opts(a, NULL, 10);
 	assert(!o->backup && o->down);
+	o = up_opts(a, NULL, 11);
+	assert(o->slow_start_ms == 30000 && o->weight == 4 &&
+	       o->max_fails == 3);
+	o = up_opts(a, NULL, 12);
+	assert(o->slow_start_ms == 3600000 && !o->max_fails);
+	o = up_opts(a, NULL, 13);
+	assert(!o->slow_start_ms);
+	o = up_opts(a, NULL, 14);
+	assert(o->slow_start_ms == 1500 && o->backup);
 	gwp_acl_destroy(a);
 
 	/* Wrong ones refuse the load, naming the server and the option. */
@@ -4205,6 +4218,18 @@ static noinline void test_upstream_server_opts(void)
 		   -EINVAL, "eject_time= wants a time");
 	up_refused("upstream p {\n server http://h:1 eject_time=1.5s;\n}\n",
 		   -EINVAL, "eject_time= wants a time");
+	up_refused("upstream p {\n server http://h:1 slow_start=61m;\n}\n",
+		   -EINVAL, "server 1: slow_start= wants a time from 0 to 1h (a number");
+	up_refused("upstream p {\n server http://h:1 slow_start=3600001ms;\n}\n",
+		   -EINVAL, "slow_start= wants a time from 0 to 1h");
+	up_refused("upstream p {\n server http://h:1 slow_start=;\n}\n",
+		   -EINVAL, "slow_start= wants a time");
+	up_refused("upstream p {\n server http://h:1 slow_start=-1s;\n}\n",
+		   -EINVAL, "slow_start= wants a time");
+	up_refused("upstream p {\n server http://h:1 slow_start=10s slow_start=10s;\n}\n",
+		   -EINVAL, "slow_start= given twice");
+	up_refused("upstream p {\n server http://h:1 slow_start;\n}\n",
+		   -EINVAL, "word 1 after the URL is not an option (expected weight=, max_conns=, max_fails=, fail_timeout=, eject_time=, slow_start=, backup or down)");
 	/* The ';' ends the directive: after the URL, nothing may follow. */
 	up_refused("upstream p {\n server http://h:1; max_fails=1;\n}\n",
 		   -EINVAL, "expected \"server URL [OPTION ...];\"");

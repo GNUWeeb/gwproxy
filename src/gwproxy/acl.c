@@ -1545,7 +1545,7 @@ static int directive_words(char **tok, int n)
  */
 enum srv_opt_kind {
 	SRV_OPT_COUNT,		/* a number, from @min to @max */
-	SRV_OPT_TIME,		/* a time, from 1 ms to GWP_UP_MAX_TIME_MS */
+	SRV_OPT_TIME,		/* a time in ms, from @min to @max */
 	SRV_OPT_FLAG,		/* a name alone: a bool set */
 };
 
@@ -1554,24 +1554,30 @@ struct srv_opt {
 	uint8_t		kind;		/* enum srv_opt_kind */
 	uint32_t	min, max;
 	size_t		off;		/* of its value in struct gwp_up_opts */
+	/* A time's @min and @max, as a message shows them. */
+	const char	*range;
 };
 
 static const struct srv_opt srv_opts[] = {
 	{ "weight=", SRV_OPT_COUNT, 1, GWP_UP_MAX_WEIGHT,
-	  offsetof(struct gwp_up_opts, weight) },
+	  offsetof(struct gwp_up_opts, weight), NULL },
 	{ "max_conns=", SRV_OPT_COUNT, 0, GWP_UP_MAX_CONNS,
-	  offsetof(struct gwp_up_opts, max_conns) },
+	  offsetof(struct gwp_up_opts, max_conns), NULL },
 	{ "max_fails=", SRV_OPT_COUNT, 0, GWP_UP_MAX_FAILS,
-	  offsetof(struct gwp_up_opts, max_fails) },
+	  offsetof(struct gwp_up_opts, max_fails), NULL },
 	{ "fail_timeout=", SRV_OPT_TIME, 1, GWP_UP_MAX_TIME_MS,
-	  offsetof(struct gwp_up_opts, fail_timeout_ms) },
+	  offsetof(struct gwp_up_opts, fail_timeout_ms), "1ms to 24h" },
 	{ "eject_time=", SRV_OPT_TIME, 1, GWP_UP_MAX_TIME_MS,
-	  offsetof(struct gwp_up_opts, eject_ms) },
-	{ "backup", SRV_OPT_FLAG, 0, 0, offsetof(struct gwp_up_opts, backup) },
-	{ "down", SRV_OPT_FLAG, 0, 0, offsetof(struct gwp_up_opts, down) },
+	  offsetof(struct gwp_up_opts, eject_ms), "1ms to 24h" },
+	{ "slow_start=", SRV_OPT_TIME, 0, GWP_UP_MAX_SLOW_START_MS,
+	  offsetof(struct gwp_up_opts, slow_start_ms), "0 to 1h" },
+	{ "backup", SRV_OPT_FLAG, 0, 0,
+	  offsetof(struct gwp_up_opts, backup), NULL },
+	{ "down", SRV_OPT_FLAG, 0, 0,
+	  offsetof(struct gwp_up_opts, down), NULL },
 };
 
-#define SRV_OPTS_LIST	"weight=, max_conns=, max_fails=, fail_timeout=, eject_time=, backup or down"
+#define SRV_OPTS_LIST	"weight=, max_conns=, max_fails=, fail_timeout=, eject_time=, slow_start=, backup or down"
 
 /*
  * A number of at most 10 digits, nothing else, into *@out; false when @s is
@@ -1666,8 +1672,9 @@ static int parse_server_opts(struct acl_load *ld, char **tok, int n,
 					    &v);
 		if (!ok || v < so->min || v > so->max) {
 			if (so->kind == SRV_OPT_TIME)
-				return load_err(ld, "upstream pool %s server %u: %s wants a time from 1ms to 24h (a number, then ms, s, m or h; seconds without one)",
-						p->name, idx, so->name);
+				return load_err(ld, "upstream pool %s server %u: %s wants a time from %s (a number, then ms, s, m or h; seconds without one)",
+						p->name, idx, so->name,
+						so->range);
 			return load_err(ld, "upstream pool %s server %u: %s wants a number from %u to %u",
 					p->name, idx, so->name, so->min,
 					so->max);
