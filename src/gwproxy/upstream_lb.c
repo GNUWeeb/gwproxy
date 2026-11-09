@@ -271,7 +271,8 @@ struct gwp_up_health *gwp_up_health_get(struct gwp_up_state *s,
 	for (h = s->health; h; h = h->next) {
 		if (h->max_fails == o->max_fails &&
 		    h->window_ms == o->fail_timeout_ms &&
-		    h->eject_ms == o->eject_ms) {
+		    h->eject_ms == o->eject_ms &&
+		    h->slow_ms == o->slow_start_ms) {
 			h->ref++;
 			goto out;
 		}
@@ -283,9 +284,11 @@ struct gwp_up_health *gwp_up_health_get(struct gwp_up_state *s,
 	if (!h)
 		goto out;
 	atomic_init(&h->eject_end, 0);
+	atomic_init(&h->ramp_end, 0);
 	h->max_fails = o->max_fails;
 	h->window_ms = o->fail_timeout_ms;
 	h->eject_ms = o->eject_ms;
+	h->slow_ms = o->slow_start_ms;
 	h->ref = 1;
 	h->st = s;
 	h->next = s->health;
@@ -315,17 +318,71 @@ void gwp_up_health_put(struct gwp_up_health *h)
 	free(h);
 }
 
+bool gwp_up_health_join(struct gwp_up_health *h, uint32_t now)
+{
+	bool ramp = false;
+	uint32_t end;
+
+	if (!h)
+		return false;
+	pthread_mutex_lock(&h->st->hlock);
+	end = atomic_load(&h->ramp_end);
+	if (!h->nr_joined++ && now && h->slow_ms &&
+	    (!end || ms_after(end, now) <= 0)) {
+		atomic_store(&h->ramp_end, stamp(now + h->slow_ms));
+		ramp = true;
+	}
+	pthread_mutex_unlock(&h->st->hlock);
+	return ramp;
+}
+
+void gwp_up_health_leave(struct gwp_up_health *h)
+{
+	if (!h)
+		return;
+	pthread_mutex_lock(&h->st->hlock);
+	if (h->nr_joined)
+		h->nr_joined--;
+	pthread_mutex_unlock(&h->st->hlock);
+}
+
+uint32_t gwp_up_health_ramp(struct gwp_up_health *h, uint32_t now)
+{
+	uint32_t end, f;
+	int32_t left;
+
+	if (!h)
+		return GWP_UP_RAMP_ONE;
+	end = atomic_load_explicit(&h->ramp_end, memory_order_relaxed);
+	if (!end)
+		return GWP_UP_RAMP_ONE;
+	left = ms_after(end, now);
+	if (left <= 0) {
+		/* Over; a new ramp set meanwhile stays. */
+		atomic_compare_exchange_strong(&h->ramp_end, &end, 0);
+		return GWP_UP_RAMP_ONE;
+	}
+	/* Not started yet: the ejection before it still runs. */
+	if ((uint32_t)left >= h->slow_ms)
+		return 1;
+	f = (uint32_t)(((uint64_t)(h->slow_ms - (uint32_t)left) *
+			GWP_UP_RAMP_ONE) / h->slow_ms);
+	return f ? f : 1;
+}
+
 /*
  * Whether the failure just recorded in @s, at @now, ejects the server for
  * @h: its last max_fails failures all fall within its window, and it was in
- * service. Under @s's hlock.
+ * service. Under @s's hlock. An ejection sets the slow start that follows
+ * it, from its end, replacing one under way.
  */
 static bool health_fail(struct gwp_up_state *s, struct gwp_up_health *h,
 			uint32_t now)
 {
 	uint32_t t, end, i;
 
-	if (s->fail_nr < h->max_fails)
+	/* Never ejected: kept for its slow start only. */
+	if (!h->max_fails || s->fail_nr < h->max_fails)
 		return false;
 	for (i = 1; i <= h->max_fails; i++) {
 		t = s->fail_at[(s->fail_next + s->fail_cap - i) % s->fail_cap];
@@ -341,6 +398,9 @@ static bool health_fail(struct gwp_up_state *s, struct gwp_up_health *h,
 			return false;	/* ejected already */
 	} while (!atomic_compare_exchange_weak(&h->eject_end, &end,
 					       stamp(now + h->eject_ms)));
+	if (h->slow_ms)
+		atomic_store(&h->ramp_end,
+			     stamp(now + h->eject_ms + h->slow_ms));
 	return true;
 }
 
@@ -595,6 +655,16 @@ struct pick {
 	bool				have_now;
 };
 
+/* The clock, read on the pick's first call. */
+static uint32_t pick_now(struct pick *c)
+{
+	if (!c->have_now) {
+		c->now = c->pk->now(c->pk->arg);
+		c->have_now = true;
+	}
+	return c->now;
+}
+
 /*
  * How long the ejection of the @i-th server still runs, 0 while it is in
  * service; reads the clock only for a server that may be ejected.
@@ -608,11 +678,7 @@ static uint32_t pick_ejected(struct pick *c, uint32_t i)
 
 	if (!gwp_up_health_may_be_ejected(h))
 		return 0;
-	if (!c->have_now) {
-		c->now = pk->now(pk->arg);
-		c->have_now = true;
-	}
-	left = gwp_up_health_ejected(h, c->now, &back);
+	left = gwp_up_health_ejected(h, pick_now(c), &back);
 	if (back && pk->back)
 		pk->back(pk->arg, i);
 	return left;
@@ -628,25 +694,100 @@ static bool pick_usable(struct pick *c, uint32_t i)
 }
 
 /*
- * The pick among the servers of the tier @t, from its position @p on (see
- * gwp_up_lb_pick()): the place in the pool of the one taken, or
- * UINT32_MAX when none may be.
+ * How much of its weight the @i-th server has now (gwp_up_health_ramp()),
+ * GWP_UP_RAMP_ONE out of its slow start; reads the clock only for a server
+ * that may be in one.
  */
-static uint32_t pick_tier(struct pick *c, const struct gwp_up_tier *t,
+static uint32_t pick_ramp(struct pick *c, uint32_t i)
+{
+	struct gwp_up_health *h = c->pk->m[i].h;
+
+	if (!gwp_up_health_may_ramp(h))
+		return GWP_UP_RAMP_ONE;
+	return gwp_up_health_ramp(h, pick_now(c));
+}
+
+/*
+ * Whether the @i-th server, which may be taken, takes the turn it was
+ * offered: always out of its slow start (and with no @random), else with
+ * the chance its ramp has reached.
+ */
+static bool pick_turn_taken(struct pick *c, uint32_t i)
+{
+	const struct gwp_up_pick *pk = c->pk;
+	uint32_t f = pick_ramp(c, i);
+
+	if (f >= GWP_UP_RAMP_ONE || !pk->random)
+		return true;
+	return (pk->random(pk->arg) >> 16) < f;
+}
+
+/*
+ * The first server of the tier @t that may be taken, from its position @p
+ * on in pool order, wrapping, one in no slow start before one in a slow
+ * start; or UINT32_MAX.
+ */
+static uint32_t pick_next(struct pick *c, const struct gwp_up_tier *t,
 			  uint32_t p)
 {
 	const struct gwp_up_pick *pk = c->pk;
+	uint32_t ramping = UINT32_MAX, i, k;
+
+	for (k = 0; k < t->n; k++, p = p + 1 < t->n ? p + 1 : 0) {
+		i = tier_member(t, p);
+		if (i == pk->skip || !pk->m[i].st || pick_full(pk, i) ||
+		    pick_ejected(c, i))
+			continue;
+		if (pick_ramp(c, i) >= GWP_UP_RAMP_ONE)
+			return i;
+		if (ramping == UINT32_MAX)
+			ramping = i;
+	}
+	return ramping;
+}
+
+/*
+ * Round-robin among the servers of the tier @t, the turn at its position
+ * @p (see gwp_up_lb_pick()): the place in the pool of the one taken, or
+ * UINT32_MAX when none may be. A server whose turn it is takes it when it
+ * may be taken and is not in a slow start that lets it pass; else up to
+ * GWP_UP_PICK_PROBES random ones are offered it in the same way, so its
+ * turns are spread by weight; else the next one in service.
+ */
+static uint32_t pick_rr(struct pick *c, const struct gwp_up_tier *t,
+			uint32_t p)
+{
+	const struct gwp_up_pick *pk = c->pk;
+	uint32_t i = tier_member(t, p), q;
+
+	if (pick_usable(c, i) && pick_turn_taken(c, i))
+		return i;
+	for (q = 0; pk->random && q < GWP_UP_PICK_PROBES; q++) {
+		i = tier_member(t, tier_drawn(t, pk->random(pk->arg)));
+		if (pick_usable(c, i) && pick_turn_taken(c, i))
+			return i;
+	}
+	return pick_next(c, t, p);
+}
+
+/*
+ * Least-connections among the servers of the tier @t, ties from its
+ * position @p on (see gwp_up_lb_pick()): the place in the pool of the one
+ * taken, or UINT32_MAX when none may be.
+ */
+static uint32_t pick_lc(struct pick *c, const struct gwp_up_tier *t,
+			uint32_t p)
+{
+	const struct gwp_up_pick *pk = c->pk;
 	uint32_t n = t->n, best = UINT32_MAX, best_val = UINT32_MAX;
-	uint32_t best_w = 1, i, k, v, w;
+	uint32_t best_w = 1, i, k, v, w, f;
 	bool weighted = t->total != 0;
 	const struct gwp_up_member *m;
 
 	/*
-	 * The start's server is the pick (round-robin) or where the ties
-	 * start (least_conn). When it cannot be taken, a random one in
-	 * service replaces it, if a probe finds one, so its turns are
-	 * spread; else round-robin takes the next in service, and
-	 * least_conn's ties start where they would have.
+	 * Where the ties start. When that server cannot be taken, a random
+	 * one in service takes its place, if a probe finds one, so its turns
+	 * are spread; else the ties start where they would have.
 	 */
 	if (!pick_usable(c, tier_member(t, p))) {
 		uint32_t q, j;
@@ -659,29 +800,34 @@ static uint32_t pick_tier(struct pick *c, const struct gwp_up_tier *t,
 			}
 		}
 	}
-	if (!pk->least_conn) {
-		i = tier_member(t, p);
-		if (pick_usable(c, i))
-			return i;
-	}
 
+	/*
+	 * The weights compared are scaled by GWP_UP_RAMP_ONE, and by the
+	 * ramp of a server in its slow start: at most 1000 * 2^16, which
+	 * times a count of 2^32 at most fits in 64 bits.
+	 */
 	for (k = 0; k < n; k++, p = p + 1 < n ? p + 1 : 0) {
 		i = tier_member(t, p);
 		m = &pk->m[i];
 		if (i == pk->skip || !m->st)
 			continue;
-		if (!pk->least_conn) {
-			if (!pick_full(pk, i) && !pick_ejected(c, i))
-				return i;
-			continue;
-		}
-		/* Not fewer than the best so far: its health does not matter. */
+		/*
+		 * Not fewer than the best so far at its full weight: neither
+		 * at less, and its health does not matter.
+		 */
 		v = gwp_up_state_open(m->st);
-		w = weighted ? member_weight(m) : 1;
+		w = (weighted ? member_weight(m) : 1) * GWP_UP_RAMP_ONE;
 		if ((m->max_conns && v >= m->max_conns) ||
 		    (best != UINT32_MAX && !fewer_open(v, w, best_val, best_w)) ||
 		    pick_ejected(c, i))
 			continue;
+		f = pick_ramp(c, i);
+		if (f < GWP_UP_RAMP_ONE) {
+			w = (w / GWP_UP_RAMP_ONE) * f;
+			if (best != UINT32_MAX &&
+			    !fewer_open(v, w, best_val, best_w))
+				continue;
+		}
 		best = i;
 		best_val = v;
 		best_w = w;
@@ -689,6 +835,19 @@ static uint32_t pick_tier(struct pick *c, const struct gwp_up_tier *t,
 			break;
 	}
 	return best;
+}
+
+/*
+ * The pick among the servers of the tier @t, from its position @p on (see
+ * gwp_up_lb_pick()): the place in the pool of the one taken, or
+ * UINT32_MAX when none may be.
+ */
+static uint32_t pick_tier(struct pick *c, const struct gwp_up_tier *t,
+			  uint32_t p)
+{
+	if (c->pk->least_conn)
+		return pick_lc(c, t, p);
+	return pick_rr(c, t, p);
 }
 
 /*

@@ -360,7 +360,7 @@ static uint32_t tp_pick(struct tpool *p, bool least_conn, uint32_t rr,
 	i = gwp_up_lb_pick(&pk);
 	/* The clock: once at most; probes: a few. */
 	assert(p->clock_reads - before <= 1);
-	assert(p->nr_random - rnd <= GWP_UP_PICK_PROBES);
+	assert(p->nr_random - rnd <= GWP_UP_PICK_MAX_RANDOM);
 	return i;
 }
 
@@ -1515,6 +1515,325 @@ static void test_backup_weights(void)
 	tp_free(&p);
 }
 
+/* The slow start's ejection state, by its settings. */
+static struct gwp_up_health *slow_of(struct gwp_up_state *s, uint32_t fails,
+				     uint32_t eject, uint32_t slow)
+{
+	struct gwp_up_opts o;
+	struct gwp_up_health *h;
+
+	gwp_up_opts_default(&o);
+	o.max_fails = fails;
+	o.fail_timeout_ms = 1000;
+	o.eject_ms = eject;
+	o.slow_start_ms = slow;
+	h = gwp_up_health_get(s, &o);
+	assert(h && h->st == s);
+	return h;
+}
+
+/*
+ * The ramp of the slow start, on an injected clock from @t0: none at a
+ * first load or with no slow_start, linear from a join that no other pool
+ * already made; from the end of an ejection, which restarts it; its own
+ * state per slow_start; with max_fails=0 it ramps but is never ejected.
+ */
+static void test_slow_ramp(uint32_t t0)
+{
+	struct gwp_up_key k = key_of(GWP_UP_SCHEME_SOCKS5H, "10.0.0.9", 1080,
+				     NULL);
+	struct gwp_up_table *t = gwp_up_table_create();
+	struct gwp_up_health *h, *h2, *z, *d;
+	const uint32_t one = GWP_UP_RAMP_ONE;
+	struct gwp_up_state *s;
+	uint32_t i;
+
+	assert(t);
+	s = gwp_up_state_get(t, &k);
+	assert(s);
+	h = slow_of(s, 1, 5000, 10000);
+	d = def_health(s);
+	assert(h != d && h->slow_ms == 10000 && !d->slow_ms);
+	h2 = slow_of(s, 1, 5000, 10000);
+	assert(h2 == h);
+	gwp_up_health_put(h2);
+	z = slow_of(s, 0, 5000, 10000);
+	assert(z != h);
+
+	/* Nothing yet: full weight, no clock needed. */
+	assert(!gwp_up_health_may_ramp(h));
+	assert(gwp_up_health_ramp(h, t0) == one);
+	assert(gwp_up_health_ramp(NULL, t0) == one);
+	assert(!gwp_up_health_join(NULL, t0));
+
+	/* A first load: no ramp; nor without slow_start. */
+	assert(!gwp_up_health_join(h, 0));
+	assert(!gwp_up_health_may_ramp(h));
+	assert(!gwp_up_health_join(d, t0));
+	assert(!gwp_up_health_may_ramp(d));
+	gwp_up_health_leave(d);
+	/* Joined by one pool already: another one changes nothing. */
+	assert(!gwp_up_health_join(h, t0));
+	assert(!gwp_up_health_may_ramp(h));
+	gwp_up_health_leave(h);
+	gwp_up_health_leave(h);
+
+	/* A reload brings it in: linear over 10 s, at least 1. */
+	assert(gwp_up_health_join(h, t0));
+	assert(gwp_up_health_may_ramp(h));
+	assert(gwp_up_health_ramp(h, t0) == 1);
+	assert(gwp_up_health_ramp(h, t0 + 1) == one / 10000);
+	assert(gwp_up_health_ramp(h, t0 + 2500) == one / 4);
+	assert(gwp_up_health_ramp(h, t0 + 5000) == one / 2);
+	assert(gwp_up_health_ramp(h, t0 + 9999) == one - one / 10000 - 1);
+	/* A clock a little behind (another worker's): the least. */
+	assert(gwp_up_health_ramp(h, t0 - 5) == 1);
+	/* A second pool joining meanwhile leaves the ramp as it is. */
+	assert(!gwp_up_health_join(h, t0 + 5000));
+	assert(gwp_up_health_ramp(h, t0 + 5000) == one / 2);
+	gwp_up_health_leave(h);
+	/* Over: ended, the cheap test says so again. */
+	assert(gwp_up_health_ramp(h, t0 + 10000) == one);
+	assert(!gwp_up_health_may_ramp(h));
+	assert(gwp_up_health_ramp(h, t0 + 5000) == one);
+	gwp_up_health_leave(h);
+
+	/* Left by every pool, then back: a ramp again. */
+	assert(gwp_up_health_join(h, t0 + 20000));
+	assert(gwp_up_health_ramp(h, t0 + 25000) == one / 2);
+	/* An ejection mid-ramp: out, then the ramp again from its end. */
+	assert(fail(h, t0 + 25000));
+	assert(gwp_up_health_ejected(h, t0 + 26000, NULL) == 4000);
+	assert(gwp_up_health_ramp(h, t0 + 26000) == 1);
+	assert(gwp_up_health_ramp(h, t0 + 30000) == 1);
+	assert(!gwp_up_health_ejected(h, t0 + 30000, NULL));
+	assert(gwp_up_health_ramp(h, t0 + 32500) == one / 4);
+	/* Ejected again during it: from the end of that one. */
+	assert(fail(h, t0 + 32500));
+	assert(gwp_up_health_ramp(h, t0 + 37500) == 1);
+	assert(gwp_up_health_ramp(h, t0 + 42500) == one / 2);
+	assert(gwp_up_health_ramp(h, t0 + 47500) == one);
+	/* An ended ramp read late: still over, not wrapped. */
+	assert(!gwp_up_health_may_ramp(h));
+	gwp_up_health_leave(h);
+
+	/*
+	 * A ramp ended but never looked at since does not keep the next
+	 * join from starting one.
+	 */
+	assert(gwp_up_health_join(h, t0 + 50000));
+	gwp_up_health_leave(h);
+	assert(gwp_up_health_may_ramp(h));
+	assert(gwp_up_health_join(h, t0 + 70000));
+	assert(gwp_up_health_ramp(h, t0 + 75000) == one / 2);
+	gwp_up_health_leave(h);
+
+	/* max_fails=0: a ramp on joining, never an ejection. */
+	assert(gwp_up_health_join(z, t0));
+	for (i = 0; i < 5; i++)
+		assert(!fail(z, t0 + i));
+	assert(!gwp_up_health_may_be_ejected(z));
+	assert(gwp_up_health_ramp(z, t0 + 5000) == one / 2);
+	gwp_up_health_leave(z);
+
+	gwp_up_health_put(z);
+	gwp_up_health_put(d);
+	gwp_up_health_put(h);
+	gwp_up_state_put(s);
+	assert(gwp_up_table_destroy(t) == 0);
+}
+
+/*
+ * Give @p's server @i the slow start @slow (with the default ejection),
+ * at the fraction @num / @den of it, from a join at the right time.
+ */
+static void tp_ramp(struct tpool *p, uint32_t i, uint32_t slow, uint32_t num,
+		    uint32_t den)
+{
+	gwp_up_health_put(p->h[i]);
+	p->h[i] = slow_of(p->s[i], GWP_UP_EJECT_FAILS, GWP_UP_EJECT_MS, slow);
+	p->m[i].h = p->h[i];
+	assert(gwp_up_health_join(p->h[i], p->clock - slow / den * num));
+	assert(gwp_up_health_ramp(p->h[i], p->clock) ==
+	       (uint32_t)((uint64_t)GWP_UP_RAMP_ONE * num / den));
+}
+
+/* Undo tp_ramp(): back to the default health. */
+static void tp_unramp(struct tpool *p, uint32_t i)
+{
+	gwp_up_health_leave(p->h[i]);
+	gwp_up_health_put(p->h[i]);
+	p->h[i] = def_health(p->s[i]);
+	p->m[i].h = p->h[i];
+}
+
+/*
+ * Round-robin with a server in its slow start, by a real generator: each
+ * server gets the share of its weight scaled by its ramp, within 3%. The
+ * ramping server's own turns are taken by chance, and those it lets pass
+ * go by the probes, which accept one in a slow start by chance too. The
+ * probes are bounded: the turns that every probe lets pass (the chance of
+ * a pass to the power GWP_UP_PICK_PROBES + 1, a tenth of a percent here)
+ * go to a server in no slow start.
+ */
+static void test_slow_rr(const uint32_t *w, const uint32_t *num, uint32_t nr,
+			 uint32_t seed)
+{
+	uint32_t hits[8] = { 0 }, rr, i;
+	uint64_t sum = 0, sw[8];
+	struct tpool p;
+
+	assert(nr <= 8);
+	tp_init(&p, nr);
+	p.xs = seed;
+	if (w)
+		tp_weights(&p, w);
+	for (i = 0; i < nr; i++) {
+		if (num[i] < 8)
+			tp_ramp(&p, i, 80000, num[i], 8);
+		sw[i] = (uint64_t)(w ? w[i] : 1) * num[i];
+		sum += sw[i];
+	}
+	for (rr = 0; rr < NR_DIST_PICKS; rr++)
+		hits[tp_pick(&p, false, rr, NONE)]++;
+	for (i = 0; i < nr; i++) {
+		uint64_t want = NR_DIST_PICKS * sw[i] / sum;
+		uint64_t tol = NR_DIST_PICKS * 3 / 100;
+
+		if (hits[i] + tol < want || hits[i] > want + tol) {
+			fprintf(stderr, "slow rr server %u: %u picks, want %llu +- %llu\n",
+				i, hits[i], (unsigned long long)want,
+				(unsigned long long)tol);
+			assert(0);
+		}
+		if (num[i] < 8)
+			tp_unramp(&p, i);
+	}
+	tp_free(&p);
+}
+
+/*
+ * The slow start in the picks, one at a time: a ramping server's turn
+ * taken or passed by the random number; one passed and every probe
+ * missing goes to the next one in service in no slow start, and with every
+ * server in one, to the first in service; least_conn counts a ramping
+ * server's open pairs against its scaled weight, exactly; with no random
+ * source, round-robin ignores the ramp; the clock is read once.
+ */
+static void test_slow_pick(void)
+{
+	uint32_t vals[2 * GWP_UP_PICK_PROBES + 1];
+	struct tpool p;
+	uint32_t i, n;
+
+	tp_init(&p, 4);
+	/* Server 1 at a quarter of its weight. */
+	tp_ramp(&p, 1, 40000, 1, 4);
+	/* No random source: its turns as usual. */
+	assert(tp_pick(&p, false, 1, NONE) == 1);
+	p.fake = vals;
+	/* A number under a quarter takes the turn, over it lets it pass. */
+	vals[0] = 0x3fff0000u;
+	p.nr_fake = 1;
+	p.ifake = 0;
+	n = p.nr_random;
+	assert(tp_pick(&p, false, 1, NONE) == 1);
+	assert(p.nr_random - n == 1);
+	/* Passed, then a probe on 3, in service. */
+	vals[0] = 0x40000000u;
+	vals[1] = tp_at(4, 3);
+	p.nr_fake = 2;
+	p.ifake = 0;
+	assert(tp_pick(&p, false, 1, NONE) == 3);
+	/* The others' turns draw nothing. */
+	n = p.nr_random;
+	assert(tp_pick(&p, false, 2, NONE) == 2);
+	assert(p.nr_random == n);
+	/* Passed, every probe back on 1 and passed: the next, 2. */
+	vals[0] = 0xffffffffu;
+	for (i = 0; i < GWP_UP_PICK_PROBES; i++) {
+		vals[1 + 2 * i] = tp_at(4, 1);
+		vals[2 + 2 * i] = 0xffffffffu;
+	}
+	p.nr_fake = 2 * GWP_UP_PICK_PROBES + 1;
+	p.ifake = 0;
+	n = p.nr_random;
+	assert(tp_pick(&p, false, 1, NONE) == 2);
+	assert(p.nr_random - n == 2 * GWP_UP_PICK_PROBES + 1);
+	/* Every server ramping: the first in service from the turn on. */
+	tp_ramp(&p, 0, 40000, 1, 4);
+	tp_ramp(&p, 2, 40000, 1, 4);
+	tp_ramp(&p, 3, 40000, 1, 4);
+	for (i = 0; i < GWP_UP_PICK_PROBES; i++)
+		vals[1 + 2 * i] = tp_at(4, i);
+	p.ifake = 0;
+	assert(tp_pick(&p, false, 1, NONE) == 1);
+	/* ... one that may be taken: 1 ejected, then 2. */
+	tp_unramp(&p, 1);
+	tp_eject(&p, 1, 100);
+	vals[0] = tp_at(4, 1);
+	for (i = 0; i < GWP_UP_PICK_PROBES; i++) {
+		vals[2 * i + 1] = 0xffffffffu;
+		vals[2 * i + 2] = tp_at(4, 1);
+	}
+	p.ifake = 0;
+	p.clock_reads = 0;
+	assert(tp_pick(&p, false, 1, NONE) == 2);
+	assert(p.clock_reads == 1);
+	for (i = 0; i < 4; i++)
+		if (i != 1)
+			tp_unramp(&p, i);
+	tp_free(&p);
+
+	/*
+	 * least_conn: 10 open on 0 to 2; 3 has 2 open at an eighth of its
+	 * weight (16 for its weight), so it is the busiest; at a quarter (8)
+	 * the least busy; at its full weight it would be from the start.
+	 */
+	tp_init(&p, 4);
+	for (i = 0; i < 3; i++)
+		tp_open(&p, i, 10);
+	tp_open(&p, 3, 2);
+	assert(tp_pick(&p, true, 1, NONE) == 3);
+	tp_ramp(&p, 3, 80000, 1, 8);
+	assert(tp_pick(&p, true, 1, NONE) == 1);
+	assert(tp_pick(&p, true, 3, NONE) == 0);
+	tp_unramp(&p, 3);
+	tp_ramp(&p, 3, 80000, 2, 8);
+	assert(tp_pick(&p, true, 1, NONE) == 3);
+	/* Exactly: 2 at a quarter (8 for its weight) ties 8, from the cursor. */
+	for (i = 0; i < 3; i++)
+		tp_open(&p, i, 8);
+	tp_unramp(&p, 3);
+	tp_ramp(&p, 3, 80000, 2, 8);
+	assert(tp_pick(&p, true, 1, NONE) == 1);
+	assert(tp_pick(&p, true, 3, NONE) == 3);
+	/* Idle, it ties the idle ones in turn. */
+	tp_open(&p, 3, 0);
+	tp_open(&p, 2, 0);
+	assert(tp_pick(&p, true, 2, NONE) == 2);
+	assert(tp_pick(&p, true, 3, NONE) == 3);
+	tp_unramp(&p, 3);
+	/* With weights: 3 open on weight 3 at half (2 per unit) vs 2 on 1. */
+	{
+		static const uint32_t w[4] = { 1, 1, 1, 3 };
+
+		tp_weights(&p, w);
+		tp_open(&p, 0, 2);
+		tp_open(&p, 1, 2);
+		tp_open(&p, 2, 2);
+		tp_open(&p, 3, 3);
+		assert(tp_pick(&p, true, 0, NONE) == 3);
+		tp_ramp(&p, 3, 80000, 4, 8);
+		assert(tp_pick(&p, true, 0, NONE) == 0);
+		assert(tp_pick(&p, true, 3, NONE) == 3);
+		tp_open(&p, 3, 4);
+		assert(tp_pick(&p, true, 3, NONE) == 0);
+		tp_unramp(&p, 3);
+	}
+	tp_free(&p);
+}
+
 #define NR_CAP		7u
 #define NR_CAP_ROUNDS	20000
 
@@ -1716,6 +2035,21 @@ int main(void)
 	test_backup_weights();
 	test_take_max_threads();
 	test_eject_threads();
+	test_slow_ramp(1000000);
+	/* Across the wrap. */
+	test_slow_ramp(0u - 30001);
+	test_slow_pick();
+	{
+		static const uint32_t one[4] = { 8, 2, 8, 8 };
+		static const uint32_t two[3] = { 8, 4, 8 };
+		static const uint32_t last[3] = { 8, 8, 1 };
+		static const uint32_t w[3] = { 1, 3, 2 };
+
+		test_slow_rr(NULL, one, 4, 31337);
+		test_slow_rr(NULL, two, 3, 4711);
+		test_slow_rr(w, two, 3, 0xdeadbeef);
+		test_slow_rr(w, last, 3, 1234567);
+	}
 	printf("All upstream_lb tests passed.\n");
 	return 0;
 }
