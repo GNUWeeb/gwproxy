@@ -51,9 +51,12 @@ struct gwp_acl;
 struct gwp_acl_pool;
 
 /* How a pool spreads connections over its servers. */
+/* The same values as enum gwp_up_method. */
 enum gwp_acl_pool_method {
 	GWP_ACL_POOL_ROUND_ROBIN	= 0,	/* the default */
 	GWP_ACL_POOL_LEAST_CONN		= 1,	/* "least_conn;" */
+	GWP_ACL_POOL_RANDOM		= 2,	/* "random;" */
+	GWP_ACL_POOL_RANDOM_TWO		= 3,	/* "random two;" */
 };
 
 /* What the OUTPUT chain chose as the upstream of a connection. */

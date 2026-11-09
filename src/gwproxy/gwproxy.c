@@ -3078,25 +3078,29 @@ static void pool_pick_back(void *arg, uint32_t i)
  * Which of @pool's servers (from 0) a pair goes to, by the pool's method:
  * round-robin, the default, takes them in turn (as many turns each as its
  * weight=); least_conn the one with the fewest open pairs for its weight,
- * ties in round-robin order. Both turn on the
- * pool's cursor, shared by all workers, and least_conn reads the counts
- * all workers keep (struct gwp_up_state), which carry across reloads.
- * Workers picking at the same time may see the same counts and choose the
- * same server; the next picks see the result, which is close enough.
+ * ties in round-robin order; random one drawn by weight, and random two
+ * the one with fewer open pairs for its weight of two drawn so. The first
+ * two turn on the pool's cursor, shared by all workers; the random ones
+ * leave it alone, one line less that every worker writes. least_conn and
+ * random two read the counts all workers keep (struct gwp_up_state), which
+ * carry across reloads. Workers picking at the same time may see the same
+ * counts and choose the same server; the next picks see the result, which
+ * is close enough.
  *
  * Only servers in service are taken: not ejected, not full (max_conns=),
  * not down, and a backup only when no other server may be taken; with all
  * of them out, the one back soonest that is not full. With @skip, the server of @skip's place whose attempt
  * failed, it is a retry: another server in service, the next one after
- * @skip in pool order (least_conn: the fewest open, ties from there), or
+ * @skip in pool order (least_conn: the fewest open, ties from there; the
+ * random ones: drawn as usual, never @skip), or
  * UINT32_MAX for none; a retry leaves the cursor alone, so the pool's
  * turns go on as if the failed pick had worked.
  *
  * The pick reads the states in place, through the pool's members (see
  * acl_srv_member()), with no copy: round-robin looks at the cursor's
  * server, and only when it is ejected at a few random ones and then the
- * next ones in turn; least_conn scans
- * the open counts of the whole pool (see gwp_up_lb_pick()). UINT32_MAX,
+ * next ones in turn; the random ones at the servers they draw; least_conn
+ * scans the open counts of the whole pool (see gwp_up_lb_pick()). UINT32_MAX,
  * when the pool has no server object at all, is a bug conn_pick_upstream()
  * reports.
  */
@@ -3118,7 +3122,9 @@ static uint32_t pool_pick_server(struct gwp_ctx *ctx, struct gwp_acl_pool *pool,
 
 	if (unlikely(!pk.m))
 		return UINT32_MAX;
-	if (skip == UINT32_MAX)
+	/* The random methods draw: no cursor, so no line shared to write. */
+	if (skip == UINT32_MAX && pk.method != GWP_UP_METHOD_RANDOM &&
+	    pk.method != GWP_UP_METHOD_RANDOM_TWO)
 		pk.rr = gwp_acl_pool_next(pool);
 	return gwp_up_lb_pick(&pk);
 }

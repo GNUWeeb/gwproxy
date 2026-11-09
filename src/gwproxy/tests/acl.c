@@ -4097,6 +4097,40 @@ static const struct gwp_up_opts *up_opts(struct gwp_acl *a, const char *user,
 	return &o;
 }
 
+/* The method directives: none, least_conn, random and random two. */
+static noinline void test_upstream_methods(void)
+{
+	static const struct {
+		const char			*line;
+		enum gwp_acl_pool_method	m;
+	} c[] = {
+		{ "", GWP_ACL_POOL_ROUND_ROBIN },
+		{ " least_conn;\n", GWP_ACL_POOL_LEAST_CONN },
+		{ " random;\n", GWP_ACL_POOL_RANDOM },
+		{ "\trandom ;\n", GWP_ACL_POOL_RANDOM },
+		{ " random two;\n", GWP_ACL_POOL_RANDOM_TWO },
+		{ " random  two ;  # by load\n", GWP_ACL_POOL_RANDOM_TWO },
+	};
+	struct gwp_acl_req req;
+	struct gwp_acl *a;
+	char text[256];
+	size_t i;
+
+	for (i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+		snprintf(text, sizeof(text),
+			 "upstream p {\n server http://h:1;\n%s"
+			 " server http://h:2 weight=2;\n}\n"
+			 "-A OUTPUT -j UPSTREAM --to p\n", c[i].line);
+		assert(!gwp_acl_parse_str(&a, text));
+		assert(up_eval(a, NULL, &req) == GWP_ACL_ACCEPT);
+		assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
+		assert(gwp_acl_pool_method(req.upstream_pool) == c[i].m);
+		assert(gwp_acl_pool_nr_servers(req.upstream_pool) == 2);
+		gwp_acl_req_release(&req);
+		gwp_acl_destroy(a);
+	}
+}
+
 /*
  * The options after a pool server's URL: the defaults where none is given,
  * the times in any unit, each option on its own.
@@ -4328,7 +4362,24 @@ static noinline void test_upstream_errors(void)
 		   "\"}\" must stand alone on its line");
 	up_refused("upstream p {\n server http://h;\n least_conn;\n"
 		   " least_conn;\n}\n", -EINVAL,
-		   "line 4: least_conn given twice");
+		   "line 4: least_conn given in upstream pool p, which has its method already (least_conn, random or random two: one at most)");
+	up_refused("upstream p {\n server http://h;\n random;\n"
+		   " least_conn;\n}\n", -EINVAL,
+		   "line 4: least_conn given in upstream pool p, which has its method already");
+	up_refused("upstream p {\n least_conn;\n server http://h;\n"
+		   " random two;\n}\n", -EINVAL,
+		   "line 4: random two given in upstream pool p, which has its method");
+	up_refused("upstream p {\n server http://h;\n random two;\n"
+		   " random;\n}\n", -EINVAL,
+		   "line 4: random given in upstream pool p, which has its method");
+	up_refused("upstream p {\n server http://h;\n random three;\n}\n",
+		   -EINVAL, "line 3: expected \"random;\" or \"random two;\"");
+	up_refused("upstream p {\n server http://h;\n random two two;\n}\n",
+		   -EINVAL, "expected \"random;\" or \"random two;\"");
+	up_refused("upstream p {\n server http://h;\n random two\n}\n",
+		   -EINVAL, "missing ';' at the end of the directive");
+	up_refused("upstream p {\n server http://h;\n randomly;\n}\n",
+		   -EINVAL, "unknown directive in upstream pool p (expected server, least_conn, random or \"}\")");
 	up_refused("upstream p {\n server http://h;\n least_conn x;\n}\n",
 		   -EINVAL, "expected \"least_conn;\"");
 	up_refused("upstream p {\n server http://h\n}\n", -EINVAL,
@@ -4564,6 +4615,7 @@ static void run_tests(void)
 	test_include_dirs();
 	test_upstream_errors();
 	test_upstream_server_opts();
+	test_upstream_methods();
 	test_upstream_pool_https();
 	test_upstream_index();
 	test_upstream_include();

@@ -114,7 +114,8 @@ struct gwp_acl_pool {
 	const struct gwp_acl_server_ops *ops;
 	uint8_t			method;		/* enum gwp_acl_pool_method */
 	bool			remote_dns;
-	bool			have_method;	/* "least_conn;" seen */
+	/* A method's directive seen (least_conn, random, random two). */
+	bool			have_method;
 	char			name[ACL_POOL_NAME_MAX + 1];
 };
 
@@ -1688,10 +1689,32 @@ static int parse_server_opts(struct acl_load *ld, char **tok, int n,
 	return 0;
 }
 
+_Static_assert(GWP_ACL_POOL_ROUND_ROBIN == (int)GWP_UP_METHOD_RR &&
+	       GWP_ACL_POOL_LEAST_CONN == (int)GWP_UP_METHOD_LEAST_CONN &&
+	       GWP_ACL_POOL_RANDOM == (int)GWP_UP_METHOD_RANDOM &&
+	       GWP_ACL_POOL_RANDOM_TWO == (int)GWP_UP_METHOD_RANDOM_TWO,
+	       "a pool's method is passed to its picks as it is");
+
+/* A pool method's directive, as written. */
+static const char *method_name(enum gwp_acl_pool_method m)
+{
+	switch (m) {
+	case GWP_ACL_POOL_LEAST_CONN:
+		return "least_conn";
+	case GWP_ACL_POOL_RANDOM:
+		return "random";
+	case GWP_ACL_POOL_RANDOM_TWO:
+		return "random two";
+	default:
+		return "round-robin";
+	}
+}
+
 /* A line inside "upstream NAME { ... }". */
 static int parse_pool_line(struct acl_load *ld, char **tok, int n)
 {
 	struct gwp_acl_pool *p = ld->pool;
+	enum gwp_acl_pool_method method;
 	uint32_t i;
 	int w;
 
@@ -1725,8 +1748,9 @@ static int parse_pool_line(struct acl_load *ld, char **tok, int n)
 	 * wrong may be a server URL with its password.
 	 */
 	w = directive_words(tok, n);
-	if (strcmp(tok[0], "server") && strcmp(tok[0], "least_conn"))
-		return load_err(ld, "unknown directive in upstream pool %s (expected server, least_conn or \"}\")",
+	if (strcmp(tok[0], "server") && strcmp(tok[0], "least_conn") &&
+	    strcmp(tok[0], "random"))
+		return load_err(ld, "unknown directive in upstream pool %s (expected server, least_conn, random or \"}\")",
 				p->name);
 	if (w < 0)
 		return load_err(ld, "missing ';' at the end of the directive");
@@ -1746,13 +1770,20 @@ static int parse_pool_line(struct acl_load *ld, char **tok, int n)
 			return r;
 		return pool_add_server(ld, tok[1], &opts);
 	}
-	if (n != 1)
-		return load_err(ld, "expected \"least_conn;\"");
+	if (!strcmp(tok[0], "random")) {
+		if (n > 2 || (n == 2 && strcmp(tok[1], "two")))
+			return load_err(ld, "expected \"random;\" or \"random two;\"");
+		method = n == 2 ? GWP_ACL_POOL_RANDOM_TWO : GWP_ACL_POOL_RANDOM;
+	} else {
+		if (n != 1)
+			return load_err(ld, "expected \"least_conn;\"");
+		method = GWP_ACL_POOL_LEAST_CONN;
+	}
 	if (p->have_method)
-		return load_err(ld, "least_conn given twice in upstream pool %s",
-				p->name);
+		return load_err(ld, "%s given in upstream pool %s, which has its method already (least_conn, random or random two: one at most)",
+				method_name(method), p->name);
 	p->have_method = true;
-	p->method = GWP_ACL_POOL_LEAST_CONN;
+	p->method = (uint8_t)method;
 	return 0;
 }
 
