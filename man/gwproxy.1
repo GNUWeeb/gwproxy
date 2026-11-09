@@ -501,9 +501,13 @@ and
 .B down
 (see
 .BR "UPSTREAM CHAINING" ),
-each at most once; and
+each at most once; and a line
 .B least_conn;
-(at most once) sets the method; round\-robin is the default.
+(or
+.B random;
+or
+.BR "random two;" )
+sets the method, one such line at most; round\-robin is the default.
 .B https://
 servers need a build with OpenSSL support; without it they fail the load.
 A pool has 1 to 8192 servers (one more fails the load), and all of them must
@@ -1891,7 +1895,16 @@ turns for every one of a server of weight 1, spread out rather than in a row
 (each run of turns as long as the weights' sum, or the next power of two,
 gives each server its share give or take one turn), and
 .B least_conn
-compares the connections open divided by the weight (exactly, not rounded). A connection counts against its server
+compares the connections open divided by the weight (exactly, not rounded).
+With
+.BR random ,
+a connection goes to a server drawn at random, each with the chance of its
+weight; with
+.BR "random two" ,
+two different servers are drawn so and the connection goes to the one with
+fewer connections open for its weight (compared as
+.B least_conn
+does), the first one drawn when they are equal. A connection counts against its server
 from the moment it is given it, before it connects, until it ends, however it
 ends: closed by either side, refused, failed to connect or in the handshake,
 or timed out. The counts belong to the server, not to the pool: a server,
@@ -1911,8 +1924,21 @@ size.
 has to compare the counts of all the servers: each new connection reads the
 count of every server of its pool, stopping early only at a server with none
 open, so in a pool of thousands of busy servers every new connection costs a
-scan of thousands of counts that other workers keep changing. Prefer
-round\-robin for large pools unless the load must follow the counts.
+scan of thousands of counts that other workers keep changing. The random
+methods cost about what round\-robin does whatever the size of the pool:
+.B random
+looks at the one server it draws,
+.B "random two"
+at two and their counts, and neither moves a turn that all workers share.
+.B "random two"
+keeps the counts of a large pool nearly as even as
+.B least_conn
+does (two draws are enough to steer clear of the busy servers), so prefer it
+to
+.B least_conn
+for pools of more than a few dozen servers, and round\-robin or
+.B random
+when the load need not follow the counts.
 .PP
 A pool also keeps track of its servers' health, from the connections they
 carry (passively: gwproxy sends no probes of its own). A failure counts
@@ -1945,7 +1971,12 @@ tries pick another starting point, so among servers with the same count
 the ejected server's turns are spread too. It still takes a server with the
 fewest connections. As with the counts, the failures
 are the server's, not the pool's: those through one pool count in every pool
-that lists the server. When every server of a pool is ejected, the
+that lists the server. The random methods draw again when a draw lands on an
+ejected or full server, up to 4 more draws in all
+.RB ( "random two" :
+until it has its two, or the draws run out, and then takes the one it has);
+when every draw misses, the pool takes the next server in service after the
+first one drawn, in the block's order. When every server of a pool is ejected, the
 pool takes the one whose ejection ends soonest; a pool of one server, and
 .BR \-\-upstream\-proxy ,
 keep using theirs, so for them an ejection shows only in the log. A server
@@ -1990,8 +2021,11 @@ numbers. The first load starts none. With round\-robin, a server at a
 fraction of its weight takes each of its turns with that chance, and the
 turns it lets pass go to the other servers by their weights, as an ejected
 server's do, so its share follows the ramp (somewhat below it when most of a
-pool ramps at once). With
-.BR least_conn ,
+pool ramps at once); the random methods take it with that chance when they
+draw it, and draw again otherwise. With
+.BR least_conn
+(and between the two servers of
+.BR "random two" ),
 its connections open count against that fraction of its weight, so it is
 busier for its weight than its count says and takes new connections only as
 the ramp lets it. A server with
@@ -2015,7 +2049,8 @@ in when all are ejected, as above).
 .B backup
 The server is used only when no other server of the pool may be: all of
 them ejected, full or down. The backups share the connections among
-themselves by the pool's method and their weights; with everything out, the
+themselves by the pool's method and their weights (the random methods draw
+among them); with everything out, the
 pool takes the main server whose ejection ends soonest, a backup only when
 every main server is full.
 .TP
@@ -2064,9 +2099,10 @@ first two may; 10.0.0.4 none.
 A connection that a pool's server fails in one of the ways that count is
 tried again, once, on another server of the same pool that is in service (not
 ejected, full or down): the next one in the block's order (when that one is
-out, one found as for an ejected server's turn), or with
+out, one found as for an ejected server's turn), with
 .B least_conn
-the least loaded one; a backup only when no other main server is in service. This is safe because nothing the client sends is
+the least loaded one, with the random methods one drawn as for any
+connection, never the server that failed; a backup only when no other main server is in service. This is safe because nothing the client sends is
 passed on before the tunnel through the upstream is up, so the retry repeats
 nothing and loses nothing. It has what is left of the connection's
 .BR \-\-connect\-timeout ,
