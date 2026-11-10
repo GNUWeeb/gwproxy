@@ -3451,10 +3451,19 @@ static int process_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	else
 		return -EINVAL;
 
+	/*
+	 * Act on the result before sending: a request refused at once (by the
+	 * ACL, --outgoing-family, a failed bind) appends its failure reply to
+	 * what this pass queued, the method reply of a pipelining client, say.
+	 * One send then carries both. Queued first, that send would still be
+	 * in flight when the refusal tore the pair down, and the failure
+	 * reply would never be sent.
+	 */
+	r = chk_prot_result(w, gcp, r);
 	if (gcp->target.len)
 		prep_send_client(w, gcp);
 
-	return chk_prot_result(w, gcp, r);
+	return r;
 }
 
 static int handle_ev_client_prot(struct gwp_wrk *w,
