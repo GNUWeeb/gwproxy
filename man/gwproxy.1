@@ -266,13 +266,29 @@ and every datagram to the client is sent from that address, whichever
 source routing would pick toward the client, so a client that takes
 datagrams only from the relay it was told (a connected UDP socket, a
 stateful firewall) gets them on a host with several addresses too.
-Datagrams are taken only from the IP address of the control connection. When
+The client's own datagrams, the ones relayed to targets, are taken only from
+the IP address of the control connection. When
 the request declares that address and a port, only that port is the client;
 when it declares any other address, or no port, the first valid datagram from
 that IP address decides the port, so another party on the same IP address can
 get there first. A client behind a NAT cannot know its outside port and is
 served by the latter rule. A client that declares the control connection's
 address with a port the NAT rewrites gets no service.
+.IP
+A datagram from any other source is taken for a target's reply, and relayed
+to the client only if it comes from the exact address and port of a target
+the client has sent to: a reply from another port or address of the same
+server (a TFTP server's new port, an anycast or load\-balanced service) is
+dropped, as is anything a target sends before the client has sent to it
+(hole punching). The
+.B OUTPUT
+chain judges such a target again after a reload, and a target it no longer
+accepts may not answer until the client is let through to it again. Only
+the 32 targets the client has sent to most recently are remembered; a reply
+from one that dropped out is dropped too, so a client that talks to more
+targets at once (a DHT node, say) loses replies. Through a pool server only
+the server's relay may answer (see
+.BR "UPSTREAM CHAINING" ).
 Default:
 .BR 1 .
 .TP
@@ -2213,7 +2229,8 @@ replies with (or the server's own address, when the reply names 0.0.0.0 or
 ::). Each datagram from the client goes to the server's relay as the client
 sent it, its SOCKS5 header included, and each from the server's relay goes
 back to the client as it came, so the server reaches the targets and wraps
-their replies; datagrams from anywhere else are dropped, as are a client's
+their replies, and which targets may answer is the server's to decide;
+datagrams from anywhere else are dropped, as are a client's
 before it is known (see
 .BR \-\-udp\-associate ).
 The
