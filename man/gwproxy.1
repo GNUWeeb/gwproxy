@@ -1760,6 +1760,14 @@ on another server; see
 and is logged with the reason, for example
 .IR "certificate verify failed: hostname mismatch" .
 .PP
+An
+.B http://
+or
+.B https://
+upstream may answer the CONNECT with interim responses (100 Continue, 102 or
+103, but not 101) before its final one; they are read past (RFC 9110 Section
+15.2), and only a 2xx after them puts the tunnel up.
+.PP
 An upstream that turns the CONNECT down is answered to an HTTP client with
 "502 Bad Gateway", or "504 Gateway Timeout" for a
 .B socks5://
