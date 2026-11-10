@@ -652,6 +652,17 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		goto einval;
 	}
 
+	/*
+	 * The system resolver needs a thread to run a lookup on. --raw-dns
+	 * and the modes without hostname targets start none, so 0 is fine
+	 * there (see gwp_ctx_init_dns()).
+	 */
+	if ((cfg->as_socks5 || cfg->as_http) && !cfg->use_raw_dns &&
+	    cfg->nr_dns_workers < 1) {
+		fprintf(stderr, ERR_WRAP "Error: -W/--nr-dns-workers must be at least 1 for SOCKS5 or HTTP with the system resolver.\n" ERR_WRAP);
+		goto einval;
+	}
+
 #ifdef CONFIG_HTTPS
 	if ((cfg->tls_cert != NULL) != (cfg->tls_key != NULL)) {
 		fprintf(stderr, ERR_WRAP "Error: --tls-cert and --tls-key must be provided together\n" ERR_WRAP);

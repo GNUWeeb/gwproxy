@@ -1163,11 +1163,15 @@ means unlimited. Default:
 .BR 65536 .
 .TP
 .BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
-Number of DNS resolver worker threads kept running, at most 1024. This does not
+Number of DNS resolver worker threads kept running, from 1 to 1024. This does not
 cap how many lookups run at once: more threads are started on demand when lookups
 are waiting, up to 64 threads or
 .IR nr ,
-whichever is larger, and those exit again after 10 seconds idle. Default:
+whichever is larger, and those exit again after 10 seconds idle.
+.B 0
+is taken only where no resolver thread is needed: with
+.B \-\-raw\-dns
+or without SOCKS5 and HTTP. Default:
 .BR 4 .
 .IP
 Each thread runs one blocking lookup, so the threads are shared out by client
