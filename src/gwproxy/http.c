@@ -821,7 +821,8 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	 * point the client is told what is wrong rather than dropped without
 	 * a word: a malformed request line or field line (RFC 9112 Sections
 	 * 3 and 5) or a repeated field that may appear only once (Host,
-	 * Content-Length, ...) gets 400, another HTTP version 505.
+	 * Content-Length, ...) gets 400, another HTTP version 505, and a
+	 * request line past the header limit 414 (RFC 9112 Section 3).
 	 */
 	if (r == -ENOMEM || (r < 0 && hc->start_st != RS_HTTP))
 		r = GWP_HTTP_ERR;
@@ -829,6 +830,8 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 		r = GWP_HTTP_BAD_REQUEST;
 	else if (r == -E2BIG)
 		r = GWP_HTTP_TOO_LARGE;
+	else if (r == -ENAMETOOLONG)
+		r = GWP_HTTP_URI_TOO_LONG;
 	else if (r == -EPROTONOSUPPORT)
 		r = GWP_HTTP_BAD_VERSION;
 	else if (r < 0)
@@ -844,6 +847,16 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	 */
 	gwnet_http_req_hdr_free(req);
 	return r;
+}
+
+int gwp_http_conn_overflow(const struct gwp_http_conn *hc)
+{
+	if (hc->start_st != RS_HTTP)
+		return GWP_HTTP_ERR;
+	if (hc->ctx_hdr.state == GWNET_HTTP_HDR_PARSE_ST_INIT ||
+	    hc->ctx_hdr.state == GWNET_HTTP_HDR_PARSE_ST_FIRST_LINE)
+		return GWP_HTTP_URI_TOO_LONG;
+	return GWP_HTTP_TOO_LARGE;
 }
 
 /*
@@ -1690,6 +1703,22 @@ int gwp_http_build_bad_version_reply(void *out, size_t out_cap)
 {
 	static const char resp[] =
 		"HTTP/1.1 505 HTTP Version Not Supported\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_uri_too_long_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 414 URI Too Long\r\n"
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n"
 		"\r\n";

@@ -7095,6 +7095,19 @@ static int http_reject_not_implemented(struct gwp_conn_pair *gcp)
 	return -EOPNOTSUPP;
 }
 
+/* The HTTP 414 reply for a request line that is too long; as the 431. */
+static int http_reject_uri_too_long(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_uri_too_long_reply(
+			gcp->target.buf + gcp->target.len,
+			gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -E2BIG;
+
+	gcp->target.len += (uint32_t)r;
+	return -E2BIG;
+}
+
 static int http_reject_bad_version(struct gwp_conn_pair *gcp)
 {
 	int r = gwp_http_build_bad_version_reply(
@@ -7368,9 +7381,16 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		 * level-triggered socket to be read again -- which would
 		 * busy-spin until the protocol timeout fires.
 		 */
-		if (gcp->client.len >= gcp->client.cap)
+		if (gcp->client.len < gcp->client.cap)
+			return 0;
+		switch (gwp_http_conn_overflow(gcp->http_conn)) {
+		case GWP_HTTP_URI_TOO_LONG:
+			return http_reject_uri_too_long(gcp);
+		case GWP_HTTP_TOO_LARGE:
 			return http_reject_too_large(gcp);
-		return 0;
+		default:
+			return -EINVAL;		/* not HTTP; no reply */
+		}
 	case GWP_HTTP_NEED_AUTH:
 		http_log_auth_failure(w, gcp);
 		return http_reject_unauthorized(gcp);
@@ -7391,6 +7411,10 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		pr_dbg(&ctx->lh, "HTTP request header too large (fd=%d)",
 		       gcp->client.fd);
 		return http_reject_too_large(gcp);
+	case GWP_HTTP_URI_TOO_LONG:
+		pr_dbg(&ctx->lh, "HTTP request line too long (fd=%d)",
+		       gcp->client.fd);
+		return http_reject_uri_too_long(gcp);
 	case GWP_HTTP_NOT_IMPLEMENTED:
 		pr_dbg(&ctx->lh, "HTTP request not served (fd=%d)",
 		       gcp->client.fd);

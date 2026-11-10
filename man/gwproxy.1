@@ -1522,7 +1522,8 @@ once rewritten (bare LF line ends become CRLF).
 A request header may take at most 16384 bytes, and must fit in
 .B \-\-client\-buf\-size
 as a whole; a larger one, or one with more than 128 field lines, is answered
-with "431 Request Header Fields Too Large".
+with "431 Request Header Fields Too Large". When it is the request line that
+runs past either limit, the answer is "414 URI Too Long" instead.
 .PP
 With
 .B \-\-auth\-file

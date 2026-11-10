@@ -248,7 +248,10 @@ static int add_field(struct gwnet_http_hdr_fields *ff, uint32_t koff,
  *             -EAGAIN if more data is needed,
  *             -EINVAL if the request line is malformed,
  *             -EPROTONOSUPPORT if it is for an HTTP version other than 1.x,
- *             -E2BIG  if the request line exceeds the maximum length.
+ *             -ENAMETOOLONG if the request line exceeds the maximum length
+ *             past the method, which for any real request means its
+ *             request-target is too long (RFC 9112 Section 3: 414),
+ *             -E2BIG  if the method alone does.
  */
 static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 				    struct gwnet_http_req_hdr *hdr)
@@ -335,7 +338,7 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 
 	off++;
 	if (ctx->tot_len + off >= ctx->max_len)
-		return -E2BIG;
+		return -ENAMETOOLONG;
 	if (off >= len)
 		return -EAGAIN;
 
@@ -353,7 +356,7 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 			return -EAGAIN;
 
 		if (ctx->tot_len + off >= ctx->max_len)
-			return -E2BIG;
+			return -ENAMETOOLONG;
 
 		if (is_space(c))
 			break;
@@ -424,7 +427,7 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	 * long followed by a CRLF (or just LF).
 	 */
 	if (ctx->tot_len + off + 3 + 1 >= ctx->max_len)
-		return -E2BIG;
+		return -ENAMETOOLONG;
 
 	for (i = 0; i < 3; i++) {
 		if (off + i >= len)
@@ -454,7 +457,7 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 
 	++off;
 	if (ctx->tot_len + off >= ctx->max_len)
-		return -E2BIG;
+		return -ENAMETOOLONG;
 
 	if (major != '1')
 		return -EPROTONOSUPPORT;
@@ -984,6 +987,7 @@ static int hdr_translate_ret_err(struct gwnet_http_hdr_pctx *ctx, int r)
 		ctx->err = GWNET_HTTP_HDR_ERR_MALFORMED;
 		break;
 	case -E2BIG:
+	case -ENAMETOOLONG:
 		ctx->err = GWNET_HTTP_HDR_ERR_TOO_LONG;
 		break;
 	default:
@@ -2697,7 +2701,16 @@ static void test_req_hdr_oversized(void)
 		ctx.len = len;
 		ctx.max_len = i;
 		r = gwnet_http_req_hdr_parse(&ctx, &hdr);
-		assert(r == -E2BIG);
+		/*
+		 * Past the method, a limit that the request line runs into
+		 * is told apart from one the fields do (414 against 431).
+		 */
+		if (i < 3)		/* in "GET" */
+			assert(r == -E2BIG);
+		else if (i < (size_t)(strchr(buf, '\n') + 1 - buf))
+			assert(r == -ENAMETOOLONG);
+		else
+			assert(r == -E2BIG);
 		assert(ctx.err == GWNET_HTTP_HDR_ERR_TOO_LONG);
 		gwnet_http_req_hdr_free(&hdr);
 		gwnet_http_hdr_pctx_free(&ctx);

@@ -1009,7 +1009,8 @@ static void test_incremental(void)
 					hp2, &t2);
 			assert(r1 == r2);
 			if (r1 == GWP_HTTP_ERR || r1 == GWP_HTTP_BAD_REQUEST ||
-			    r1 == GWP_HTTP_TOO_LARGE)
+			    r1 == GWP_HTTP_TOO_LARGE ||
+			    r1 == GWP_HTTP_URI_TOO_LONG)
 				continue;
 			assert(t1 == t2);
 			assert(!strcmp(hp1, hp2));
@@ -1019,7 +1020,7 @@ static void test_incremental(void)
 	assert(feed_steps(reqs[0], strlen(reqs[0]), 1, fwd1, &l1, hp1, &t1) ==
 	       GWP_HTTP_FORWARD && t1 == 4);
 	assert(feed_steps(longline, strlen(longline), 1, fwd1, &l1, hp1,
-			  &t1) == GWP_HTTP_TOO_LARGE);
+			  &t1) == GWP_HTTP_URI_TOO_LONG);
 	assert(feed_steps(longfield, strlen(longfield), 3, fwd1, &l1, hp1,
 			  &t1) == GWP_HTTP_TOO_LARGE);
 	PRTEST_OK();
@@ -1661,6 +1662,46 @@ static void test_header_limits(void)
 	assert(hc);
 	r = proc(hc, NULL, buf, &host, &port, &req, &req_len, NULL);
 	assert(r == GWP_HTTP_TOO_LARGE);
+	gwp_http_conn_free(hc);
+
+	/*
+	 * A request-target past the limit is a URI too long (RFC 9112
+	 * Section 3), a CONNECT authority too, not a header too large.
+	 */
+	n = (size_t)sprintf(buf, "GET http://example.com/");
+	memset(buf + n, 'a', 17000);
+	sprintf(buf + n + 17000, " HTTP/1.1\r\n\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	r = proc(hc, NULL, buf, &host, &port, &req, &req_len, NULL);
+	assert(r == GWP_HTTP_URI_TOO_LONG);
+	gwp_http_conn_free(hc);
+	n = (size_t)sprintf(buf, "CONNECT ");
+	memset(buf + n, 'a', 17000);
+	sprintf(buf + n + 17000, ":443 HTTP/1.1\r\n\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	r = proc(hc, NULL, buf, &host, &port, &req, &req_len, NULL);
+	assert(r == GWP_HTTP_URI_TOO_LONG);
+	gwp_http_conn_free(hc);
+
+	/* A request line that fills a buffer: the same, as for a field. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	r = proc(hc, NULL, "GET http://example.com/aaaa", &host, &port, &req,
+		 &req_len, NULL);
+	assert(r == GWP_HTTP_NEED_MORE);
+	assert(gwp_http_conn_overflow(hc) == GWP_HTTP_URI_TOO_LONG);
+	r = proc(hc, NULL, "GET http://example.com/ HTTP/1.1\r\nX: aaa", &host,
+		 &port, &req, &req_len, NULL);
+	assert(r == GWP_HTTP_NEED_MORE);
+	assert(gwp_http_conn_overflow(hc) == GWP_HTTP_TOO_LARGE);
+	gwp_http_conn_free(hc);
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	r = proc(hc, NULL, "GETGETGET", &host, &port, &req, &req_len, NULL);
+	assert(r == GWP_HTTP_NEED_MORE);
+	assert(gwp_http_conn_overflow(hc) == GWP_HTTP_ERR);
 	gwp_http_conn_free(hc);
 
 	/* A single field longer than 16 KiB: refused, not dropped. */

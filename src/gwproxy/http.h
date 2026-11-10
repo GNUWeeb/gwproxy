@@ -39,6 +39,7 @@ enum gwp_http_result {
 				 * origin-form, a scheme other than http://;
 				 * reply 501. */
 	GWP_HTTP_BAD_VERSION,	/* An HTTP version other than 1.x; 505. */
+	GWP_HTTP_URI_TOO_LONG,	/* Request line past the header limit; 414. */
 };
 
 /*
@@ -74,6 +75,14 @@ const char *gwp_http_conn_username(const struct gwp_http_conn *hc);
  */
 bool gwp_http_conn_auth_failed(const struct gwp_http_conn *hc,
 			       const char **user, size_t *len);
+
+/**
+ * What to answer a client whose request header has filled the buffer, with
+ * gwp_http_conn_process() still asking for more: GWP_HTTP_URI_TOO_LONG while
+ * the request line is not complete, GWP_HTTP_TOO_LARGE once it is, and
+ * GWP_HTTP_ERR if the bytes have not yet shown they are HTTP at all.
+ */
+int gwp_http_conn_overflow(const struct gwp_http_conn *hc);
 
 /**
  * Parse the client's request header and, once it is complete, classify the
@@ -240,6 +249,15 @@ int gwp_http_build_not_implemented_reply(void *out, size_t out_cap);
  * @return	Number of bytes written to @out, or -ENOBUFS if too small.
  */
 int gwp_http_build_bad_version_reply(void *out, size_t out_cap);
+
+/**
+ * Build a "414 URI Too Long" reply (RFC 9112 Section 3), for a request line
+ * that does not fit the request header limit or the client buffer
+ * (GWP_HTTP_URI_TOO_LONG).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_uri_too_long_reply(void *out, size_t out_cap);
 
 /**
  * Build an upstream "CONNECT <authority> HTTP/1.1" request (used when chaining
