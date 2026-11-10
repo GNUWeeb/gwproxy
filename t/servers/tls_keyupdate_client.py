@@ -35,6 +35,13 @@
 #       On the control connection of a SOCKS5 UDP association: what the proxy's
 #       engine has to say there must also come through, and must not pile up
 #       when the client asks for it without reading.
+#   udpseg
+#       On a UDP association's control connection again, send KeyUpdate
+#       requests each in one TCP segment with a data byte, so that every read
+#       by the proxy has data in it as well. All the answers but the last
+#       (which OpenSSL gives only when it gets to its next message) must
+#       come, past the point where the proxy stops reading a client whose
+#       answers wait, and a half-close must then end the association.
 #   shut
 #       The origin finishes sending, which ends the proxy's sending to the
 #       client, and goes on reading. Keep asking and sending a byte each time:
@@ -49,6 +56,7 @@ import ctypes.util
 import random
 import select
 import socket
+import struct
 import sys
 import threading
 import time
@@ -72,6 +80,11 @@ STRAND_DATA = b"x" * 64
 STRAND_TALK = b"p" * 200
 STRAND_STALL = 30       # the origin got nothing for this long: it is stuck
 STRAND_MSS = 8192       # what the client sends in, see strand_round()
+# Past the proxy's limit on queued answers at --target-buf-size=4096, about
+# 29 KiB, with room to spare.
+UDPSEG_UPDATES = 3000
+KEY_UPDATE_RECORD = 27  # a KeyUpdate's record on the wire
+UDPSEG_END = 10         # how long a half-close may take to end it
 
 SSL_ERROR_WANT_READ = 2
 SSL_ERROR_WANT_WRITE = 3
@@ -361,13 +374,9 @@ def noread(port, pid):
 def udp(port, pid):
     # Much less and the answers to read below crawl through the tiny window.
     c = Client(port, rcvbuf=STRAND_RCVBUF)
-    c.write(b"\x05\x01\x00")
-    if c.read_some() != b"\x05\x00":
-        return "SOCKS5 greeting refused"
-    c.write(b"\x05\x03\x00\x01\0\0\0\0\0\0")
-    rep = c.read_some()
-    if len(rep) != 10 or rep[1] != 0:
-        return "UDP ASSOCIATE got %r" % rep
+    err = socks5_udp_associate(c)
+    if err:
+        return err
     err = expect_answer(c, "on a UDP association")
     if err:
         return err
@@ -392,6 +401,91 @@ def udp(port, pid):
         n = LIB.SSL_write(c.ssl, b"x", 1)
         if n != 1 and LIB.SSL_get_error(c.ssl, n) != SSL_ERROR_WANT_WRITE:
             return "SSL_write failed"
+    return None
+
+
+def socks5_udp_associate(c):
+    c.write(b"\x05\x01\x00")
+    if c.read_some() != b"\x05\x00":
+        return "SOCKS5 greeting refused"
+    c.write(b"\x05\x03\x00\x01\0\0\0\0\0\0")
+    rep = c.read_some()
+    if len(rep) != 10 or rep[1] != 0:
+        return "UDP ASSOCIATE got %r" % rep
+    return None
+
+
+class RawReader:
+    """Counts what arrives on the client's socket, raw, until it ends. Only
+    the proxy's answers can come once the handshake's tickets are read, and
+    OpenSSL never reads them, as the client does not call SSL_read()."""
+
+    def __init__(self, s):
+        self.s = s
+        self.count = 0
+        self.end = None
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        try:
+            while True:
+                d = self.s.recv(65536)
+                if not d:
+                    break
+                self.count += len(d)
+        except OSError:
+            pass
+        self.end = time.monotonic()
+
+
+def udpseg(port, pid):
+    c = Client(port)
+    err = socks5_udp_associate(c)
+    if err:
+        return err
+    c.s.setblocking(False)
+    c.drain(1)
+    c.s.setblocking(True)
+    # A proxy that stops reading must not block the client for good.
+    c.s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                   struct.pack("ll", 1, 0))
+    rd = RawReader(c.s)
+
+    prog = Progress()
+    sent = 0
+    while sent < UDPSEG_UPDATES:
+        c.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
+        c.key_update()
+        while True:
+            n = LIB.SSL_write(c.ssl, b"x", 1)
+            if n == 1:
+                break
+            if LIB.SSL_get_error(c.ssl, n) != SSL_ERROR_WANT_WRITE:
+                return "SSL_write failed"
+            if prog.stuck(sent, rd.count):
+                return ("proxy stopped reading after %d of %d KeyUpdates, "
+                        "%d bytes of answers" % (sent, UDPSEG_UPDATES,
+                                                 rd.count))
+        c.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 0)
+        sent += 1
+
+    want = (UDPSEG_UPDATES - 1) * KEY_UPDATE_RECORD
+    while rd.count < want:
+        if rd.end is not None:
+            return "proxy hung up after %d of %d bytes of answers" % (
+                rd.count, want)
+        if prog.stuck(rd.count):
+            return ("got %d of %d bytes of answers, nothing moved for %d s"
+                    % (rd.count, want, RESUME_STALL))
+        time.sleep(0.05)
+
+    c.s.shutdown(socket.SHUT_WR)
+    start = time.monotonic()
+    while rd.end is None:
+        if time.monotonic() - start > UDPSEG_END:
+            return "association still up %d s after a half-close" % (
+                UDPSEG_END)
+        time.sleep(0.05)
     return None
 
 
@@ -643,7 +737,8 @@ def main():
     scenario, port, pid = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
     try:
         err = {"answer": answer, "noread": noread, "burst": burst,
-               "strand": strand, "shut": shut, "udp": udp}[scenario](port, pid)
+               "strand": strand, "shut": shut, "udp": udp,
+               "udpseg": udpseg}[scenario](port, pid)
     except (RuntimeError, OSError) as e:
         err = repr(e)
     print(err or "ok")

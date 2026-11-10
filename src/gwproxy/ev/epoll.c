@@ -3489,13 +3489,19 @@ static int arm_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &evl);
 }
 
-static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/*
+ * Take in what the client sent, and act on it. Only the @first pass of
+ * client_prot_in() reads the socket; later ones take only what a TLS
+ * client's engine already holds, as splice_recv() does.
+ */
+static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				    bool first)
 {
 	uint32_t from = gcp->client.len;
 	ssize_t ret;
 	int r, ct;
 
-	ret = __do_recv(&gcp->client);
+	ret = splice_recv(&gcp->client, first);
 	if (unlikely(ret < 0))
 		return (int)ret;
 	if (!ret) {
@@ -3529,7 +3535,21 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 		 * association down.
 		 */
 		gcp->client.len = 0;
-		return gcp->client.rd_eof ? -ECONNRESET : 0;
+		if (gcp->client.rd_eof)
+			return -ECONNRESET;
+		/*
+		 * A TLS client's engine may have queued records of its own
+		 * while decrypting them (a KeyUpdate's answer): send them as
+		 * in any other state. Left unsent, they pile up until
+		 * client_rx_held() parks the fd with no EPOLLOUT to drain
+		 * them, and the end of the control connection goes unseen.
+		 */
+		if (client_reply_pending(gcp)) {
+			ret = __do_send(&gcp->target, &gcp->client);
+			if (ret < 0)
+				return (int)ret;
+		}
+		return arm_client_prot_out(w, gcp);
 	}
 	if (ct == CONN_STATE_PROT) {
 		r = handle_conn_state_prot(w, gcp);
@@ -3590,16 +3610,23 @@ static int handle_ev_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gc
  * request, say), and the rest is only taken once that has been parsed.
  * Records left once the connect has started are taken when it completes
  * (see flush_early_data()).
+ *
+ * Only the first pass reads the socket; what is left there is reported
+ * again by the level-triggered EPOLLIN. Some states drop what the client
+ * sends (a UDP association's control connection, a forwarding request
+ * waiting for its lookup), so client.buf never fills there: passes that
+ * read the socket would go on for as long as a fast client keeps sending,
+ * and hold up every other connection of the worker.
  */
 static int client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	int r = handle_ev_client_prot_in(w, gcp);
+	int r = handle_ev_client_prot_in(w, gcp, true);
 
 #ifdef CONFIG_HTTPS
 	while (!r && gcp->client.tls && !client_past_handshake(gcp) &&
 	       gcp->client.len < gcp->client.cap &&
 	       gwp_ssl_rx_more(gcp->client.tls))
-		r = handle_ev_client_prot_in(w, gcp);
+		r = handle_ev_client_prot_in(w, gcp, false);
 #endif
 	return r;
 }
