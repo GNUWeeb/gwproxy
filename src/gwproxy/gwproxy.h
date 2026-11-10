@@ -974,6 +974,12 @@ struct gwp_wrk {
 	 * enough to stamp every event with (gwp_conn_pair::last_act).
 	 */
 	uint32_t		now;
+	/*
+	 * The INPUT chain's refusals: logged at most once a second, from
+	 * @acl_deny_next on, with the number left out since (gwp_wrk_acl_denied()).
+	 */
+	uint32_t		acl_deny_next;
+	uint32_t		acl_deny_quiet;
 	pthread_t		thread;
 
 	/*
@@ -1124,6 +1130,7 @@ struct gwp_ctx {
 
 struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w);
 bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
+void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 /* Make @gcp chain through @up (NULL: go direct), dropping what it had. */

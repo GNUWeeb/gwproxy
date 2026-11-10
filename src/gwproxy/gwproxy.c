@@ -2649,6 +2649,32 @@ bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
 	return false;
 }
 
+/*
+ * Log a client just accepted from @addr that the INPUT chain rejected. Such a
+ * client costs only an accept and a close, so it can come back as fast as it
+ * likes: log at most one line a second per worker, saying how many were left
+ * out since the previous one, so a flood of them cannot flood the log.
+ */
+void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	uint32_t quiet;
+
+	if ((int32_t)(w->now - w->acl_deny_next) < 0) {
+		w->acl_deny_quiet++;
+		return;
+	}
+
+	quiet = w->acl_deny_quiet;
+	w->acl_deny_quiet = 0;
+	w->acl_deny_next = w->now + 1;
+	if (quiet)
+		pr_info(&ctx->lh, "ACL denied client %s (and %u more since the last such line)",
+			ip_to_str(addr), quiet);
+	else
+		pr_info(&ctx->lh, "ACL denied client %s", ip_to_str(addr));
+}
+
 /* Uncount a client gwp_ctx_iplim_get() admitted. */
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr)
 {

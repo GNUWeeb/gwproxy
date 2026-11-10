@@ -348,6 +348,11 @@ is not given, a built\-in default ACL is applied instead (see
 .BR \-\-acl\-allow\-all
 below). Each line is one directive, evaluated top\-to\-bottom
 with first\-match\-wins; a chain's policy applies when nothing matches.
+A client that the
+.B INPUT
+chain rejects is closed as soon as it is accepted, before anything is read from
+it, and logged at info level with its address, at most once a second per worker
+thread, with the number rejected since the previous line.
 A word that starts with
 .B #
 begins a comment that runs to the end of the line; a

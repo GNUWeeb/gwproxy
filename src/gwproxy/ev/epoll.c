@@ -1054,7 +1054,7 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	 * flood of them should cost no more than an accept and a close.
 	 */
 	if (!gwp_ctx_acl_client_allowed(ctx, &addr, GWP_ACL_PROTO_TCP)) {
-		pr_info(&ctx->lh, "ACL denied client %s", ip_to_str(&addr));
+		gwp_wrk_acl_denied(w, &addr);
 		__sys_close(fd);
 		return 0;
 	}
