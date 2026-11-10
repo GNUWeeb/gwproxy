@@ -1517,7 +1517,11 @@ refuse.
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
 does not send another request on the connection, and the connection is closed
-once the origin has finished. A response that is not valid HTTP/1.x, one whose
+once the origin has finished. With Transfer\-Encoding present, any
+Content\-Length is dropped from the response (RFC 9112 Section 6.3), and a
+Content\-Length given more than once is passed on once. A response that is not
+valid HTTP/1.x, one with a Content\-Length that does not name a single length
+(two that differ, a list of different values, not a number), one whose
 header is too large, and a 407 from the origin, which would invite the client
 to hand over its proxy credentials, are answered with "502 Bad Gateway"
 instead. The response header, together with any interim (1xx) responses before

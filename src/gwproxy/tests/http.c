@@ -640,6 +640,85 @@ static int res_feed(struct gwp_http_conn *hc, const char *in, bool eof,
 				      out_len);
 }
 
+/*
+ * A final response is framed by its Transfer-Encoding, or else its
+ * Content-Length (RFC 9112 Section 6.3): with both, the Content-Length goes;
+ * one that does not name a single length is a response the client could
+ * frame differently from the origin, 502; one named more than once goes on
+ * once. Interim responses, which have no body, are left alone.
+ */
+static void test_res_framing(void)
+{
+#define CC	"Connection: close\r\nProxy-Connection: close\r\n\r\n"
+	static const struct {
+		const char	*in;
+		int		ret;
+		const char	*out;
+	} cases[] = {
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+		  "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 0,
+		  "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n" CC
+		  "0\r\n\r\n" },
+		{ "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n"
+		  "content-length: abc\r\nContent-Length: 7\r\n\r\n", 0,
+		  "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n" CC },
+		{ "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nzz", 0,
+		  "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n" CC "zz" },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+		  "Content-Length: 7\r\n\r\n", -EBADMSG, NULL },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 5, 7\r\n\r\n",
+		  -EBADMSG, NULL },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n",
+		  -EBADMSG, NULL },
+		{ "HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\n", -EBADMSG, NULL },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n",
+		  -EBADMSG, NULL },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 5,\r\n\r\n",
+		  -EBADMSG, NULL },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 1 2\r\n\r\n",
+		  -EBADMSG, NULL },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n",
+		  -EBADMSG, NULL },
+		{ "HTTP/1.1 200 OK\r\n"
+		  "Content-Length: 9223372036854775808\r\n\r\n", -EBADMSG,
+		  NULL },
+		{ "HTTP/1.1 200 OK\r\n"
+		  "Content-Length: 9223372036854775807\r\n\r\n", 0,
+		  "HTTP/1.1 200 OK\r\n"
+		  "Content-Length: 9223372036854775807\r\n" CC },
+		{ "HTTP/1.1 200 OK\r\nContent-Length:  2 \r\n\r\nok", 0,
+		  "HTTP/1.1 200 OK\r\nContent-Length:  2 \r\n" CC "ok" },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 2, 2,02\r\nX: 1\r\n"
+		  "content-length: 2\r\n\r\nok", 0,
+		  "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX: 1\r\n" CC "ok" },
+		{ "HTTP/1.1 100 Continue\r\nContent-Length: x\r\n\r\n"
+		  "HTTP/1.1 204 No Content\r\n\r\n", 0,
+		  "HTTP/1.1 100 Continue\r\nContent-Length: x\r\n\r\n"
+		  "HTTP/1.1 204 No Content\r\n" CC },
+	};
+#undef CC
+	struct gwp_http_conn *hc;
+	char out[1024];
+	size_t i, out_len;
+	int r;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		r = res_feed(hc, cases[i].in, false, out, sizeof(out),
+			     &out_len);
+		assert(r == cases[i].ret);
+		if (!r)
+			assert(out_len == strlen(cases[i].out) &&
+			       !memcmp(out, cases[i].out, out_len));
+		else
+			assert(gwp_http_fwd_res_state(hc) ==
+			       GWP_HTTP_RES_FAILED);
+		gwp_http_conn_free(hc);
+	}
+	PRTEST_OK();
+}
+
 static void test_res_rewrite(void)
 {
 	/*
@@ -2135,6 +2214,7 @@ int main(void)
 		test_forward_conn_limit();
 		test_req_framing();
 		test_res_rewrite();
+		test_res_framing();
 		test_res_interim();
 		test_res_reject();
 		test_res_limits();

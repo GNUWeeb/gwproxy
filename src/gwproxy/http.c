@@ -1337,6 +1337,46 @@ struct res_line {
 };
 
 /*
+ * Take the Content-Length value at @v (@len bytes, from just after the colon)
+ * into *@val and count its elements in *@nr: a single non-negative decimal,
+ * or a list of them, which must all be the same (RFC 9110 Section 8.6). The
+ * value is held to the limit of a request's (set_req_framing()). Returns 0,
+ * or -EBADMSG for anything else: the origin can then not be told to have
+ * meant one length.
+ */
+static int res_cl_value(const char *v, size_t len, bool *have, uint64_t *val,
+			int *nr)
+{
+	const char *p = v, *end = v + len;
+
+	for (;;) {
+		uint64_t x = 0;
+		const char *d;
+
+		while (p < end && (*p == ' ' || *p == '\t'))
+			p++;
+		for (d = p; p < end && *p >= '0' && *p <= '9'; p++) {
+			uint64_t n = (uint64_t)(*p - '0');
+
+			if (x > ((uint64_t)INT64_MAX - n) / 10)
+				return -EBADMSG;
+			x = x * 10 + n;
+		}
+		if (p == d || (*have && x != *val))
+			return -EBADMSG;
+		*have = true;
+		*val = x;
+		(*nr)++;
+		while (p < end && (*p == ' ' || *p == '\t'))
+			p++;
+		if (p == end)
+			return 0;
+		if (*p++ != ',')
+			return -EBADMSG;
+	}
+}
+
+/*
  * Rewrite one complete response header (@len bytes, ending with its blank
  * line) into @out: lines are normalised to CRLF, hop-by-hop fields and fields
  * named by Connection are dropped and, for a final response, the client is
@@ -1355,7 +1395,9 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 	struct res_line lines[RES_MAX_FIELDS];
 	struct conn_tok toks[CONN_MAX_TOKENS];
 	const char *p = hdr, *end = hdr + len, *q;
-	int nr_toks = 0, nr_lines = 0, l;
+	int nr_toks = 0, nr_lines = 0, nr_cl = 0, l;
+	bool has_te = false, have_cl = false, cl_done = false;
+	uint64_t cl = 0;
 	size_t n, o, i;
 
 	/* Status line: HTTP/1.x SP 3DIGIT [ SP reason-phrase ] */
@@ -1413,6 +1455,32 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		}
 	}
 
+	/*
+	 * The framing of a final response (RFC 9112 Section 6.3), which the
+	 * client reads the body by: with Transfer-Encoding present, every
+	 * Content-Length goes, as an intermediary MUST remove it; without,
+	 * a Content-Length that does not name one length makes the response
+	 * unusable (502), and one named more than once is passed on once.
+	 */
+	if (*code >= 200) {
+		for (l = 0; l < nr_lines; l++) {
+			if (lines[l].klen == 17 &&
+			    !strncasecmp(hdr + lines[l].off,
+					 "Transfer-Encoding", 17))
+				has_te = true;
+		}
+		for (l = 0; !has_te && l < nr_lines; l++) {
+			const char *k = hdr + lines[l].off;
+
+			if (lines[l].klen != 14 ||
+			    strncasecmp(k, "Content-Length", 14))
+				continue;
+			if (res_cl_value(k + 15, lines[l].len - 15, &have_cl,
+					 &cl, &nr_cl) < 0)
+				return -EBADMSG;
+		}
+	}
+
 	for (l = 0; l < nr_lines; l++) {
 		const char *k = hdr + lines[l].off;
 		size_t klen = lines[l].klen;
@@ -1423,6 +1491,25 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		if (!is_framing_field(k, klen) &&
 		    conn_toks_have(toks, nr_toks, k, klen))
 			continue;
+		if (*code >= 200 && (has_te || nr_cl > 1) && klen == 14 &&
+		    !strncasecmp(k, "Content-Length", 14)) {
+			char v[24];
+			int vl;
+
+			/* Dropped, or the one line left for all of them. */
+			if (has_te || cl_done)
+				continue;
+			vl = snprintf(v, sizeof(v), "%" PRIu64, cl);
+			if (o + klen + 2 + (size_t)vl + 2 > out_cap)
+				return -E2BIG;
+			memcpy(out + o, k, klen);
+			memcpy(out + o + klen, ": ", 2);
+			memcpy(out + o + klen + 2, v, (size_t)vl);
+			memcpy(out + o + klen + 2 + vl, "\r\n", 2);
+			o += klen + 2 + (size_t)vl + 2;
+			cl_done = true;
+			continue;
+		}
 		if (o + n + 2 > out_cap)
 			return -E2BIG;
 		memcpy(out + o, k, n);
