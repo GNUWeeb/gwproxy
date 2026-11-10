@@ -877,7 +877,10 @@ struct gwp_wrk_dns {
 enum {
 	/* The protocol, connect or idle timeout of the pair. */
 	GWP_TMR_CONN		= 0,
-	/* The next connect attempt joins the race. */
+	/*
+	 * The next connect attempt joins the race; before it, while the
+	 * name resolves with --raw-dns, the query is sent again.
+	 */
 	GWP_TMR_ATTEMPT		= 1,
 };
 

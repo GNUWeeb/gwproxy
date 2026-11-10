@@ -147,6 +147,7 @@ int gwp_dns_res_prep_query(struct gwp_dns_resolver *res,
 		return (int)tmp;
 
 	gdp->buf_len = (uint16_t)tmp;
+	gdp->nr_sent = 0;
 	return 0;
 }
 

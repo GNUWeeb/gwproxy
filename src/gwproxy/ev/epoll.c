@@ -44,17 +44,50 @@ static int tls_flush_hs(struct gwp_conn *c);
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
 #include <gwproxy/dns_resolver.h>
-static int send_dns_payload(struct gwp_conn_pair *gcp)
+
+static int tmr_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		   uint32_t kind, uint64_t ms);
+static void tmr_disarm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		       uint32_t kind);
+
+/*
+ * A raw query is sent up to GWP_RAW_DNS_TRIES times. The wait for a reply
+ * starts at GWP_RAW_DNS_WAIT_MS and doubles after each send (1 s, 2 s, 4 s),
+ * as a stub resolver backs off, so one lost datagram costs a second instead
+ * of the whole protocol timeout. After the last wait the lookup fails as a
+ * name that does not resolve. That bounds every lookup, at 7 s per address
+ * family, also when --protocol-timeout sets no limit.
+ *
+ * The wait runs on the pair's GWP_TMR_ATTEMPT timer: no connect attempt is
+ * raced before the name has resolved, and drop_raw_dns_query() disarms it
+ * when the lookup ends, before handle_connect() may arm it for the race.
+ */
+#define GWP_RAW_DNS_TRIES	3
+#define GWP_RAW_DNS_WAIT_MS	1000ull
+
+/*
+ * Send the query in gdp->buf, the first time or again, and arm the wait for
+ * its reply.
+ */
+static int send_dns_payload(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_dns_packet *gdp = gcp->gdp;
 	ssize_t sr;
 
 	sr = __sys_sendto(gdp->fd, gdp->buf, gdp->buf_len, MSG_NOSIGNAL,
 			  NULL, 0);
-	if (unlikely(sr < 0))
+	/*
+	 * A full send buffer on a resend is a datagram lost on the way, which
+	 * the next try covers; the first send has no earlier one to fall back
+	 * on.
+	 */
+	if (unlikely(sr < 0) && !(gdp->nr_sent && (sr == -EAGAIN ||
+						    sr == -ENOBUFS)))
 		return (int)sr;
 
-	return 0;
+	gdp->nr_sent++;
+	return tmr_arm(w, gcp, GWP_TMR_ATTEMPT,
+		       GWP_RAW_DNS_WAIT_MS << (gdp->nr_sent - 1));
 }
 
 /*
@@ -74,7 +107,7 @@ static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_RAW_DNS_QUERY;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->gdp->fd, &ev);
 		if (likely(!r))
-			r = send_dns_payload(gcp);
+			r = send_dns_payload(w, gcp);
 		/*
 		 * Answered as a lookup that failed, -EAGAIN from a full send
 		 * buffer included: passed on, it reads as "nothing to do yet"
@@ -92,6 +125,41 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst);
 static int drop_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * The lookup failed for @err: close its socket, and, as the name did not
+ * resolve, the origin is unreachable: answer in whatever protocol the client
+ * speaks (SOCKS5 REP, or HTTP 502) and close, as the getaddrinfo path does.
+ * The error returned then tears down this one pair (handle_event()).
+ *
+ * The client gets the reply that path gives for any failed lookup, host
+ * unreachable (REP 0x04), whatever the reason here: NXDOMAIN, SERVFAIL, an
+ * answer with no usable address, a malformed reply, a server that never
+ * answered come back as assorted errnos
+ * that would otherwise read as a general failure (REP 0x01). The reason
+ * itself goes to the log.
+ */
+static int fail_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      int err)
+{
+	int r;
+
+	r = drop_raw_dns_query(w, gcp);
+	if (unlikely(r))
+		return r;
+
+	pr_dbg(&w->ctx->lh, "DNS query failed: %s (%s; gcp_idx=%u)",
+	       gcp->gdp->host, strerror(-err), gcp->idx);
+	r = gwp_conn_fail_reply(w, gcp, -EHOSTUNREACH);
+	if (!r && gcp->target.len) {
+		ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+		if (unlikely(sr < 0))
+			r = (int)sr;
+	}
+
+	return r ? r : err;
+}
 
 /*
  * One datagram from the query's socket. Returns 1 when the lookup is still
@@ -112,18 +180,16 @@ static int handle_raw_dns_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 					 GWP_MAX_CONN_CAND, &nr);
 	if (ret == -ESRCH)
 		return 1;
-	/* The lookup is over: its socket is done with. */
-	if (ret != -EAGAIN) {
-		r = drop_raw_dns_query(w, gcp);
-		if (unlikely(r))
-			return r;
-	}
 	if (ret == -EAGAIN) {
-		/* Retry with the fallback record type. */
-		ret = send_dns_payload(gcp);
+		/* Retry with the fallback record type, on a schedule of its own. */
+		ret = send_dns_payload(w, gcp);
 		if (likely(!ret))
 			return 1;
 	} else if (likely(!ret)) {
+		/* The lookup is over: its socket is done with. */
+		r = drop_raw_dns_query(w, gcp);
+		if (unlikely(r))
+			return r;
 		/* Every address of the reply, so a dead one has a fallback. */
 		gwp_conn_set_candidates(gcp, addrs, nr);
 		pr_dbg(&ctx->lh, "Resolved DNS query for %s to %s (%u addr, gcp_idx=%u)",
@@ -132,29 +198,33 @@ static int handle_raw_dns_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return handle_connect(w, gcp);
 	}
 
-	/*
-	 * The name did not resolve, so the origin is unreachable: answer
-	 * in whatever protocol the client speaks (SOCKS5 REP, or HTTP 502)
-	 * and close, as the getaddrinfo path does. The error then tears
-	 * down this one pair (handle_event()).
-	 *
-	 * The client gets the reply that path gives for any failed lookup,
-	 * host unreachable (REP 0x04), whatever the reason here: NXDOMAIN,
-	 * SERVFAIL, an answer with no usable address and a malformed reply
-	 * come back as assorted errnos that would otherwise read as a
-	 * general failure (REP 0x01). The reason itself goes to the log.
-	 */
-	pr_dbg(&ctx->lh, "DNS query failed: %s (%s; gcp_idx=%u)",
-	       gcp->gdp->host, strerror((int)-ret), gcp->idx);
-	r = gwp_conn_fail_reply(w, gcp, -EHOSTUNREACH);
-	if (!r && gcp->target.len) {
-		ssize_t sr = __do_send(&gcp->target, &gcp->client);
+	return fail_raw_dns_query(w, gcp, (int)ret);
+}
 
-		if (unlikely(sr < 0))
-			r = (int)sr;
-	}
+/*
+ * No reply came within the wait (see GWP_RAW_DNS_TRIES): the query or its
+ * reply was lost, or the server is slow or down. Send the same query again,
+ * under the same transaction ID, so a late reply to an earlier send is still
+ * taken; or, when the tries are spent, fail the lookup.
+ */
+static int handle_raw_dns_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_dns_packet *gdp = gcp->gdp;
+	int r;
 
-	return r ? r : (int)ret;
+	if (!w->ctx->cfg.use_raw_dns || !gdp || gdp->fd < 0)
+		return 0;
+
+	if (gdp->nr_sent >= GWP_RAW_DNS_TRIES)
+		return fail_raw_dns_query(w, gcp, -ETIMEDOUT);
+
+	pr_dbg(&w->ctx->lh, "DNS query for %s unanswered, sending it again (try %u; gcp_idx=%u)",
+	       gdp->host, gdp->nr_sent + 1u, gcp->idx);
+	r = send_dns_payload(w, gcp);
+	if (unlikely(r))
+		return fail_raw_dns_query(w, gcp, r);
+
+	return 0;
 }
 
 /*
@@ -167,7 +237,6 @@ static int handle_raw_dns_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 static int handle_ev_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
 	uint8_t buf[DNS_EDNS_UDP_SIZE];
 	ssize_t ret;
 	int i, r;
@@ -179,11 +248,12 @@ static int handle_ev_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			 * The socket is connected, so an ICMP port unreachable
 			 * from a DNS server that is down -- or simply not
 			 * listening where we were told -- is reported here as
-			 * -ECONNREFUSED. It ends nothing: the lookup times out
-			 * on its own, as it would with no reply at all.
+			 * -ECONNREFUSED. It ends nothing: the lookup fails on
+			 * its own once its tries are spent, as it would with no
+			 * reply at all.
 			 */
 			if (ret != -EAGAIN && ret != -EINTR)
-				pr_dbg(&ctx->lh, "DNS socket recv failed: %s",
+				pr_dbg(&w->ctx->lh, "DNS socket recv failed: %s",
 				       strerror((int)-ret));
 			return 0;
 		}
@@ -197,6 +267,12 @@ static int handle_ev_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 #else
 static int chk_handle_dns_query(struct gwp_wrk __unused *w,
+				struct gwp_conn_pair __unused *gcp)
+{
+	return 0;
+}
+
+static int handle_raw_dns_timer(struct gwp_wrk __unused *w,
 				struct gwp_conn_pair __unused *gcp)
 {
 	return 0;
@@ -447,6 +523,8 @@ static int drop_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (!w->ctx->cfg.use_raw_dns || !gcp->gdp || gcp->gdp->fd < 0)
 		return 0;
 
+	/* Its retransmission timer goes with it (see GWP_RAW_DNS_TRIES). */
+	tmr_disarm(w, gcp, GWP_TMR_ATTEMPT);
 	ep_del(w, gcp->gdp->fd);
 	gwp_dns_res_drop_query(gcp->gdp);
 	return credit_fd_closed(w, 1);
@@ -3893,6 +3971,8 @@ static int run_timers(struct gwp_wrk *w)
 		tmr_disarm(w, gcp, kind);
 		if (kind == GWP_TMR_CONN)
 			r = handle_conn_timer(w, gcp);
+		else if (gwp_in_dns_lookup(gcp))
+			r = handle_raw_dns_timer(w, gcp);
 		else
 			r = handle_attempt_timer(w, gcp);
 

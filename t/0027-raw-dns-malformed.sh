@@ -27,6 +27,8 @@
 # It must also stay within one query per address family. The resolver used to
 # send the same query again on every unusable answer, as fast as the server
 # answered, until the protocol timeout -- thousands of queries for one request.
+# A question that is not ours is no answer at all, so that lookup sends its
+# query again on its schedule (after 1 s and 3 s): three sends, no more.
 #
 # The port matters as much as the payload here. --dns-server used to drop the
 # port from "addr:port" and query 53 regardless, and because the socket is
@@ -79,7 +81,7 @@ loop=epoll
 # took minutes on a loaded host. A case keeps its files in $WORK/<case>.
 dns_case()
 {
-	local mode="$1" W="$WORK/$1" dp p rep nq code
+	local mode="$1" W="$WORK/$1" dp p rep nq code max
 
 	mkdir -p "$W"
 	case "$mode" in
@@ -152,8 +154,10 @@ dns_case()
 		# Anything still being sent would show up by now.
 		sleep 0.5
 		nq="$(cat "$W/nr_queries" 2>/dev/null)"
-		[ -n "$nq" ] && [ "$nq" -le 2 ] || \
-			fail "[$loop] $mode took '$nq' queries (want at most 2)"
+		max=2
+		[ "$mode" = question-label ] && max=3
+		[ -n "$nq" ] && [ "$nq" -le "$max" ] || \
+			fail "[$loop] $mode took '$nq' queries (want at most $max)"
 		;;
 	esac
 

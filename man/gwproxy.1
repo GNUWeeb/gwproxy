@@ -1189,6 +1189,16 @@ SOCKS5 reply
 .B 0x04
 (host unreachable), HTTP
 .BR 502 .
+A query that has no reply after 1\ s is sent again, and again 2\ s after
+that; 4\ s after the third send the lookup fails as for a name that does not
+resolve. So a lookup takes at most 7\ s per address family, also with
+.BR \-\-protocol\-timeout=0 ;
+a shorter
+.B \-\-protocol\-timeout
+ends it first, with the timeout reply (SOCKS5
+.BR 0x06 ,
+HTTP
+.BR 504 ).
 Default:
 .BR 0 .
 .SS Upstream proxy chaining
