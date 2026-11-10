@@ -3529,7 +3529,21 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 		 * association down.
 		 */
 		gcp->client.len = 0;
-		return gcp->client.rd_eof ? -ECONNRESET : 0;
+		if (gcp->client.rd_eof)
+			return -ECONNRESET;
+		/*
+		 * A TLS client's engine may have queued records of its own
+		 * while decrypting them (a KeyUpdate's answer): send them as
+		 * in any other state. Left unsent, they pile up until
+		 * client_rx_held() parks the fd with no EPOLLOUT to drain
+		 * them, and the end of the control connection goes unseen.
+		 */
+		if (client_reply_pending(gcp)) {
+			ret = __do_send(&gcp->target, &gcp->client);
+			if (ret < 0)
+				return (int)ret;
+		}
+		return arm_client_prot_out(w, gcp);
 	}
 	if (ct == CONN_STATE_PROT) {
 		r = handle_conn_state_prot(w, gcp);
