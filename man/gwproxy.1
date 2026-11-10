@@ -2372,10 +2372,11 @@ which requires
 .BR SIGINT ", " SIGTERM
 Stop at once: workers leave their event loops and every connection is closed,
 with whatever is still in its buffers or on its way discarded. There is no
-drain. A client in the middle of a transfer sees a normal end of stream after
+drain. A client in the middle of a download sees a normal end of stream after
 only part of the data, so a protocol that does not mark its own end cannot tell
-this from a complete transfer. The process exits once a reload in progress is
-over (see
+this from a complete transfer; a client still sending, with data the proxy has
+not read yet, sees its connection reset instead. The process exits once a
+reload in progress is over (see
 .BR "RELOADING THE FILES" ).
 A lookup still in the system resolver, which can take until the resolver's
 own timeout, is waited for at most one second, or until a second
