@@ -2310,6 +2310,32 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 }
 
 /*
+ * Whether the error @err (SO_ERROR) of a connect says that the target accepted
+ * and then reset the connection: a refused SYN gives ECONNREFUSED, one that is
+ * never answered ETIMEDOUT. What it sent before the reset can still be read,
+ * so the connect counts as a success. Not for an upstream proxy, whose reset
+ * fails the handshake that is yet to run on the connection.
+ */
+static bool target_was_up(const struct gwp_conn_pair *gcp, int err)
+{
+	return (err == ECONNRESET || err == EPIPE) && !gcp->upstream;
+}
+
+/*
+ * A connect that target_was_up() took as a success. Reading SO_ERROR has
+ * cleared the error, so it is recorded here, as conn_note_reset() would:
+ * forwarding then reads what the target sent, and ends there.
+ */
+static void target_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      int err)
+{
+	pr_dbg(&w->ctx->lh, "Target connected, then ended: %s (idx=%u, fd=%d)",
+		strerror(err), gcp->idx, gcp->target.fd);
+	gcp->target.rst = true;
+	gcp->target.wr_shut = true;
+}
+
+/*
  * A racing connect attempt reported a result. The first one to succeed wins and
  * its socket becomes the target; a failure just retires that attempt, and only
  * when nothing is left in flight and no candidate remains does the client hear
@@ -2321,7 +2347,7 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 {
 	struct gwp_ctx *ctx = w->ctx;
 	socklen_t l = sizeof(int);
-	int r, err = 0, fd;
+	int r, err = 0, up_err = 0, fd;
 
 	if (unlikely(slot >= GWP_MAX_CONN_CAND))
 		return -EINVAL;
@@ -2334,6 +2360,12 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 	if (unlikely(r < 0)) {
 		pr_err(&ctx->lh, "getsockopt error: %s", strerror(-r));
 		err = -r;
+	}
+
+	/* Connected, then reset; see target_was_up(). */
+	if (r >= 0 && target_was_up(gcp, err)) {
+		up_err = err;
+		err = 0;
 	}
 
 	if (!err && gwp_target_is_self(w, gcp, &gcp->attempt_addr[slot], true))
@@ -2373,6 +2405,8 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 	r = adopt_winning_attempt(w, gcp, slot);
 	if (unlikely(r))
 		return r;
+	if (up_err)
+		target_note_reset(w, gcp, up_err);
 
 	return handle_ev_target_conn_result(w, gcp);
 }
@@ -2653,6 +2687,10 @@ static int handle_ev_target_conn_err(struct gwp_wrk *w,
 	r = __sys_getsockopt(gcp->target.fd, SOL_SOCKET, SO_ERROR, &err, &l);
 	if (unlikely(r < 0))
 		err = -r;
+	else if (target_was_up(gcp, err)) {
+		target_note_reset(w, gcp, err);
+		return 0;
+	}
 	if (!err)
 		err = ECONNRESET;
 
@@ -2734,6 +2772,8 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		}
 
 		r = handle_ev_target_conn_err(w, gcp);
+		if (!r)
+			return handle_ev_target_conn_result(w, gcp);
 		if (gwp_in_upstream_hs(gcp))
 			return upstream_fail(w, gcp, r);
 		/* Plain forwarding's connect to its upstream. */
