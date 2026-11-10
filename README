@@ -11,11 +11,16 @@ Features
   - SOCKS5 proxy (RFC 1928):
       - CONNECT to IPv4, IPv6 and domain-name (ATYP) targets.
       - UDP ASSOCIATE: relay UDP datagrams to IPv4/IPv6 targets (on both
-        the epoll and io_uring loops). Datagrams to domain-name targets
-        are dropped (no per-datagram DNS yet), and the command is refused
-        when an upstream proxy is configured (UDP is not chained).
-        Replies are relayed only from an address and port the client
-        has sent to (and the ACL still allows).
+        the epoll and io_uring loops). A client that an ACL
+        "-j UPSTREAM" rule sends through a pool has its UDP chained: the
+        pool's socks5:// or socks5h:// server carries the association
+        (an http:// or https:// server cannot, and the command is then
+        refused). --upstream-proxy is not used for UDP: without an ACL
+        choice the command is refused when it is given. Datagrams to
+        domain-name targets are dropped (no per-datagram DNS yet), except
+        through a socks5h:// server, which gets them as they are.
+        A direct relay passes replies only from an address and port the
+        client has sent to (and the ACL still allows).
       - Username/password authentication (RFC 1929), or no authentication.
   - HTTP proxy:
       - CONNECT tunneling.
