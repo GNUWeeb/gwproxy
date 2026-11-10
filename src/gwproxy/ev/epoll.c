@@ -2719,6 +2719,20 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * returns that first (see conn_note_reset()).
 	 */
 	if (unlikely(ev->events & EPOLLERR) && !gcp->is_target_alive) {
+		/*
+		 * The request is out and the upstream may have answered ahead
+		 * of its reset: a refusal is the upstream's to give, and must
+		 * not be taken for the upstream failing. Read and parse it;
+		 * with nothing queued, recv() returns the error itself.
+		 */
+		if (gwp_in_upstream_hs(gcp) && !gcp->up_tx &&
+		    gcp->conn_state != CONN_STATE_UPSTREAM_TLS_HS) {
+			struct epoll_event uev = *ev;
+
+			uev.events |= EPOLLIN;
+			return handle_ev_upstream(w, gcp, &uev);
+		}
+
 		r = handle_ev_target_conn_err(w, gcp);
 		if (gwp_in_upstream_hs(gcp))
 			return upstream_fail(w, gcp, r);
