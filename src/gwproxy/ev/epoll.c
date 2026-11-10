@@ -2906,12 +2906,25 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	/*
 	 * Held before the upstream handshake, the target is watched only for
-	 * a hangup: the upstream went away before it was spoken to.
+	 * a hangup: the upstream went away before it was spoken to. That is
+	 * a failure of the chain, REP 0x01 or 502, as a hangup during the
+	 * handshake is (gwp_upstream_fail_reply()). But target.buf still
+	 * holds the rest of the client's method or auth reply, which that
+	 * would drop: the failure reply goes after it.
 	 */
 	if (unlikely(upstream_start_held(gcp))) {
 		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_HUP, 0);
 		if (gwp_conn_upstream_failed(w, gcp, -ECONNRESET, true))
 			return upstream_redial(w, gcp, -ECONNRESET);
+		r = gwp_conn_fail_reply(w, gcp, -EPROTO);
+		if (unlikely(r))
+			return r;
+		if (client_reply_pending(gcp)) {
+			ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+			if (unlikely(sr < 0))
+				return (int)sr;
+		}
 		return -ECONNRESET;
 	}
 
