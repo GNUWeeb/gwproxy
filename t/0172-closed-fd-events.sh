@@ -108,6 +108,12 @@ hold_check()
 # The client of the pool and DNS parts: a SOCKS5 tunnel to <dst>:<hp>, idle
 # for a second, then used and closed; the proxy must stay idle meanwhile
 # and after. Exit 2 when it spun.
+#
+# Its CONNECT waits on servers that answer late on purpose, and the default
+# connect timeout of 5 seconds bounds all of it, the retry on the second
+# pool server included: a machine that stalls for a few seconds (a loaded
+# CI runner) ran out of it, and the client got REP 0x06. Those parts give
+# the proxy as long as the client waits, 20 seconds.
 cat >"$WORK/tunnel.py" <<'PY'
 import os, socket, struct, sys, time
 
@@ -289,7 +295,8 @@ for loop in epoll io_uring; do
 			echo '-A OUTPUT -j UPSTREAM --to p --accept'
 		} >"$WORK/pool.$loop.acl"
 		hold_start "$loop/redial" --log-level=4 --as-socks5=1 \
-			--event-loop="$loop" --acl-file="$WORK/pool.$loop.acl"
+			--event-loop="$loop" --acl-file="$WORK/pool.$loop.acl" \
+			--connect-timeout=20
 		if [ "$HELD" = 1 ]; then
 			rc=0
 			for _ in 1 2; do
@@ -334,7 +341,8 @@ for loop in epoll io_uring; do
 		timeout 10 bash -c "until grep -q ready '$WORK/dns.log'; do sleep 0.05; done" ||
 			fail "the DNS server did not start"
 		hold_start "$loop/dns" --log-level=3 --acl-allow-all --as-socks5=1 \
-			--event-loop="$loop" --raw-dns=1 --dns-server="127.0.0.1:$dp"
+			--event-loop="$loop" --raw-dns=1 --dns-server="127.0.0.1:$dp" \
+			--connect-timeout=20
 		if [ "$HELD" = 1 ]; then
 			out="$(python3 "$WORK/tunnel.py" "$PP" "$GPID" "$HLOG" q.example "$hp")"
 			hold_check "$loop/dns" $? "$out"
