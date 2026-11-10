@@ -1339,8 +1339,13 @@ prevent. In this they differ from the global
 which stays best\-effort. They apply to TCP target connections \(em SOCKS5,
 HTTP, plain and transparent forwarding, and the hop to an
 .B \-\-upstream\-proxy
-\(em but not to the SOCKS5 UDP relay, matching the reach of
-.BR "\-j BIND" .
+\(em and not to the SOCKS5 UDP relay socket, matching the reach of
+.BR "\-j BIND" :
+the relay's datagrams to targets leave from whichever source routing picks.
+Those of a UDP association through a pool server, though, go to the
+server's relay from the address, and out of the interface, of gwproxy's
+control connection to that server, which these options do bind (see
+.BR "UPSTREAM CHAINING" ).
 A matching
 .B \-j BIND
 rule
@@ -2192,7 +2197,11 @@ server cannot carry UDP, and the client is refused (reply 0x07). gwproxy
 connects to the server as for a CONNECT through it, with the same
 authentication, and asks it for a UDP ASSOCIATE of its own, naming the
 address of that connection and the port of the relay socket gwproxy sends
-the datagrams from. The client is answered only once the server has: on
+the datagrams from. They are sent from that address, and out of the
+interface that connection is bound to, if any, so they come from where the
+server was told even when
+.BR \-\-bind\-source ", " \-\-bind\-iface " or " "\-j BIND"
+moved that connection off the address routing would pick. The client is answered only once the server has: on
 success with gwproxy's own relay address, as for a direct relay, and the
 server's relay, where gwproxy sends the datagrams, is the address the server
 replies with (or the server's own address, when the reply names 0.0.0.0 or

@@ -569,10 +569,14 @@ struct gwp_udp_peers {
  * relay takes the datagrams (@relay, in the family of the pair's udp_fd), and
  * the last domain target's OUTPUT verdict, as struct gwp_udp_acl_cache keeps
  * an address's: @ok for @dom and @dport, while @valid and the ACL is still at
- * generation @gen.
+ * generation @gen. The datagrams leave from @local, the address of the
+ * control connection that gwproxy's own UDP ASSOCIATE declares, and out of
+ * @ifindex, the interface that connection is bound to (0 for none).
  */
 struct gwp_udp_up {
 	struct gwp_sockaddr	relay;
+	struct gwp_sockaddr	local;
+	uint32_t		ifindex;
 	socklen_t		relay_len;
 	uint32_t		gen;
 	__be16			dport;

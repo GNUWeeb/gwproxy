@@ -6450,6 +6450,8 @@ static enum gwp_udp_act udp_up_classify(struct gwp_wrk *w,
 	out->len = n;
 	out->dst = u->relay;
 	out->dstlen = u->relay_len;
+	out->from = &u->local;
+	out->from_ifindex = u->ifindex;
 	return GWP_UDP_TO_TARGET;
 
 from_relay:
@@ -6920,11 +6922,20 @@ size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
 	}
 }
 
+/*
+ * What gwproxy's own UDP ASSOCIATE to the pair's upstream declares: the
+ * address of the control connection to it, and the port of the relay
+ * socket. The control connection follows --bind-source and --bind-iface
+ * (or -j BIND), and the relay socket, bound to the wildcard address, does
+ * not, so its datagrams to the server are sent from that address and out
+ * of that interface (gcp->udp_up): a server that takes datagrams only from
+ * the declared address, as gwproxy does, would drop them otherwise.
+ */
 int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_sockaddr local, relay;
 	socklen_t slen = sizeof(local);
-	int r;
+	int r, ifindex = 0;
 
 	r = __sys_getsockname(gcp->target.fd, &local.sa, &slen);
 	if (r >= 0) {
@@ -6936,6 +6947,15 @@ int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		       strerror(-r), gcp->idx);
 		return r;
 	}
+#ifdef SO_BINDTOIFINDEX
+	/* Unknown to a kernel older than 5.0: no interface then. */
+	slen = sizeof(ifindex);
+	if (__sys_getsockopt(gcp->target.fd, SOL_SOCKET, SO_BINDTOIFINDEX,
+			     &ifindex, &slen) < 0 || ifindex < 0)
+		ifindex = 0;
+#endif
+	gcp->udp_up->local = local;
+	gcp->udp_up->ifindex = (uint32_t)ifindex;
 
 	/* An IPv4 control connection names its address as IPv4. */
 	gwp_socks5_reply_addr_from_sockaddr(&local, &gcp->up_dst);
