@@ -43,6 +43,7 @@
 #endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <getopt.h>
 #include <signal.h>
@@ -1458,6 +1459,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
 		free(gcp->udp_peers);
 		free(gcp->udp_up);
+		free(gcp->udp_eg);
 		gwp_conn_set_upstream(w->ctx, gcp, NULL);
 
 		/*
@@ -3026,13 +3028,14 @@ static const char *gcp_req_user(const struct gwp_conn_pair *gcp)
 }
 
 /*
- * OUTPUT verdict for a UDP ASSOCIATE datagram to @target. Only the verdict
- * applies to UDP (no DNAT, MARK or BIND), and every input but the target is
- * fixed for the association (pinned peer, username), so the last target's
- * verdict is reused while the target and the ruleset generation stay the
- * same: a client streaming to one peer costs one evaluation, not one per
- * datagram. A chain with a -m statistic rule is evaluated every time, as its
- * answer changes per evaluation.
+ * OUTPUT verdict for a UDP ASSOCIATE datagram to @target. No DNAT applies to
+ * UDP; a direct relay keeps the -j MARK and -j BIND of the target in
+ * gcp->udp_eg, for udp_egress(). Every input but the target is fixed for
+ * the association (pinned peer, username), so the last target's verdict is
+ * reused while the target and the ruleset generation stay the same: a
+ * client streaming to one peer costs one evaluation, not one per datagram.
+ * A chain with a -m statistic rule is evaluated every time, as its answer
+ * changes per evaluation.
  */
 static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			       const struct gwp_sockaddr *target)
@@ -3053,6 +3056,15 @@ static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	/* UDP is relayed direct: -j UPSTREAM does not apply to it. */
 	gwp_acl_req_release(&req);
 
+	if (gcp->udp_eg) {
+		struct gwp_conn_sockopt *so = &gcp->udp_eg->so;
+
+		memset(so, 0, sizeof(*so));
+		so->mark_set = req.mark_set;
+		so->mark = req.mark;
+		if (req.bind.set)
+			so->bind = req.bind;
+	}
 	c->valid = req.cacheable;
 	c->gen = req.gen;
 	c->dst = *target;
@@ -4008,6 +4020,72 @@ out:
 }
 
 /*
+ * Whether the kernel takes SO_MARK per datagram, as the UDP relay gives
+ * --mark to the datagrams to the targets only (see udp_egress()). A kernel
+ * older than 5.0 does not, nor, on some, a process with CAP_NET_RAW but not
+ * CAP_NET_ADMIN, which SO_MARK on a socket is happy with. Asked of a
+ * sendmsg() that sends nothing: the mark comes first, then an IP_PKTINFO
+ * naming an interface that does not exist, so a kernel that takes the mark
+ * fails the send with ENODEV, and one that does not with EPERM or EINVAL.
+ * Where it does not, the relay socket itself is marked, as it was before
+ * the mark went per datagram: the datagrams to the clients get it too.
+ */
+__cold
+static void gwp_ctx_init_udp_mark(struct gwp_ctx *ctx)
+{
+	union gwp_udp_cmsg cb;
+	struct gwp_sockaddr dst;
+	struct in_pktinfo pi;
+	struct cmsghdr *cm;
+	struct msghdr mh;
+	struct iovec iov;
+	ssize_t r;
+	int fd;
+
+	ctx->udp_sk_mark = 0;
+	fd = __sys_socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return;
+
+	memset(&cb, 0, sizeof(cb));
+	cm = (struct cmsghdr *)(void *)cb.b;
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type = SO_MARK;
+	cm->cmsg_len = CMSG_LEN(sizeof(ctx->cfg.mark));
+	memcpy(CMSG_DATA(cm), &ctx->cfg.mark, sizeof(ctx->cfg.mark));
+	cm = (struct cmsghdr *)(void *)(cb.b + CMSG_SPACE(sizeof(ctx->cfg.mark)));
+	memset(&pi, 0, sizeof(pi));
+	pi.ipi_ifindex = INT_MAX;
+	cm->cmsg_level = IPPROTO_IP;
+	cm->cmsg_type = IP_PKTINFO;
+	cm->cmsg_len = CMSG_LEN(sizeof(pi));
+	memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
+
+	memset(&dst, 0, sizeof(dst));
+	dst.i4.sin_family = AF_INET;
+	dst.i4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	dst.i4.sin_port = htons(9);	/* discard, were it ever sent */
+	iov.iov_base = &pi;
+	iov.iov_len = 0;
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_name = &dst.sa;
+	mh.msg_namelen = sizeof(dst.i4);
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = cb.b;
+	mh.msg_controllen = CMSG_SPACE(sizeof(ctx->cfg.mark)) +
+			    CMSG_SPACE(sizeof(pi));
+	r = __sys_sendmsg(fd, &mh, MSG_NOSIGNAL);
+	__sys_close(fd);
+	if (r >= 0 || r == -ENODEV)
+		return;
+
+	ctx->udp_sk_mark = ctx->cfg.mark;
+	pr_warn(&ctx->lh, "--mark: the kernel does not take SO_MARK per datagram (%s), so the UDP relay marks its datagrams to the clients too",
+		strerror((int)-r));
+}
+
+/*
  * Turn --bind-source/--bind-iface into the ready-made bind spec the connect
  * path applies when no ACL -j BIND rule claimed the connection. Done once here
  * rather than per connection, and validated here so a typo (a malformed
@@ -4897,6 +4975,7 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 				goto out_free_log;
 			}
 		}
+		gwp_ctx_init_udp_mark(ctx);
 	}
 
 	if (ctx->cfg.pid_file)
@@ -5184,6 +5263,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gwp_conn_close_attempts(gcp);
 	free(gcp->udp_peers);
 	free(gcp->udp_up);
+	free(gcp->udp_eg);
 	gwp_conn_set_upstream(w->ctx, gcp, NULL);
 
 	gwp_conn_pair_drop_dns(w, gcp);
@@ -6741,6 +6821,10 @@ static enum gwp_udp_act udp_up_classify(struct gwp_wrk *w,
 	out->dstlen = u->relay_len;
 	out->from = &u->local;
 	out->from_ifindex = u->ifindex;
+	if (u->mark != w->ctx->udp_sk_mark) {
+		out->mark = u->mark;
+		out->mark_set = true;
+	}
 	return GWP_UDP_TO_TARGET;
 
 from_relay:
@@ -6756,6 +6840,119 @@ from_relay:
 	return GWP_UDP_TO_CLIENT;
 }
 
+/* The failures of udp_egress() an association has logged, once each. */
+enum {
+	GWP_UDP_EG_IFACE	= 1 << 0,
+	GWP_UDP_EG_FAMILY	= 1 << 1,
+	GWP_UDP_EG_V6_BOTH	= 1 << 2,
+};
+
+/*
+ * The index of interface @name, looked up at most once a second for @eg: an
+ * interface that comes up later is found, and one that went away, or came
+ * back with another index, is noticed. 0 when there is no such interface.
+ */
+static uint32_t udp_eg_ifindex(struct gwp_wrk *w, struct gwp_udp_egress *eg,
+			       const char *name)
+{
+	if (eg->if_at != w->now || strcmp(eg->ifname, name)) {
+		snprintf(eg->ifname, sizeof(eg->ifname), "%s", name);
+		eg->ifindex = if_nametoindex(name);
+		eg->if_at = w->now;
+	}
+	return eg->ifindex;
+}
+
+/*
+ * Set @out, a direct association's datagram to its target out->dst, to leave
+ * the relay socket the way a TCP connection to that target would: from the
+ * source address, out of the interface, and with the mark that a matching
+ * ACL -j BIND or -j MARK rule, else --bind-source, --bind-iface and --mark,
+ * give it, as gwp_create_sock_target() applies them, and as strictly. The
+ * socket is bound to nothing, as it talks to the client too, so these go
+ * with each datagram (gwp_udp_src_cmsg()): the datagrams to the client keep
+ * the address the client was told and routing's interface, and carry no
+ * mark, as on a TCP client connection.
+ *
+ * Returns false, to drop the datagram, where a connection would fail: an
+ * interface that does not exist (yet), or an ACL source of the other family.
+ * Also for an IPv6 target with both a source and an interface: per datagram
+ * the kernel holds an IPv6 one to the interface only when it picks the
+ * source itself, and would otherwise send it by another interface where
+ * this one has no route to the target. A source port is not applied: the
+ * datagrams leave from the relay socket's port.
+ */
+static bool udp_egress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		       struct gwp_udp_out *out)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_udp_egress *eg = gcp->udp_eg;
+	const struct gwp_conn_sockopt *so = (eg && ctx->acl) ? &eg->so : NULL;
+	const struct gwp_acl_bind *b = NULL;
+	uint32_t mark = ctx->cfg.mark;
+	bool global = false;
+	const char *why;
+	uint8_t bit;
+
+	/* A -j MARK replaces --mark, as on a TCP connection. */
+	if (so && so->mark_set)
+		mark = so->mark;
+	if (mark != ctx->udp_sk_mark) {
+		out->mark = mark;
+		out->mark_set = true;
+	}
+
+	/* A -j BIND replaces --bind-source and --bind-iface wholesale. */
+	if (so && so->bind.set) {
+		b = &so->bind;
+	} else if (ctx->bind_def.set) {
+		b = &ctx->bind_def;
+		global = true;
+	}
+	if (!b)
+		return true;
+	/* Allocated whenever there is a bind to apply, see the caller. */
+	assert(eg);
+
+	if (b->iface[0]) {
+		out->from_ifindex = udp_eg_ifindex(w, eg, b->iface);
+		if (!out->from_ifindex) {
+			bit = GWP_UDP_EG_IFACE;
+			why = "no such interface";
+			goto drop;
+		}
+	}
+	if (b->have_src) {
+		if (conn_bind_src(&eg->src, &b->src, &out->dst)) {
+			out->from = &eg->src;
+		} else if (!global) {
+			/* --bind-source of the other family just does not apply. */
+			bit = GWP_UDP_EG_FAMILY;
+			why = "the -j BIND --to-source is of another family";
+			goto drop;
+		}
+	}
+	if (out->from && out->from_ifindex &&
+	    out->dst.sa.sa_family == AF_INET6 &&
+	    !IN6_IS_ADDR_V4MAPPED(&out->dst.i6.sin6_addr)) {
+		bit = GWP_UDP_EG_V6_BOTH;
+		why = "an IPv6 datagram cannot be held to both a source and an interface";
+		goto drop;
+	}
+	return true;
+
+drop:
+	if (!(eg->warned & bit)) {
+		eg->warned |= bit;
+		pr_err(&ctx->lh,
+		       "UDP relay: dropping the datagrams to %s from %s on interface %s: %s (idx=%u)",
+		       ip_to_str(&out->dst),
+		       b->have_src ? ip_to_str(&b->src) : "(any)",
+		       b->iface[0] ? b->iface : "(any)", why, gcp->idx);
+	}
+	return false;
+}
+
 enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 					struct gwp_conn_pair *gcp,
 					unsigned char *base, size_t n,
@@ -6766,6 +6963,7 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 
 	out->from = NULL;
 	out->from_ifindex = 0;
+	out->mark_set = false;
 	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
 		return udp_up_classify(w, gcp, base, n, src, out);
 
@@ -6811,16 +7009,24 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 			gcp->udp_peer = *src;
 			gcp->udp_pinned = true;
 		}
+		/* Room for what the ACL and the bind options say, see udp_egress(). */
+		if (!gcp->udp_eg && (w->ctx->acl || w->ctx->bind_def.set)) {
+			gcp->udp_eg = calloc(1, sizeof(*gcp->udp_eg));
+			if (unlikely(!gcp->udp_eg))
+				return GWP_UDP_DROP;
+		}
 		if (!udp_target_allowed(w->ctx, gcp, &tsa))
 			return GWP_UDP_DROP;	/* ACL denied this datagram */
+		out->dst = tsa;
+		out->dstlen = tslen;
+		if (!udp_egress(w, gcp, out))
+			return GWP_UDP_DROP;
 		/* Only a target the client has sent to may answer it. */
 		if (!udp_peer_note(gcp, &tsa,
 				   w->ctx->acl ? gcp->udp_acl.gen : 0))
 			return GWP_UDP_DROP;
 		out->buf = base + hdr_len;
 		out->len = n - hdr_len;
-		out->dst = tsa;
-		out->dstlen = tslen;
 		return GWP_UDP_TO_TARGET;
 	} else {
 		/* Target -> client: prepend a header in the front slack. */
@@ -7080,8 +7286,9 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (relay.sa.sa_family == AF_INET6)
 		setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
-	if (ctx->cfg.mark)
-		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)ctx->cfg.mark);
+	/* The datagrams to the targets carry their mark, see udp_egress(). */
+	if (ctx->udp_sk_mark)
+		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)ctx->udp_sk_mark);
 
 	r = __sys_bind(fd, &relay.sa, relay_len);
 	if (r < 0) {
@@ -7155,37 +7362,43 @@ size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
 {
 	const struct gwp_sockaddr *f = out->from;
 	struct cmsghdr *cm = (struct cmsghdr *)(void *)cb->b;
-	struct in_addr a4;
+	struct in_addr a4 = { 0 };
+	size_t len = 0;
 	bool f4, d4;
 
-	if (!f)
-		return 0;
-	if (f->sa.sa_family == AF_INET) {
-		f4 = true;
-		a4 = f->i4.sin_addr;
-	} else if (f->sa.sa_family == AF_INET6) {
-		f4 = IN6_IS_ADDR_V4MAPPED(&f->i6.sin6_addr);
-		memcpy(&a4, &f->i6.sin6_addr.s6_addr[12], sizeof(a4));
-	} else {
-		return 0;
-	}
 	/* The destination has the relay socket's family. */
 	d4 = out->dst.sa.sa_family == AF_INET ||
 	     IN6_IS_ADDR_V4MAPPED(&out->dst.i6.sin6_addr);
+	f4 = d4;
+	if (f && f->sa.sa_family == AF_INET) {
+		f4 = true;
+		a4 = f->i4.sin_addr;
+	} else if (f && f->sa.sa_family == AF_INET6) {
+		f4 = IN6_IS_ADDR_V4MAPPED(&f->i6.sin6_addr);
+		memcpy(&a4, &f->i6.sin6_addr.s6_addr[12], sizeof(a4));
+	} else {
+		f = NULL;
+	}
 	if (f4 != d4)
+		f = NULL;
+	if (!f && !out->from_ifindex && !out->mark_set)
 		return 0;
 
-	assert(CMSG_SPACE(sizeof(struct in6_pktinfo)) <= sizeof(cb->b));
+	assert(CMSG_SPACE(sizeof(struct in6_pktinfo)) +
+	       CMSG_SPACE(sizeof(uint32_t)) <= sizeof(cb->b));
 	memset(cb, 0, sizeof(*cb));
-	if (out->dst.sa.sa_family == AF_INET6) {
+	if (!f && !out->from_ifindex) {
+		/* Only a mark. */
+	} else if (out->dst.sa.sa_family == AF_INET6) {
 		struct in6_pktinfo pi;
 
+		/* With no source, the unspecified one: routing picks it. */
 		memset(&pi, 0, sizeof(pi));
-		if (f4) {
+		if (d4) {
 			pi.ipi6_addr.s6_addr[10] = 0xff;
 			pi.ipi6_addr.s6_addr[11] = 0xff;
 			memcpy(&pi.ipi6_addr.s6_addr[12], &a4, sizeof(a4));
-		} else {
+		} else if (f) {
 			pi.ipi6_addr = f->i6.sin6_addr;
 			/* A link-local source is of its own link. */
 			pi.ipi6_ifindex = f->i6.sin6_scope_id;
@@ -7196,7 +7409,7 @@ size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
 		cm->cmsg_type = IPV6_PKTINFO;
 		cm->cmsg_len = CMSG_LEN(sizeof(pi));
 		memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
-		return CMSG_SPACE(sizeof(pi));
+		len = CMSG_SPACE(sizeof(pi));
 	} else {
 		struct in_pktinfo pi;
 
@@ -7207,8 +7420,17 @@ size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
 		cm->cmsg_type = IP_PKTINFO;
 		cm->cmsg_len = CMSG_LEN(sizeof(pi));
 		memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
-		return CMSG_SPACE(sizeof(pi));
+		len = CMSG_SPACE(sizeof(pi));
 	}
+	if (out->mark_set) {
+		cm = (struct cmsghdr *)(void *)(cb->b + len);
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type = SO_MARK;
+		cm->cmsg_len = CMSG_LEN(sizeof(out->mark));
+		memcpy(CMSG_DATA(cm), &out->mark, sizeof(out->mark));
+		len += CMSG_SPACE(sizeof(out->mark));
+	}
+	return len;
 }
 
 /*
@@ -7218,13 +7440,15 @@ size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
  * (or -j BIND), and the relay socket, bound to the wildcard address, does
  * not, so its datagrams to the server are sent from that address and out
  * of that interface (gcp->udp_up): a server that takes datagrams only from
- * the declared address, as gwproxy does, would drop them otherwise.
+ * the declared address, as gwproxy does, would drop them otherwise. They
+ * carry the connection's mark (--mark or -j MARK) as well, as the socket
+ * has none of its own (see udp_egress()).
  */
 int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_sockaddr local, relay;
 	socklen_t slen = sizeof(local);
-	int r, ifindex = 0;
+	int r, ifindex = 0, mark = 0;
 
 	r = __sys_getsockname(gcp->target.fd, &local.sa, &slen);
 	if (r >= 0) {
@@ -7243,8 +7467,13 @@ int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			     &ifindex, &slen) < 0 || ifindex < 0)
 		ifindex = 0;
 #endif
+	slen = sizeof(mark);
+	if (__sys_getsockopt(gcp->target.fd, SOL_SOCKET, SO_MARK, &mark,
+			     &slen) < 0)
+		mark = 0;
 	gcp->udp_up->local = local;
 	gcp->udp_up->ifindex = (uint32_t)ifindex;
+	gcp->udp_up->mark = (uint32_t)mark;
 
 	/* An IPv4 control connection names its address as IPv4. */
 	gwp_socks5_reply_addr_from_sockaddr(&local, &gcp->up_dst);

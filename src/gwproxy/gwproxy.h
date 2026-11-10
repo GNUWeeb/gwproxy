@@ -607,19 +607,44 @@ struct gwp_udp_peers {
  * the last domain target's OUTPUT verdict, as struct gwp_udp_acl_cache keeps
  * an address's: @ok for @dom and @dport, while @valid and the ACL is still at
  * generation @gen. The datagrams leave from @local, the address of the
- * control connection that gwproxy's own UDP ASSOCIATE declares, and out of
- * @ifindex, the interface that connection is bound to (0 for none).
+ * control connection that gwproxy's own UDP ASSOCIATE declares, out of
+ * @ifindex, the interface that connection is bound to (0 for none), and
+ * with @mark, its SO_MARK (0 for none).
  */
 struct gwp_udp_up {
 	struct gwp_sockaddr	relay;
 	struct gwp_sockaddr	local;
 	uint32_t		ifindex;
+	uint32_t		mark;
 	socklen_t		relay_len;
 	uint32_t		gen;
 	__be16			dport;
 	bool			valid;
 	bool			ok;
 	char			dom[256];
+};
+
+/*
+ * How a direct UDP association's datagrams to its targets leave the relay
+ * socket, which also talks to the client and so is bound to nothing: the
+ * source address, interface and mark that --bind-source, --bind-iface and
+ * --mark, or an ACL -j BIND or -j MARK rule, give a TCP connection to the
+ * same target are applied to each datagram (gwp_udp_src_cmsg()). @so holds
+ * the ACL's -j MARK and -j BIND for the target of gcp->udp_acl, the last
+ * one judged. @ifname is the last interface name looked up, and @ifindex
+ * its index (0 when it was not found), looked up again when the second
+ * changes (@if_at), as the interface may come and go. @src is the source of
+ * the datagram being sent, spelled for its destination. @warned holds the
+ * GWP_UDP_EG_* failures already logged for the association. Allocated on
+ * the association's first datagram that needs it.
+ */
+struct gwp_udp_egress {
+	struct gwp_conn_sockopt	so;
+	struct gwp_sockaddr	src;
+	uint32_t		ifindex;
+	uint32_t		if_at;
+	char			ifname[16];
+	uint8_t			warned;
 };
 
 struct gwp_conn_pair {
@@ -685,6 +710,8 @@ struct gwp_conn_pair {
 	struct gwp_udp_peers	*udp_peers;
 	/* A UDP association through the upstream, see GWP_CONN_FLAG_UDP_UP. */
 	struct gwp_udp_up	*udp_up;
+	/* A direct UDP association's egress state; NULL until it needs one. */
+	struct gwp_udp_egress	*udp_eg;
 	/* The next pair on the epoll loop's list of pairs to free (@dead). */
 	struct gwp_conn_pair	*next_dead;
 	/*
@@ -1162,6 +1189,12 @@ struct gwp_ctx {
 	 * neither option was given.
 	 */
 	struct gwp_acl_bind		bind_def;
+	/*
+	 * The SO_MARK of every UDP relay socket: 0, as the datagrams to the
+	 * targets carry --mark each, but --mark when the kernel does not take
+	 * a mark per datagram (see gwp_ctx_init_udp_mark()).
+	 */
+	uint32_t			udp_sk_mark;
 	struct gwp_cfg			cfg;
 	/* The locked --pid-file, removed on exit; -1 when there is none. */
 	int				pid_fd;
@@ -1341,27 +1374,32 @@ struct gwp_udp_out {
 	 */
 	const struct gwp_sockaddr *from;
 	uint32_t		from_ifindex;
+	/* The SO_MARK to send with, when @mark_set; else the socket's own. */
+	uint32_t		mark;
+	bool			mark_set;
 };
 
 /*
- * Room for the source address control message of a relayed datagram
- * (gwp_udp_src_cmsg()): CMSG_SPACE() of a struct in6_pktinfo, with the
- * padding of both parts spelled out, and aligned as control messages are.
+ * Room for the control messages of a relayed datagram (gwp_udp_src_cmsg()):
+ * CMSG_SPACE() of a struct in6_pktinfo and of a 32-bit SO_MARK, with the
+ * padding of each part spelled out, and aligned as control messages are.
  * (A struct cmsghdr member would make it a type of variable size, as the
  * header ends in a flexible array.)
  */
 union gwp_udp_cmsg {
 	size_t		align;
-	unsigned char	b[sizeof(struct cmsghdr) + sizeof(struct in6_pktinfo) +
-			  2 * sizeof(size_t)];
+	unsigned char	b[2 * sizeof(struct cmsghdr) +
+			  sizeof(struct in6_pktinfo) + sizeof(uint32_t) +
+			  4 * sizeof(size_t)];
 };
 
 /*
- * Build in @cb the control message that makes a datagram of @out leave the
- * relay socket from @out->from, and return its length for msg_controllen:
- * IPV6_PKTINFO on the dual-stack relay (an IPv4 source v4-mapped), IP_PKTINFO
- * on an IPv4 one. Returns 0, for no control message, when @out names no source
- * or one of the other family than the destination.
+ * Build in @cb the control messages that make a datagram of @out leave the
+ * relay socket from @out->from and out of @out->from_ifindex, and with
+ * @out->mark, and return their length for msg_controllen: IPV6_PKTINFO on
+ * the dual-stack relay (an IPv4 source v4-mapped), IP_PKTINFO on an IPv4
+ * one, then SO_MARK. A source of the other family than the destination is
+ * left out. Returns 0 when there is nothing to say.
  */
 size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb);
 

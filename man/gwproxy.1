@@ -719,8 +719,13 @@ fails (it needs
 or, since Linux 5.11,
 .BR CAP_NET_RAW )
 the connection is dropped rather than egressing unmarked via the wrong route.
-It applies to TCP target connections (SOCKS5, HTTP, plain and transparent), not
-the UDP relay. (The coarse global
+It applies to TCP target connections (SOCKS5, HTTP, plain and transparent) and
+to the datagrams the SOCKS5 UDP relay sends to a target (see
+.BR \-\-bind\-iface ),
+which a rule tells apart with
+.BR "\-p udp" ;
+a datagram whose mark cannot be set is dropped. (The coarse
+global
 .B \-\-mark
 remains best\-effort.)
 .IP
@@ -738,7 +743,8 @@ is required. Like
 .BR MARK ,
 it is a composable modifier (the last match wins), takes
 .B \-\-accept
-the same way, and applies to the same TCP target connections. It
+the same way, and applies to the same TCP target connections and UDP relay
+datagrams. It
 .I replaces
 the global
 .BR \-\-bind\-source / \-\-bind\-iface
@@ -1421,12 +1427,37 @@ prevent. In this they differ from the global
 which stays best\-effort. They apply to TCP target connections \(em SOCKS5,
 HTTP, plain and transparent forwarding, and the hop to an
 .B \-\-upstream\-proxy
-\(em and not to the SOCKS5 UDP relay socket, matching the reach of
-.BR "\-j BIND" :
-the relay's datagrams to targets leave from whichever source routing picks.
-Those of a UDP association through a pool server, though, go to the
-server's relay from the address, and out of the interface, of gwproxy's
-control connection to that server, which these options do bind (see
+\(em and to the datagrams the SOCKS5 UDP relay sends to its targets.
+.IP
+The relay socket also talks to the client, so it is bound to neither: each
+datagram to a target is given its source address and interface, and its
+mark, as it is sent
+.RB ( IP_PKTINFO / IPV6_PKTINFO " and " SO_MARK
+control messages), from these options,
+.BR \-\-mark ,
+or an ACL
+.BR "\-j BIND" " or " "\-j MARK"
+rule matching that target, as a TCP connection to it would be; the datagrams
+to the client are sent as before, from the address it was told and with no
+mark. It is as strict: a datagram is dropped where a connection would fail
+\(em an interface that does not exist (looked up again at most once a
+second, so one that comes up later is used), or a
+.B \-\-to\-source
+of the other family \(em and logged once for the association. The
+differences: the port of a source is not used, the datagrams leave from the
+relay's own port; and a datagram to an IPv6 target that is to be held to both
+a source and an interface is dropped, because the kernel holds an IPv6
+datagram to the interface given with it only when it picks the source itself,
+and sends one with a source of its own by any other interface where this one
+has no route to the target. An interface alone, or a source alone, is
+applied to IPv6 targets as to IPv4 ones. A kernel older than 5.0, or one that
+does not let the process mark a single datagram, has the
+.B \-\-mark
+set on the relay socket instead, which then marks the datagrams to the client
+as well (a warning at startup says so).
+The datagrams of a UDP association through a pool server go to the
+server's relay from the address, out of the interface and with the mark of
+gwproxy's control connection to that server, which these options bind (see
 .BR "UPSTREAM CHAINING" ).
 A matching
 .B \-j BIND
@@ -2382,9 +2413,9 @@ server cannot carry UDP, and the client is refused (reply 0x07). gwproxy
 connects to the server as for a CONNECT through it, with the same
 authentication, and asks it for a UDP ASSOCIATE of its own, naming the
 address of that connection and the port of the relay socket gwproxy sends
-the datagrams from. They are sent from that address, and out of the
-interface that connection is bound to, if any, so they come from where the
-server was told even when
+the datagrams from. They are sent from that address, out of the
+interface that connection is bound to, if any, and with its mark, so they
+come from where the server was told even when
 .BR \-\-bind\-source ", " \-\-bind\-iface " or " "\-j BIND"
 moved that connection off the address routing would pick. The client is answered only once the server has: on
 success with gwproxy's own relay address, as for a direct relay, and the
