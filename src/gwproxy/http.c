@@ -13,6 +13,7 @@
 #include <string.h>
 #include <strings.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #include "http.h"
 #include "http1.h"
@@ -49,6 +50,13 @@ struct gwp_http_conn {
 	 * "GET http://host/path") as opposed to a CONNECT tunnel.
 	 */
 	bool				is_forward;
+
+	/*
+	 * The Max-Forwards value a forwarded TRACE or OPTIONS request goes on
+	 * with, one less than it came with (RFC 9110 Section 7.6.2); -1 to
+	 * copy the field, if any, as it is.
+	 */
+	int64_t				max_fwd;
 
 	/*
 	 * The target's authority, once classified, split in place into the
@@ -404,7 +412,7 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 
 	ok = buf_add(buf, cap, &n, method, req->method_len) &&
 	     buf_add(buf, cap, &n, " ", 1) &&
-	     (*path == '/' || buf_add(buf, cap, &n, "/", 1)) &&
+	     (*path == '/' || *path == '*' || buf_add(buf, cap, &n, "/", 1)) &&
 	     buf_add(buf, cap, &n, path, path_len) &&
 	     buf_add(buf, cap, &n, ver, 11);
 	if (!ok)
@@ -451,6 +459,22 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 		    conn_toks_have(toks, nr_toks, k, f->klen) ||
 		    (f->klen == 4 && !strncasecmp(k, "Host", 4)))
 			continue;
+
+		/* Never longer than the value it replaces. */
+		if (hc->max_fwd >= 0 && f->klen == 12 &&
+		    !strncasecmp(k, "Max-Forwards", 12)) {
+			char v[24];
+			int vl = snprintf(v, sizeof(v), "%" PRId64,
+					  hc->max_fwd);
+
+			ok = buf_add(buf, cap, &n, k, f->klen) &&
+			     buf_add(buf, cap, &n, ": ", 2) &&
+			     buf_add(buf, cap, &n, v, (size_t)vl) &&
+			     buf_add(buf, cap, &n, "\r\n", 2);
+			if (!ok)
+				goto too_big;
+			continue;
+		}
 
 		ok = buf_add(buf, cap, &n, k, f->klen) &&
 		     buf_add(buf, cap, &n, ": ", 2) &&
@@ -582,6 +606,47 @@ static int set_req_framing(struct gwp_http_conn *hc)
 }
 
 /*
+ * RFC 9110 Section 7.6.2: a proxy that receives a TRACE or OPTIONS request
+ * with Max-Forwards MUST NOT forward it once that is 0, but answer it as its
+ * final recipient: OPTIONS with a 200, TRACE, whose echo of the request is
+ * not offered, with a 501. Above 0 the request goes on with one less
+ * (hc->max_fwd). The value is digits only, a larger one than 2^32 - 1 taken
+ * for that; anything else gets a 400. Other methods are not hop-limited and
+ * keep the field as it is. Returns 0 to forward the request, else the
+ * gwp_http_conn_process() result to answer it with.
+ */
+static int max_forwards(struct gwp_http_conn *hc)
+{
+	uint8_t m = hc->req_hdr.method;
+	uint64_t v = 0;
+	const char *p;
+	size_t len, i;
+
+	hc->max_fwd = -1;
+	if (m != GWNET_HTTP_METHOD_TRACE && m != GWNET_HTTP_METHOD_OPTIONS)
+		return 0;
+	p = gwnet_http_hdr_fields_get(&hc->req_hdr.fields, "Max-Forwards",
+				      &len);
+	if (!p)
+		return 0;
+	if (!len)
+		return GWP_HTTP_BAD_REQUEST;
+	for (i = 0; i < len; i++) {
+		if (p[i] < '0' || p[i] > '9')
+			return GWP_HTTP_BAD_REQUEST;
+		if (v < UINT32_MAX)
+			v = v * 10 + (uint64_t)(p[i] - '0');
+	}
+	if (v > UINT32_MAX)
+		v = UINT32_MAX;
+	if (!v)
+		return m == GWNET_HTTP_METHOD_OPTIONS ? GWP_HTTP_OPTIONS_REPLY :
+							GWP_HTTP_NOT_IMPLEMENTED;
+	hc->max_fwd = (int64_t)v - 1;
+	return 0;
+}
+
+/*
  * The rewrite of a forwarding request is built here, on the stack, before it
  * replaces the request in the caller's buffer; a larger one in a buffer
  * allocated for it. The rewrite is never more than twice the header's size
@@ -595,7 +660,8 @@ static int set_req_framing(struct gwp_http_conn *hc)
  * takes the place of the original header in @buf (*@len of @cap bytes) and
  * whatever followed the header moves along behind it. *@len and *@hdr_len_p
  * are set to the new lengths. Returns GWP_HTTP_FORWARD, GWP_HTTP_BAD_REQUEST,
- * GWP_HTTP_NOT_IMPLEMENTED, GWP_HTTP_TOO_LARGE or GWP_HTTP_ERR.
+ * GWP_HTTP_NOT_IMPLEMENTED, GWP_HTTP_OPTIONS_REPLY, GWP_HTTP_TOO_LARGE or
+ * GWP_HTTP_ERR.
  */
 /* Not inlined: its stack frame must not add up with its callers'. */
 static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
@@ -653,9 +719,19 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 		path = slash;
 		path_len = (size_t)(uri_end - slash);
 	} else {
-		path = "/";
+		/*
+		 * RFC 9112 Section 3.2.4: an OPTIONS request for a URI with
+		 * an empty path and no query asks about the server as a
+		 * whole, and goes to it as "OPTIONS *".
+		 */
+		path = hc->req_hdr.method == GWNET_HTTP_METHOD_OPTIONS ?
+		       "*" : "/";
 		path_len = 1;
 	}
+
+	r = max_forwards(hc);
+	if (r)
+		return r;
 
 	for (i = 0; i < hc->req_hdr.fields.nr; i++) {
 		const struct gwnet_http_hdr_fields *ff = &hc->req_hdr.fields;
@@ -1676,6 +1752,22 @@ int gwp_http_build_too_large_reply(void *out, size_t out_cap)
 {
 	static const char resp[] =
 		"HTTP/1.1 431 Request Header Fields Too Large\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_options_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 200 OK\r\n"
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n"
 		"\r\n";

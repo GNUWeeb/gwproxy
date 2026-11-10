@@ -1453,7 +1453,14 @@ of ordinary absolute\-form requests such as "GET http://host/path", which
 gwproxy rewrites to origin form, fetches from the origin and relays back, one
 request per connection. Any method is forwarded, spelt as the client sent it:
 extension methods such as WebDAV's PROPFIND as well. A fragment ("#...") in
-the URI is not part of the request and is not sent on.
+the URI is not part of the request and is not sent on. An OPTIONS request
+for a URI with an empty path and no query, such as "OPTIONS http://host:8080",
+goes to the origin as "OPTIONS *". TRACE and OPTIONS requests are hop\-limited
+by Max\-Forwards (RFC 9110 Section 7.6.2): one with "Max\-Forwards: 0" is
+answered by gwproxy itself, an OPTIONS with "200 OK" and a TRACE with "501 Not
+Implemented", and one with a larger value goes on with one less. A Max\-Forwards
+value that is not a number gets "400 Bad Request" on these two methods; other
+methods keep the field as it is.
 .PP
 A connection whose first bytes cannot start a request line, a method token
 followed by a space after at most one empty line, is closed at once without a

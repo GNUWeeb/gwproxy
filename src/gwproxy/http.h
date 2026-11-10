@@ -36,10 +36,14 @@ enum gwp_http_result {
 				 * repeated); reply 400. */
 	GWP_HTTP_TOO_LARGE,	/* Header too long or too many fields; 431. */
 	GWP_HTTP_NOT_IMPLEMENTED, /* A request this proxy does not serve:
-				 * origin-form, a scheme other than http://;
-				 * reply 501. */
+				 * origin-form, a scheme other than http://,
+				 * a TRACE with Max-Forwards: 0; reply
+				 * 501. */
 	GWP_HTTP_BAD_VERSION,	/* An HTTP version other than 1.x; 505. */
 	GWP_HTTP_URI_TOO_LONG,	/* Request line past the header limit; 414. */
+	GWP_HTTP_OPTIONS_REPLY,	/* An OPTIONS request with Max-Forwards: 0,
+				 * which this proxy answers itself; reply
+				 * 200. */
 };
 
 /*
@@ -234,6 +238,14 @@ int gwp_http_build_gateway_timeout_reply(void *out, size_t out_cap);
  * @return	Number of bytes written to @out, or -ENOBUFS if too small.
  */
 int gwp_http_build_too_large_reply(void *out, size_t out_cap);
+
+/**
+ * Build the "200 OK" reply to an OPTIONS request that this proxy answers
+ * as its final recipient (GWP_HTTP_OPTIONS_REPLY).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_options_reply(void *out, size_t out_cap);
 
 /**
  * Build a "501 Not Implemented" reply, for a request this proxy does not

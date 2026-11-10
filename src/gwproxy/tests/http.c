@@ -1180,6 +1180,88 @@ static void test_req_errors(void)
 }
 
 /*
+ * TRACE and OPTIONS are hop-limited by Max-Forwards (RFC 9110 Section
+ * 7.6.2): at 0 the proxy answers them itself, above it they go on with one
+ * less. Other methods keep the field as it is. An OPTIONS for a URI with an
+ * empty path and no query goes on as "OPTIONS *" (RFC 9112 Section 3.2.4).
+ */
+static void test_max_forwards(void)
+{
+	static const struct {
+		const char	*in;
+		int		want;
+		const char	*out;
+	} cases[] = {
+		{ "TRACE http://h/ HTTP/1.1\r\nMax-Forwards: 0\r\n\r\n",
+		  GWP_HTTP_NOT_IMPLEMENTED, NULL },
+		{ "OPTIONS http://h/ HTTP/1.1\r\nMax-Forwards: 0\r\n\r\n",
+		  GWP_HTTP_OPTIONS_REPLY, NULL },
+		{ "OPTIONS http://h/ HTTP/1.1\r\nmax-forwards: 000\r\n\r\n",
+		  GWP_HTTP_OPTIONS_REPLY, NULL },
+		{ "OPTIONS http://h/ HTTP/1.1\r\nMax-Forwards: x\r\n\r\n",
+		  GWP_HTTP_BAD_REQUEST, NULL },
+		{ "TRACE http://h/ HTTP/1.1\r\nMax-Forwards: -1\r\n\r\n",
+		  GWP_HTTP_BAD_REQUEST, NULL },
+		{ "TRACE http://h/ HTTP/1.1\r\nMax-Forwards:\r\n\r\n",
+		  GWP_HTTP_BAD_REQUEST, NULL },
+		{ "TRACE http://h/ HTTP/1.1\r\nMax-Forwards: 1 2\r\n\r\n",
+		  GWP_HTTP_BAD_REQUEST, NULL },
+		{ "TRACE http://h/ HTTP/1.1\r\nMax-Forwards: 3\r\n\r\n",
+		  GWP_HTTP_FORWARD,
+		  "TRACE / HTTP/1.1\r\nHost: h\r\nMax-Forwards: 2\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "OPTIONS http://h/a HTTP/1.1\r\nmax-FORWARDS: 0010\r\n\r\n",
+		  GWP_HTTP_FORWARD,
+		  "OPTIONS /a HTTP/1.1\r\nHost: h\r\nmax-FORWARDS: 9\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "TRACE http://h/ HTTP/1.1\r\n"
+		  "Max-Forwards: 99999999999999999999999\r\n\r\n",
+		  GWP_HTTP_FORWARD,
+		  "TRACE / HTTP/1.1\r\nHost: h\r\nMax-Forwards: 4294967294\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "GET http://h/ HTTP/1.1\r\nMax-Forwards: 0\r\n\r\n",
+		  GWP_HTTP_FORWARD,
+		  "GET / HTTP/1.1\r\nHost: h\r\nMax-Forwards: 0\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "GET http://h/ HTTP/1.1\r\nMax-Forwards: x\r\n\r\n",
+		  GWP_HTTP_FORWARD,
+		  "GET / HTTP/1.1\r\nHost: h\r\nMax-Forwards: x\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "OPTIONS http://h:8001 HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD,
+		  "OPTIONS * HTTP/1.1\r\nHost: h:8001\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "OPTIONS http://h#f HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD,
+		  "OPTIONS * HTTP/1.1\r\nHost: h\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "OPTIONS http://h?q HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD,
+		  "OPTIONS /?q HTTP/1.1\r\nHost: h\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "OPTIONS http://h/ HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD,
+		  "OPTIONS / HTTP/1.1\r\nHost: h\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "GET http://h HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD,
+		  "GET / HTTP/1.1\r\nHost: h\r\n"
+		  "Connection: close\r\n\r\n" },
+	};
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req;
+	size_t i, req_len;
+	int r;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		r = run(hc, NULL, cases[i].in, &host, &port, &req, &req_len);
+		assert(r == cases[i].want);
+		if (cases[i].out)
+			assert(!strcmp(req, cases[i].out));
+		gwp_http_conn_free(hc);
+	}
+	PRTEST_OK();
+}
+
+/*
  * Feed the @len bytes at @in to a new connection, one byte at a time when
  * @bytewise, else in one go, and return the first result that is not
  * GWP_HTTP_NEED_MORE, or that after the last byte.
@@ -2061,6 +2143,7 @@ int main(void)
 		test_errors();
 		test_req_start();
 		test_req_errors();
+		test_max_forwards();
 		test_field_obs_text();
 		test_duplicate_field();
 		test_underscore_alias();

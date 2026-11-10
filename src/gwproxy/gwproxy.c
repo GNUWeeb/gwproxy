@@ -7108,6 +7108,22 @@ static int http_reject_uri_too_long(struct gwp_conn_pair *gcp)
 	return -E2BIG;
 }
 
+/*
+ * Queue the 200 for an OPTIONS request with Max-Forwards: 0, which this proxy
+ * answers itself (GWP_HTTP_OPTIONS_REPLY). Nothing more is done for the
+ * request, so the return is negative as for a refusal.
+ */
+static int http_answer_options(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_options_reply(gcp->target.buf + gcp->target.len,
+					     gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -ECANCELED;
+}
+
 static int http_reject_bad_version(struct gwp_conn_pair *gcp)
 {
 	int r = gwp_http_build_bad_version_reply(
@@ -7419,6 +7435,10 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		pr_dbg(&ctx->lh, "HTTP request not served (fd=%d)",
 		       gcp->client.fd);
 		return http_reject_not_implemented(gcp);
+	case GWP_HTTP_OPTIONS_REPLY:
+		pr_dbg(&ctx->lh, "Answering OPTIONS with Max-Forwards: 0 (fd=%d)",
+		       gcp->client.fd);
+		return http_answer_options(gcp);
 	case GWP_HTTP_BAD_VERSION:
 		pr_dbg(&ctx->lh, "HTTP version not supported (fd=%d)",
 		       gcp->client.fd);
