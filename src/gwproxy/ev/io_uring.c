@@ -2672,13 +2672,22 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		gcp->nr_timers_armed--;
 
 	/*
+	 * It fired just as the pair started going away, in the batch that
+	 * failed it. Whatever answer the client is owed has been given, and
+	 * its send may be prepared but not yet submitted: a timeout reply
+	 * written into target.buf now would be sent in its place, cut to its
+	 * length. The cancels are queued, and nothing is left to time.
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
+		return 0;
+
+	/*
 	 * Idle check: close the pair if nothing moved for the whole timeout,
 	 * else look again once the rest of it has passed. Only one timeout
 	 * may carry the check: a handshake timer that fired just as the
 	 * tunnel came up arrives here too, and must not start a second one.
 	 */
-	if (gcp->idle_timer && !is_timer_del && res == -ETIME &&
-	    !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL)) {
+	if (gcp->idle_timer && !is_timer_del && res == -ETIME) {
 		int left = gwp_idle_left(w->now, gcp->last_act,
 					 ctx->cfg.idle_timeout);
 
@@ -2728,7 +2737,11 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				gwp_conn_upstream_failed(w, gcp, r, false);
 			}
 
-			if (gwp_in_upstream_hs(gcp)) {
+			/*
+			 * A send in flight reads target.buf as it was queued:
+			 * what is there then is for the client, and stays.
+			 */
+			if (gwp_in_upstream_hs(gcp) && !gcp->client_tx) {
 				gcp->target.len = 0;
 				gwp_conn_buf_compact(&gcp->target);
 			}
