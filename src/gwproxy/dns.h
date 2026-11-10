@@ -88,6 +88,28 @@ int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg);
  */
 void gwp_dns_ctx_free(struct gwp_dns_ctx *ctx);
 
+/*
+ * Sleep for at most @ms milliseconds; return true to stop waiting at once.
+ */
+typedef bool (*gwp_dns_wait_fn)(int ms, void *arg);
+
+/**
+ * Free the DNS context as gwp_dns_ctx_free() does, but wait at most
+ * @grace_ms milliseconds for the resolver threads to stop: a thread in a
+ * system resolver lookup stops only once the lookup returns, which can take
+ * as long as the resolver's timeout. @wait, if not NULL, does the sleeping
+ * between checks and can end the wait early; @arg is passed to it. A
+ * negative @grace_ms waits for every thread.
+ *
+ * The threads still running then are left to run until the process exits,
+ * and the context with them, untouched: only the process exit may follow.
+ *
+ * @return	How many threads were left running; 0 when the context
+ *		was freed.
+ */
+uint32_t gwp_dns_ctx_free_timed(struct gwp_dns_ctx *ctx, int grace_ms,
+				gwp_dns_wait_fn wait, void *arg);
+
 /**
  * Queue a DNS resolution request. The finished entry is delivered on
  * completion queue @cq_idx: it is pushed there and the queue's eventfd
