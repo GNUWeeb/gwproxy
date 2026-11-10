@@ -442,6 +442,16 @@ struct gwp_conn {
 	bool		wr_shut;
 
 	/*
+	 * The peer reset the connection (or it died otherwise) while the pair
+	 * was forwarding: a plaintext side only. Nothing more can be sent to
+	 * it, so @wr_shut is set with it and what was queued for it is
+	 * dropped, but what it sent before is still read up to @rd_eof and
+	 * delivered. Recorded when first seen, as the recv() or send() that
+	 * reports the error also clears it from the socket.
+	 */
+	bool		rst;
+
+	/*
 	 * TLS state for this endpoint, NULL for a plaintext one: the client's
 	 * when it connected with TLS (--tls-cert), the target's when it is an
 	 * https:// upstream proxy. Once set and the handshake has completed,

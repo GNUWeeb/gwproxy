@@ -1575,6 +1575,60 @@ static bool splice_again(const struct gwp_conn __unused *src,
 #endif
 }
 
+/*
+ * @c's recv() or send() failed with @err while the pair forwards. A plaintext
+ * peer that reset the connection, or died otherwise, ends only its own side:
+ * nothing more can be sent to it, and what was queued for it is dropped (see
+ * fwd_send()), but what it sent before is still queued on its socket ahead of
+ * the error and goes on to the other side, like any data before an EOF. A
+ * failed recv() has returned the last of it. After a failed send() it is still
+ * to be read, and recv() ends with an EOF then: the error is reported once.
+ * Returns true when @err was taken so.
+ *
+ * TLS sides are left as they were: do_recv_tls() has its own way of ending at a
+ * failed recv(), and a pair whose TLS side failed goes down at once, with
+ * gwp_conn_pair_abort_target() passing the abort on.
+ */
+static bool conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    struct gwp_conn *c, int err, bool rx)
+{
+	if (!gcp->is_target_alive || c->tls)
+		return false;
+	if (err != -ECONNRESET && err != -EPIPE && err != -ETIMEDOUT)
+		return false;
+
+	if (rx)
+		c->rd_eof = true;
+	if (!c->rst) {
+		pr_dbg(&w->ctx->lh, "%s connection ended: %s (idx=%u, fd=%d)",
+			c == &gcp->client ? "Client" : "Target",
+			strerror(-err), gcp->idx, c->fd);
+		c->rst = true;
+	}
+	c->wr_shut = true;
+	return true;
+}
+
+/*
+ * Forward @src's data to @dst; once @dst was reset (conn_note_reset()), drop
+ * it instead, as it can no longer be delivered.
+ */
+static ssize_t fwd_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			struct gwp_conn *src, struct gwp_conn *dst)
+{
+	ssize_t ret;
+
+	if (likely(!dst->rst)) {
+		ret = __do_send(src, dst);
+		if (likely(ret >= 0) ||
+		    !conn_note_reset(w, gcp, dst, (int)ret, false))
+			return ret;
+	}
+
+	gwp_conn_buf_consume(src, src->len);
+	return 0;
+}
+
 __hot
 static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		     struct gwp_conn *src, struct gwp_conn *dst, bool do_recv,
@@ -1589,7 +1643,8 @@ static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			uint32_t from = src->len;
 
 			ret = splice_recv(src, first);
-			if (unlikely(ret < 0))
+			if (unlikely(ret < 0) &&
+			    !conn_note_reset(w, gcp, src, (int)ret, true))
 				return (int)ret;
 
 			if (gwp_http_fwd_active(gcp)) {
@@ -1602,7 +1657,7 @@ static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		}
 
 		if (do_send) {
-			ret = __do_send(src, dst);
+			ret = fwd_send(w, gcp, src, dst);
 			if (unlikely(ret < 0))
 				return (int)ret;
 		}
@@ -2348,6 +2403,25 @@ static int conn_wr_flushed(struct gwp_conn __unused *c)
 }
 
 /*
+ * @c's stream has ended and all of it has been handed to @o's side: whether
+ * @o's write side can be shut, as conn_wr_flushed() tells. When @c was reset
+ * (conn_note_reset()), a TLS @o gets no close_notify, which would turn the
+ * abort into a clean end: once the ciphertext it is owed has left, the pair
+ * goes down as it did at the reset before, and gwp_conn_pair_abort_target()
+ * deals with it. A plaintext @o is closed as for any end of @c's stream.
+ */
+static int conn_end_flushed(struct gwp_conn *c, struct gwp_conn *o)
+{
+#ifdef CONFIG_HTTPS
+	if (c->rst && o->tls)
+		return gwp_ssl_bio_pending(o->tls) > 0 ? 0 : -ECONNRESET;
+#else
+	(void)c;
+#endif
+	return conn_wr_flushed(o);
+}
+
+/*
  * While @c's input is held up (conn_rx_held()), the engine can be left with
  * whole records whose ciphertext has already left the socket. No EPOLLIN brings
  * those back, and whichever send takes the hold away may be the last event for
@@ -2397,12 +2471,12 @@ static int conn_rx_resume(struct gwp_wrk __unused *w,
 		again = c->len == c->cap || conn_rx_held(gcp, c);
 
 		if (t != &gcp->target || gcp->is_target_alive) {
-			ret = __do_send(c, t);
+			ret = fwd_send(w, gcp, c, t);
 			if (unlikely(ret < 0))
 				return (int)ret;
 		}
 		if (!c->wr_shut) {
-			ret = __do_send(t, c);
+			ret = fwd_send(w, gcp, t, c);
 			if (unlikely(ret < 0))
 				return (int)ret;
 		}
@@ -2441,7 +2515,7 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (gwp_upstream_tls_cut(gcp))
 			return -ECONNRESET;
 #endif
-		r = conn_wr_flushed(&gcp->client);
+		r = conn_end_flushed(&gcp->target, &gcp->client);
 		if (r < 0)
 			return r;
 		/*
@@ -2474,7 +2548,7 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * nothing, though, so the pair goes now.
 		 */
 		if (gcp->is_target_alive) {
-			r = conn_wr_flushed(&gcp->target);
+			r = conn_end_flushed(&gcp->client, &gcp->target);
 			if (r < 0)
 				return r;
 			if (r) {
@@ -2638,19 +2712,20 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return -ECONNRESET;
 	}
 
-	if (unlikely(ev->events & EPOLLERR)) {
-		if (!gcp->is_target_alive) {
-			r = handle_ev_target_conn_err(w, gcp);
-			if (gwp_in_upstream_hs(gcp))
-				return upstream_fail(w, gcp, r);
-			/* Plain forwarding's connect to its upstream. */
-			if (gwp_conn_upstream_failed(w, gcp, r, true))
-				return upstream_redial(w, gcp, r);
-			return r;
-		}
-
-		pr_err(&w->ctx->lh, "EPOLLERR on target connection event");
-		return -ECONNRESET;
+	/*
+	 * An error before the tunnel is up ends the connect or the upstream
+	 * handshake. Once it is up, the error is read like the data before
+	 * it: what a peer sent ahead of its reset is still queued, and recv()
+	 * returns that first (see conn_note_reset()).
+	 */
+	if (unlikely(ev->events & EPOLLERR) && !gcp->is_target_alive) {
+		r = handle_ev_target_conn_err(w, gcp);
+		if (gwp_in_upstream_hs(gcp))
+			return upstream_fail(w, gcp, r);
+		/* Plain forwarding's connect to its upstream. */
+		if (gwp_conn_upstream_failed(w, gcp, r, true))
+			return upstream_redial(w, gcp, r);
+		return r;
 	}
 
 	if (!gcp->is_target_alive) {
@@ -2667,7 +2742,7 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * unread data in its receive buffer, and EPOLLIN keeps firing (level
 	 * triggered) until recv() returns 0 and sets rd_eof.
 	 */
-	if (ev->events & (EPOLLIN | EPOLLHUP)) {
+	if (ev->events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
 		r = do_splice(w, gcp, &gcp->target, &gcp->client, true, true);
 		if (r)
 			return r;
@@ -2679,7 +2754,7 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return r;
 	}
 
-	if ((ev->events & EPOLLHUP) && gcp->target.rd_eof)
+	if ((ev->events & (EPOLLHUP | EPOLLERR)) && gcp->target.rd_eof)
 		hup = handle_ev_hup(&gcp->target);
 
 	return forward_progress(w, gcp, hup);
@@ -2766,8 +2841,15 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_conn *hup = NULL;
 	int r;
 
-	if (unlikely(ev->events & EPOLLERR)) {
-		pr_err(&w->ctx->lh, "EPOLLERR on client connection event");
+	/*
+	 * A client that resets before the tunnel is up has nothing to be
+	 * delivered to. Past that, the error is read like the data before it,
+	 * as for the target (handle_ev_target()).
+	 */
+	if (unlikely(ev->events & EPOLLERR) &&
+	    (!gcp->is_target_alive || (gcp->flags & GWP_CONN_FLAG_UDP_UP))) {
+		pr_dbg(&w->ctx->lh, "Client connection ended with an error (idx=%u)",
+			gcp->idx);
 		return -ECONNRESET;
 	}
 
@@ -2789,7 +2871,7 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (unlikely(upstream_start_held(gcp)))
 		return handle_ev_client_held(w, gcp, ev);
 
-	if (ev->events & (EPOLLIN | EPOLLHUP)) {
+	if (ev->events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
 		r = do_splice(w, gcp, &gcp->client, &gcp->target, true,
 			      gcp->is_target_alive);
 		if (r)
@@ -2815,7 +2897,7 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return r;
 	}
 
-	if ((ev->events & EPOLLHUP) && gcp->client.rd_eof)
+	if ((ev->events & (EPOLLHUP | EPOLLERR)) && gcp->client.rd_eof)
 		hup = handle_ev_hup(&gcp->client);
 
 	return forward_progress(w, gcp, hup);
