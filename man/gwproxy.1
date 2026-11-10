@@ -54,7 +54,9 @@ event loop. It recovers gracefully from file\-descriptor exhaustion
 (EMFILE/ENFILE): a worker out of descriptors stops accepting and tries again
 after 100 ms on io_uring; on epoll, once several connections' worth have been
 closed, or after 5 seconds at the latest. It caches DNS answers for hostname
-targets, tries and races the
+targets when asked to
+.RB ( \-\-dns\-cache\-secs ,
+off by default), tries and races the
 addresses of a multi\-homed name on either loop (see
 .BR "TARGET ADDRESS SELECTION" ),
 and can mark its own outgoing connections with
@@ -1127,6 +1129,19 @@ chain) on every connection. Note the cache uses this fixed duration, not the
 authoritative record TTL, so a short\-TTL name may be served stale for up to
 .I sec
 seconds.
+.IP
+A failed lookup is remembered too: until the entry expires, requests for the
+name are answered at once with SOCKS5 reply
+.B 0x04
+(host unreachable) or HTTP
+.BR 502 ,
+without a new lookup. The entry is kept for 30 seconds when the answer is that the name, or
+an address of the family asked for, does not exist, and for 5 seconds after
+any other failure, such as a timeout or a server failure; never longer than
+.I sec
+seconds. This, too, is a fixed duration, not the zone's negative caching TTL,
+so a name that was just published or fixed can keep failing for up to that
+long.
 .TP
 .BR \-\-dns\-cache\-max\-entries=\fInr\fR
 Bound the DNS cache to at most
