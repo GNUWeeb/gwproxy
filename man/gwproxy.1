@@ -157,8 +157,11 @@ against the proxy's own address.
 .TP
 .BR \-t ", " \-\-target=\fIaddr:port\fR
 For plain TCP forwarding, the fixed destination every accepted connection is
-proxied to. Ignored in SOCKS5/HTTP/transparent modes, where the destination
-comes from the protocol or the socket.
+proxied to. Ignored in SOCKS5/HTTP modes, where the destination comes from
+the protocol; there the value is not even parsed, so a bad address or port is
+not refused either. Refused at startup with
+.BR \-\-as\-transparent ,
+which takes the destination from the socket.
 .TP
 .BR \-w ", " \-\-nr\-workers=\fInr\fR
 Number of worker threads, each with its own
