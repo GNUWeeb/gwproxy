@@ -490,9 +490,9 @@ enum {
 	 */
 	GWP_CONN_FLAG_UP_FAILED		= (1ull << 7ull),
 	/*
-	 * The client has been given its failure reply (gwp_conn_fail_reply()),
-	 * so a failure that surfaces again on its way out gives no second
-	 * one (gwp_upstream_fail_reply()).
+	 * The client has been given its failure reply (gwp_conn_fail_reply(),
+	 * gwp_acl_reject_reply()), so a failure that surfaces again on its
+	 * way out gives no second one.
 	 */
 	GWP_CONN_FLAG_FAIL_REPLIED	= (1ull << 9ull),
 	/*
@@ -1480,7 +1480,9 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  * Build the "ACL denied" downstream reply (SOCKS5 CONNECT refusal or HTTP 403)
  * into gcp->target.buf, ready for the caller to flush its own way. Logs the
  * denial. Returns -EACCES (the terminal handshake verdict) once the reply is
- * built, or a negative errno if it could not be built.
+ * built, or a negative errno if it could not be built. Once the client has
+ * its final answer (GWP_CONN_FLAG_FAIL_REPLIED) it adds nothing and returns
+ * -EACCES.
  */
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
@@ -1490,6 +1492,8 @@ int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
  * into gcp->target.buf, ready for the caller to flush its own way. @err is a
  * negative errno. Returns 0 (including for plain forwarding, which has no
  * protocol to answer in), or a negative errno if the reply could not be built.
+ * Once the client has its final answer (GWP_CONN_FLAG_FAIL_REPLIED) it adds
+ * nothing and returns 0.
  */
 int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
 
