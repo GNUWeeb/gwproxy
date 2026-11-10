@@ -2409,6 +2409,19 @@ parse:
 		/* An https:// upstream's close_notify, see upstream_tls_rx(). */
 		if (gcp->target.rd_eof)
 			return upstream_iou_fail(w, gcp, -ECONNRESET);
+#ifdef CONFIG_HTTPS
+		/*
+		 * The engine may have records of its own to send in answer to
+		 * what it read (the alert that refuses a renegotiation), which
+		 * the upstream may wait for before it replies. Their send's
+		 * completion goes on to the recv.
+		 */
+		if (target_is_tls(gcp) && target_cipher_next(gcp)) {
+			gcp->up_tx = true;
+			prep_send_target_cipher(w, gcp, EV_BIT_IOU_UPSTREAM_S5);
+			return 0;
+		}
+#endif
 		if (unlikely(!prep_upstream_recv(w, gcp)))
 			return upstream_iou_fail(w, gcp, -ENOMEM);
 		return 0;
