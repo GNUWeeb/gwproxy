@@ -500,9 +500,9 @@ enum {
 	 */
 	GWP_CONN_FLAG_UP_FAILED		= (1ull << 7ull),
 	/*
-	 * The client has been given its failure reply (gwp_conn_fail_reply()),
-	 * so a failure that surfaces again on its way out gives no second
-	 * one (gwp_upstream_fail_reply()).
+	 * The client has been given its failure reply (gwp_conn_fail_reply(),
+	 * gwp_acl_reject_reply()), so a failure that surfaces again on its
+	 * way out gives no second one.
 	 */
 	GWP_CONN_FLAG_FAIL_REPLIED	= (1ull << 9ull),
 	/*
@@ -614,6 +614,14 @@ struct gwp_conn_pair {
 	 * io_uring has no timerfd to test for.
 	 */
 	struct __kernel_timespec	ats;
+	/*
+	 * When the earliest of the pair's live protocol, connect or idle
+	 * timers expires, in CLOCK_MONOTONIC ms; 0 when none is live. An
+	 * expiry that comes before it, or while none is live, is that of a
+	 * timer that was removed as it fired: io_uring cannot tell the two
+	 * apart, as both carry the same user_data (handle_ev_timer()).
+	 */
+	uint64_t			tmr_due;
 #ifdef CONFIG_HTTPS
 	/*
 	 * Persistent ciphertext scratch for the client's TLS on the io_uring
@@ -767,6 +775,15 @@ struct gwp_conn_pair {
 	 * searched from its start again on every read.
 	 */
 	uint32_t		up_scan;
+
+#ifdef CONFIG_IO_URING
+	/*
+	 * The error that ends the pair, while its teardown waits for the
+	 * failure reply to reach the client (hold_for_fail_reply()); 0
+	 * otherwise.
+	 */
+	int			fail_err;
+#endif
 
 	/*
 	 * How the attempt through the upstream failed, when the place that
@@ -1490,7 +1507,9 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  * Build the "ACL denied" downstream reply (SOCKS5 CONNECT refusal or HTTP 403)
  * into gcp->target.buf, ready for the caller to flush its own way. Logs the
  * denial. Returns -EACCES (the terminal handshake verdict) once the reply is
- * built, or a negative errno if it could not be built.
+ * built, or a negative errno if it could not be built. Once the client has
+ * its final answer (GWP_CONN_FLAG_FAIL_REPLIED) it adds nothing and returns
+ * -EACCES.
  */
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
@@ -1500,6 +1519,8 @@ int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
  * into gcp->target.buf, ready for the caller to flush its own way. @err is a
  * negative errno. Returns 0 (including for plain forwarding, which has no
  * protocol to answer in), or a negative errno if the reply could not be built.
+ * Once the client has its final answer (GWP_CONN_FLAG_FAIL_REPLIED) it adds
+ * nothing and returns 0.
  */
 int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
 

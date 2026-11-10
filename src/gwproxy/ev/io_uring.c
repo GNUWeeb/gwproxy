@@ -763,11 +763,32 @@ static struct io_uring_sqe *prep_send_client(struct gwp_wrk *w,
 	return __prep_send_client(w, gcp);
 }
 
+/*
+ * The precise clock, not the coarse one of gwp_now_ms(): this is compared
+ * with when a kernel timer fired, and the coarse clock lags the one the
+ * kernel times io_uring timeouts with by up to a tick.
+ */
+static uint64_t iou_now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000ull + (uint64_t)t.tv_nsec / 1000000ull;
+}
+
 static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 					      struct gwp_conn_pair *gcp,
 					      int sec)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
+	uint64_t now = iou_now_ms(), due = now + (uint64_t)sec * 1000ull;
+
+	/*
+	 * The timeout runs from its submission, which is later, so it never
+	 * expires before @due. Another one still live may expire first.
+	 */
+	if (!gcp->tmr_due || gcp->tmr_due <= now || due < gcp->tmr_due)
+		gcp->tmr_due = due;
 
 	gcp->ts.tv_nsec = 0;
 	gcp->ts.tv_sec = sec;
@@ -802,6 +823,11 @@ static void prep_timer_del_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
 
+	/*
+	 * Whatever expiry comes from here on, until a timer is armed again,
+	 * is the removed one's: it fired before the removal could reach it.
+	 */
+	gcp->tmr_due = 0;
 	io_uring_prep_timeout_remove(s, EV_BIT_IOU_TIMER | PTR_TO_U64(gcp), 0);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TIMER_DEL;
@@ -2701,13 +2727,59 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		gcp->nr_timers_armed--;
 
 	/*
+	 * It fired just as the pair started going away, in the batch that
+	 * failed it. Whatever answer the client is owed has been given, and
+	 * its send may be prepared but not yet submitted: a timeout reply
+	 * written into target.buf now would be sent in its place, cut to its
+	 * length. The cancels are queued, and nothing is left to time.
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
+		return 0;
+
+	/*
+	 * A removal matches by user_data alone, and the timer armed in place
+	 * of the removed one has the same: when the removed one had fired
+	 * already, its expiry still comes here, after the removal failed with
+	 * -ENOENT or in the same batch, before the removal was even
+	 * submitted. do_prep_connect() swaps the protocol timer for the
+	 * connect timer as the lookup completes, which may be just as the
+	 * protocol timeout runs out: taken for the connect's, that expiry
+	 * would answer a timeout and cancel a connect the target may have
+	 * accepted already, and charge an upstream a timeout. The handovers
+	 * of a pair whose target is up are harmless: is_target_alive is set
+	 * first, and the idle check looks at the time itself.
+	 *
+	 * A live timer never expires before tmr_due, so one that does, or
+	 * with none live, was removed: only account for it.
+	 */
+	if (!is_timer_del && res == -ETIME) {
+		uint64_t now = iou_now_ms();
+
+		if (!gcp->tmr_due || now < gcp->tmr_due) {
+			pr_dbg(&ctx->lh,
+			       "Ignoring the expiry of a removed timer (idx=%u)",
+			       gcp->idx);
+			return 0;
+		}
+		if (!gcp->nr_timers_armed)
+			gcp->tmr_due = 0;
+
+		/* The failure reply did not reach the client in time. */
+		if (gcp->fail_err) {
+			pr_dbg(&ctx->lh,
+			       "The failure reply was not sent in time (idx=%u)",
+			       gcp->idx);
+			return gcp->fail_err;
+		}
+	}
+
+	/*
 	 * Idle check: close the pair if nothing moved for the whole timeout,
 	 * else look again once the rest of it has passed. Only one timeout
 	 * may carry the check: a handshake timer that fired just as the
 	 * tunnel came up arrives here too, and must not start a second one.
 	 */
-	if (gcp->idle_timer && !is_timer_del && res == -ETIME &&
-	    !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL)) {
+	if (gcp->idle_timer && !is_timer_del && res == -ETIME) {
 		int left = gwp_idle_left(w->now, gcp->last_act,
 					 ctx->cfg.idle_timeout);
 
@@ -2757,7 +2829,11 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				gwp_conn_upstream_failed(w, gcp, r, false);
 			}
 
-			if (gwp_in_upstream_hs(gcp)) {
+			/*
+			 * A send in flight reads target.buf as it was queued:
+			 * what is there then is for the client, and stays.
+			 */
+			if (gwp_in_upstream_hs(gcp) && !gcp->client_tx) {
 				gcp->target.len = 0;
 				gwp_conn_buf_compact(&gcp->target);
 			}
@@ -3002,8 +3078,14 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	gcp->client_tx = false;
 	r = handle_sock_ret(r);
-	if (r < 0)
+	if (r < 0) {
+#ifdef CONFIG_HTTPS
+		/* Nothing of the tx scratch is on its way any more. */
+		if (client_is_tls(gcp))
+			gcp->tls_io->tx_sent = gcp->tls_io->tx_len;
+#endif
 		return r;
+	}
 
 #ifdef CONFIG_HTTPS
 	if (client_is_tls(gcp)) {
@@ -3013,6 +3095,17 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (t->tx_sent < t->tx_len) {	/* short send: flush remainder */
 			prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
 			return 0;
+		}
+		/*
+		 * The pair has failed, and only its failure reply is left to
+		 * send (hold_for_fail_reply()): encrypt the rest of it, and
+		 * end the pair once it is out.
+		 */
+		if (gcp->fail_err) {
+			if (gcp->target.len > 0 ||
+			    gwp_ssl_bio_pending(gcp->client.tls) > 0)
+				send_client_tls(w, gcp);
+			return client_send_busy(gcp) ? 0 : gcp->fail_err;
 		}
 		/*
 		 * Ciphertext flushed; encrypt/queue more, else go back to the
@@ -3049,6 +3142,10 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		prep_send_client(w, gcp);
 		return 0;
 	}
+
+	/* The failure reply is out (hold_for_fail_reply()): end the pair. */
+	if (gcp->fail_err)
+		return gcp->fail_err;
 
 	/* The reply is out; the upstream handshake may use target.buf now. */
 	if (upstream_start_held(gcp))
@@ -3100,9 +3197,9 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 /*
  * The ACL rejected this target: queue a client reply (SOCKS5 REP 0x02, or HTTP
- * 403) and return an error so the connection is torn down. The reply send is
- * best-effort (it may be cancelled by the teardown), matching the other
- * io_uring rejection paths.
+ * 403) and return an error so the connection is torn down, once the reply is
+ * out if a send to the client is still in flight (hold_for_fail_reply()), as
+ * on the other io_uring rejection paths.
  */
 static int acl_reject_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -3480,10 +3577,19 @@ static int process_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	else
 		return -EINVAL;
 
+	/*
+	 * Act on the result before sending: a request refused at once (by the
+	 * ACL, --outgoing-family, a failed bind) appends its failure reply to
+	 * what this pass queued, the method reply of a pipelining client, say.
+	 * One send then carries both. Queued first, that send would still be
+	 * in flight when the refusal tore the pair down, and the failure
+	 * reply would never be sent.
+	 */
+	r = chk_prot_result(w, gcp, r);
 	if (gcp->target.len)
 		prep_send_client(w, gcp);
 
-	return chk_prot_result(w, gcp, r);
+	return r;
 }
 
 static int handle_ev_client_prot(struct gwp_wrk *w,
@@ -3569,6 +3675,53 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 }
 
 /*
+ * How long a pair that failed waits at most for its failure reply to reach
+ * the client (hold_for_fail_reply()), in seconds.
+ */
+#define GWP_FAIL_REPLY_SEC 5
+
+/*
+ * @err ends the pair, and its client has been given a failure reply, but a
+ * send to the client is still on its way: the reply is in it, or in
+ * target.buf behind it, to be sent by its completion. The teardown would
+ * cancel that send, and drop its completion: the client would get only what
+ * went before the reply, "05 00" and EOF for a SOCKS5 client that sent its
+ * CONNECT along with its greeting, when its lookup failed before the method
+ * reply was out (a name in the negative cache, say). Keep the pair until
+ * handle_ev_client_send() has sent the rest, and have it return @err then.
+ * Returns true when the teardown is to wait.
+ *
+ * Only while nothing else is in flight that could take the pair further: a
+ * connect attempt, I/O on the target or the UDP relay, a lookup. A timer
+ * bounds the wait, the pair's own if it is due soon enough, else one armed
+ * here, so a client that does not read cannot hold the pair, whatever
+ * --connect-timeout and --protocol-timeout are; handle_ev_timer() returns
+ * @err when it expires.
+ */
+static bool hold_for_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				int err)
+{
+	uint64_t now, due;
+
+	if (gcp->fail_err || !(gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED) ||
+	    !client_send_busy(gcp))
+		return false;
+	if (has_inflight_attempt(gcp) || gcp->nr_ops_target ||
+	    gcp->nr_ops_udp || gcp->gde)
+		return false;
+
+	gcp->fail_err = err;
+	now = iou_now_ms();
+	due = now + GWP_FAIL_REPLY_SEC * 1000ull;
+	if (gcp->tmr_due <= now || gcp->tmr_due > due)
+		prep_timer_target(w, gcp, GWP_FAIL_REPLY_SEC);
+	pr_dbg(&w->ctx->lh,
+	       "Waiting for the failure reply to be sent (idx=%u, err=%d)",
+	       gcp->idx, err);
+	return true;
+}
+
+/*
  * Finished getaddrinfo() lookups of this worker; one wakeup may carry many.
  * Each pair holds a reference for its lookup (prep_domain_resolution()),
  * dropped here once the result is used, exactly as an SQE's completion does,
@@ -3596,7 +3749,8 @@ static int handle_ev_dns_cq(struct gwp_wrk *w)
 			gwp_dns_entry_free(e);
 		} else {
 			r = handle_ev_dns_query(w, gcp);
-			if (r && !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL))
+			if (r && !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL) &&
+			    !hold_for_fail_reply(w, gcp, r))
 				shutdown_gcp(w, gcp);
 		}
 		put_gcp(w, gcp);
@@ -3792,7 +3946,8 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 
 out:
 	gcp = udata;
-	if (r && !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL))
+	if (r && !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL) &&
+	    !hold_for_fail_reply(w, gcp, r))
 		shutdown_gcp(w, gcp);
 
 	put_gcp(w, gcp);
