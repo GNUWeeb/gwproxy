@@ -2869,26 +2869,30 @@ static int handle_sock_ret(int r)
 }
 
 /*
- * A send to @c failed with @err while the pair forwards. A plaintext peer that
- * reset the connection, or died otherwise, ends only its own side, as on the
- * epoll loop (conn_note_reset() there): nothing more can be sent to it, so its
- * write side counts as shut and what is queued for it is dropped (see
- * drop_for_reset()), but what it sent before is still queued on its socket
- * and goes on to the other side, like any data before an EOF. Its recv ends
- * with an EOF then, as the send has taken the error off the socket. The reset
- * is recorded in gwp_conn::rst. Returns true when @err was taken so.
+ * A recv from @c (@rx) or a send to it failed with @err while the pair
+ * forwards. A plaintext peer that reset the connection, or died otherwise,
+ * ends only its own side, as on the epoll loop (conn_note_reset() there):
+ * nothing more can be sent to it, so its write side counts as shut and what
+ * is queued for it is dropped (see drop_for_reset()), but what it sent before
+ * goes on to the other side, like any data before an EOF. A failed recv has
+ * returned the last of it, and is taken as the end of @c's stream. After a
+ * failed send it is still queued on the socket, and the recv ends with an EOF
+ * then, as the send has taken the error off the socket. The reset is
+ * recorded in gwp_conn::rst. Returns true when @err was taken so.
  *
  * TLS sides are left as they were: a failure on one ends the pair at once,
  * and gwp_conn_pair_abort_target() passes the abort on.
  */
 static bool conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			    struct gwp_conn *c, int err)
+			    struct gwp_conn *c, int err, bool rx)
 {
 	if (!gcp->is_target_alive || c->tls)
 		return false;
 	if (err != -ECONNRESET && err != -EPIPE && err != -ETIMEDOUT)
 		return false;
 
+	if (rx)
+		c->rd_eof = true;
 	if (!c->rst) {
 		pr_dbg(&w->ctx->lh, "%s connection ended: %s (idx=%u, fd=%d)",
 			c == &gcp->client ? "Client" : "Target",
@@ -3052,7 +3056,12 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (r < 0) {
 		if (r == -EAGAIN || r == -EINTR)
 			return prep_recv_client(w, gcp);
-		return r;
+		if (!conn_note_reset(w, gcp, &gcp->client, r, true))
+			return r;
+		/* A send to the client in flight finds the reset itself. */
+		if (!gcp->client_tx)
+			gwp_conn_buf_consume(&gcp->target, gcp->target.len);
+		return iou_forward_progress(w, gcp);
 	}
 
 #ifdef CONFIG_HTTPS
@@ -3119,7 +3128,15 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			prep_recv_target(w, gcp);
 			return 0;
 		}
-		return r;
+		/*
+		 * A reset ends the target's stream as an EOF would, after all
+		 * it sent: the HTTP forwarding filter answers 502 for an origin
+		 * that resets inside its response header, as for one that
+		 * closes there.
+		 */
+		if (!conn_note_reset(w, gcp, &gcp->target, r, true))
+			return r;
+		r = 0;
 	}
 
 	from = gcp->target.len;
@@ -3158,7 +3175,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 
 	gcp->client_tx = false;
-	if (r < 0 && conn_note_reset(w, gcp, &gcp->client, r)) {
+	if (r < 0 && conn_note_reset(w, gcp, &gcp->client, r, false)) {
 		gwp_conn_buf_consume(&gcp->target, gcp->target.len);
 		return iou_forward_progress(w, gcp);
 	}
@@ -3217,6 +3234,9 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	if (r > 0)
 		gwp_conn_buf_consume(&gcp->target, (size_t)r);
+	/* The client was reset meanwhile (handle_ev_client_recv()). */
+	if (drop_for_reset(&gcp->target, &gcp->client))
+		return iou_forward_progress(w, gcp);
 
 	/*
 	 * A short send leaves unsent bytes in target.buf; flush the remainder
@@ -3256,9 +3276,11 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	/*
 	 * The target was reset: what the client sends can no longer reach it,
 	 * but what the target sent before the reset is still to be read, and
-	 * the target's recv goes on until it ends (conn_note_reset()).
+	 * the target's recv goes on until it ends (conn_note_reset()). Over
+	 * HTTP forwarding, a request whose send failed so while the response
+	 * header is awaited is answered 502 then, as a reset there is.
 	 */
-	if (r < 0 && conn_note_reset(w, gcp, &gcp->target, r)) {
+	if (r < 0 && conn_note_reset(w, gcp, &gcp->target, r, false)) {
 		gwp_conn_buf_consume(&gcp->client, gcp->client.len);
 		return iou_forward_progress(w, gcp);
 	}
@@ -3273,6 +3295,9 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	if (r > 0)
 		gwp_conn_buf_consume(&gcp->client, (size_t)r);
+	/* The target was reset meanwhile (handle_ev_target_recv()). */
+	if (drop_for_reset(&gcp->client, &gcp->target))
+		return iou_forward_progress(w, gcp);
 
 	/* Short send: flush the rest before reading more from the client. */
 	if (gcp->client.len > 0) {

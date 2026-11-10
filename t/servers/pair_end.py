@@ -5,6 +5,7 @@
 #
 # Usage:
 #   pair_end.py send-error <mode> <dir> <proxy_port> <proxy_pid> <target_port>
+#   pair_end.py origin-reset <how> <proxy_port> <origin_port> [<rounds>]
 #
 # <mode> is how the client reaches the target listening on <target_port>:
 # plain (the proxy runs with --target pointing there), socks5 or http (a
@@ -16,6 +17,13 @@
 # reset peer, and reads: it must get every byte the proxy acknowledged, then
 # an end of stream (EOF or a reset).
 #
+# "origin-reset": an HTTP forwarding request ("GET http://...") to an origin
+# that ends before a complete response header, as <how> says: "rst" reads the
+# request and resets, "part-rst" sends part of a header and resets,
+# "accept-rst" resets right after the accept, unread, and "part-fin" sends
+# part of a header and closes (the control). The client must get a 502 every
+# time.
+#
 # Prints "ok", or one line per problem.
 
 import fcntl
@@ -23,6 +31,7 @@ import os
 import socket
 import struct
 import sys
+import threading
 import time
 
 TIMEOUT = 30
@@ -185,10 +194,56 @@ def send_error(mode, d, pport, pid, tport):
         errors.append("%s %s: no end after the data" % (mode, d))
 
 
+def origin(ls, how, rounds):
+    for _ in range(rounds):
+        try:
+            t, _ = ls.accept()
+        except OSError:
+            return
+        t.settimeout(TIMEOUT)
+        try:
+            if how != "accept-rst":
+                req = b""
+                while b"\r\n\r\n" not in req:
+                    d = t.recv(4096)
+                    if not d:
+                        break
+                    req += d
+            if how.startswith("part"):
+                t.sendall(b"HTTP/1.1 200 OK\r\nContent-Le")
+                time.sleep(0.05)
+        except OSError:
+            pass
+        if how.endswith("rst"):
+            rst(t)
+        else:
+            t.close()
+
+
+def origin_reset(how, pport, oport, rounds):
+    ls = listener(oport)
+    th = threading.Thread(target=origin, args=(ls, how, rounds), daemon=True)
+    th.start()
+    for i in range(rounds):
+        c = socket.create_connection(("127.0.0.1", pport), timeout=TIMEOUT)
+        c.sendall(b"GET http://127.0.0.1:%d/ HTTP/1.1\r\n"
+                  b"Host: 127.0.0.1:%d\r\n\r\n" % (oport, oport))
+        got, end = read_all(c)
+        c.close()
+        if not got.startswith(b"HTTP/1.1 502 "):
+            errors.append("%s round %d: %r, then %s" %
+                          (how, i, got[:40], end))
+    th.join(TIMEOUT)
+    ls.close()
+
+
 def main():
     a = sys.argv[1:]
     if a[0] == "send-error":
         send_error(a[1], a[2], int(a[3]), int(a[4]), int(a[5]))
+    elif a[0] == "origin-reset":
+        origin_reset(a[1], int(a[2]), int(a[3]),
+                     int(a[4]) if len(a) > 4 else 10)
     else:
         raise SystemExit("unknown case %r" % a[0])
     print("\n".join(errors) if errors else "ok")
