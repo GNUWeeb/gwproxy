@@ -2504,10 +2504,80 @@ static bool upstream_start_held(struct gwp_conn_pair *gcp)
 	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
 }
 
+/*
+ * Answer the client that its request timed out (SOCKS5 REP 0x06, HTTP 504),
+ * by @err, the timer's -ETIME.
+ *
+ * Send only what gwp_conn_fail_reply() added: plain forwarding has no reply
+ * to give, and a stalled upstream handshake leaves its own bytes in
+ * target.buf, which are dropped first. A send in flight reads target.buf as
+ * it was queued: what is there then is for the client, and stays.
+ */
+static void timeout_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			  int err)
+{
+	uint32_t len;
+
+	if (gwp_in_upstream_hs(gcp) && !gcp->client_tx) {
+		gcp->target.len = 0;
+		gwp_conn_buf_compact(&gcp->target);
+	}
+	len = gcp->target.len;
+	if (!gwp_conn_fail_reply(w, gcp, err) && gcp->target.len > len)
+		prep_send_client(w, gcp);
+}
+
+/*
+ * The connect timeout ran out during the handshake with an upstream proxy.
+ * A plaintext upstream's request in flight works on target.buf, where the
+ * client's answer goes: a recv of the upstream's reply writes into it from
+ * its start, under the answer, whenever the reply comes in, and the client
+ * would be sent the upstream's grant and the start of the tunnel in place of
+ * the timeout. Cancel the request, and answer once it has completed
+ * (handle_ev_upstream_s5()). Returns true when the answer is to wait.
+ *
+ * An https:// upstream's requests use the engine's buffers and the
+ * ciphertext scratch, never target.buf.
+ */
+static bool upstream_tmo(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct io_uring_sqe *s;
+
+	if (!gwp_in_upstream_hs(gcp) || !gcp->nr_ops_target)
+		return false;
+#ifdef CONFIG_HTTPS
+	if (target_is_tls(gcp))
+		return false;
+#endif
+	if (gcp->flags & GWP_CONN_FLAG_UP_TMO_WAIT)
+		return true;
+
+	gcp->flags |= GWP_CONN_FLAG_UP_TMO_WAIT;
+	s = get_sqe_nofail(w);
+	io_uring_prep_cancel_fd(s, gcp->target.fd, IORING_ASYNC_CANCEL_ALL);
+	io_uring_sqe_set_data(s, gcp);
+	s->user_data |= EV_BIT_IOU_UPSTREAM_CANCEL;
+	get_gcp(gcp);
+	pr_dbg(&w->ctx->lh,
+	       "Cancelling the upstream handshake before the timeout reply (idx=%u, fd=%d)",
+	       gcp->idx, gcp->target.fd);
+	return true;
+}
+
 static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
 	int r = handle_sock_ret(cqe->res);
+
+	/*
+	 * The connect timeout ran out while this was in flight: whatever it
+	 * brought is dropped, and the client is answered now that target.buf
+	 * is ours again (upstream_tmo()).
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_UP_TMO_WAIT) {
+		timeout_reply(w, gcp, -ETIME);
+		return -ETIME;
+	}
 
 	if (r < 0)
 		return upstream_iou_fail(w, gcp, r);
@@ -2980,15 +3050,9 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * while a target socket exists, while the target's name is
 		 * being looked up, and during a race, where there is no target
 		 * fd yet, so the in-flight attempts count as one.
-		 *
-		 * Send only what gwp_conn_fail_reply() added: plain forwarding
-		 * has no reply to give, and a stalled upstream handshake leaves
-		 * its own bytes in target.buf, which are dropped first.
 		 */
 		if (gcp->target.fd >= 0 || has_inflight_attempt(gcp) ||
 		    gwp_in_dns_lookup(gcp)) {
-			uint32_t len;
-
 			/* Not while the name resolves: no upstream yet. */
 			if (!gwp_in_dns_lookup(gcp)) {
 				gwp_upstream_note_end(gcp,
@@ -2998,18 +3062,11 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				gwp_conn_upstream_failed(w, gcp, r, false);
 			}
 
-			/*
-			 * A send in flight reads target.buf as it was queued:
-			 * what is there then is for the client, and stays.
-			 */
-			if (gwp_in_upstream_hs(gcp) && !gcp->client_tx) {
-				gcp->target.len = 0;
-				gwp_conn_buf_compact(&gcp->target);
-			}
-			len = gcp->target.len;
-			if (!gwp_conn_fail_reply(w, gcp, r) &&
-			    gcp->target.len > len)
-				prep_send_client(w, gcp);
+			/* The pair ends once the answer can be given. */
+			if (upstream_tmo(w, gcp))
+				r = 0;
+			else
+				timeout_reply(w, gcp, r);
 		}
 	}
 
@@ -4214,6 +4271,10 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		break;
 	case EV_BIT_IOU_CLIENT_WATCH_DEL:
 		pr_dbg(&ctx->lh, "Handling client watch removal: %d", cqe->res);
+		r = 0;
+		break;
+	case EV_BIT_IOU_UPSTREAM_CANCEL:
+		pr_dbg(&ctx->lh, "Handling upstream handshake cancel: %d", cqe->res);
 		r = 0;
 		break;
 	case EV_BIT_IOU_TARGET_CANCEL:

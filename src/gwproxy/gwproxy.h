@@ -322,6 +322,8 @@ enum {
 	 */
 	EV_BIT_IOU_CLIENT_WATCH		= (25ull << 48ull),
 	EV_BIT_IOU_CLIENT_WATCH_DEL	= (27ull << 48ull),
+	/* The cancel of an upstream handshake request, see upstream_tmo(). */
+	EV_BIT_IOU_UPSTREAM_CANCEL	= (28ull << 48ull),
 	EV_BIT_IOU_LINGER		= EV_BIT_LINGER,
 	/* The linger set's timeout, and the moves of its deadline. */
 	EV_BIT_IOU_LINGER_TMR		= (52ull << 48ull),
@@ -541,6 +543,13 @@ enum {
 	 * relay takes the datagrams.
 	 */
 	GWP_CONN_FLAG_UDP_UP		= (1ull << 11ull),
+	/*
+	 * io_uring: the connect timeout ran out during the handshake with a
+	 * plaintext upstream while a request of it was in flight on
+	 * target.buf. The client's answer waits for that request to complete
+	 * (upstream_tmo()).
+	 */
+	GWP_CONN_FLAG_UP_TMO_WAIT	= (1ull << 12ull),
 };
 
 enum {
