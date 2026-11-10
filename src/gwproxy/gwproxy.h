@@ -766,6 +766,15 @@ struct gwp_conn_pair {
 	 */
 	uint32_t		up_scan;
 
+#ifdef CONFIG_IO_URING
+	/*
+	 * The error that ends the pair, while its teardown waits for the
+	 * failure reply to reach the client (hold_for_fail_reply()); 0
+	 * otherwise.
+	 */
+	int			fail_err;
+#endif
+
 	/*
 	 * How the attempt through the upstream failed, when the place that
 	 * saw it knows better than the errno it returns: an enum
