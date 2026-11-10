@@ -209,6 +209,14 @@ ifeq ($(CONFIG_SANITIZE),y)
 	cd $(LIBURING_DIR) && ./configure --enable-sanitizer;
 endif
 	@$(MAKE) -C $(LIBURING_DIR) library
+
+# The io_uring loop's kernel check (ev/iou_probe.h) is header-only, so its unit
+# test is built straight from its source, against liburing.
+GWIOU_PROBE_TEST_TARGET = $(GWPROXY_DIR)/tests/iou_probe.t
+ALL_TEST_TARGETS += $(GWIOU_PROBE_TEST_TARGET)
+
+$(GWIOU_PROBE_TEST_TARGET): $(GWPROXY_DIR)/tests/iou_probe.c $(GWPROXY_DIR)/ev/iou_probe.h $(EXTRA_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBURING_TARGET) $(LIBS)
 endif # ifeq ($(CONFIG_IO_URING),y)
 
 $(GWPROXY_TARGET): $(ALL_GWPROXY_OBJECTS)

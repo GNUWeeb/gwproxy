@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #endif
 #include <gwproxy/ev/io_uring.h>
+#include <gwproxy/ev/iou_probe.h>
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
 #include <gwproxy/acl.h>
@@ -133,6 +134,40 @@ struct gwp_iou_udp {
 	unsigned char		buf[GWP_UDP_RELAY_BUFSZ];
 };
 
+/*
+ * Refuse a kernel that lacks what this loop relies on (see ev/iou_probe.h)
+ * instead of leaking a socket with every close. The stop doorbell has
+ * nothing armed on it yet, so it is what the probe's cancel looks for. Every
+ * ring is the same kernel's, so the first worker's alone is probed; the
+ * features of each are at hand anyway.
+ */
+__cold
+static int check_kernel(struct gwp_wrk *w, struct iou *iou)
+{
+	const char *lacks;
+	int r, res = 0;
+
+	lacks = gwp_iou_kernel_lacks(iou->ring.features, 0);
+	if (!lacks && !w->idx) {
+		r = gwp_iou_probe_cancel(&iou->ring, iou->stop_efd, &res);
+		if (r < 0) {
+			pr_err(&w->ctx->lh, "Worker %u: io_uring probe failed: %s",
+			       w->idx, strerror(-r));
+			return r;
+		}
+		lacks = gwp_iou_kernel_lacks(iou->ring.features, res);
+	}
+
+	if (lacks) {
+		pr_err(&w->ctx->lh,
+		       "The io_uring event loop needs Linux %s or later: this kernel lacks %s; use --event-loop=epoll",
+		       GWP_IOU_MIN_KERNEL, lacks);
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
 __cold
 int gwp_ctx_init_thread_io_uring(struct gwp_wrk *w)
 {
@@ -156,9 +191,15 @@ int gwp_ctx_init_thread_io_uring(struct gwp_wrk *w)
 	if (r < 0)
 		goto err_close_efd;
 
+	r = check_kernel(w, iou);
+	if (r < 0)
+		goto err_exit_ring;
+
 	w->iou = iou;
 	return 0;
 
+err_exit_ring:
+	io_uring_queue_exit(&iou->ring);
 err_close_efd:
 	__sys_close(iou->stop_efd);
 err_free_iou:
