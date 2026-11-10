@@ -173,7 +173,13 @@ target's name; a client whose request is waiting for one when the time runs out
 gets a SOCKS5 reply 0x06 or an HTTP 504 first. With
 .B \-\-connect\-timeout=0
 it also bounds the connect of a client that half\-closes its connection while
-the connect is in progress (see there). Default:
+the connect is in progress (see there).
+.B 0
+(or a negative value) sets no limit: a client that sends half a request, or
+nothing at all, then holds its connection for as long as it stays connected,
+and with
+.B \-\-connect\-timeout=0
+nothing bounds the connect of a client that has half\-closed either. Default:
 .BR 10 .
 .TP
 .BR \-c ", " \-\-connect\-timeout=\fIsec\fR
