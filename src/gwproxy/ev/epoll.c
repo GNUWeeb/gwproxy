@@ -1173,6 +1173,15 @@ static bool adj_epl_out(struct gwp_conn *src, struct gwp_conn *dst)
 
 #ifdef CONFIG_HTTPS
 	/*
+	 * A TLS destination whose engine cannot take the plaintext before
+	 * it has heard from the peer (a renegotiation it has not answered)
+	 * gets it only once the peer has been read: a writable socket would
+	 * only bring back the same SSL_write() at once, for as long as the
+	 * peer likes.
+	 */
+	if (dst->tls && gwp_ssl_tx_starved(dst->tls))
+		want_out = false;
+	/*
 	 * A TLS destination may have ciphertext still queued in its send BIO
 	 * (a short socket write, or a handshake/alert record) even when there
 	 * is no plaintext to forward, so keep EPOLLOUT armed until it drains.
@@ -1449,8 +1458,12 @@ again:
 				break;
 			continue;
 		}
+		/*
+		 * Ciphertext must drain first, or the engine waits for the
+		 * peer (gwp_ssl_tx_starved(), which adj_epl_out() heeds).
+		 */
 		if (sr == GWP_SSL_WANT_READ || sr == GWP_SSL_WANT_WRITE)
-			break;		/* ciphertext must drain first */
+			break;
 		return -EIO;
 	}
 
@@ -2108,6 +2121,16 @@ static int upstream_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	/* Receive phase: read and parse the reply. */
 	if (ev->events & EPOLLIN) {
 		sr = __do_recv(&gcp->target);
+#ifdef CONFIG_HTTPS
+		/*
+		 * A record that fails to verify or a fatal alert, with nothing
+		 * of the reply decrypted before it (tls_decrypt()).
+		 */
+		if (unlikely(sr == -EIO) && gcp->target.tls) {
+			gwp_upstream_tls_rx_fail(w, gcp);
+			return -EPROTO;
+		}
+#endif
 		if (unlikely(sr < 0))
 			return (int)sr;
 	}

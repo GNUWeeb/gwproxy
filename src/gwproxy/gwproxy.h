@@ -1585,6 +1585,12 @@ int gwp_upstream_tls_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /* The TLS handshake with the upstream proxy failed: log why. */
 void gwp_upstream_tls_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+/*
+ * Past the handshake, the upstream's TLS stream failed before anything of
+ * the CONNECT's reply came (a record that fails to verify, a fatal alert):
+ * a failure of the upstream's, like a failed handshake. Log why.
+ */
+void gwp_upstream_tls_rx_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /*
  * The https:// upstream's stream has ended, and the end was a cut rather than

@@ -1313,7 +1313,12 @@ static int target_tls_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			break;
 	}
 
-	if (gwp_ssl_bio_pending(c->tls) > 0)
+	/*
+	 * Also the client's data that the engine could not take before it
+	 * had heard from the upstream (target_tls_sent()): it may now.
+	 */
+	if (gwp_ssl_bio_pending(c->tls) > 0 ||
+	    (gcp->up_tls_io->tx_fwd && gcp->client.len))
 		send_target_tls(w, gcp, false);
 
 	if (c->len) {
@@ -1398,6 +1403,14 @@ static int target_tls_sent(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (t->tx_fwd) {
+		/*
+		 * The engine cannot take the client's data before it has heard
+		 * from the upstream (a renegotiation in progress): keep it, and
+		 * the client unread, for target_tls_pump() to send once the
+		 * upstream's answer is in.
+		 */
+		if (gcp->client.len && gwp_ssl_tx_starved(gcp->target.tls))
+			return 0;
 		t->tx_fwd = false;
 		if (!gcp->client.rd_eof) {
 			if (client_is_tls(gcp))
@@ -2253,9 +2266,10 @@ static int upstream_tls_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 /*
  * Decrypt what the upstream sent into target.buf, for the CONNECT's reply. Its
  * close_notify ends the stream as a hangup would, once what came before it has
- * been looked at.
+ * been looked at. A record that fails to verify, or a fatal alert, fails the
+ * attempt as the upstream's TLS failure.
  */
-static int upstream_tls_rx(struct gwp_conn_pair *gcp)
+static int upstream_tls_rx(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->target;
 	size_t got;
@@ -2264,8 +2278,10 @@ static int upstream_tls_rx(struct gwp_conn_pair *gcp)
 	while (c->len < c->cap) {
 		got = 0;
 		sr = gwp_ssl_read(c->tls, c->buf + c->len, c->cap - c->len, &got);
-		if (sr == GWP_SSL_ERROR)
-			return -ECONNRESET;
+		if (sr == GWP_SSL_ERROR) {
+			gwp_upstream_tls_rx_fail(w, gcp);
+			return -EPROTO;
+		}
 		if (!got) {
 			if (sr == GWP_SSL_OK)
 				c->rd_eof = true;
@@ -2368,7 +2384,7 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		gwp_ssl_rx_commit(gcp->target.tls, (size_t)r);
 		if (gcp->conn_state == CONN_STATE_UPSTREAM_TLS_HS)
 			return upstream_tls_step(w, gcp);
-		r = upstream_tls_rx(gcp);
+		r = upstream_tls_rx(w, gcp);
 		if (r)
 			return upstream_iou_fail(w, gcp, r);
 		goto parse;
@@ -2406,6 +2422,19 @@ parse:
 		/* An https:// upstream's close_notify, see upstream_tls_rx(). */
 		if (gcp->target.rd_eof)
 			return upstream_iou_fail(w, gcp, -ECONNRESET);
+#ifdef CONFIG_HTTPS
+		/*
+		 * The engine may have records of its own to send in answer to
+		 * what it read (the alert that refuses a renegotiation), which
+		 * the upstream may wait for before it replies. Their send's
+		 * completion goes on to the recv.
+		 */
+		if (target_is_tls(gcp) && target_cipher_next(gcp)) {
+			gcp->up_tx = true;
+			prep_send_target_cipher(w, gcp, EV_BIT_IOU_UPSTREAM_S5);
+			return 0;
+		}
+#endif
 		if (unlikely(!prep_upstream_recv(w, gcp)))
 			return upstream_iou_fail(w, gcp, -ENOMEM);
 		return 0;

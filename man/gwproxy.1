@@ -1540,7 +1540,10 @@ bytes do not, so
 gwproxy advertises only the "http/1.1" ALPN protocol, cleanly downgrading an
 HTTP/2\-preferring client. The OpenSSL engine is driven entirely through memory
 BIOs and never touches the socket directly. TLS termination works on both the
-epoll and io_uring event loops.
+epoll and io_uring event loops. A client's request to renegotiate a TLS 1.2
+session is refused with a
+.B no_renegotiation
+alert.
 .PP
 The end of a TLS client's stream reaches the target as a normal end of stream
 only if it is one. If a record fails to verify, the client sends a fatal alert,
@@ -1726,12 +1729,23 @@ also be the URL's host's: a name must be among the certificate's DNS names
 not count), and is sent as the TLS server
 name (SNI); an IP address literal must be among its IP addresses, and is not
 sent as SNI. TLS 1.2 is the oldest version accepted. A handshake that fails,
-or a certificate that is refused, fails the connection as any other upstream
-failure does (SOCKS5 reply 0x01, HTTP 502 to the client, after a pool's retry
+a certificate that is refused, or a TLS stream that fails before the
+CONNECT's reply (a record that fails to verify, a fatal alert) fails the
+connection as any other upstream failure does (SOCKS5 reply 0x01, HTTP 502 to the client, after a pool's retry
 on another server; see
 .BR "Upstream pools" )
 and is logged with the reason, for example
 .IR "certificate verify failed: hostname mismatch" .
+.PP
+gwproxy does not take part in a TLS 1.2 renegotiation: it answers an
+upstream's HelloRequest with a
+.B no_renegotiation
+alert and goes on with the session as it is. An upstream that insists on
+renegotiating, as OpenSSL's servers do (they take the refusal as fatal), ends
+the session: before the CONNECT's reply that fails the connection like a
+failed handshake, and once the tunnel is up the tunnel's stream is cut. TLS 1.3 has no renegotiation; its
+KeyUpdate is answered as usual. (A gwproxy built with an OpenSSL older than
+1.1.0h cannot refuse, and renegotiates.)
 .PP
 An upstream that turns the CONNECT down is answered to an HTTP client with
 "502 Bad Gateway", or "504 Gateway Timeout" for a
@@ -1945,7 +1959,8 @@ A pool also keeps track of its servers' health, from the connections they
 carry (passively: gwproxy sends no probes of its own). A failure counts
 against a server only when it is the server's own: its TCP connection
 refused, reset or timed out, its TLS handshake failing (a refused
-certificate included), a SOCKS5 server that accepts none of the offered
+certificate included) or its TLS stream failing before the CONNECT's reply,
+a SOCKS5 server that accepts none of the offered
 authentication methods, refuses the credentials or answers a CONNECT with
 reply 0x07 or 0x08 (a refused UDP ASSOCIATE never counts, see below), an
 HTTP server that answers 407, a reply that does not parse, the
