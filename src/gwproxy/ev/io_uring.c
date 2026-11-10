@@ -2077,7 +2077,8 @@ static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
  * client's reply is in target.buf. Send it, and bring the relay up. The two
  * control connections are watched only for their end from now on: either one
  * closing ends the association. A recv on the upstream's stands for that
- * watch; the reply's send completion arms it (handle_ev_client_send()).
+ * watch; for a plaintext client the reply's send completion arms it
+ * (handle_ev_client_send()).
  */
 static int udp_up_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -2089,6 +2090,17 @@ static int udp_up_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gwp_conn_upstream_up(gcp);
 	gcp->client.len = 0;
 	prep_send_client(w, gcp);
+#ifdef CONFIG_HTTPS
+	/*
+	 * A TLS client's reply completion goes back to the protocol pass
+	 * that arm_udp_relay() leaves pending (prot_resume), not to the
+	 * branch that arms the watch, so arm it now. The reply is in the
+	 * engine already (send_client_tls()), and what the watch reads is
+	 * dropped without touching target.len.
+	 */
+	if (client_is_tls(gcp))
+		prep_recv_target(w, gcp);
+#endif
 	return arm_udp_relay(w, gcp);
 }
 
