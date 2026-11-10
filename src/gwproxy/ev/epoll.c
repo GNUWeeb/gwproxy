@@ -772,10 +772,14 @@ static void log_target_connected(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 /*
  * Register a new client's descriptors: its target socket, if it has one by
- * now, and the client socket under @cl_ev_bit.
+ * now, and the client socket under @cl_ev_bit. With @cl_watched, the client
+ * socket is in the epoll set already, under EV_BIT_CLIENT, as wait_for_target()
+ * put it there; its registration is then left as handle_ev_client() has kept
+ * it, as resetting it would bring back what that took away (EPOLLIN on a
+ * client at EOF, say).
  */
 static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			       uint64_t cl_ev_bit)
+			       uint64_t cl_ev_bit, bool cl_watched)
 {
 	struct epoll_event ev;
 	int r;
@@ -784,7 +788,8 @@ static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * If epoll_ctl() fails, don't bother closing the target socket
 	 * because it will be closed in free_conn_pair() anyway.
 	 */
-	gcp->client.ep_mask = EPOLLIN | EPOLLRDHUP;
+	if (!cl_watched)
+		gcp->client.ep_mask = EPOLLIN | EPOLLRDHUP;
 
 	if (gcp->target.fd >= 0) {
 		gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
@@ -797,11 +802,14 @@ static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		gcp->target.ep_mask = 0;
 	}
 
-	ev.events = gcp->client.ep_mask;
-	ev.data.u64 = PTR_TO_U64(gcp) | cl_ev_bit;
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->client.fd, &ev);
-	if (unlikely(r))
-		return r;
+	if (!cl_watched) {
+		ev.events = gcp->client.ep_mask;
+		ev.data.u64 = PTR_TO_U64(gcp) | cl_ev_bit;
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->client.fd,
+				    &ev);
+		if (unlikely(r))
+			return r;
+	}
 
 	if (gcp->target.fd >= 0) {
 		log_conn_pair_created(w, gcp);
@@ -816,9 +824,11 @@ static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 /*
  * Plain and transparent forwarding: create the target socket, start its
  * connect, and register the pair. -EMFILE or -ENFILE leaves the pair as it
- * was, to be tried again (see wait_for_target()).
+ * was, to be tried again (see wait_for_target()). @cl_watched: the client is
+ * registered already, as it is while it waits for that.
  */
-static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    bool cl_watched)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_sockaddr *ca;
@@ -843,7 +853,7 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			 * yet, its retry is just this again.
 			 */
 			if (gwp_conn_upstream_failed(w, gcp, target_fd, true))
-				return start_new_target(w, gcp);
+				return start_new_target(w, gcp, cl_watched);
 		}
 		return target_fd;
 	}
@@ -857,19 +867,28 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->upstream)
 		gcp->is_target_alive = false;
 
-	return register_new_client(w, gcp, EV_BIT_CLIENT);
+	return register_new_client(w, gcp, EV_BIT_CLIENT, cl_watched);
 }
 
 /*
  * The descriptor table is full, and an accepted client has no target socket
  * yet. Closing the client would turn a passing shortage into a reset seen by
  * the client, so keep it and try again every 100 ms (RETRY_DELAY_MS), as the
- * io_uring loop does, for as long as its connect timeout allows. Only its
- * timer runs meanwhile: what the client sends waits in its socket.
+ * io_uring loop does, for as long as its connect timeout allows.
+ *
+ * The client is watched meanwhile, registered as for a connect under way
+ * (register_new_client()): handle_ev_client() takes in what it sends, ends the
+ * pair if it resets or hangs up, and bounds a half-close (bound_fin_connect()),
+ * which matters most at --connect-timeout=0, where no timer ends the wait.
+ * Left unwatched, a client that is gone kept its descriptor, scarce as they
+ * are then, and had its target dialled once one was free.
  */
 static int wait_for_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			   int e)
 {
+	struct epoll_event ev;
+	int r;
+
 	if (w->nr_tgt_wait == w->tgt_wait_cap) {
 		uint32_t cap = w->tgt_wait_cap ? w->tgt_wait_cap * 2 : 16;
 		struct gwp_conn_pair **p;
@@ -880,6 +899,14 @@ static int wait_for_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		w->tgt_wait = p;
 		w->tgt_wait_cap = cap;
 	}
+
+	gcp->client.ep_mask = EPOLLIN | EPOLLRDHUP;
+	gcp->target.ep_mask = 0;
+	ev.events = gcp->client.ep_mask;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
+	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->client.fd, &ev);
+	if (unlikely(r))
+		return r;
 
 	pr_warn(&w->ctx->lh,
 		"Too many open files, retrying the target connect (idx=%u, ca=%s)",
@@ -899,7 +926,7 @@ static void retry_new_targets(struct gwp_wrk *w)
 	w->nr_tgt_wait = 0;
 	for (i = 0; i < n; i++) {
 		gcp = w->tgt_wait[i];
-		r = start_new_target(w, gcp);
+		r = start_new_target(w, gcp, true);
 		if (r == -EMFILE || r == -ENFILE) {
 			/* Still waiting; the list only shrinks here. */
 			w->tgt_wait[w->nr_tgt_wait++] = gcp;
@@ -958,10 +985,10 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			gcp->conn_state = CONN_STATE_TLS_DETECT;
 #endif
 		gcp->target.fd = -1;
-		return register_new_client(w, gcp, EV_BIT_CLIENT_PROT);
+		return register_new_client(w, gcp, EV_BIT_CLIENT_PROT, false);
 	}
 
-	r = start_new_target(w, gcp);
+	r = start_new_target(w, gcp, false);
 	if (r == -EMFILE || r == -ENFILE)
 		r = wait_for_target(w, gcp, r);
 	return r;
