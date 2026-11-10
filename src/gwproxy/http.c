@@ -38,6 +38,13 @@ struct gwp_http_conn {
 	size_t				scan;
 
 	/*
+	 * Whether the first bytes can start a request line at all (enum
+	 * req_start), and how many of them have been looked at.
+	 */
+	uint8_t				start_st;
+	size_t				start_off;
+
+	/*
 	 * True for a forwarding request (absolute-form target, e.g.
 	 * "GET http://host/path") as opposed to a CONNECT tunnel.
 	 */
@@ -710,6 +717,72 @@ static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			char *buf, size_t *len, size_t cap, char **host_p,
 			char **port_p, size_t *hdr_len_p);
 
+static bool is_tchar(unsigned char c)
+{
+	if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+	    (c >= 'a' && c <= 'z'))
+		return true;
+	return c && strchr("!#$%&'*+-.^_`|~", c);
+}
+
+/*
+ * How far the client's first bytes have shown it to speak HTTP (enum
+ * req_start): a request line starts, after at most one empty line (RFC 9112
+ * Section 2.2), with a method token and the white space behind it.
+ */
+enum req_start {
+	RS_START = 0,	/* Nothing seen yet. */
+	RS_CR,		/* A CR, which only an empty line may start with. */
+	RS_LINE,	/* The empty line; a method must start next. */
+	RS_METHOD,	/* Within the method token. */
+	RS_HTTP,	/* A method and the white space after it: HTTP. */
+	RS_NOT_HTTP,	/* A byte no request line can have there. */
+};
+
+/*
+ * Take the bytes from where the last call left off to @len in @p, and return
+ * the new enum req_start. A client speaking another protocol (SOCKS4, TLS on
+ * a listener without --tls-cert, ...) is told apart within its first bytes
+ * this way, rather than when a line end happens to come or the protocol
+ * timeout ends the wait.
+ */
+static int req_start_scan(struct gwp_http_conn *hc, const char *p, size_t len)
+{
+	size_t i = hc->start_off;
+	uint8_t st = hc->start_st;
+
+	for (; i < len && st != RS_HTTP && st != RS_NOT_HTTP; i++) {
+		unsigned char c = (unsigned char)p[i];
+
+		switch (st) {
+		case RS_START:
+			if (c == '\r')
+				st = RS_CR;
+			else if (c == '\n')
+				st = RS_LINE;
+			else
+				st = is_tchar(c) ? RS_METHOD : RS_NOT_HTTP;
+			break;
+		case RS_CR:
+			st = c == '\n' ? RS_LINE : RS_NOT_HTTP;
+			break;
+		case RS_LINE:
+			st = is_tchar(c) ? RS_METHOD : RS_NOT_HTTP;
+			break;
+		case RS_METHOD:
+			if (c == ' ' || c == '\t')
+				st = RS_HTTP;
+			else if (!is_tchar(c))
+				st = RS_NOT_HTTP;
+			break;
+		}
+	}
+
+	hc->start_off = i;
+	hc->start_st = st;
+	return st;
+}
+
 int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			  void *buf, size_t *buf_len, size_t cap,
 			  char **host_p, char **port_p, size_t *hdr_len_p)
@@ -727,6 +800,12 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	 * limit the parser runs anyway, to refuse the header.
 	 */
 	*hdr_len_p = 0;
+	if (hc->start_off > len)
+		hc->start_off = hc->start_st = 0;
+	if (hc->start_st != RS_HTTP &&
+	    req_start_scan(hc, p, len) == RS_NOT_HTTP)
+		return GWP_HTTP_ERR;
+
 	if (hc->scan > len || hc->scan < ctx->off)
 		hc->scan = ctx->off;
 	if (len <= REQ_HDR_MAX && !memchr(p + hc->scan, '\n', len - hc->scan)) {
@@ -875,14 +954,6 @@ static bool is_framing_field(const char *k, size_t klen)
 {
 	return (klen == 14 && !strncasecmp(k, "Content-Length", 14)) ||
 	       (klen == 17 && !strncasecmp(k, "Transfer-Encoding", 17));
-}
-
-static bool is_tchar(unsigned char c)
-{
-	if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-	    (c >= 'a' && c <= 'z'))
-		return true;
-	return c && strchr("!#$%&'*+-.^_`|~", c);
 }
 
 /*

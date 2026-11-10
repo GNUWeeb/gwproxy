@@ -1453,6 +1453,11 @@ of ordinary absolute\-form requests such as "GET http://host/path", which
 gwproxy rewrites to origin form, fetches from the origin and relays back, one
 request per connection.
 .PP
+A connection whose first bytes cannot start a request line, a method token
+followed by a space, is closed at once without a reply: a SOCKS4 request, say,
+or a SOCKS5 greeting on a listener without
+.BR \-\-as\-socks5 .
+.PP
 Only that one request reaches the origin: its body, delimited by Content\-Length
 or chunked Transfer\-Encoding, is forwarded, and anything the client sends after
 it is discarded. A request gwproxy cannot delimit unambiguously (both framing

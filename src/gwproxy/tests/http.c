@@ -1056,6 +1056,82 @@ static void test_errors(void)
 }
 
 /*
+ * Feed the @len bytes at @in to a new connection, one byte at a time when
+ * @bytewise, else in one go, and return the first result that is not
+ * GWP_HTTP_NEED_MORE, or that after the last byte.
+ */
+static int feed_raw(const char *in, size_t len, bool bytewise)
+{
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char buf[256], *h, *p;
+	size_t n, l, rl;
+	int r = GWP_HTTP_NEED_MORE;
+
+	assert(hc && len <= sizeof(buf));
+	for (n = bytewise ? 1 : len; n <= len; n++) {
+		memcpy(buf, in, n);
+		l = n;
+		r = gwp_http_conn_process(hc, NULL, buf, &l, sizeof(buf), &h,
+					  &p, &rl);
+		if (r != GWP_HTTP_NEED_MORE)
+			break;
+	}
+	gwp_http_conn_free(hc);
+	return r;
+}
+
+/*
+ * Bytes that cannot start a request line are refused as soon as they are
+ * seen, without waiting for a line end that a client speaking another
+ * protocol may never send. A request line starts with a method token and the
+ * white space after it, and anything that may still become one waits.
+ */
+static void test_req_start(void)
+{
+#define RS(s, want)	{ s, sizeof(s) - 1, want }
+	static const struct {
+		const char	*in;
+		size_t		len;
+		int		want;
+	} cases[] = {
+		/* SOCKS4 CONNECT, SOCKS4a, NULs, binary, TLS, SOCKS5. */
+		RS("\x04\x01\x00\x50\x7f\x00\x00\x01\x00", GWP_HTTP_ERR),
+		RS("\x04\x01\x00\x50\x00\x00\x00\x01u\x00h\x00", GWP_HTTP_ERR),
+		RS("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", GWP_HTTP_ERR),
+		RS("\xff\xfe\xfd", GWP_HTTP_ERR),
+		RS("\x16\x03\x01\x02\x00\x01", GWP_HTTP_ERR),
+		RS("\x05\x01\x00", GWP_HTTP_ERR),
+		/* A byte off the token grammar in the method, or before it. */
+		RS("GET\x01", GWP_HTTP_ERR),
+		RS("GE(T", GWP_HTTP_ERR),
+		RS(" GET", GWP_HTTP_ERR),
+		RS("\tGET", GWP_HTTP_ERR),
+		RS("\r\r", GWP_HTTP_ERR),
+		RS("\rGET", GWP_HTTP_ERR),
+		/* What may still be a request waits for the rest. */
+		RS("G", GWP_HTTP_NEED_MORE),
+		RS("GET", GWP_HTTP_NEED_MORE),
+		RS("get", GWP_HTTP_NEED_MORE),
+		RS("PROPFIND", GWP_HTTP_NEED_MORE),
+		RS("GET ", GWP_HTTP_NEED_MORE),
+		RS("GET\t", GWP_HTTP_NEED_MORE),
+		RS("GET http://h/", GWP_HTTP_NEED_MORE),
+		RS("GET \x01\x02\x03", GWP_HTTP_NEED_MORE),
+		RS("\r", GWP_HTTP_NEED_MORE),
+	};
+#undef RS
+	size_t i;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		assert(feed_raw(cases[i].in, cases[i].len, false) ==
+		       cases[i].want);
+		assert(feed_raw(cases[i].in, cases[i].len, true) ==
+		       cases[i].want);
+	}
+	PRTEST_OK();
+}
+
+/*
  * The rewrite never adds more than GWP_HTTP_REWRITE_SLACK, so with that much
  * room behind a full buffer no request is refused for what was read behind
  * its header. The worst case takes it all.
@@ -1811,6 +1887,7 @@ int main(void)
 		test_res_direct();
 		test_need_more();
 		test_errors();
+		test_req_start();
 		test_field_obs_text();
 		test_duplicate_field();
 		test_underscore_alias();
