@@ -6461,6 +6461,7 @@ from_relay:
 	out->dst = gcp->udp_peer;
 	out->dstlen = gcp->udp_peer.sa.sa_family == AF_INET ?
 		      sizeof(gcp->udp_peer.i4) : sizeof(gcp->udp_peer.i6);
+	out->from = &gcp->udp_local;
 	return GWP_UDP_TO_CLIENT;
 }
 
@@ -6472,6 +6473,8 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 {
 	bool client_dgram;
 
+	out->from = NULL;
+	out->from_ifindex = 0;
 	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
 		return udp_up_classify(w, gcp, base, n, src, out);
 
@@ -6545,6 +6548,7 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 		out->dst = gcp->udp_peer;
 		out->dstlen = gcp->udp_peer.sa.sa_family == AF_INET ?
 			      sizeof(gcp->udp_peer.i4) : sizeof(gcp->udp_peer.i6);
+		out->from = &gcp->udp_local;
 		return GWP_UDP_TO_CLIENT;
 	}
 }
@@ -6650,6 +6654,12 @@ static void udp_pin_declared(struct gwp_conn_pair *gcp, int family)
  * from the relay socket. An IPv4 client of a dual-stack listener is told an
  * IPv4 address, not the v4-mapped form of it that getsockname() reports.
  * @relay is the relay socket's address, or NULL to read it.
+ *
+ * The relay socket is bound to the wildcard address, so the address is
+ * kept too (gcp->udp_local): the datagrams to the client are sent from it,
+ * not from whichever source routing would pick toward the client. A client
+ * that checks where they come from, with a connect()ed socket or behind a
+ * stateful firewall, takes only those from BND.ADDR.
  */
 static int udp_client_bnd(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			  const struct gwp_sockaddr *relay,
@@ -6665,6 +6675,7 @@ static int udp_client_bnd(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			strerror(-r));
 		return r;
 	}
+	gcp->udp_local = local;
 	if (!relay) {
 		slen = sizeof(ra);
 		r = __sys_getsockname(gcp->udp_fd, &ra.sa, &slen);
@@ -6847,6 +6858,66 @@ reply:
 	gcp->target.len += (uint32_t)out_len;
 
 	return (rep == GWP_SOCKS5_REP_SUCCESS) ? 0 : -ECONNREFUSED;
+}
+
+size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
+{
+	const struct gwp_sockaddr *f = out->from;
+	struct cmsghdr *cm = (struct cmsghdr *)(void *)cb->b;
+	struct in_addr a4;
+	bool f4, d4;
+
+	if (!f)
+		return 0;
+	if (f->sa.sa_family == AF_INET) {
+		f4 = true;
+		a4 = f->i4.sin_addr;
+	} else if (f->sa.sa_family == AF_INET6) {
+		f4 = IN6_IS_ADDR_V4MAPPED(&f->i6.sin6_addr);
+		memcpy(&a4, &f->i6.sin6_addr.s6_addr[12], sizeof(a4));
+	} else {
+		return 0;
+	}
+	/* The destination has the relay socket's family. */
+	d4 = out->dst.sa.sa_family == AF_INET ||
+	     IN6_IS_ADDR_V4MAPPED(&out->dst.i6.sin6_addr);
+	if (f4 != d4)
+		return 0;
+
+	assert(CMSG_SPACE(sizeof(struct in6_pktinfo)) <= sizeof(cb->b));
+	memset(cb, 0, sizeof(*cb));
+	if (out->dst.sa.sa_family == AF_INET6) {
+		struct in6_pktinfo pi;
+
+		memset(&pi, 0, sizeof(pi));
+		if (f4) {
+			pi.ipi6_addr.s6_addr[10] = 0xff;
+			pi.ipi6_addr.s6_addr[11] = 0xff;
+			memcpy(&pi.ipi6_addr.s6_addr[12], &a4, sizeof(a4));
+		} else {
+			pi.ipi6_addr = f->i6.sin6_addr;
+			/* A link-local source is of its own link. */
+			pi.ipi6_ifindex = f->i6.sin6_scope_id;
+		}
+		if (out->from_ifindex)
+			pi.ipi6_ifindex = out->from_ifindex;
+		cm->cmsg_level = IPPROTO_IPV6;
+		cm->cmsg_type = IPV6_PKTINFO;
+		cm->cmsg_len = CMSG_LEN(sizeof(pi));
+		memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
+		return CMSG_SPACE(sizeof(pi));
+	} else {
+		struct in_pktinfo pi;
+
+		memset(&pi, 0, sizeof(pi));
+		pi.ipi_spec_dst = a4;
+		pi.ipi_ifindex = (int)out->from_ifindex;
+		cm->cmsg_level = IPPROTO_IP;
+		cm->cmsg_type = IP_PKTINFO;
+		cm->cmsg_len = CMSG_LEN(sizeof(pi));
+		memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
+		return CMSG_SPACE(sizeof(pi));
+	}
 }
 
 int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)

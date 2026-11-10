@@ -256,6 +256,11 @@ the proxy rejects it with reply
 .B CONNECT
 unaffected; only meaningful with
 .BR \-\-as\-socks5 .
+The reply names the address the client reached the proxy at as BND.ADDR,
+and every datagram to the client is sent from that address, whichever
+source routing would pick toward the client, so a client that takes
+datagrams only from the relay it was told (a connected UDP socket, a
+stateful firewall) gets them on a host with several addresses too.
 Datagrams are taken only from the IP address of the control connection. When
 the request declares that address and a port, only that port is the client;
 when it declares any other address, or no port, the first valid datagram from

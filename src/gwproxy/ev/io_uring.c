@@ -130,6 +130,7 @@ struct gwp_iou_udp {
 	struct iovec		iov;
 	struct gwp_sockaddr	src;	/* recvmsg source of the last datagram */
 	struct gwp_sockaddr	dst;	/* sendmsg destination                 */
+	union gwp_udp_cmsg	cb;	/* sendmsg source (gwp_udp_src_cmsg()) */
 	unsigned char		buf[GWP_UDP_RELAY_BUFSZ];
 };
 
@@ -3295,22 +3296,27 @@ static void prep_udp_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	get_gcp_io(gcp, s);
 }
 
-/* Arm a relay sendmsg of @buf[0..len) to @dst (part of the same scratch). */
+/*
+ * Arm a relay sendmsg of @out's datagram (part of the same scratch), from
+ * the source it must come from, if it has one.
+ */
 static void prep_udp_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			  unsigned char *buf, size_t len,
-			  const struct gwp_sockaddr *dst, socklen_t dstlen)
+			  const struct gwp_udp_out *out)
 {
 	struct gwp_iou_udp *u = gcp->udp_iou;
 	struct io_uring_sqe *s = get_sqe_nofail(w);
 
-	u->dst = *dst;
-	u->iov.iov_base = buf;
-	u->iov.iov_len = len;
+	u->dst = out->dst;
+	u->iov.iov_base = out->buf;
+	u->iov.iov_len = out->len;
 	memset(&u->mh, 0, sizeof(u->mh));
 	u->mh.msg_name = &u->dst;
-	u->mh.msg_namelen = dstlen;
+	u->mh.msg_namelen = out->dstlen;
 	u->mh.msg_iov = &u->iov;
 	u->mh.msg_iovlen = 1;
+	u->mh.msg_controllen = gwp_udp_src_cmsg(out, &u->cb);
+	if (u->mh.msg_controllen)
+		u->mh.msg_control = u->cb.b;
 	io_uring_prep_sendmsg(s, gcp->udp_fd, &u->mh, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UDP_TX;
@@ -3354,7 +3360,7 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 	}
 
-	prep_udp_send(w, gcp, out.buf, out.len, &out.dst, out.dstlen);
+	prep_udp_send(w, gcp, &out);
 	return 0;
 }
 
