@@ -134,8 +134,8 @@ static int drop_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
  *
  * The client gets the reply that path gives for any failed lookup, host
  * unreachable (REP 0x04), whatever the reason here: NXDOMAIN, SERVFAIL, an
- * answer with no usable address, a malformed reply, a server that never
- * answered come back as assorted errnos
+ * answer with no usable address, a malformed reply, a server that refused
+ * the query or never answered it come back as assorted errnos
  * that would otherwise read as a general failure (REP 0x01). The reason
  * itself goes to the log.
  */
@@ -243,20 +243,18 @@ static int handle_ev_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	for (i = 0; i < GWP_RAW_DNS_BUDGET; i++) {
 		ret = __sys_recv(gcp->gdp->fd, buf, sizeof(buf), 0);
-		if (ret < 0) {
-			/*
-			 * The socket is connected, so an ICMP port unreachable
-			 * from a DNS server that is down -- or simply not
-			 * listening where we were told -- is reported here as
-			 * -ECONNREFUSED. It ends nothing: the lookup fails on
-			 * its own once its tries are spent, as it would with no
-			 * reply at all.
-			 */
-			if (ret != -EAGAIN && ret != -EINTR)
-				pr_dbg(&w->ctx->lh, "DNS socket recv failed: %s",
-				       strerror((int)-ret));
+		if (ret == -EAGAIN || ret == -EINTR)
 			return 0;
-		}
+		/*
+		 * The socket is connected, so an ICMP error for a query sent
+		 * on it is reported here: -ECONNREFUSED from a DNS server
+		 * that is down, or not listening where we were told. The
+		 * only server there is cannot answer, so fail the lookup at
+		 * once, as the system resolver does, instead of waiting out
+		 * the tries.
+		 */
+		if (ret < 0)
+			return fail_raw_dns_query(w, gcp, (int)ret);
 
 		r = handle_raw_dns_reply(w, gcp, buf, (uint16_t)ret);
 		if (r <= 0)

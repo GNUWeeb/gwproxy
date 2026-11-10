@@ -1191,7 +1191,9 @@ SOCKS5 reply
 .BR 502 .
 A query that has no reply after 1\ s is sent again, and again 2\ s after
 that; 4\ s after the third send the lookup fails as for a name that does not
-resolve. So a lookup takes at most 7\ s per address family, also with
+resolve. It fails at once when the server refuses the query (an ICMP port
+unreachable comes back), as with the system resolver. So a lookup takes at most
+7\ s per address family, also with
 .BR \-\-protocol\-timeout=0 ;
 a shorter
 .B \-\-protocol\-timeout

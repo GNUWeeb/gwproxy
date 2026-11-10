@@ -112,14 +112,16 @@ dns_case()
 		# -ECONNREFUSED on recv. That used to break the event loop: one
 		# unreachable resolver and the worker took every connection
 		# down with it. Nothing is started on this port on purpose.
+		# The lookup fails then and there, as for a name that does not
+		# resolve (t/0253 times it).
 		dp="$(pick_port)"
 		p="$(pick_port)"
 		gwp_start "127.0.0.1:$p" --as-socks5=1 --raw-dns=1 \
 			--dns-server="127.0.0.1:$dp" --event-loop="$loop" \
 			--nr-workers=1
 		rep="$(ask "$p" "$hp")"
-		[ "$rep" = "NONE" ] || \
-			fail "[$loop] an absent DNS server somehow answered (got '$rep')"
+		[ "$rep" = "REP=0x04" ] || \
+			fail "[$loop] an absent DNS server got '$rep' (want REP=0x04)"
 		kill -0 "$GWP_PID" 2>/dev/null || \
 			fail "[$loop] proxy died because its DNS server was unreachable"
 		return 0
