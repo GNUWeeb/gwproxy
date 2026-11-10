@@ -517,6 +517,16 @@ void gwp_upstream_tls_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TLS, 0);
 }
 
+void gwp_upstream_tls_rx_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream *up = gcp->upstream;
+
+	pr_err(&w->ctx->lh, "Upstream TLS failed before the CONNECT reply (class=%s, idx=%u, host=%s, up=%s): %s",
+		fail_class(GWP_UPSTREAM_END_TLS, 0), gcp->idx, up->host,
+		ip_to_str(&up->addr), gwp_ssl_errstr());
+	gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TLS, 0);
+}
+
 bool gwp_upstream_tls_cut(struct gwp_conn_pair *gcp)
 {
 	if (!gcp->target.tls)

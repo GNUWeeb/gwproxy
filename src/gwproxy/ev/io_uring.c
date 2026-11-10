@@ -2253,9 +2253,10 @@ static int upstream_tls_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 /*
  * Decrypt what the upstream sent into target.buf, for the CONNECT's reply. Its
  * close_notify ends the stream as a hangup would, once what came before it has
- * been looked at.
+ * been looked at. A record that fails to verify, or a fatal alert, fails the
+ * attempt as the upstream's TLS failure.
  */
-static int upstream_tls_rx(struct gwp_conn_pair *gcp)
+static int upstream_tls_rx(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->target;
 	size_t got;
@@ -2264,8 +2265,10 @@ static int upstream_tls_rx(struct gwp_conn_pair *gcp)
 	while (c->len < c->cap) {
 		got = 0;
 		sr = gwp_ssl_read(c->tls, c->buf + c->len, c->cap - c->len, &got);
-		if (sr == GWP_SSL_ERROR)
-			return -ECONNRESET;
+		if (sr == GWP_SSL_ERROR) {
+			gwp_upstream_tls_rx_fail(w, gcp);
+			return -EPROTO;
+		}
 		if (!got) {
 			if (sr == GWP_SSL_OK)
 				c->rd_eof = true;
@@ -2368,7 +2371,7 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		gwp_ssl_rx_commit(gcp->target.tls, (size_t)r);
 		if (gcp->conn_state == CONN_STATE_UPSTREAM_TLS_HS)
 			return upstream_tls_step(w, gcp);
-		r = upstream_tls_rx(gcp);
+		r = upstream_tls_rx(w, gcp);
 		if (r)
 			return upstream_iou_fail(w, gcp, r);
 		goto parse;

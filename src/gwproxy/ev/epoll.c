@@ -2121,6 +2121,16 @@ static int upstream_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	/* Receive phase: read and parse the reply. */
 	if (ev->events & EPOLLIN) {
 		sr = __do_recv(&gcp->target);
+#ifdef CONFIG_HTTPS
+		/*
+		 * A record that fails to verify or a fatal alert, with nothing
+		 * of the reply decrypted before it (tls_decrypt()).
+		 */
+		if (unlikely(sr == -EIO) && gcp->target.tls) {
+			gwp_upstream_tls_rx_fail(w, gcp);
+			return -EPROTO;
+		}
+#endif
 		if (unlikely(sr < 0))
 			return (int)sr;
 	}
