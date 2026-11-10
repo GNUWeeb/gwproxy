@@ -63,8 +63,12 @@ hold_start()
 		sed 's/^/# gwp: /' "$HLOG" >&2
 		fail "[$name] the proxy did not listen on $PP"
 	fi
-	timeout 10 bash -c "until [ -s '$st' ]; do sleep 0.05; done" ||
-		fail "[$name] fd_holder.py reported nothing"
+	# Not just the first state: the helper writes one before the proxy
+	# has opened any socket ("HELD 0"), and only learns at the first one
+	# whether pidfd_getfd() is allowed. Wait for its verdict on the
+	# listener, which is open by now.
+	timeout 20 bash -c "until grep -qE 'NOGETFD|HELD [1-9]' '$st' 2>/dev/null; do sleep 0.05; done" ||
+		fail "[$name] fd_holder.py did not take the listener ($(cat "$st" 2>/dev/null))"
 	GPID="$(awk '{print $2}' "$st")"
 	HST="$st"
 	HELD=1
@@ -214,8 +218,7 @@ for loop in epoll io_uring; do
 		        time.sleep(0.02)
 		    return False
 
-		time.sleep(0.3)		# the listeners are held by now
-		base = held()
+		base = held()		# the listener, held since hold_start
 		conns = []
 		for _ in range(n):
 		    c = socket.create_connection(("127.0.0.1", port), timeout=10)
