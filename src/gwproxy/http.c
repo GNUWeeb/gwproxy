@@ -149,25 +149,6 @@ bool gwp_http_conn_auth_failed(const struct gwp_http_conn *hc,
 }
 
 /*
- * Map a parsed HTTP method code back to its request-line token. Returns NULL
- * for a method the forwarding proxy does not re-emit.
- */
-static const char *http_method_str(uint8_t method)
-{
-	switch (method) {
-	case GWNET_HTTP_METHOD_GET:	return "GET";
-	case GWNET_HTTP_METHOD_POST:	return "POST";
-	case GWNET_HTTP_METHOD_PUT:	return "PUT";
-	case GWNET_HTTP_METHOD_DELETE:	return "DELETE";
-	case GWNET_HTTP_METHOD_HEAD:	return "HEAD";
-	case GWNET_HTTP_METHOD_OPTIONS:	return "OPTIONS";
-	case GWNET_HTTP_METHOD_PATCH:	return "PATCH";
-	case GWNET_HTTP_METHOD_TRACE:	return "TRACE";
-	default:			return NULL;
-	}
-}
-
-/*
  * Split a "host:port" authority (a CONNECT target, or the authority of an
  * absolute-form URI) into NUL-terminated @host_p/@port_p in place. Any
  * userinfo is discarded. IPv6 literals in brackets ("[::1]:80") are unwrapped.
@@ -389,7 +370,7 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 	static const char cls[] = "Connection: close\r\n\r\n";
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
 	const struct gwnet_http_hdr_fields *ff = &req->fields;
-	const char *method = http_method_str(req->method);
+	const char *method = gwnet_http_req_method(req);
 	const char *ver = (req->version == GWNET_HTTP_VER_1_0) ?
 			  " HTTP/1.0\r\n" : " HTTP/1.1\r\n";
 	size_t conn_len;
@@ -399,9 +380,6 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 	size_t n = 0, i;
 	int nr_toks = 0;
 	bool ok;
-
-	if (!method)
-		return -EINVAL;
 
 	/* Too many options to check every field against is not plausible. */
 	if (conn) {
@@ -424,7 +402,7 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 	    conn_toks_have(toks, nr_toks, "Host", 4))
 		return -EBADMSG;
 
-	ok = buf_add(buf, cap, &n, method, strlen(method)) &&
+	ok = buf_add(buf, cap, &n, method, req->method_len) &&
 	     buf_add(buf, cap, &n, " ", 1) &&
 	     (*path == '/' || buf_add(buf, cap, &n, "/", 1)) &&
 	     buf_add(buf, cap, &n, path, path_len) &&

@@ -277,28 +277,31 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	if (!len)
 		return -EAGAIN;
 
-	method_code = GWNET_HTTP_METHOD_UNKNOWN;
-	for (i = 0; i < nr_methods; i++) {
-		const struct method_entry *me = &methods[i];
-		size_t mlen = me->len;
-
-		cmpl = min_st(len, mlen);
-		if (memcmp(buf, me->str, cmpl))
-			continue;
-
-		if (cmpl < mlen)
+	/*
+	 * The method is a token (RFC 9110 Section 9.1), and case-sensitive.
+	 * Any token is taken: the ones not in the table are extension
+	 * methods (WebDAV's PROPFIND, say), GWNET_HTTP_METHOD_OTHER.
+	 */
+	while (is_tchar(buf[off])) {
+		if (++off >= len)
 			return -EAGAIN;
-
-		method_code = me->code;
-		off += mlen;
-		break;
+		if (ctx->tot_len + off >= ctx->max_len)
+			return -E2BIG;
 	}
-
-	if (method_code == GWNET_HTTP_METHOD_UNKNOWN)
+	if (!off)
 		return -EINVAL;
 
-	if (off >= len)
-		return -EAGAIN;
+	method_code = GWNET_HTTP_METHOD_OTHER;
+	for (i = 0; i < nr_methods; i++) {
+		const struct method_entry *me = &methods[i];
+
+		if (off == me->len && !memcmp(buf, me->str, off)) {
+			method_code = me->code;
+			break;
+		}
+	}
+	hdr->method_off = (uint32_t)ctx->off;
+	hdr->method_len = (uint32_t)off;
 
 	/*
 	 * After the method, there must be a space.
@@ -1753,26 +1756,59 @@ static void test_req_hdr_invalid_uri_chars2(void)
 	PRTEST_OK();
 }
 
+/*
+ * Any token is a method (RFC 9110 Section 9.1): the known ones get their
+ * code, others GWNET_HTTP_METHOD_OTHER, and either way the name is where
+ * the request line has it. Method names are case-sensitive.
+ */
 static void test_req_hdr_invalid_method(void)
 {
-	static const char buf[] =
-		"INVALID /index.html HTTP/1.1\r\n"
-		"Host: example.com\r\n"
-		"\r\n";
-	static const size_t len = sizeof(buf) - 1;
+	static const struct {
+		const char	*line;
+		int		ret;
+		uint8_t		code;
+		size_t		mlen;
+	} cases[] = {
+		{ "INVALID /index.html HTTP/1.1\r\n\r\n", 0,
+		  GWNET_HTTP_METHOD_OTHER, 7 },
+		{ "PROPFIND /a HTTP/1.1\r\n\r\n", 0,
+		  GWNET_HTTP_METHOD_OTHER, 8 },
+		{ "get /a HTTP/1.1\r\n\r\n", 0, GWNET_HTTP_METHOD_OTHER, 3 },
+		{ "GETS /a HTTP/1.1\r\n\r\n", 0, GWNET_HTTP_METHOD_OTHER, 4 },
+		{ "GE /a HTTP/1.1\r\n\r\n", 0, GWNET_HTTP_METHOD_OTHER, 2 },
+		{ "M-SEARCH~!#$%&'*+.^_`| /a HTTP/1.1\r\n\r\n", 0,
+		  GWNET_HTTP_METHOD_OTHER, 22 },
+		{ "GET /a HTTP/1.1\r\n\r\n", 0, GWNET_HTTP_METHOD_GET, 3 },
+		{ "CONNECT h:1 HTTP/1.1\r\n\r\n", 0,
+		  GWNET_HTTP_METHOD_CONNECT, 7 },
+		{ "GE(T /a HTTP/1.1\r\n\r\n", -EINVAL, 0, 0 },
+		{ "GET\x01 /a HTTP/1.1\r\n\r\n", -EINVAL, 0, 0 },
+		{ " GET /a HTTP/1.1\r\n\r\n", -EINVAL, 0, 0 },
+		{ "/a HTTP/1.1\r\n\r\n", -EINVAL, 0, 0 },
+		{ "GET\r\n\r\n", -EINVAL, 0, 0 },
+	};
 	struct gwnet_http_hdr_pctx ctx;
 	struct gwnet_http_req_hdr hdr;
+	size_t i;
 	int r;
 
-	r = gwnet_http_hdr_pctx_init(&ctx);
-	assert(!r);
-	ctx.buf = buf;
-	ctx.len = len;
-	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		r = gwnet_http_hdr_pctx_init(&ctx);
+		assert(!r);
+		ctx.buf = cases[i].line;
+		ctx.len = strlen(cases[i].line);
+		r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+		assert(r == cases[i].ret);
+		if (!r) {
+			assert(hdr.method == cases[i].code);
+			assert(hdr.method_len == cases[i].mlen);
+			assert(gwnet_http_req_method(&hdr) == cases[i].line);
+		} else {
+			assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+		}
+		gwnet_http_req_hdr_free(&hdr);
+		gwnet_http_hdr_pctx_free(&ctx);
+	}
 	PRTEST_OK();
 }
 

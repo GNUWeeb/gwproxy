@@ -48,6 +48,8 @@ enum {
 	GWNET_HTTP_METHOD_PATCH		= 7,
 	GWNET_HTTP_METHOD_TRACE		= 8,
 	GWNET_HTTP_METHOD_CONNECT	= 9,
+	/* Any other token; its name is in the request line. */
+	GWNET_HTTP_METHOD_OTHER		= 10,
 };
 
 /*
@@ -99,14 +101,17 @@ gwnet_http_hdr_field_val(const struct gwnet_http_hdr_fields *ff,
 }
 
 /*
- * The request line. The request-target (@uri) and its path and query string
- * are offsets into the header, like the fields: @path is the start of @uri
- * with any trailing '/' but one dropped, @qs what follows the first '?' (no
- * query string if @qs_len is 0). Use gwnet_http_req_uri() and friends.
+ * The request line. The method's name, the request-target (@uri) and its path
+ * and query string are offsets into the header, like the fields: @path is the
+ * start of @uri with any trailing '/' but one dropped, @qs what follows the
+ * first '?' (no query string if @qs_len is 0). Use gwnet_http_req_uri() and
+ * friends.
  */
 struct gwnet_http_req_hdr {
 	uint8_t		method;
 	uint8_t		version;
+	uint32_t	method_off;
+	uint32_t	method_len;
 	uint32_t	uri_off;
 	uint32_t	uri_len;
 	uint32_t	path_len;
@@ -119,6 +124,12 @@ struct gwnet_http_req_hdr {
 static inline const char *gwnet_http_req_uri(const struct gwnet_http_req_hdr *h)
 {
 	return h->fields.base + h->uri_off;
+}
+
+static inline const char *
+gwnet_http_req_method(const struct gwnet_http_req_hdr *h)
+{
+	return h->fields.base + h->method_off;
 }
 
 static inline const char *gwnet_http_req_qs(const struct gwnet_http_req_hdr *h)

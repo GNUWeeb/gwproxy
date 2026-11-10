@@ -1030,8 +1030,10 @@ static void test_errors(void)
 		"GET https://example.com/ HTTP/1.1\r\n\r\n";
 	static const char bare[] =	/* neither origin- nor absolute-form */
 		"GET foo HTTP/1.1\r\n\r\n";
-	static const char badmethod[] =
-		"WAT http://example.com/ HTTP/1.1\r\n\r\n";
+	static const char extmethod[] =
+		"PROPFIND http://example.com/dav/ HTTP/1.1\r\nDepth: 1\r\n\r\n";
+	static const char lcmethod[] =
+		"get http://example.com/ HTTP/1.1\r\n\r\n";
 	struct gwp_http_conn *hc;
 	char *host, *port;
 	const char *req = NULL;
@@ -1047,9 +1049,22 @@ static void test_errors(void)
 	assert(run(hc, NULL, bare, &host, &port, &req, &req_len) == GWP_HTTP_ERR);
 	gwp_http_conn_free(hc);
 
+	/* Any method token is forwarded, spelt as the client sent it. */
 	hc = gwp_http_conn_alloc();
 	assert(hc);
-	assert(run(hc, NULL, badmethod, &host, &port, &req, &req_len) == GWP_HTTP_ERR);
+	assert(run(hc, NULL, extmethod, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	assert(!strcmp(req, "PROPFIND /dav/ HTTP/1.1\r\n"
+			    "Host: example.com\r\nDepth: 1\r\n"
+			    "Connection: close\r\n\r\n"));
+	gwp_http_conn_free(hc);
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, lcmethod, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	assert(!strcmp(req, "get / HTTP/1.1\r\nHost: example.com\r\n"
+			    "Connection: close\r\n\r\n"));
 	gwp_http_conn_free(hc);
 
 	PRTEST_OK();
