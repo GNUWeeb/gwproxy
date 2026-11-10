@@ -79,6 +79,11 @@ struct gwp_ssl {
 	bool		rx_closed;
 	/* Reading failed for good; the engine is not to be asked again. */
 	bool		rx_failed;
+	/*
+	 * The last SSL_write() took nothing and asked for ciphertext first,
+	 * and nothing has been received since: writing again cannot help.
+	 */
+	bool		tx_starved;
 };
 
 _Static_assert(GWP_SSL_RECORD_MAX >= SSL3_RT_HEADER_LENGTH +
@@ -516,8 +521,10 @@ void gwp_ssl_rx_commit(struct gwp_ssl *s, size_t len)
 {
 	s->rq.pinned = false;
 	s->rq.tail += len;
-	if (len)
+	if (len) {
 		s->rx_starved = false;
+		s->tx_starved = false;
+	}
 }
 
 bool gwp_ssl_rx_more(struct gwp_ssl *s)
@@ -669,9 +676,17 @@ int gwp_ssl_write(struct gwp_ssl *s, const void *buf, size_t len,
 	r = SSL_write(s->ssl, buf, cap_int(len));
 	if (r > 0) {
 		*consumed = (size_t)r;
+		s->tx_starved = false;
 		return GWP_SSL_OK;
 	}
-	return map_err(s, r);
+	r = map_err(s, r);
+	s->tx_starved = r == GWP_SSL_WANT_READ;
+	return r;
+}
+
+bool gwp_ssl_tx_starved(struct gwp_ssl *s)
+{
+	return s->tx_starved;
 }
 
 int gwp_ssl_shutdown(struct gwp_ssl *s)
