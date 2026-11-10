@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #endif
 #include <gwproxy/ev/io_uring.h>
+#include <gwproxy/ev/iou_probe.h>
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
 #include <gwproxy/acl.h>
@@ -133,6 +134,40 @@ struct gwp_iou_udp {
 	unsigned char		buf[GWP_UDP_RELAY_BUFSZ];
 };
 
+/*
+ * Refuse a kernel that lacks what this loop relies on (see ev/iou_probe.h)
+ * instead of leaking a socket with every close. The stop doorbell has
+ * nothing armed on it yet, so it is what the probe's cancel looks for. Every
+ * ring is the same kernel's, so the first worker's alone is probed; the
+ * features of each are at hand anyway.
+ */
+__cold
+static int check_kernel(struct gwp_wrk *w, struct iou *iou)
+{
+	const char *lacks;
+	int r, res = 0;
+
+	lacks = gwp_iou_kernel_lacks(iou->ring.features, 0);
+	if (!lacks && !w->idx) {
+		r = gwp_iou_probe_cancel(&iou->ring, iou->stop_efd, &res);
+		if (r < 0) {
+			pr_err(&w->ctx->lh, "Worker %u: io_uring probe failed: %s",
+			       w->idx, strerror(-r));
+			return r;
+		}
+		lacks = gwp_iou_kernel_lacks(iou->ring.features, res);
+	}
+
+	if (lacks) {
+		pr_err(&w->ctx->lh,
+		       "The io_uring event loop needs Linux %s or later: this kernel lacks %s; use --event-loop=epoll",
+		       GWP_IOU_MIN_KERNEL, lacks);
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
 __cold
 int gwp_ctx_init_thread_io_uring(struct gwp_wrk *w)
 {
@@ -156,9 +191,15 @@ int gwp_ctx_init_thread_io_uring(struct gwp_wrk *w)
 	if (r < 0)
 		goto err_close_efd;
 
+	r = check_kernel(w, iou);
+	if (r < 0)
+		goto err_exit_ring;
+
 	w->iou = iou;
 	return 0;
 
+err_exit_ring:
+	io_uring_queue_exit(&iou->ring);
 err_close_efd:
 	__sys_close(iou->stop_efd);
 err_free_iou:
@@ -341,6 +382,7 @@ static void cancel_all_requests(struct gwp_wrk *w)
 
 	for (;;) {
 		bool done;
+		int res;
 
 		r = io_uring_wait_cqe(ring, &cqe);
 		if (r == -EINTR)
@@ -348,9 +390,19 @@ static void cancel_all_requests(struct gwp_wrk *w)
 		if (r < 0)
 			goto out_err;
 		done = cqe->user_data == tag;
+		res = cqe->res;
 		io_uring_cqe_seen(ring, cqe);
-		if (done)
+		if (!done)
+			continue;
+		/*
+		 * The count of requests cancelled, or -ENOENT for none.
+		 * Anything else, such as the -EINVAL of a kernel that does
+		 * not know the flag, cancelled nothing.
+		 */
+		if (res >= 0 || res == -ENOENT)
 			return;
+		r = res;
+		goto out_err;
 	}
 
 out_err:
@@ -3927,18 +3979,25 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	case EV_BIT_IOU_STOP:
 		pr_dbg(&ctx->lh, "Handling stop doorbell: %d", cqe->res);
 		return 0;
-	case EV_BIT_IOU_CLOSE:
+	case EV_BIT_IOU_CLOSE: {
+		int fd = (int)CLEAR_EV_BIT(cqe->user_data);
+
 		/*
 		 * Closes are queued with IOSQE_CQE_SKIP_SUCCESS, so only a
-		 * failure gets here. The descriptor is gone either way (close
-		 * releases it even when it reports an error), and nothing
-		 * waits on it, so this concerns no connection but its own:
-		 * report it and keep serving the others.
+		 * failure gets here. Once a close has run, the descriptor is
+		 * gone even when it reports an error. -EINVAL, though, means
+		 * the request was refused before it ran, so the descriptor is
+		 * still open (and cannot have been reused): close it here.
+		 * Nothing waits on it either way, so this concerns no
+		 * connection but its own: report it and keep serving the
+		 * others.
 		 */
-		pr_warn(&ctx->lh, "close(%u) failed: %s",
-			(unsigned)CLEAR_EV_BIT(cqe->user_data),
+		pr_warn(&ctx->lh, "close(%d) failed: %s", fd,
 			strerror(-cqe->res));
+		if (cqe->res == -EINVAL)
+			__sys_close(fd);
 		return 0;
+	}
 	default:
 		pr_err(&ctx->lh, "Unknown event bit: %" PRIu64 "; res=%d", ev_bit, cqe->res);
 		return -EINVAL;

@@ -69,7 +69,7 @@ Features
     Note --outgoing-family cannot reach past an upstream proxy that resolves
     the name itself (socks5h:// and http://).
   - Two event loops: epoll (default) and io_uring (optional, enabled at
-    build time and selected at run time).
+    build time and selected at run time; needs Linux 5.19 or later).
   - Multi-threaded workers using SO_REUSEPORT, with graceful recovery from
     file-descriptor exhaustion (EMFILE/ENFILE).
   - Opt-in DNS caching for SOCKS5/HTTP hostname targets (--dns-cache-secs),

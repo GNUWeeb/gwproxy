@@ -89,7 +89,9 @@ or
 The
 .B io_uring
 loop is only available when gwproxy was built with io_uring support (see
-.BR "AVAILABILITY" ).
+.BR "AVAILABILITY" ),
+and needs Linux 5.19 or later (see
+.BR "EVENT LOOPS" ).
 Default:
 .BR epoll .
 .TP
@@ -183,15 +185,13 @@ for the same name (see
 (or a negative value) sets no limit: the kernel still gives up on a target that
 never answers after its SYN retries, but an upstream proxy that accepts and then
 says nothing is waited for as long as the client stays. A client that resets its
-connection ends the wait at once, though with io_uring on a kernel older than
-5.13 only when the connect ends. One that has sent a FIN may only have finished
+connection ends the wait at once. One that has sent a FIN may only have finished
 sending and be waiting for the answer, so its FIN is passed on once the target
 is up; but as it can no longer end the wait itself,
 .B \-\-protocol\-timeout
 bounds the rest of the connect from that FIN on (the upstream proxy handshake
 included), and the client gets a SOCKS5 reply 0x06 or an HTTP 504 when it runs
-out. With io_uring on a kernel older than 5.13 the FIN goes unnoticed and the
-wait stays unbounded.
+out.
 Default:
 .BR 5 .
 .TP
@@ -2375,7 +2375,14 @@ Each worker uses one event loop, selected with
 is always available and is the default.
 .B io_uring
 is available only in builds configured with io_uring support and is selected at
-run time. All proxy features, including TLS termination and the multi\-address
+run time. It needs Linux 5.19 or later: it queues its closes with
+IOSQE_CQE_SKIP_SUCCESS (Linux 5.17) and ends a connection's requests with
+IORING_ASYNC_CANCEL_FD and IORING_ASYNC_CANCEL_ALL (Linux 5.19). Each worker
+checks for both when it sets up its ring, and on an older kernel, or wherever
+the kernel refuses them, gwproxy does not start, with an error naming what is
+missing; use
+.B epoll
+there. All proxy features, including TLS termination and the multi\-address
 racing described under
 .BR "TARGET ADDRESS SELECTION" ,
 work on both loops, except the built\-in raw DNS resolver
