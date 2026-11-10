@@ -2365,11 +2365,8 @@ Multi\-address fallback and racing work on both the
 and the
 .B io_uring
 event loop. A racing connection holds one target socket per attempt in flight,
-up to four instead of one, and on
-.B epoll
-it additionally holds a file descriptor for its attempt timer, which the
-.B io_uring
-loop does not need; size the descriptor limit accordingly, or set
+up to four instead of one, on either loop; size the descriptor limit
+accordingly, or set
 .B \-\-connect\-attempt\-delay=0
 to keep a single attempt in flight.
 .PP
