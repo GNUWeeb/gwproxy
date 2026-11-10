@@ -32,7 +32,8 @@ for target, path in ((b'/p?q#f', b'/p?q'), (b'/p#f?g/h', b'/p'),
         print('%r: got %r' % (target, st))
         continue
     got = o.wait(n + 1)
-    want = (b'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' %
+    want = (b'GET %s HTTP/1.1\r\nHost: %s\r\nVia: 1.1 gwproxy\r\n'
+            b'Connection: close\r\n\r\n' %
             (path, auth))
     if got != want:
         errors += 1

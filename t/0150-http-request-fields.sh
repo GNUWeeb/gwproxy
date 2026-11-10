@@ -121,7 +121,7 @@ def req(lines, tail=b'', method=b'GET', p=b''):
 def out(lines, tail=b'', method=b'GET'):
     return (b'%s / HTTP/1.1\r\nHost: %s\r\n' % (method, auth) +
             b''.join(l + b'\r\n' for l in lines) +
-            b'Connection: close\r\n\r\n' + tail)
+            b'Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n' + tail)
 
 
 def ok(name, data, want, p=None):

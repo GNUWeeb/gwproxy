@@ -74,6 +74,7 @@ printf '%s' \
 	$'Proxy-Foo: f\r\n' \
 	$'Proxys: s\r\n' \
 	$'X-After: 2\r\n' \
+	$'Via: 1.1 gwproxy\r\n' \
 	$'Connection: close\r\n' \
 	$'\r\n' \
 	'body' >"$WORK/fwd.want"

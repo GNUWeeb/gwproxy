@@ -216,7 +216,7 @@ static void test_forward_drops_proxy(void)
 		"GET /cgi HTTP/1.1\r\nHost: example.com\r\n"
 		"X-Before: 1\r\nProxys: s\r\nProxy-Foo: f\r\n"
 		"Proxy_: u\r\nX-After: 2\r\n"
-		"Connection: close\r\n\r\n";
+		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
 	struct gwp_http_conn *hc = gwp_http_conn_alloc();
 	char *host, *port;
 	const char *req = NULL;
@@ -486,7 +486,8 @@ static void test_forward_conn_limit(void)
 	{
 		static const char want[] =
 			"GET / HTTP/1.1\r\nHost: example.com\r\n"
-			"X-32: c\r\nConnection: close\r\n\r\n";
+			"X-32: c\r\nVia: 1.1 gwproxy\r\n"
+			"Connection: close\r\n\r\n";
 
 		assert(req_len == strlen(want) && !memcmp(req, want, req_len));
 	}
@@ -649,7 +650,8 @@ static int res_feed(struct gwp_http_conn *hc, const char *in, bool eof,
  */
 static void test_res_framing(void)
 {
-#define CC	"Connection: close\r\nProxy-Connection: close\r\n\r\n"
+#define CC	"Via: 1.1 gwproxy\r\nConnection: close\r\n" \
+		"Proxy-Connection: close\r\n\r\n"
 	static const struct {
 		const char	*in;
 		int		ret;
@@ -743,6 +745,7 @@ static void test_res_rewrite(void)
 		"Set-Cookie: a=1\r\n"
 		"Set-Cookie: b=2\r\n"
 		"Content-Length: 5\r\n"
+		"Via: 1.1 gwproxy\r\n"
 		"Connection: close\r\n"
 		"Proxy-Connection: close\r\n"
 		"\r\n"
@@ -763,7 +766,8 @@ static void test_res_rewrite(void)
 			"HTTP/1.0 200 OK\nKeep-Alive: x\nA: b\n\nbody";
 		static const char lf_want[] =
 			"HTTP/1.0 200 OK\r\nA: b\r\n"
-			"Connection: close\r\nProxy-Connection: close\r\n\r\n"
+			"Via: 1.0 gwproxy\r\nConnection: close\r\n"
+			"Proxy-Connection: close\r\n\r\n"
 			"body";
 		size_t o = 0;
 
@@ -803,7 +807,8 @@ static void test_res_interim(void)
 	assert(gwp_http_fwd_res_input(hc, rest, strlen(rest), false, out,
 				      sizeof(out), &out_len) == 0);
 	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
-	assert(strstr(out, "HTTP/1.1 204 No Content\r\nConnection: close\r\n"));
+	assert(strstr(out, "HTTP/1.1 204 No Content\r\nVia: 1.1 gwproxy\r\n"
+		      "Connection: close\r\n"));
 
 	gwp_http_conn_free(hc);
 	PRTEST_OK();
@@ -855,7 +860,8 @@ static void test_res_limits(void)
 	{
 		static const char want[] =
 			"HTTP/1.1 200 OK\r\nKeep: me\r\n"
-			"Connection: close\r\nProxy-Connection: close\r\n"
+			"Via: 1.1 gwproxy\r\nConnection: close\r\n"
+			"Proxy-Connection: close\r\n"
 			"\r\n";
 
 		assert(out_len == strlen(want) && !memcmp(out, want, out_len));
@@ -876,10 +882,92 @@ static void test_res_limits(void)
 	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
 				      sizeof(out), &out_len) == 0);
 	assert(out_len == strlen("HTTP/1.1 200 OK\r\nB: y\r\n"
+				 "Via: 1.1 gwproxy\r\n"
 				 "Connection: close\r\n"
 				 "Proxy-Connection: close\r\n\r\n"));
 
 	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+/*
+ * A forwarded request and a final response name this hop in Via (RFC 9110
+ * Section 7.6.3), with the version of HTTP they were received with: at the
+ * end of the last Via passed on, or in one of its own. An interim response is
+ * passed on as it came.
+ */
+static void test_via(void)
+{
+	static const struct {
+		const char	*in;
+		const char	*out;
+	} req_cases[] = {
+		{ "GET http://h/ HTTP/1.0\r\n\r\n",
+		  "GET / HTTP/1.0\r\nHost: h\r\nVia: 1.0 gwproxy\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "GET http://h/ HTTP/1.1\r\nVia: 1.0 a\r\nA: b\r\n"
+		  "via: 1.1 b (x)\r\n\r\n",
+		  "GET / HTTP/1.1\r\nHost: h\r\n"
+		  "Via: 1.0 a, 1.1 b (x), 1.1 gwproxy\r\nA: b\r\n"
+		  "Connection: close\r\n\r\n" },
+		{ "GET http://h/ HTTP/1.1\r\nVia:\r\n\r\n",
+		  "GET / HTTP/1.1\r\nHost: h\r\nVia: 1.1 gwproxy\r\n"
+		  "Connection: close\r\n\r\n" },
+		/* A Via that Connection names goes, ours stays. */
+		{ "GET http://h/ HTTP/1.1\r\nVia: 1.1 a\r\n"
+		  "Connection: via\r\n\r\n",
+		  "GET / HTTP/1.1\r\nHost: h\r\nVia: 1.1 gwproxy\r\n"
+		  "Connection: close\r\n\r\n" },
+	};
+	static const struct {
+		const char	*in;
+		const char	*out;
+	} res_cases[] = {
+		{ "HTTP/1.0 200 OK\r\n\r\n",
+		  "HTTP/1.0 200 OK\r\nVia: 1.0 gwproxy\r\n"
+		  "Connection: close\r\nProxy-Connection: close\r\n\r\n" },
+		{ "HTTP/1.1 200 OK\nVia: 1.0 a\nA: b\nVia:  1.1 b \n\n",
+		  "HTTP/1.1 200 OK\r\nVia: 1.0 a\r\nA: b\r\n"
+		  "Via:  1.1 b , 1.1 gwproxy\r\n"
+		  "Connection: close\r\nProxy-Connection: close\r\n\r\n" },
+		{ "HTTP/1.1 200 OK\r\nVia: \r\n\r\n",
+		  "HTTP/1.1 200 OK\r\nVia:  1.1 gwproxy\r\n"
+		  "Connection: close\r\nProxy-Connection: close\r\n\r\n" },
+		{ "HTTP/1.1 200 OK\r\nVia: 1.1 a\r\nConnection: Via\r\n\r\n",
+		  "HTTP/1.1 200 OK\r\nVia: 1.1 gwproxy\r\n"
+		  "Connection: close\r\nProxy-Connection: close\r\n\r\n" },
+		{ "HTTP/1.1 100 Continue\r\nVia: 1.1 a\r\n\r\n",
+		  "HTTP/1.1 100 Continue\r\nVia: 1.1 a\r\n\r\n" },
+	};
+	struct gwp_http_conn *hc;
+	const char *req;
+	char *host, *port, out[1024];
+	size_t i, req_len, out_len;
+
+	for (i = 0; i < sizeof(req_cases) / sizeof(req_cases[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		assert(run(hc, NULL, req_cases[i].in, &host, &port, &req,
+			   &req_len) == GWP_HTTP_FORWARD);
+		if (strcmp(req, req_cases[i].out))
+			fprintf(stderr, "request %zu: %s\n", i, req);
+		assert(!strcmp(req, req_cases[i].out));
+		gwp_http_conn_free(hc);
+	}
+
+	for (i = 0; i < sizeof(res_cases) / sizeof(res_cases[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		assert(!res_feed(hc, res_cases[i].in, false, out, sizeof(out),
+				 &out_len));
+		if (out_len != strlen(res_cases[i].out) ||
+		    memcmp(out, res_cases[i].out, out_len))
+			fprintf(stderr, "response %zu: %.*s\n", i,
+				(int)out_len, out);
+		assert(out_len == strlen(res_cases[i].out) &&
+		       !memcmp(out, res_cases[i].out, out_len));
+		gwp_http_conn_free(hc);
+	}
 	PRTEST_OK();
 }
 
@@ -1162,7 +1250,7 @@ static void test_errors(void)
 	       GWP_HTTP_FORWARD);
 	assert(!strcmp(req, "PROPFIND /dav/ HTTP/1.1\r\n"
 			    "Host: example.com\r\nDepth: 1\r\n"
-			    "Connection: close\r\n\r\n"));
+			    "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n"));
 	gwp_http_conn_free(hc);
 
 	hc = gwp_http_conn_alloc();
@@ -1170,7 +1258,7 @@ static void test_errors(void)
 	assert(run(hc, NULL, lcmethod, &host, &port, &req, &req_len) ==
 	       GWP_HTTP_FORWARD);
 	assert(!strcmp(req, "get / HTTP/1.1\r\nHost: example.com\r\n"
-			    "Connection: close\r\n\r\n"));
+			    "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n"));
 	gwp_http_conn_free(hc);
 
 	PRTEST_OK();
@@ -1249,6 +1337,7 @@ static void test_req_errors(void)
 		/* What is forwarded is HTTP/1.1, the empty line gone. */
 		if (r == GWP_HTTP_FORWARD)
 			assert(!strcmp(req, "GET / HTTP/1.1\r\nHost: h\r\n"
+					    "Via: 1.1 gwproxy\r\n"
 					    "Connection: close\r\n\r\n"));
 		/* Whatever the client sent before the tunnel is dropped. */
 		if (r == GWP_HTTP_CONNECT)
@@ -1288,39 +1377,39 @@ static void test_max_forwards(void)
 		{ "TRACE http://h/ HTTP/1.1\r\nMax-Forwards: 3\r\n\r\n",
 		  GWP_HTTP_FORWARD,
 		  "TRACE / HTTP/1.1\r\nHost: h\r\nMax-Forwards: 2\r\n"
-		  "Connection: close\r\n\r\n" },
+		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 		{ "OPTIONS http://h/a HTTP/1.1\r\nmax-FORWARDS: 0010\r\n\r\n",
 		  GWP_HTTP_FORWARD,
 		  "OPTIONS /a HTTP/1.1\r\nHost: h\r\nmax-FORWARDS: 9\r\n"
-		  "Connection: close\r\n\r\n" },
+		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 		{ "TRACE http://h/ HTTP/1.1\r\n"
 		  "Max-Forwards: 99999999999999999999999\r\n\r\n",
 		  GWP_HTTP_FORWARD,
 		  "TRACE / HTTP/1.1\r\nHost: h\r\nMax-Forwards: 4294967294\r\n"
-		  "Connection: close\r\n\r\n" },
+		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 		{ "GET http://h/ HTTP/1.1\r\nMax-Forwards: 0\r\n\r\n",
 		  GWP_HTTP_FORWARD,
 		  "GET / HTTP/1.1\r\nHost: h\r\nMax-Forwards: 0\r\n"
-		  "Connection: close\r\n\r\n" },
+		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 		{ "GET http://h/ HTTP/1.1\r\nMax-Forwards: x\r\n\r\n",
 		  GWP_HTTP_FORWARD,
 		  "GET / HTTP/1.1\r\nHost: h\r\nMax-Forwards: x\r\n"
-		  "Connection: close\r\n\r\n" },
+		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 		{ "OPTIONS http://h:8001 HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD,
 		  "OPTIONS * HTTP/1.1\r\nHost: h:8001\r\n"
-		  "Connection: close\r\n\r\n" },
+		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 		{ "OPTIONS http://h#f HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD,
 		  "OPTIONS * HTTP/1.1\r\nHost: h\r\n"
-		  "Connection: close\r\n\r\n" },
+		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 		{ "OPTIONS http://h?q HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD,
 		  "OPTIONS /?q HTTP/1.1\r\nHost: h\r\n"
-		  "Connection: close\r\n\r\n" },
+		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 		{ "OPTIONS http://h/ HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD,
 		  "OPTIONS / HTTP/1.1\r\nHost: h\r\n"
-		  "Connection: close\r\n\r\n" },
+		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 		{ "GET http://h HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD,
 		  "GET / HTTP/1.1\r\nHost: h\r\n"
-		  "Connection: close\r\n\r\n" },
+		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 	};
 	struct gwp_http_conn *hc;
 	char *host, *port;
@@ -1486,7 +1575,7 @@ static void test_field_obs_text(void)
 		"GET http://e/ HTTP/1.1\r\nX-N: caf\xc3\xa9 \xff\r\n\r\n";
 	static const char want[] =
 		"GET / HTTP/1.1\r\nHost: e\r\nX-N: caf\xc3\xa9 \xff\r\n"
-		"Connection: close\r\n\r\n";
+		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
 	struct gwp_http_conn *hc;
 	char *host, *port;
 	const char *req = NULL;
@@ -1531,6 +1620,7 @@ static void test_res_interim_run(void)
 	static const char one[] = "HTTP/1.1 100\r\n\r\n";
 	static const char fin[] = "HTTP/1.1 200 OK\r\n\r\nbody";
 	static const char fin_out[] = "HTTP/1.1 200 OK\r\n"
+				      "Via: 1.1 gwproxy\r\n"
 				      "Connection: close\r\n"
 				      "Proxy-Connection: close\r\n"
 				      "\r\nbody";
@@ -1636,7 +1726,7 @@ static void test_underscore_alias(void)
 		"_: z\r\nContent__Length: 1\r\nContent-Length_: 1\r\n"
 		"Content_Lengthx: 1\r\nXContent_Length: 1\r\n"
 		"Host_: h\r\nTE_: x\r\nContent-Length: 4\r\n"
-		"Connection: close\r\n\r\n";
+		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
 	struct gwp_http_conn *hc;
 	char *host, *port, buf[256];
 	const char *req;
@@ -1712,7 +1802,7 @@ static void test_duplicate_field(void)
 		"POST / HTTP/1.1\r\nHost: example.com\r\n"
 		"X-Forwarded-For: 1\r\nContent-Length: 0\r\n"
 		"x-forwarded-for: 2\r\nX-Forwarded-For: 3\r\n"
-		"Connection: close\r\n\r\n";
+		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
 	static const char tunnel[] =
 		"CONNECT example.com:443 HTTP/1.1\r\n"
 		"X-A: 1\r\nX-A: 2\r\n\r\n";
@@ -1768,7 +1858,7 @@ static void test_forward_in_place(void)
 		"POST http://e/x HTTP/1.1\r\nContent-Length: 4\r\n\r\nbodyMORE";
 	static const char body_want[] =
 		"POST /x HTTP/1.1\r\nHost: e\r\nContent-Length: 4\r\n"
-		"Connection: close\r\n\r\nbodyMORE";
+		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\nbodyMORE";
 	static const char grow[] = "GET http://e HTTP/1.1\r\nX: y\r\n\r\n";
 	static char buf[16384], want[16384];
 	struct gwp_http_conn *hc;
@@ -1794,7 +1884,8 @@ static void test_forward_in_place(void)
 	n += 6000;
 	wn += 6000;
 	n += (size_t)sprintf(buf + n, "\r\n\r\nTAIL");
-	wn += (size_t)sprintf(want + wn, "\r\nConnection: close\r\n\r\nTAIL");
+	wn += (size_t)sprintf(want + wn, "\r\nVia: 1.1 gwproxy\r\n"
+			     "Connection: close\r\n\r\nTAIL");
 	hc = gwp_http_conn_alloc();
 	assert(hc);
 	len = n;
@@ -2218,6 +2309,7 @@ int main(void)
 		test_res_interim();
 		test_res_reject();
 		test_res_limits();
+		test_via();
 		test_res_direct();
 		test_need_more();
 		test_errors();

@@ -73,6 +73,7 @@ printf '%s' \
 	$'Vary: x\r\n' \
 	$'Content-Length: 4\r\n' \
 	$'X-Keep: spaced value\r\n' \
+	$'Via: 1.1 gwproxy\r\n' \
 	$'Connection: close\r\n' \
 	$'\r\n' \
 	'body' >"$WORK/fwd.want"

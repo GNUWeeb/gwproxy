@@ -1606,6 +1606,14 @@ own outgoing requests ("httpoxy"), so the client could pick where the origin's
 requests go. No other name reaches CGI as HTTP_PROXY, so it has no alias to
 refuse.
 .PP
+gwproxy names itself in the Via field (RFC 9110 Section 7.6.3) of the request
+it forwards and of the origin's final response: "1.1 gwproxy", or "1.0
+gwproxy" for a message received as HTTP/1.0, goes at the end of the last Via
+the message carries, or in a Via of its own when it has none (or only one that
+Connection names, which is dropped). Interim (1xx) responses are passed on
+without it. A CONNECT tunnel carries whatever the client sends through it and
+gets no Via.
+.PP
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
 does not send another request on the connection, and the connection is closed

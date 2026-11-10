@@ -50,12 +50,13 @@ enum gwp_http_result {
  * The most the rewrite of a forwarding request can add to its header: "/" for
  * an empty path, a CR on the request line, "Host: " and its CRLF for the
  * "http://" of the URI, "Connection: close" and its CRLF plus a CR on the
- * blank line, and for each of the 128 field lines a CR and a space after the
- * colon. The caller keeps this much room behind whatever it reads a header
- * into: the first read can fill the buffer, with the start of the body behind
- * the header, and the request must not be refused for that.
+ * blank line, "Via: 1.1 gwproxy" and its CRLF, and for each of the 128 field
+ * lines a CR and a space after the colon. The caller keeps this much room
+ * behind whatever it reads a header into: the first read can fill the buffer,
+ * with the start of the body behind the header, and the request must not be
+ * refused for that.
  */
-#define GWP_HTTP_REWRITE_SLACK	279
+#define GWP_HTTP_REWRITE_SLACK	297
 
 /* Allocate/free a per-connection HTTP proxy state. */
 struct gwp_http_conn *gwp_http_conn_alloc(void);
