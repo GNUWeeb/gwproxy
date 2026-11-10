@@ -54,7 +54,9 @@ event loop. It recovers gracefully from file\-descriptor exhaustion
 (EMFILE/ENFILE): a worker out of descriptors stops accepting and tries again
 after 100 ms on io_uring; on epoll, once several connections' worth have been
 closed, or after 5 seconds at the latest. It caches DNS answers for hostname
-targets, tries and races the
+targets when asked to
+.RB ( \-\-dns\-cache\-secs ,
+off by default), tries and races the
 addresses of a multi\-homed name on either loop (see
 .BR "TARGET ADDRESS SELECTION" ),
 and can mark its own outgoing connections with
@@ -157,14 +159,30 @@ against the proxy's own address.
 .TP
 .BR \-t ", " \-\-target=\fIaddr:port\fR
 For plain TCP forwarding, the fixed destination every accepted connection is
-proxied to. Ignored in SOCKS5/HTTP/transparent modes, where the destination
-comes from the protocol or the socket.
+proxied to. Ignored in SOCKS5/HTTP modes, where the destination comes from
+the protocol; there the value is not even parsed, so a bad address or port is
+not refused either. Refused at startup with
+.BR \-\-as\-transparent ,
+which takes the destination from the socket.
 .TP
 .BR \-w ", " \-\-nr\-workers=\fInr\fR
 Number of worker threads, each with its own
 .B SO_REUSEPORT
 listener, from 1 to 1024. Default:
 .BR 4 .
+.IP
+Since every listener sets
+.BR SO_REUSEPORT ,
+another process of the same user that listens on the same address and port
+with
+.B SO_REUSEPORT
+too, such as a second gwproxy, shares the port with this one: the kernel
+spreads new connections over both, each handling them with its own
+configuration. That makes an overlapping restart possible, but a second
+instance started by mistake gets no error either. gwproxy therefore logs a
+warning at startup when another socket already listens on its
+.B \-\-bind
+address and port, and starts all the same.
 .TP
 .BR \-o ", " \-\-protocol\-timeout=\fIsec\fR
 Seconds allowed for a client to complete the SOCKS5/HTTP (and, if enabled, TLS)
@@ -173,7 +191,13 @@ target's name; a client whose request is waiting for one when the time runs out
 gets a SOCKS5 reply 0x06 or an HTTP 504 first. With
 .B \-\-connect\-timeout=0
 it also bounds the connect of a client that half\-closes its connection while
-the connect is in progress (see there). Default:
+the connect is in progress (see there).
+.B 0
+(or a negative value) sets no limit: a client that sends half a request, or
+nothing at all, then holds its connection for as long as it stays connected,
+and with
+.B \-\-connect\-timeout=0
+nothing bounds the connect of a client that has half\-closed either. Default:
 .BR 10 .
 .TP
 .BR \-c ", " \-\-connect\-timeout=\fIsec\fR
@@ -1158,6 +1182,19 @@ chain) on every connection. Note the cache uses this fixed duration, not the
 authoritative record TTL, so a short\-TTL name may be served stale for up to
 .I sec
 seconds.
+.IP
+A failed lookup is remembered too: until the entry expires, requests for the
+name are answered at once with SOCKS5 reply
+.B 0x04
+(host unreachable) or HTTP
+.BR 502 ,
+without a new lookup. The entry is kept for 30 seconds when the answer is that the name, or
+an address of the family asked for, does not exist, and for 5 seconds after
+any other failure, such as a timeout or a server failure; never longer than
+.I sec
+seconds. This, too, is a fixed duration, not the zone's negative caching TTL,
+so a name that was just published or fixed can keep failing for up to that
+long.
 .TP
 .BR \-\-dns\-cache\-max\-entries=\fInr\fR
 Bound the DNS cache to at most
@@ -1170,11 +1207,15 @@ means unlimited. Default:
 .BR 65536 .
 .TP
 .BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
-Number of DNS resolver worker threads kept running, at most 1024. This does not
+Number of DNS resolver worker threads kept running, from 1 to 1024. This does not
 cap how many lookups run at once: more threads are started on demand when lookups
 are waiting, up to 64 threads or
 .IR nr ,
-whichever is larger, and those exit again after 10 seconds idle. Default:
+whichever is larger, and those exit again after 10 seconds idle.
+.B 0
+is taken only where no resolver thread is needed: with
+.B \-\-raw\-dns
+or without SOCKS5 and HTTP. Default:
 .BR 4 .
 .IP
 Each thread runs one blocking lookup, so the threads are shared out by client
@@ -2403,11 +2444,8 @@ Multi\-address fallback and racing work on both the
 and the
 .B io_uring
 event loop. A racing connection holds one target socket per attempt in flight,
-up to four instead of one, and on
-.B epoll
-it additionally holds a file descriptor for its attempt timer, which the
-.B io_uring
-loop does not need; size the descriptor limit accordingly, or set
+up to four instead of one, on either loop; size the descriptor limit
+accordingly, or set
 .B \-\-connect\-attempt\-delay=0
 to keep a single attempt in flight.
 .PP

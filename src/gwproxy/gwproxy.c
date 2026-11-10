@@ -652,6 +652,17 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		goto einval;
 	}
 
+	/*
+	 * The system resolver needs a thread to run a lookup on. --raw-dns
+	 * and the modes without hostname targets start none, so 0 is fine
+	 * there (see gwp_ctx_init_dns()).
+	 */
+	if ((cfg->as_socks5 || cfg->as_http) && !cfg->use_raw_dns &&
+	    cfg->nr_dns_workers < 1) {
+		fprintf(stderr, ERR_WRAP "Error: -W/--nr-dns-workers must be at least 1 for SOCKS5 or HTTP with the system resolver.\n" ERR_WRAP);
+		goto einval;
+	}
+
 #ifdef CONFIG_HTTPS
 	if ((cfg->tls_cert != NULL) != (cfg->tls_key != NULL)) {
 		fprintf(stderr, ERR_WRAP "Error: --tls-cert and --tls-key must be provided together\n" ERR_WRAP);
@@ -1416,6 +1427,53 @@ static void gwp_ctx_warn_open_proxy(struct gwp_ctx *ctx,
 }
 
 /*
+ * Every listener sets SO_REUSEPORT, so a second gwproxy started by mistake on
+ * the same --bind (an old instance still running, two units with different
+ * configurations) starts without an error, and the kernel then spreads new
+ * connections over both. Refusing to start would break a deliberate
+ * overlapping restart, so only warn. A probe bind without SO_REUSEPORT, before
+ * this instance's own listeners exist, fails with EADDRINUSE when another
+ * socket listens on the port. It races with other instances starting at the
+ * same time, which is fine for a warning. Port 0 gets a fresh port per
+ * worker and cannot collide.
+ */
+__cold
+static void gwp_ctx_warn_shared_port(struct gwp_ctx *ctx,
+				     const struct gwp_sockaddr *addr)
+{
+	socklen_t slen;
+	int fd, r;
+
+	if (addr->sa.sa_family == AF_INET) {
+		if (!addr->i4.sin_port)
+			return;
+		slen = sizeof(addr->i4);
+	} else if (addr->sa.sa_family == AF_INET6) {
+		if (!addr->i6.sin6_port)
+			return;
+		slen = sizeof(addr->i6);
+	} else {
+		return;
+	}
+
+	fd = __sys_socket(addr->sa.sa_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return;
+
+	/* As the listener has them, but for SO_REUSEPORT. */
+	setskopt_int(fd, SOL_SOCKET, SO_REUSEADDR, 1);
+	if (addr->sa.sa_family == AF_INET6)
+		setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+			     ctx->cfg.bind_ipv6_only ? 1 : 0);
+
+	r = __sys_bind(fd, &addr->sa, slen);
+	__sys_close(fd);
+	if (r == -EADDRINUSE)
+		pr_warn(&ctx->lh, "Another socket already listens on %s: if it is another gwproxy (or anything else with SO_REUSEPORT) of this user, the kernel will share new connections between it and this one",
+			ip_to_str(addr));
+}
+
+/*
  * A kernel without IPv6 (booted with ipv6.disable=1) refuses every AF_INET6
  * socket. The wildcard [::] -- the default --bind among others -- asks for
  * every address the host has, which there are the IPv4 ones: listen on
@@ -1484,6 +1542,7 @@ static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 	if (r)
 		return r;
 	gwp_ctx_warn_open_proxy(ctx, &bind_addr);
+	gwp_ctx_warn_shared_port(ctx, &bind_addr);
 
 	if (posix_memalign((void **)&workers, GWP_CACHELINE,
 			   (size_t)cfg->nr_workers * sizeof(*workers)))
