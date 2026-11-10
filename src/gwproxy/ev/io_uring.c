@@ -3085,12 +3085,16 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 	 * socket: close() answers unread data with an RST instead of a FIN.
 	 * Here a write side is shut only after the other socket's read side
 	 * reached EOF, so when both are done both sockets have been read to
-	 * EOF; the test is kept explicit, as in the epoll loop.
+	 * EOF; the test is kept explicit, as in the epoll loop. The survivor
+	 * of a reset gets no FIN at all: the teardown passes the reset on
+	 * (gwp_conn_reset_passes_to()).
 	 */
 	done = gcp->client.wr_shut && gcp->target.wr_shut;
-	if (shut_client && !(done && gcp->client.rd_eof))
+	if (shut_client && !(done && (gcp->client.rd_eof ||
+		gwp_conn_reset_passes_to(gcp, &gcp->client))))
 		__sys_shutdown(gcp->client.fd, SHUT_WR);
-	if (shut_target && !(done && gcp->target.rd_eof))
+	if (shut_target && !(done && (gcp->target.rd_eof ||
+		gwp_conn_reset_passes_to(gcp, &gcp->target))))
 		__sys_shutdown(gcp->target.fd, SHUT_WR);
 	if (done)
 		return -ECONNRESET;

@@ -9,6 +9,7 @@
 #   pair_end.py fail-reply <how> <bytes> <proxy_port> <target_port>
 #   pair_end.py linger-load <clients> <proxy_port> <proxy_pid>
 #   pair_end.py two-way <mode> <proxy_port> <target_port> <ends>
+#   pair_end.py reset-idle <mode> <dir> <proxy_port> <target_port>
 #
 # <mode> is how the client reaches the target listening on <target_port>:
 # plain (the proxy runs with --target pointing there), socks5 or http (a
@@ -40,6 +41,9 @@
 # buffer is full; then the target resets, the client stops uploading and
 # reads. It must get every byte the proxy acknowledged from the target, then
 # an end in <ends> (a comma-separated list of eof and rst).
+#
+# "reset-idle": the peer named by <dir> (tgt or cli) resets a tunnel with
+# nothing pending. The other side must see a reset as well, not an EOF.
 #
 # "linger-load": <clients> clients send a forwarding POST to a proxy that
 # wants credentials, and keep sending the body for 4 s, a little at a time,
@@ -344,6 +348,19 @@ def two_way(mode, pport, tport, want):
         errors.append("two-way %s: all the data, then %s" % (mode, how))
 
 
+def reset_idle(mode, d, pport, tport):
+    ls = listener(tport)
+    c, t = open_tunnel(mode, pport, ls, tport)
+    snd, rcv = (t, c) if d == "tgt" else (c, t)
+    rst(snd)
+    got, how = read_all(rcv)
+    rcv.close()
+    ls.close()
+    if got or how != "rst":
+        errors.append("%s %s: %d bytes, then %s instead of a reset" %
+                      (mode, d, len(got), how))
+
+
 def nfds(pid):
     return len(os.listdir("/proc/%d/fd" % pid))
 
@@ -422,6 +439,8 @@ def main():
         fail_reply(a[1], int(a[2]), int(a[3]), int(a[4]))
     elif a[0] == "two-way":
         two_way(a[1], int(a[2]), int(a[3]), a[4].split(","))
+    elif a[0] == "reset-idle":
+        reset_idle(a[1], a[2], int(a[3]), int(a[4]))
     elif a[0] == "linger-load":
         linger_load(int(a[1]), int(a[2]), int(a[3]))
     elif a[0] == "origin-reset":

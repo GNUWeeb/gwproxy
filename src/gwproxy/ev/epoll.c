@@ -2660,12 +2660,16 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * socket: close() answers unread data with an RST instead of a FIN,
 	 * so a socket whose read side has not reached EOF still gets the
 	 * explicit shutdown(). Likewise a hung-up fd needs no EPOLL_CTL_DEL
-	 * here: the teardown takes it out (__free_conn_pair()).
+	 * here: the teardown takes it out (__free_conn_pair()). The survivor
+	 * of a reset gets no FIN at all: the teardown passes the reset on
+	 * (gwp_conn_reset_passes_to()).
 	 */
 	done = gcp->client.wr_shut && gcp->target.wr_shut;
-	if (shut_client && !(done && gcp->client.rd_eof))
+	if (shut_client && !(done && (gcp->client.rd_eof ||
+		gwp_conn_reset_passes_to(gcp, &gcp->client))))
 		__sys_shutdown(gcp->client.fd, SHUT_WR);
-	if (shut_target && !(done && gcp->target.rd_eof))
+	if (shut_target && !(done && (gcp->target.rd_eof ||
+		gwp_conn_reset_passes_to(gcp, &gcp->target))))
 		__sys_shutdown(gcp->target.fd, SHUT_WR);
 	if (done)
 		return -ECONNRESET;

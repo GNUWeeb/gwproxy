@@ -1347,13 +1347,25 @@ static void gwp_conn_pair_abort_target(const struct gwp_conn_pair __unused *gcp)
 #endif
 }
 
+bool gwp_conn_reset_passes_to(const struct gwp_conn_pair *gcp,
+			      const struct gwp_conn *c)
+{
+	const struct gwp_conn *o = c == &gcp->client ? &gcp->target :
+						       &gcp->client;
+
+	return !c->tls && !c->rst && gwp_conn_reset_passed(gcp, o);
+}
+
 /*
  * How long a socket may linger (gwp_conn_pair_linger()), in ms: long enough
  * for a peer to take what it was sent, or to finish sending what it had
  * started, short enough not to hold descriptors for clients that never stop;
- * never longer than --protocol-timeout, the bound of the handshake.
+ * never longer than --protocol-timeout, the bound of the handshake. A reset
+ * that is passed on waits longer for the peer to take what it is owed, as
+ * the reset destroys what is left.
  */
 #define GWP_LINGER_FIN_MS	2000u
+#define GWP_LINGER_RST_MS	5000u
 
 static uint32_t gwp_linger_bound(const struct gwp_cfg *cfg)
 {
@@ -1364,19 +1376,28 @@ static uint32_t gwp_linger_bound(const struct gwp_cfg *cfg)
 }
 
 /*
- * Linger on @c, which may still get input: it has not been read to its end.
- * Not when it was reset, as there is nobody left to linger for, nor when the
+ * Linger on @c: until the reset of the other side can be passed on to it
+ * (gwp_conn_reset_passes_to()) without destroying what it is still owed, or
+ * when it may still get input, as it has not been read to its end. Not when
+ * it was reset itself, as there is nobody left to linger for, nor when the
  * pair aborts it (@abort), as the reset is then the point.
  */
-static int gwp_conn_linger(struct gwp_wrk *w, struct gwp_conn *c, bool abort)
+static int gwp_conn_linger(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   struct gwp_conn *c, bool abort)
 {
 	int r;
 
-	if (c->fd < 0 || c->rst || abort || c->rd_eof)
+	if (c->fd < 0 || c->rst || abort)
 		return 0;
 
-	r = gwp_linger_add(w->linger, c->fd, GWP_LINGER_FIN,
-			   gwp_linger_bound(&w->ctx->cfg));
+	if (gwp_conn_reset_passes_to(gcp, c))
+		r = gwp_linger_add(w->linger, c->fd, GWP_LINGER_RST,
+				   GWP_LINGER_RST_MS);
+	else if (!c->rd_eof)
+		r = gwp_linger_add(w->linger, c->fd, GWP_LINGER_FIN,
+				   gwp_linger_bound(&w->ctx->cfg));
+	else
+		return 0;
 	c->fd = -1;
 	return r;
 }
@@ -1388,10 +1409,11 @@ int gwp_conn_pair_linger(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (!w->linger)
 		return 0;
 
-	n = gwp_conn_linger(w, &gcp->client, gwp_conn_pair_aborts_client(gcp));
+	n = gwp_conn_linger(w, gcp, &gcp->client,
+			    gwp_conn_pair_aborts_client(gcp));
 	/* A target that is not up yet has no peer to linger for. */
 	if (gcp->is_target_alive)
-		n += gwp_conn_linger(w, &gcp->target,
+		n += gwp_conn_linger(w, gcp, &gcp->target,
 				     gwp_conn_pair_aborts_target(gcp));
 	return n;
 }

@@ -1365,12 +1365,24 @@ bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
 			   const struct gwp_conn *c);
 
 /*
+ * The other side of @c was reset (gwp_conn_reset_passed()), and @c, the
+ * plaintext survivor, is to be reset in turn once it has taken what it is
+ * owed, so that the cut shows: the end of the pair gives it no FIN, and
+ * gwp_conn_pair_linger() resets it. A TLS survivor is ended as the TLS
+ * TERMINATION and UPSTREAM CHAINING sections of the manual describe.
+ */
+bool gwp_conn_reset_passes_to(const struct gwp_conn_pair *gcp,
+			      const struct gwp_conn *c);
+
+/*
  * @gcp is done and about to be freed, with no I/O left in flight on its
  * sockets and both out of the event loop's own set. Hand those that may still
  * get input to the worker's linger set (linger.h) instead of closing them, so
  * that a close does not reset the connection and destroy what is still on
- * its way to the peer: a failure reply, the end of a response. Their fds are
- * set to -1 then. Returns the number of descriptors closed at once in there.
+ * its way to the peer: a failure reply, the end of a response. A reset to be
+ * passed on (gwp_conn_reset_passes_to()) waits there for the same reason.
+ * Their fds are set to -1 then. Returns the number of descriptors closed at
+ * once in there.
  */
 int gwp_conn_pair_linger(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
