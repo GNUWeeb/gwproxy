@@ -4440,6 +4440,8 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_upstream *up = gcp->upstream;
 	bool udp_refused;
 	unsigned int val;
+	uint16_t up_val;
+	uint8_t up_end;
 	char why[64];
 
 	if (!up || gcp->is_target_alive || (gcp->flags & GWP_CONN_FLAG_UP_FAILED))
@@ -4518,16 +4520,24 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	    (gcp->flags & (GWP_CONN_FLAG_UP_RETRIED | GWP_CONN_FLAG_IS_DYING |
 			   GWP_CONN_FLAG_IS_CANCEL)))
 		return false;
+	up_end = gcp->up_end;
+	up_val = gcp->up_val;
 	if (!upstream_retry(w, gcp))
 		return false;
 	/*
 	 * A pool may mix socks5h:// servers with http:// and https:// ones,
-	 * which cannot carry UDP: the retry is spent, and the failure stands.
+	 * which cannot carry UDP: the retry is spent, and the failure stands,
+	 * as the first server ended it. upstream_retry() cleared how it ended
+	 * for the new attempt, and the client's answer is made from that
+	 * (gwp_upstream_fail_reply()), so put it back.
 	 */
 	if ((gcp->flags & GWP_CONN_FLAG_UDP_UP) &&
 	    gcp->upstream->type != GWP_UPSTREAM_SOCKS5) {
 		pr_dbg(&w->ctx->lh, "Upstream retry for idx=%u landed on a server that cannot carry UDP; giving up",
 		       gcp->idx);
+		gcp->flags |= GWP_CONN_FLAG_UP_FAILED;
+		gcp->up_end = up_end;
+		gcp->up_val = up_val;
 		return false;
 	}
 	return true;
