@@ -3558,6 +3558,9 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		struct gwp_sockaddr src;
 		socklen_t srclen = sizeof(src);
 		struct gwp_udp_out out;
+		union gwp_udp_cmsg cb;
+		struct msghdr mh;
+		struct iovec iov;
 		ssize_t n;
 
 		n = __sys_recvfrom(fd, buf + off, 65535, MSG_NOSIGNAL,
@@ -3572,9 +3575,23 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		if (gwp_udp_relay_classify(w, gcp, buf + off, (size_t)n, &src,
 					   &out) == GWP_UDP_DROP)
 			continue;
+		gcp->last_act = w->now;
 
-		__sys_sendto(fd, out.buf, out.len, MSG_NOSIGNAL, &out.dst.sa,
-			     out.dstlen);
+		/* From the source the datagram must come from, if it has one. */
+		iov.iov_base = out.buf;
+		iov.iov_len = out.len;
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_name = &out.dst.sa;
+		mh.msg_namelen = out.dstlen;
+		mh.msg_iov = &iov;
+		mh.msg_iovlen = 1;
+		mh.msg_controllen = gwp_udp_src_cmsg(&out, &cb);
+		if (mh.msg_controllen)
+			mh.msg_control = cb.b;
+		n = __sys_sendmsg(fd, &mh, MSG_NOSIGNAL);
+		if (n < 0 && n != -EAGAIN)
+			pr_dbg(&w->ctx->lh, "UDP relay sendmsg: %s",
+			       strerror((int)-n));
 	}
 
 	return 0;
@@ -4070,8 +4087,14 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		/* Torn down earlier in this batch; see free_conn_pair(). */
 		if (gcp->flags & GWP_CONN_FLAG_IS_DYING)
 			return 0;
-		/* Any event is activity (--idle-timeout). */
-		gcp->last_act = w->now;
+		/*
+		 * Any event is activity (--idle-timeout), but for the UDP
+		 * relay's: a datagram counts only when it is relayed
+		 * (handle_ev_udp_relay()), so that one anybody can send, and
+		 * that is dropped, does not keep an association open.
+		 */
+		if (ev_bit != EV_BIT_UDP_RELAY)
+			gcp->last_act = w->now;
 	}
 
 	/*

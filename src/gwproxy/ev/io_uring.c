@@ -131,6 +131,7 @@ struct gwp_iou_udp {
 	struct iovec		iov;
 	struct gwp_sockaddr	src;	/* recvmsg source of the last datagram */
 	struct gwp_sockaddr	dst;	/* sendmsg destination                 */
+	union gwp_udp_cmsg	cb;	/* sendmsg source (gwp_udp_src_cmsg()) */
 	unsigned char		buf[GWP_UDP_RELAY_BUFSZ];
 };
 
@@ -2167,7 +2168,8 @@ static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
  * client's reply is in target.buf. Send it, and bring the relay up. The two
  * control connections are watched only for their end from now on: either one
  * closing ends the association. A recv on the upstream's stands for that
- * watch; the reply's send completion arms it (handle_ev_client_send()).
+ * watch; for a plaintext client the reply's send completion arms it
+ * (handle_ev_client_send()).
  */
 static int udp_up_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -2179,6 +2181,17 @@ static int udp_up_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gwp_conn_upstream_up(gcp);
 	gcp->client.len = 0;
 	prep_send_client(w, gcp);
+#ifdef CONFIG_HTTPS
+	/*
+	 * A TLS client's reply completion goes back to the protocol pass
+	 * that arm_udp_relay() leaves pending (prot_resume), not to the
+	 * branch that arms the watch, so arm it now. The reply is in the
+	 * engine already (send_client_tls()), and what the watch reads is
+	 * dropped without touching target.len.
+	 */
+	if (client_is_tls(gcp))
+		prep_recv_target(w, gcp);
+#endif
 	return arm_udp_relay(w, gcp);
 }
 
@@ -3460,22 +3473,27 @@ static void prep_udp_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	get_gcp_io(gcp, s);
 }
 
-/* Arm a relay sendmsg of @buf[0..len) to @dst (part of the same scratch). */
+/*
+ * Arm a relay sendmsg of @out's datagram (part of the same scratch), from
+ * the source it must come from, if it has one.
+ */
 static void prep_udp_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			  unsigned char *buf, size_t len,
-			  const struct gwp_sockaddr *dst, socklen_t dstlen)
+			  const struct gwp_udp_out *out)
 {
 	struct gwp_iou_udp *u = gcp->udp_iou;
 	struct io_uring_sqe *s = get_sqe_nofail(w);
 
-	u->dst = *dst;
-	u->iov.iov_base = buf;
-	u->iov.iov_len = len;
+	u->dst = out->dst;
+	u->iov.iov_base = out->buf;
+	u->iov.iov_len = out->len;
 	memset(&u->mh, 0, sizeof(u->mh));
 	u->mh.msg_name = &u->dst;
-	u->mh.msg_namelen = dstlen;
+	u->mh.msg_namelen = out->dstlen;
 	u->mh.msg_iov = &u->iov;
 	u->mh.msg_iovlen = 1;
+	u->mh.msg_controllen = gwp_udp_src_cmsg(out, &u->cb);
+	if (u->mh.msg_controllen)
+		u->mh.msg_control = u->cb.b;
 	io_uring_prep_sendmsg(s, gcp->udp_fd, &u->mh, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UDP_TX;
@@ -3519,7 +3537,8 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 	}
 
-	prep_udp_send(w, gcp, out.buf, out.len, &out.dst, out.dstlen);
+	gcp->last_act = w->now;
+	prep_udp_send(w, gcp, &out);
 	return 0;
 }
 
@@ -3837,8 +3856,14 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	if (nr_ops) {
 		assert(*nr_ops);
 		(*nr_ops)--;
-		/* Activity, for --idle-timeout. */
-		((struct gwp_conn_pair *)udata)->last_act = w->now;
+		/*
+		 * Activity, for --idle-timeout, but for the UDP relay's: a
+		 * datagram counts only when it is relayed
+		 * (handle_ev_udp_relay()), so that one anybody can send, and
+		 * that is dropped, does not keep an association open.
+		 */
+		if (ev_bit != EV_BIT_IOU_UDP_RX && ev_bit != EV_BIT_IOU_UDP_TX)
+			((struct gwp_conn_pair *)udata)->last_act = w->now;
 
 		/*
 		 * The pair is being torn down and its cancels are queued, so

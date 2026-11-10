@@ -199,7 +199,12 @@ Default:
 Close an established tunnel, or a SOCKS5 UDP association, once no data has
 moved in either direction for this many seconds. Any traffic restarts the
 count, so a tunnel that keeps moving data is never closed, however long it
-lives; a UDP association counts as active while datagrams go either way.
+lives; a UDP association counts as active while datagrams are relayed either
+way. A datagram the relay drops (one from a stranger, or one it cannot or
+may not pass on, see
+.BR \-\-udp\-associate )
+does not count, so sending junk to the relay port does not keep a quiet
+association open.
 The check runs on a coarse per\-worker clock, compares whole seconds and runs
 about once a second, so a pair can outlive the timeout by up to about two
 seconds.
@@ -256,13 +261,34 @@ the proxy rejects it with reply
 .B CONNECT
 unaffected; only meaningful with
 .BR \-\-as\-socks5 .
-Datagrams are taken only from the IP address of the control connection. When
+The reply names the address the client reached the proxy at as BND.ADDR,
+and every datagram to the client is sent from that address, whichever
+source routing would pick toward the client, so a client that takes
+datagrams only from the relay it was told (a connected UDP socket, a
+stateful firewall) gets them on a host with several addresses too.
+The client's own datagrams, the ones relayed to targets, are taken only from
+the IP address of the control connection. When
 the request declares that address and a port, only that port is the client;
 when it declares any other address, or no port, the first valid datagram from
 that IP address decides the port, so another party on the same IP address can
 get there first. A client behind a NAT cannot know its outside port and is
 served by the latter rule. A client that declares the control connection's
 address with a port the NAT rewrites gets no service.
+.IP
+A datagram from any other source is taken for a target's reply, and relayed
+to the client only if it comes from the exact address and port of a target
+the client has sent to: a reply from another port or address of the same
+server (a TFTP server's new port, an anycast or load\-balanced service) is
+dropped, as is anything a target sends before the client has sent to it
+(hole punching). The
+.B OUTPUT
+chain judges such a target again after a reload, and a target it no longer
+accepts may not answer until the client is let through to it again. Only
+the 32 targets the client has sent to most recently are remembered; a reply
+from one that dropped out is dropped too, so a client that talks to more
+targets at once (a DHT node, say) loses replies. Through a pool server only
+the server's relay may answer (see
+.BR "UPSTREAM CHAINING" ).
 Default:
 .BR 1 .
 .TP
@@ -1351,8 +1377,13 @@ prevent. In this they differ from the global
 which stays best\-effort. They apply to TCP target connections \(em SOCKS5,
 HTTP, plain and transparent forwarding, and the hop to an
 .B \-\-upstream\-proxy
-\(em but not to the SOCKS5 UDP relay, matching the reach of
-.BR "\-j BIND" .
+\(em and not to the SOCKS5 UDP relay socket, matching the reach of
+.BR "\-j BIND" :
+the relay's datagrams to targets leave from whichever source routing picks.
+Those of a UDP association through a pool server, though, go to the
+server's relay from the address, and out of the interface, of gwproxy's
+control connection to that server, which these options do bind (see
+.BR "UPSTREAM CHAINING" ).
 A matching
 .B \-j BIND
 rule
@@ -2219,14 +2250,19 @@ server cannot carry UDP, and the client is refused (reply 0x07). gwproxy
 connects to the server as for a CONNECT through it, with the same
 authentication, and asks it for a UDP ASSOCIATE of its own, naming the
 address of that connection and the port of the relay socket gwproxy sends
-the datagrams from. The client is answered only once the server has: on
+the datagrams from. They are sent from that address, and out of the
+interface that connection is bound to, if any, so they come from where the
+server was told even when
+.BR \-\-bind\-source ", " \-\-bind\-iface " or " "\-j BIND"
+moved that connection off the address routing would pick. The client is answered only once the server has: on
 success with gwproxy's own relay address, as for a direct relay, and the
 server's relay, where gwproxy sends the datagrams, is the address the server
 replies with (or the server's own address, when the reply names 0.0.0.0 or
 ::). Each datagram from the client goes to the server's relay as the client
 sent it, its SOCKS5 header included, and each from the server's relay goes
 back to the client as it came, so the server reaches the targets and wraps
-their replies; datagrams from anywhere else are dropped, as are a client's
+their replies, and which targets may answer is the server's to decide;
+datagrams from anywhere else are dropped, as are a client's
 before it is known (see
 .BR \-\-udp\-associate ).
 The

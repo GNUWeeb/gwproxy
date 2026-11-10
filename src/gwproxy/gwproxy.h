@@ -579,10 +579,14 @@ struct gwp_udp_peers {
  * relay takes the datagrams (@relay, in the family of the pair's udp_fd), and
  * the last domain target's OUTPUT verdict, as struct gwp_udp_acl_cache keeps
  * an address's: @ok for @dom and @dport, while @valid and the ACL is still at
- * generation @gen.
+ * generation @gen. The datagrams leave from @local, the address of the
+ * control connection that gwproxy's own UDP ASSOCIATE declares, and out of
+ * @ifindex, the interface that connection is bound to (0 for none).
  */
 struct gwp_udp_up {
 	struct gwp_sockaddr	relay;
+	struct gwp_sockaddr	local;
+	uint32_t		ifindex;
 	socklen_t		relay_len;
 	uint32_t		gen;
 	__be16			dport;
@@ -716,6 +720,11 @@ struct gwp_conn_pair {
 	 * from a target in @udp_peers.
 	 */
 	struct gwp_sockaddr	udp_peer;
+	/*
+	 * The address the client reached the proxy at, which it is told is the
+	 * relay's (BND.ADDR): datagrams to it are sent from there.
+	 */
+	struct gwp_sockaddr	udp_local;
 	/* Last client->target datagram's ACL verdict; see udp_target_allowed(). */
 	struct gwp_udp_acl_cache	udp_acl;
 	struct gwp_sockaddr	client_addr;
@@ -1285,7 +1294,35 @@ struct gwp_udp_out {
 	size_t			len;
 	struct gwp_sockaddr	dst;
 	socklen_t		dstlen;
+	/*
+	 * The source to send from, or NULL for the one routing picks, and the
+	 * interface to send out of, or 0 for the source's scope (if any).
+	 */
+	const struct gwp_sockaddr *from;
+	uint32_t		from_ifindex;
 };
+
+/*
+ * Room for the source address control message of a relayed datagram
+ * (gwp_udp_src_cmsg()): CMSG_SPACE() of a struct in6_pktinfo, with the
+ * padding of both parts spelled out, and aligned as control messages are.
+ * (A struct cmsghdr member would make it a type of variable size, as the
+ * header ends in a flexible array.)
+ */
+union gwp_udp_cmsg {
+	size_t		align;
+	unsigned char	b[sizeof(struct cmsghdr) + sizeof(struct in6_pktinfo) +
+			  2 * sizeof(size_t)];
+};
+
+/*
+ * Build in @cb the control message that makes a datagram of @out leave the
+ * relay socket from @out->from, and return its length for msg_controllen:
+ * IPV6_PKTINFO on the dual-stack relay (an IPv4 source v4-mapped), IP_PKTINFO
+ * on an IPv4 one. Returns 0, for no control message, when @out names no source
+ * or one of the other family than the destination.
+ */
+size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb);
 
 /*
  * SOCKS5 UDP relay per-datagram classifier, shared by both event loops. @base
