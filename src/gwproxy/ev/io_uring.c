@@ -1313,7 +1313,12 @@ static int target_tls_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			break;
 	}
 
-	if (gwp_ssl_bio_pending(c->tls) > 0)
+	/*
+	 * Also the client's data that the engine could not take before it
+	 * had heard from the upstream (target_tls_sent()): it may now.
+	 */
+	if (gwp_ssl_bio_pending(c->tls) > 0 ||
+	    (gcp->up_tls_io->tx_fwd && gcp->client.len))
 		send_target_tls(w, gcp, false);
 
 	if (c->len) {
@@ -1398,6 +1403,14 @@ static int target_tls_sent(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (t->tx_fwd) {
+		/*
+		 * The engine cannot take the client's data before it has heard
+		 * from the upstream (a renegotiation in progress): keep it, and
+		 * the client unread, for target_tls_pump() to send once the
+		 * upstream's answer is in.
+		 */
+		if (gcp->client.len && gwp_ssl_tx_starved(gcp->target.tls))
+			return 0;
 		t->tx_fwd = false;
 		if (!gcp->client.rd_eof) {
 			if (client_is_tls(gcp))
