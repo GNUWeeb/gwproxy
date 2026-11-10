@@ -604,6 +604,14 @@ struct gwp_conn_pair {
 	 * io_uring has no timerfd to test for.
 	 */
 	struct __kernel_timespec	ats;
+	/*
+	 * When the earliest of the pair's live protocol, connect or idle
+	 * timers expires, in CLOCK_MONOTONIC ms; 0 when none is live. An
+	 * expiry that comes before it, or while none is live, is that of a
+	 * timer that was removed as it fired: io_uring cannot tell the two
+	 * apart, as both carry the same user_data (handle_ev_timer()).
+	 */
+	uint64_t			tmr_due;
 #ifdef CONFIG_HTTPS
 	/*
 	 * Persistent ciphertext scratch for the client's TLS on the io_uring

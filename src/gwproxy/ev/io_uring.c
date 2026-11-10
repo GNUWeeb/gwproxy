@@ -763,11 +763,32 @@ static struct io_uring_sqe *prep_send_client(struct gwp_wrk *w,
 	return __prep_send_client(w, gcp);
 }
 
+/*
+ * The precise clock, not the coarse one of gwp_now_ms(): this is compared
+ * with when a kernel timer fired, and the coarse clock lags the one the
+ * kernel times io_uring timeouts with by up to a tick.
+ */
+static uint64_t iou_now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000ull + (uint64_t)t.tv_nsec / 1000000ull;
+}
+
 static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 					      struct gwp_conn_pair *gcp,
 					      int sec)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
+	uint64_t now = iou_now_ms(), due = now + (uint64_t)sec * 1000ull;
+
+	/*
+	 * The timeout runs from its submission, which is later, so it never
+	 * expires before @due. Another one still live may expire first.
+	 */
+	if (!gcp->tmr_due || gcp->tmr_due <= now || due < gcp->tmr_due)
+		gcp->tmr_due = due;
 
 	gcp->ts.tv_nsec = 0;
 	gcp->ts.tv_sec = sec;
@@ -802,6 +823,11 @@ static void prep_timer_del_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
 
+	/*
+	 * Whatever expiry comes from here on, until a timer is armed again,
+	 * is the removed one's: it fired before the removal could reach it.
+	 */
+	gcp->tmr_due = 0;
 	io_uring_prep_timeout_remove(s, EV_BIT_IOU_TIMER | PTR_TO_U64(gcp), 0);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TIMER_DEL;
@@ -2680,6 +2706,35 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 */
 	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
 		return 0;
+
+	/*
+	 * A removal matches by user_data alone, and the timer armed in place
+	 * of the removed one has the same: when the removed one had fired
+	 * already, its expiry still comes here, after the removal failed with
+	 * -ENOENT or in the same batch, before the removal was even
+	 * submitted. do_prep_connect() swaps the protocol timer for the
+	 * connect timer as the lookup completes, which may be just as the
+	 * protocol timeout runs out: taken for the connect's, that expiry
+	 * would answer a timeout and cancel a connect the target may have
+	 * accepted already, and charge an upstream a timeout. The handovers
+	 * of a pair whose target is up are harmless: is_target_alive is set
+	 * first, and the idle check looks at the time itself.
+	 *
+	 * A live timer never expires before tmr_due, so one that does, or
+	 * with none live, was removed: only account for it.
+	 */
+	if (!is_timer_del && res == -ETIME) {
+		uint64_t now = iou_now_ms();
+
+		if (!gcp->tmr_due || now < gcp->tmr_due) {
+			pr_dbg(&ctx->lh,
+			       "Ignoring the expiry of a removed timer (idx=%u)",
+			       gcp->idx);
+			return 0;
+		}
+		if (!gcp->nr_timers_armed)
+			gcp->tmr_due = 0;
+	}
 
 	/*
 	 * Idle check: close the pair if nothing moved for the whole timeout,
