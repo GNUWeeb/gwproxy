@@ -3340,6 +3340,7 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		if (gwp_udp_relay_classify(w, gcp, buf + off, (size_t)n, &src,
 					   &out) == GWP_UDP_DROP)
 			continue;
+		gcp->last_act = w->now;
 
 		/* From the source the datagram must come from, if it has one. */
 		iov.iov_base = out.buf;
@@ -3824,8 +3825,14 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		/* Torn down earlier in this batch; see free_conn_pair(). */
 		if (gcp->flags & GWP_CONN_FLAG_IS_DYING)
 			return 0;
-		/* Any event is activity (--idle-timeout). */
-		gcp->last_act = w->now;
+		/*
+		 * Any event is activity (--idle-timeout), but for the UDP
+		 * relay's: a datagram counts only when it is relayed
+		 * (handle_ev_udp_relay()), so that one anybody can send, and
+		 * that is dropped, does not keep an association open.
+		 */
+		if (ev_bit != EV_BIT_UDP_RELAY)
+			gcp->last_act = w->now;
 	}
 
 	/*

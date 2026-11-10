@@ -3360,6 +3360,7 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 	}
 
+	gcp->last_act = w->now;
 	prep_udp_send(w, gcp, &out);
 	return 0;
 }
@@ -3621,8 +3622,14 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	if (nr_ops) {
 		assert(*nr_ops);
 		(*nr_ops)--;
-		/* Activity, for --idle-timeout. */
-		((struct gwp_conn_pair *)udata)->last_act = w->now;
+		/*
+		 * Activity, for --idle-timeout, but for the UDP relay's: a
+		 * datagram counts only when it is relayed
+		 * (handle_ev_udp_relay()), so that one anybody can send, and
+		 * that is dropped, does not keep an association open.
+		 */
+		if (ev_bit != EV_BIT_IOU_UDP_RX && ev_bit != EV_BIT_IOU_UDP_TX)
+			((struct gwp_conn_pair *)udata)->last_act = w->now;
 
 		/*
 		 * The pair is being torn down and its cancels are queued, so

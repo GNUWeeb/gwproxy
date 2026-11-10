@@ -199,7 +199,12 @@ Default:
 Close an established tunnel, or a SOCKS5 UDP association, once no data has
 moved in either direction for this many seconds. Any traffic restarts the
 count, so a tunnel that keeps moving data is never closed, however long it
-lives; a UDP association counts as active while datagrams go either way.
+lives; a UDP association counts as active while datagrams are relayed either
+way. A datagram the relay drops (one from a stranger, or one it cannot or
+may not pass on, see
+.BR \-\-udp\-associate )
+does not count, so sending junk to the relay port does not keep a quiet
+association open.
 The check runs on a coarse per\-worker clock, compares whole seconds and runs
 about once a second, so a pair can outlive the timeout by up to about two
 seconds.
