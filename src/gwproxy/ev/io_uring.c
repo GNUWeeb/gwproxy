@@ -472,6 +472,51 @@ static void arm_accept_retry(struct gwp_wrk *w)
 	s->user_data = EV_BIT_IOU_ACCEPT_RETRY;
 }
 
+/*
+ * Watch the linger set (gwp_conn_pair_linger()): one-shot, re-armed by its
+ * completion, which does the set's work.
+ */
+static void arm_linger_poll(struct gwp_wrk *w)
+{
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	io_uring_prep_poll_add(s, gwp_linger_fd(w->linger), POLLIN);
+	s->user_data = EV_BIT_IOU_LINGER;
+}
+
+/*
+ * Have a timeout complete when the linger set is next due for a look
+ * (gwp_linger_next_ms()): one at a time, moved earlier when a socket that
+ * joins the set is due before it.
+ */
+static void arm_linger_timer(struct gwp_wrk *w)
+{
+	uint64_t at = gwp_linger_next_ms(w->linger);
+	struct iou *iou = w->iou;
+	struct io_uring_sqe *s;
+
+	if (!at || (iou->linger_at_ms && iou->linger_at_ms <= at))
+		return;
+
+	/*
+	 * A timeout not yet submitted reads the new deadline as well, as does
+	 * the update that follows it: both want this one.
+	 */
+	iou->linger_ts.tv_sec = (long long)(at / 1000ull);
+	iou->linger_ts.tv_nsec = (long long)(at % 1000ull) * 1000000ll;
+	s = get_sqe_nofail(w);
+	if (iou->linger_at_ms) {
+		io_uring_prep_timeout_update(s, &iou->linger_ts,
+					     EV_BIT_IOU_LINGER_TMR,
+					     IORING_TIMEOUT_ABS);
+		s->user_data = EV_BIT_IOU_LINGER_TMR_UPD;
+	} else {
+		io_uring_prep_timeout(s, &iou->linger_ts, 0, IORING_TIMEOUT_ABS);
+		s->user_data = EV_BIT_IOU_LINGER_TMR;
+	}
+	iou->linger_at_ms = at;
+}
+
 static void prep_close(struct gwp_wrk *w, int fd)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
@@ -550,6 +595,12 @@ static bool put_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (x > 1)
 		return false;
 
+	/*
+	 * Nothing is in flight on the sockets any more: those that may still
+	 * get input linger (gwp_conn_pair_linger()), and the rest close here.
+	 */
+	gwp_conn_pair_linger(w, gcp);
+	arm_linger_timer(w);
 	tg_fd = gcp->target.fd;
 	cl_fd = gcp->client.fd;
 	ud_fd = gcp->udp_fd;
@@ -1210,6 +1261,16 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		} else {
 			break;	/* ciphertext must drain first */
 		}
+	}
+
+	/*
+	 * The proxy's last reply to the client is all in the engine now: its
+	 * close_notify goes right behind it, in the same send. Not before:
+	 * the engine refuses to encrypt anything once it has been shut down.
+	 */
+	if (unlikely(gcp->client.last_reply) && !gcp->target.len) {
+		gwp_ssl_shutdown(ssl);
+		t->closing = true;
 	}
 
 	n = gwp_ssl_bio_read(ssl, t->tx, sizeof(t->tx));
@@ -2705,6 +2766,7 @@ static void target_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	pr_dbg(&w->ctx->lh, "Target connected, then ended: %s (idx=%u, fd=%d)",
 		strerror(-res), gcp->idx, gcp->target.fd);
+	gcp->target.rst = true;
 	gcp->target.wr_shut = true;
 	gwp_conn_buf_consume(&gcp->client, gcp->client.len);
 }
@@ -2976,6 +3038,55 @@ static int handle_sock_ret(int r)
 }
 
 /*
+ * A recv from @c (@rx) or a send to it failed with @err while the pair
+ * forwards. A plaintext peer that reset the connection, or died otherwise,
+ * ends only its own side, as on the epoll loop (conn_note_reset() there):
+ * nothing more can be sent to it, so its write side counts as shut and what
+ * is queued for it is dropped (see drop_for_reset()), but what it sent before
+ * goes on to the other side, like any data before an EOF. A failed recv has
+ * returned the last of it, and is taken as the end of @c's stream. After a
+ * failed send it is still queued on the socket, and the recv ends with an EOF
+ * then, as the send has taken the error off the socket. The reset is
+ * recorded in gwp_conn::rst. Returns true when @err was taken so.
+ *
+ * TLS sides are left as they were: a failure on one ends the pair at once,
+ * and gwp_conn_pair_abort_target() passes the abort on.
+ */
+static bool conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    struct gwp_conn *c, int err, bool rx)
+{
+	if (!gcp->is_target_alive || c->tls)
+		return false;
+	if (err != -ECONNRESET && err != -EPIPE && err != -ETIMEDOUT)
+		return false;
+
+	if (rx)
+		c->rd_eof = true;
+	if (!c->rst) {
+		pr_dbg(&w->ctx->lh, "%s connection ended: %s (idx=%u, fd=%d)",
+			c == &gcp->client ? "Client" : "Target",
+			strerror(-err), gcp->idx, c->fd);
+		c->rst = true;
+	}
+	c->wr_shut = true;
+	return true;
+}
+
+/*
+ * @dst was reset (conn_note_reset()): what @src holds for it can no longer be
+ * delivered. Drop it instead of sending it, and do not read @src for @dst
+ * any more: the pair ends once @dst's own stream has been delivered, which
+ * does not wait for @src. Returns true when @dst was reset.
+ */
+static bool drop_for_reset(struct gwp_conn *src, struct gwp_conn *dst)
+{
+	if (likely(!dst->rst))
+		return false;
+	gwp_conn_buf_consume(src, src->len);
+	return true;
+}
+
+/*
  * Half-close bookkeeping for the forwarding path, mirroring the epoll
  * forward_progress(). Once a direction's source is at EOF and its buffer has
  * been flushed to the peer, shut the peer's write side so it observes the FIN.
@@ -3013,6 +3124,35 @@ static bool tls_close_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
 	return false;
 }
+
+/*
+ * The plaintext target was reset (conn_note_reset()) and the TLS client has
+ * been handed all it sent. A close_notify would turn the abort into a clean
+ * end: once the ciphertext the client is owed has left, the pair goes down
+ * as it did at the reset before, and gwp_conn_pair_abort_target() deals with
+ * it, as on the epoll loop (conn_end_flushed() there). Returns 0 while
+ * ciphertext is on its way, whose send completion comes back here.
+ */
+static int tls_client_cut(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_iou_tls *t = gcp->tls_io;
+
+	if (t->tx_sent < t->tx_len)
+		return 0;
+	if (gwp_ssl_bio_pending(gcp->client.tls) > 0) {
+		send_client_tls(w, gcp);
+		return 0;
+	}
+	return -ECONNRESET;
+}
+
+/* Likewise for an https:// upstream once the plaintext client was reset. */
+static int tls_target_cut(struct gwp_conn_pair *gcp)
+{
+	struct gwp_iou_tls *t = gcp->up_tls_io;
+
+	return t->tx_sent < t->tx_len ? 0 : -ECONNRESET;
+}
 #endif
 
 static int iou_forward_progress(struct gwp_wrk __unused *w,
@@ -3025,6 +3165,8 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 		/* As for a TLS client below: not an end to pass on. */
 		if (gwp_upstream_tls_cut(gcp))
 			return -ECONNRESET;
+		if (client_is_tls(gcp) && gwp_conn_reset_passed(gcp, &gcp->target))
+			return tls_client_cut(w, gcp);
 		if (client_is_tls(gcp) && !tls_close_client(w, gcp))
 			return 0;
 #endif
@@ -3041,6 +3183,8 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 		/* Not an end to pass on; see gwp_free_conn_pair(). */
 		if (client_is_tls(gcp) && gwp_ssl_rx_cut(gcp->client.tls))
 			return -ECONNRESET;
+		if (target_is_tls(gcp) && gcp->client.rst)
+			return tls_target_cut(gcp);
 		if (target_is_tls(gcp) && !tls_close_target(w, gcp))
 			return 0;
 #endif
@@ -3059,12 +3203,16 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 	 * socket: close() answers unread data with an RST instead of a FIN.
 	 * Here a write side is shut only after the other socket's read side
 	 * reached EOF, so when both are done both sockets have been read to
-	 * EOF; the test is kept explicit, as in the epoll loop.
+	 * EOF; the test is kept explicit, as in the epoll loop. The survivor
+	 * of a reset gets no FIN at all: the teardown passes the reset on
+	 * (gwp_conn_reset_passes_to()).
 	 */
 	done = gcp->client.wr_shut && gcp->target.wr_shut;
-	if (shut_client && !(done && gcp->client.rd_eof))
+	if (shut_client && !(done && (gcp->client.rd_eof ||
+		gwp_conn_reset_passes_to(gcp, &gcp->client))))
 		__sys_shutdown(gcp->client.fd, SHUT_WR);
-	if (shut_target && !(done && gcp->target.rd_eof))
+	if (shut_target && !(done && (gcp->target.rd_eof ||
+		gwp_conn_reset_passes_to(gcp, &gcp->target))))
 		__sys_shutdown(gcp->target.fd, SHUT_WR);
 	if (done)
 		return -ECONNRESET;
@@ -3081,7 +3229,12 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (r < 0) {
 		if (r == -EAGAIN || r == -EINTR)
 			return prep_recv_client(w, gcp);
-		return r;
+		if (!conn_note_reset(w, gcp, &gcp->client, r, true))
+			return r;
+		/* A send to the client in flight finds the reset itself. */
+		if (!gcp->client_tx)
+			gwp_conn_buf_consume(&gcp->target, gcp->target.len);
+		return iou_forward_progress(w, gcp);
 	}
 
 #ifdef CONFIG_HTTPS
@@ -3148,7 +3301,15 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			prep_recv_target(w, gcp);
 			return 0;
 		}
-		return r;
+		/*
+		 * A reset ends the target's stream as an EOF would, after all
+		 * it sent: the HTTP forwarding filter answers 502 for an origin
+		 * that resets inside its response header, as for one that
+		 * closes there.
+		 */
+		if (!conn_note_reset(w, gcp, &gcp->target, r, true))
+			return r;
+		r = 0;
 	}
 
 	from = gcp->target.len;
@@ -3162,6 +3323,9 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (r)
 			return r;
 	}
+
+	if (drop_for_reset(&gcp->target, &gcp->client))
+		return iou_forward_progress(w, gcp);
 
 	/*
 	 * Usually what was read is sent on, but an HTTP forwarding filter may
@@ -3184,6 +3348,10 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 
 	gcp->client_tx = false;
+	if (r < 0 && conn_note_reset(w, gcp, &gcp->client, r, false)) {
+		gwp_conn_buf_consume(&gcp->target, gcp->target.len);
+		return iou_forward_progress(w, gcp);
+	}
 	r = handle_sock_ret(r);
 	if (r < 0) {
 #ifdef CONFIG_HTTPS
@@ -3239,6 +3407,9 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	if (r > 0)
 		gwp_conn_buf_consume(&gcp->target, (size_t)r);
+	/* The client was reset meanwhile (handle_ev_client_recv()). */
+	if (drop_for_reset(&gcp->target, &gcp->client))
+		return iou_forward_progress(w, gcp);
 
 	/*
 	 * A short send leaves unsent bytes in target.buf; flush the remainder
@@ -3275,6 +3446,17 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int r = cqe->res;
 
+	/*
+	 * The target was reset: what the client sends can no longer reach it,
+	 * but what the target sent before the reset is still to be read, and
+	 * the target's recv goes on until it ends (conn_note_reset()). Over
+	 * HTTP forwarding, a request whose send failed so while the response
+	 * header is awaited is answered 502 then, as a reset there is.
+	 */
+	if (r < 0 && conn_note_reset(w, gcp, &gcp->target, r, false)) {
+		gwp_conn_buf_consume(&gcp->client, gcp->client.len);
+		return iou_forward_progress(w, gcp);
+	}
 	r = handle_sock_ret(r);
 	if (r < 0)
 		return r;
@@ -3286,6 +3468,9 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	if (r > 0)
 		gwp_conn_buf_consume(&gcp->client, (size_t)r);
+	/* The target was reset meanwhile (handle_ev_target_recv()). */
+	if (drop_for_reset(&gcp->client, &gcp->target))
+		return iou_forward_progress(w, gcp);
 
 	/* Short send: flush the rest before reading more from the client. */
 	if (gcp->client.len > 0) {
@@ -3699,6 +3884,9 @@ static int process_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * reply would never be sent.
 	 */
 	r = chk_prot_result(w, gcp, r);
+	/* Refused: what is queued is the client's last reply. */
+	if (r < 0)
+		gcp->client.last_reply = true;
 	if (gcp->target.len)
 		prep_send_client(w, gcp);
 
@@ -4046,6 +4234,23 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	case EV_BIT_IOU_STOP:
 		pr_dbg(&ctx->lh, "Handling stop doorbell: %d", cqe->res);
 		return 0;
+	case EV_BIT_IOU_LINGER:
+		if (cqe->res == -ECANCELED)
+			return 0;
+		gwp_linger_run(w->linger);
+		arm_linger_poll(w);
+		arm_linger_timer(w);
+		return 0;
+	case EV_BIT_IOU_LINGER_TMR:
+		if (cqe->res == -ECANCELED)
+			return 0;
+		w->iou->linger_at_ms = 0;
+		gwp_linger_run(w->linger);
+		arm_linger_timer(w);
+		return 0;
+	case EV_BIT_IOU_LINGER_TMR_UPD:
+		/* -ENOENT: it had expired already, and is re-armed from there. */
+		return 0;
 	case EV_BIT_IOU_CLOSE: {
 		int fd = (int)CLEAR_EV_BIT(cqe->user_data);
 
@@ -4176,6 +4381,7 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 
 	io_uring_set_iowait(&w->iou->ring, false);
 	arm_stop_poll(w);
+	arm_linger_poll(w);
 	if (ctx->dns)
 		arm_dns_cq_poll(w);
 	arm_accept(w);

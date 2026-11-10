@@ -1609,11 +1609,12 @@ does not send another request on the connection, and the connection is closed
 once the origin has finished. With Transfer\-Encoding present, any
 Content\-Length is dropped from the response (RFC 9112 Section 6.3), and a
 Content\-Length given more than once is passed on once. A response that is not
-valid HTTP/1.x, one with a Content\-Length that does not name a single length
-(two that differ, a list of different values, not a number), one whose
-header is too large, and a 407 from the origin, which would invite the client
-to hand over its proxy credentials, are answered with "502 Bad Gateway"
-instead. The response header, together with any interim (1xx) responses before
+valid HTTP/1.x, one that ends before its header is complete, whether the
+origin closes or resets the connection, one with a Content\-Length that does
+not name a single length (two that differ, a list of different values, not a
+number), one whose header is too large, and a 407 from the origin, which would
+invite the client to hand over its proxy credentials, are answered with
+"502 Bad Gateway" instead. The response header, together with any interim (1xx) responses before
 it that the client has not yet received, may take at most
 .B \-\-target\-buf\-size
 minus 64 bytes, and must still fit in
@@ -1637,6 +1638,47 @@ and
 .B \-\-as\-http=1
 serves both protocols on the same listening port. The protocol is detected from
 the client's first bytes, and both share the same credential store.
+.SH HOW CONNECTIONS END
+Each direction of a tunnel ends on its own. When one side is done sending (a
+TCP FIN), gwproxy delivers everything it sent and then shuts the other side's
+write side, so the end is passed on as a half\-close, while the other direction
+goes on; the pair is closed once both directions are done.
+.PP
+A plaintext side that resets its connection (TCP RST) ends only its own
+direction, whether gwproxy reads the reset or learns of it from a send that
+fails: what that side sent before the reset is still delivered, and what was
+waiting to go to it is dropped. The other side's connection is then reset as
+well, rather than closed, so that a protocol delimited by the connection
+closing does not take the cut stream for complete. As a reset throws away what
+its socket has not delivered yet, gwproxy first waits until the peer has
+acknowledged everything sent to it, for at most 5 seconds. Earlier
+versions of gwproxy closed it normally. A 502 that gwproxy sends in place of the response
+of an origin that reset (see
+.BR HTTP )
+is complete, and ends with a normal close. How the end of a TLS side's stream
+is passed on is described under
+.B "TLS TERMINATION"
+and
+.BR "UPSTREAM CHAINING" .
+.PP
+A connection whose peer may still be sending when gwproxy closes it, such as
+a client refused while it uploads a request body, or one that sent more
+behind a request that fails, is not closed at once: a close with input left
+unread resets the connection, which can destroy the reply on its way. gwproxy
+shuts its write side instead, so that the reply is followed by a normal end of
+stream, reads and discards what the peer still sends, and closes the
+connection once the peer has closed too, or has acknowledged everything and
+stopped sending, or after 2 seconds, or
+.B \-\-protocol\-timeout
+if that is shorter. A peer that sends more than 16 MiB meanwhile is cut off.
+Each worker keeps at most 4096 such connections at once, and no more than an
+eighth of the descriptor limit shared between the workers; beyond that a
+connection is closed at once.
+.PP
+A reply that gwproxy itself sends a TLS client before closing the connection,
+an HTTP error status or a SOCKS5 reply refusing the request, is followed by a
+.B close_notify
+in the same send, as a forwarded response is.
 .SH TLS TERMINATION
 When built with OpenSSL and started with
 .B \-\-tls\-cert
@@ -1909,7 +1951,10 @@ equally on any other teardown, including
 .B \-\-idle\-timeout
 and gwproxy shutting down. A tunnel that fails before it is up, and a 502
 gwproxy sends in place of an unusable response to a forwarded request, end
-with a normal close. When the client is done sending, the upstream is sent a
+with a normal close, after a
+.B close_notify
+to a TLS client (see
+.BR "HOW CONNECTIONS END" ). When the client is done sending, the upstream is sent a
 .B close_notify
 before the TCP FIN. A TLS client
 .RB ( \-\-tls\-cert )
@@ -2523,8 +2568,11 @@ with whatever is still in its buffers or on its way discarded. There is no
 drain. A client in the middle of a download sees a normal end of stream after
 only part of the data, so a protocol that does not mark its own end cannot tell
 this from a complete transfer; a client still sending, with data the proxy has
-not read yet, sees its connection reset instead. The process exits once a
-reload in progress is over (see
+not read yet, sees its connection reset instead. Connections that gwproxy is
+still closing (see
+.BR "HOW CONNECTIONS END" )
+are closed, or reset, at once. The process exits once a reload in progress is
+over (see
 .BR "RELOADING THE FILES" ).
 A lookup still in the system resolver, which can take until the resolver's
 own timeout, is waited for at most one second, or until a second

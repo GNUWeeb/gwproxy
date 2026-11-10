@@ -16,6 +16,7 @@
 #include <gwproxy/dns.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/iplimit.h>
+#include <gwproxy/linger.h>
 #include <gwproxy/upstream.h>
 #include <gwproxy/upstream_lb.h>
 #include <gwproxy/log.h>
@@ -261,6 +262,12 @@ enum {
 	 */
 	EV_BIT_ATTEMPT_TIMER		= (48ull << 48ull),
 
+	/*
+	 * The worker's linger set (linger.h), on both loops: one of its
+	 * sockets has input, or one of its checks is due.
+	 */
+	EV_BIT_LINGER			= (51ull << 48ull),
+
 	EV_BIT_CLIENT_PROT		= (1000ull << 48ull),
 
 #ifdef CONFIG_IO_URING
@@ -315,6 +322,10 @@ enum {
 	 */
 	EV_BIT_IOU_CLIENT_WATCH		= (25ull << 48ull),
 	EV_BIT_IOU_CLIENT_WATCH_DEL	= (27ull << 48ull),
+	EV_BIT_IOU_LINGER		= EV_BIT_LINGER,
+	/* The linger set's timeout, and the moves of its deadline. */
+	EV_BIT_IOU_LINGER_TMR		= (52ull << 48ull),
+	EV_BIT_IOU_LINGER_TMR_UPD	= (53ull << 48ull),
 #endif
 };
 
@@ -450,6 +461,13 @@ struct gwp_conn {
 	 * reports the error also clears it from the socket.
 	 */
 	bool		rst;
+
+	/*
+	 * The client only: what is queued for it is the last thing the proxy
+	 * sends it, its failure reply. A TLS client gets a close_notify right
+	 * behind it, in the same flush (do_send_tls(), send_client_tls()).
+	 */
+	bool		last_reply;
 
 	/*
 	 * TLS state for this endpoint, NULL for a plaintext one: the client's
@@ -891,6 +909,14 @@ struct iou {
 	 */
 	struct gwp_held_sqe	*held_first;
 	struct gwp_held_sqe	*held_last;
+
+	/*
+	 * The timeout for the linger set's next look (arm_linger_timer()):
+	 * its absolute deadline, which must outlive the SQE's submission, and
+	 * when it is due in CLOCK_MONOTONIC ms, 0 while none is armed.
+	 */
+	struct __kernel_timespec linger_ts;
+	uint64_t		linger_at_ms;
 };
 #endif
 
@@ -1028,6 +1054,12 @@ struct gwp_wrk {
 	 * (no copy); the tail holds up to one max-size UDP payload.
 	 */
 	unsigned char		*udp_buf;
+
+	/*
+	 * The sockets of this worker's finished pairs that are still being
+	 * closed (gwp_conn_pair_linger()).
+	 */
+	struct gwp_linger_set	*linger;
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	struct gwp_wrk_dns	*dns;
@@ -1376,6 +1408,37 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
  */
 int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
 void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair *gcp);
+
+/*
+ * @c, one side of @gcp, was reset while the pair forwarded (gwp_conn::rst),
+ * and its stream is to end on the other side as a cut, not as a normal end.
+ * Not when the HTTP forwarding filter has answered 502 in place of the
+ * origin's response: that reply is complete.
+ */
+bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
+			   const struct gwp_conn *c);
+
+/*
+ * The other side of @c was reset (gwp_conn_reset_passed()), and @c, the
+ * plaintext survivor, is to be reset in turn once it has taken what it is
+ * owed, so that the cut shows: the end of the pair gives it no FIN, and
+ * gwp_conn_pair_linger() resets it. A TLS survivor is ended as the TLS
+ * TERMINATION and UPSTREAM CHAINING sections of the manual describe.
+ */
+bool gwp_conn_reset_passes_to(const struct gwp_conn_pair *gcp,
+			      const struct gwp_conn *c);
+
+/*
+ * @gcp is done and about to be freed, with no I/O left in flight on its
+ * sockets and both out of the event loop's own set. Hand those that may still
+ * get input to the worker's linger set (linger.h) instead of closing them, so
+ * that a close does not reset the connection and destroy what is still on
+ * its way to the peer: a failure reply, the end of a response. A reset to be
+ * passed on (gwp_conn_reset_passes_to()) waits there for the same reason.
+ * Their fds are set to -1 then. Returns the number of descriptors closed at
+ * once in there.
+ */
+int gwp_conn_pair_linger(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /* True if the ACL INPUT chain permits an incoming client for @proto (allow-all
  * with no ACL). */

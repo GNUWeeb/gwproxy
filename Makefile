@@ -41,6 +41,7 @@ GWPROXY_CC_SOURCES = \
 	$(GWPROXY_DIR)/log.c \
 	$(GWPROXY_DIR)/net.c \
 	$(GWPROXY_DIR)/iplimit.c \
+	$(GWPROXY_DIR)/linger.c \
 	$(GWPROXY_DIR)/upstream.c \
 	$(GWPROXY_DIR)/upstream_lb.c \
 	$(GWPROXY_DIR)/ev/epoll.c \
