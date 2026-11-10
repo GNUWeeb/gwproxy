@@ -132,7 +132,7 @@ for loop in epoll io_uring; do
 	done
 
 	write_acl 1
-	gwp_hup "$front" "$log" 1
+	gwp_hup "$front" "$log" 2
 	MARK="$(wc -l <"$log")"
 	hold "$loop s after" s 6
 	want "$loop s" "picks after" "$(picks_since p_s)" " 5 1; 1 2;"

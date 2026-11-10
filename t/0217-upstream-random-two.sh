@@ -151,7 +151,7 @@ for loop in epoll io_uring; do
 
 	# A newcomer on a slow start is drawn but next to never taken.
 	write_acl 1
-	gwp_hup "$front" "$log" 1
+	gwp_hup "$front" "$log" 2
 	grep -q "Upstream 127\.0\.0\.1:$g4 comes into service on a slow start of 3600 s" "$log" ||
 		fail "[$loop r] the slow start was not logged"
 	for i in $(seq 1 20); do
