@@ -303,7 +303,8 @@ static void test_forward_authority_end(void)
 	/* A fragment straight after the authority leaves nothing to send. */
 	hc = gwp_http_conn_alloc();
 	assert(hc);
-	assert(run(hc, NULL, frag_at, &host, &port, &req, &req_len) == GWP_HTTP_ERR);
+	assert(run(hc, NULL, frag_at, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_BAD_REQUEST);
 	gwp_http_conn_free(hc);
 
 	PRTEST_OK();
@@ -1041,12 +1042,14 @@ static void test_errors(void)
 
 	hc = gwp_http_conn_alloc();
 	assert(hc);
-	assert(run(hc, NULL, https, &host, &port, &req, &req_len) == GWP_HTTP_ERR);
+	assert(run(hc, NULL, https, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_NOT_IMPLEMENTED);
 	gwp_http_conn_free(hc);
 
 	hc = gwp_http_conn_alloc();
 	assert(hc);
-	assert(run(hc, NULL, bare, &host, &port, &req, &req_len) == GWP_HTTP_ERR);
+	assert(proc(hc, NULL, bare, &host, &port, &req, &req_len, NULL) ==
+	       GWP_HTTP_BAD_REQUEST);
 	gwp_http_conn_free(hc);
 
 	/* Any method token is forwarded, spelt as the client sent it. */
@@ -1067,6 +1070,88 @@ static void test_errors(void)
 			    "Connection: close\r\n\r\n"));
 	gwp_http_conn_free(hc);
 
+	PRTEST_OK();
+}
+
+/*
+ * A request that is recognisably HTTP is answered, not dropped: 400 for a
+ * malformed request line or field line or a target with no usable authority,
+ * 501 for one this proxy does not serve, 505 for another HTTP version. One
+ * empty line before the request line is skipped, and HTTP/1.x above 1.1 is
+ * taken for HTTP/1.1.
+ */
+static void test_req_errors(void)
+{
+	static const struct {
+		const char	*in;
+		int		want;
+	} cases[] = {
+		{ "GET http://h/ HTTP/1.1\r\nX: a\r\n  b\r\n\r\n",
+		  GWP_HTTP_BAD_REQUEST },
+		{ "GET http://h/ HTTP/1.1\r\nHost : x\r\n\r\n",
+		  GWP_HTTP_BAD_REQUEST },
+		{ "GET http://h/ HTTP/1.1\r\nX: a\x01b\r\n\r\n",
+		  GWP_HTTP_BAD_REQUEST },
+		{ "GET http://h/ HTTP/1.1\r\n\xff: 1\r\n\r\n",
+		  GWP_HTTP_BAD_REQUEST },
+		{ "GET http://h/ HTTP/1.1\r\nX: a\rb\r\n\r\n",
+		  GWP_HTTP_BAD_REQUEST },
+		{ "GET  http://h/ HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET http://h/\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET http://h/ HTTP/1.1 \r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET http://h/ HTTP/1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET http://h/ HTTP/1.10\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET http://h/ http/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET foo HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET http://h:/ HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET http://:80/ HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET http:/// HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET http://u@/ HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "GET http://[::1/ HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "OPTIONS foo HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "CONNECT h HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "CONNECT h: HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "CONNECT :1 HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "CONNECT [::1] HTTP/1.1\r\n\r\n", GWP_HTTP_BAD_REQUEST },
+		{ "\r\n\r\nGET http://h/ HTTP/1.1\r\n\r\n", GWP_HTTP_ERR },
+		{ "GET / HTTP/1.1\r\nHost: h\r\n\r\n", GWP_HTTP_NOT_IMPLEMENTED },
+		{ "GET https://h/ HTTP/1.1\r\n\r\n", GWP_HTTP_NOT_IMPLEMENTED },
+		{ "GET ftp://h/ HTTP/1.1\r\n\r\n", GWP_HTTP_NOT_IMPLEMENTED },
+		{ "OPTIONS * HTTP/1.1\r\n\r\n", GWP_HTTP_NOT_IMPLEMENTED },
+		{ "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", GWP_HTTP_BAD_VERSION },
+		{ "GET http://h/ HTTP/2.0\r\n\r\n", GWP_HTTP_BAD_VERSION },
+		{ "GET http://h/ HTTP/3.0\r\n\r\n", GWP_HTTP_BAD_VERSION },
+		{ "GET http://h/ HTTP/0.9\r\n\r\n", GWP_HTTP_BAD_VERSION },
+		{ "GET http://h/ HTTP/1.2\r\n\r\n", GWP_HTTP_FORWARD },
+		{ "GET http://h/ HTTP/1.9\r\n\r\n", GWP_HTTP_FORWARD },
+		{ "\r\nGET http://h/ HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD },
+		{ "\nGET http://h/ HTTP/1.1\r\n\r\n", GWP_HTTP_FORWARD },
+		{ "\r\nCONNECT h:1 HTTP/1.1\r\n\r\n", GWP_HTTP_CONNECT },
+	};
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req;
+	size_t i, req_len;
+	int r;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		r = proc(hc, NULL, cases[i].in, &host, &port, &req, &req_len,
+			 NULL);
+		if (r != cases[i].want)
+			fprintf(stderr, "case %zu: %d, want %d\n", i, r,
+				cases[i].want);
+		assert(r == cases[i].want);
+		/* What is forwarded is HTTP/1.1, the empty line gone. */
+		if (r == GWP_HTTP_FORWARD)
+			assert(!strcmp(req, "GET / HTTP/1.1\r\nHost: h\r\n"
+					    "Connection: close\r\n\r\n"));
+		/* Whatever the client sent before the tunnel is dropped. */
+		if (r == GWP_HTTP_CONNECT)
+			assert(req_len == strlen(cases[i].in));
+		gwp_http_conn_free(hc);
+	}
 	PRTEST_OK();
 }
 
@@ -1133,6 +1218,14 @@ static void test_req_start(void)
 		RS("GET http://h/", GWP_HTTP_NEED_MORE),
 		RS("GET \x01\x02\x03", GWP_HTTP_NEED_MORE),
 		RS("\r", GWP_HTTP_NEED_MORE),
+		RS("\r\n", GWP_HTTP_NEED_MORE),
+		RS("\n", GWP_HTTP_NEED_MORE),
+		RS("\r\nGET", GWP_HTTP_NEED_MORE),
+		RS("\r\nGET http://h/ HTTP/1.1\r\n", GWP_HTTP_NEED_MORE),
+		/* One empty line is all that is skipped. */
+		RS("\r\n\r\n", GWP_HTTP_ERR),
+		RS("\n\n", GWP_HTTP_ERR),
+		RS("\r\n ", GWP_HTTP_ERR),
 	};
 #undef RS
 	size_t i;
@@ -1903,6 +1996,7 @@ int main(void)
 		test_need_more();
 		test_errors();
 		test_req_start();
+		test_req_errors();
 		test_field_obs_text();
 		test_duplicate_field();
 		test_underscore_alias();

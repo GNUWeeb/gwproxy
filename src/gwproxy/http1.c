@@ -247,6 +247,7 @@ static int add_field(struct gwnet_http_hdr_fields *ff, uint32_t koff,
  * @return     0 on success,
  *             -EAGAIN if more data is needed,
  *             -EINVAL if the request line is malformed,
+ *             -EPROTONOSUPPORT if it is for an HTTP version other than 1.x,
  *             -E2BIG  if the request line exceeds the maximum length.
  */
 static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
@@ -273,9 +274,31 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	const char *uri, *qs, *path, *buf = &ctx->buf[ctx->off];
 	uint32_t uri_len, qs_len, path_len;
 	uint8_t method_code, version_code;
+	char major;
 
 	if (!len)
 		return -EAGAIN;
+
+	/*
+	 * RFC 9112 Section 2.2: a server SHOULD ignore at least one empty
+	 * line received before the request line. One is skipped, CRLF or a
+	 * bare LF; another is refused like any other byte that cannot start
+	 * a method.
+	 */
+	if (!ctx->tot_len && (buf[0] == '\r' || buf[0] == '\n')) {
+		off = buf[0] == '\r' ? 2 : 1;
+		if (len < off)
+			return -EAGAIN;
+		if (off == 2 && buf[1] != '\n')
+			return -EINVAL;
+		ctx->off += off;
+		ctx->tot_len += off;
+		buf += off;
+		len -= off;
+		off = 0;
+		if (!len)
+			return -EAGAIN;
+	}
 
 	/*
 	 * The method is a token (RFC 9110 Section 9.1), and case-sensitive.
@@ -315,32 +338,6 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 		return -E2BIG;
 	if (off >= len)
 		return -EAGAIN;
-
-	/*
-	 * Per RFC 7230, Section 5.3.1:
-	 * When making a request directly to an origin server,
-	 * other than a CONNECT or server-wide OPTIONS request
-	 * a client MUST send only the absolute path and query
-	 * components of the target URI as the request-target.
-	 * If the target URI's path component is empty, the
-	 * client MUST send "/" as the path within the
-	 * origin-form of request-target.
-	 */
-	if (method_code != GWNET_HTTP_METHOD_CONNECT &&
-	    method_code != GWNET_HTTP_METHOD_OPTIONS) {
-		/*
-		 * Origin-form starts with '/'. absolute-form (which a client
-		 * uses to address a forwarding proxy, RFC 7230 Section 5.3.2)
-		 * starts with a scheme, i.e. an alphabetic character; it is
-		 * validated in full once the whole request-target has been
-		 * captured below.
-		 */
-		if (buf[off] != '/' && !is_alpha(buf[off]))
-			return -EINVAL;
-	} else {
-		if (!is_vchar(buf[off]))
-			return -EINVAL;
-	}
 
 	path = uri = &buf[off];
 	qs = NULL;
@@ -389,6 +386,10 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 		}
 	}
 
+	/* Two spaces in a row: no request-target at all. */
+	if (!uri_len)
+		return -EINVAL;
+
 	/*
 	 * Trim trailing slashes from the path.
 	 *
@@ -401,6 +402,75 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 			break; /* Keep at least one slash. */
 		path_len--;
 	}
+
+	/*
+	 * The version: "HTTP/" DIGIT "." DIGIT (RFC 9112 Section 2.3). A
+	 * higher minor version than 1 is HTTP/1.1 to us (RFC 9110 Section
+	 * 2.5); another major version, the HTTP/2 connection preface "PRI *
+	 * HTTP/2.0" among them, is one this parser does not speak, which is
+	 * told apart from a malformed line (-EPROTONOSUPPORT).
+	 */
+	reml = len - off;
+	cmpl = min_st(reml, 5);
+	if (memcmp(&buf[off], "HTTP/", cmpl))
+		return -EINVAL;
+	if (cmpl < 5)
+		return -EAGAIN;
+	off += 5;
+
+	/*
+	 * Check exceeding length upfront, we know that
+	 * the rest of the version is always 3 characters
+	 * long followed by a CRLF (or just LF).
+	 */
+	if (ctx->tot_len + off + 3 + 1 >= ctx->max_len)
+		return -E2BIG;
+
+	for (i = 0; i < 3; i++) {
+		if (off + i >= len)
+			return -EAGAIN;
+		if (i == 1 ? buf[off + i] != '.' :
+		    (buf[off + i] < '0' || buf[off + i] > '9'))
+			return -EINVAL;
+	}
+	major = buf[off];
+	version_code = buf[off + 2] == '0' ? GWNET_HTTP_VER_1_0 :
+					     GWNET_HTTP_VER_1_1;
+	off += 3;
+	if (off >= len)
+		return -EAGAIN;
+
+	/*
+	 * After the HTTP version, expect a CRLF. But the CR
+	 * is optional, so we can also accept just LF.
+	 */
+	if (buf[off] == '\r') {
+		if (++off >= len)
+			return -EAGAIN;
+	}
+
+	if (buf[off] != '\n')
+		return -EINVAL;
+
+	++off;
+	if (ctx->tot_len + off >= ctx->max_len)
+		return -E2BIG;
+
+	if (major != '1')
+		return -EPROTONOSUPPORT;
+
+	/*
+	 * Per RFC 9112 Section 3.2: a request to an origin server, other than
+	 * a CONNECT or server-wide OPTIONS request, carries the absolute path
+	 * and query (origin-form, starting with '/'). absolute-form, which a
+	 * client uses to address a forwarding proxy (Section 3.2.2), starts
+	 * with a scheme, i.e. an alphabetic character; the proxy layer
+	 * validates the rest.
+	 */
+	if (method_code != GWNET_HTTP_METHOD_CONNECT &&
+	    method_code != GWNET_HTTP_METHOD_OPTIONS && uri[0] != '/' &&
+	    !is_alpha(uri[0]))
+		return -EINVAL;
 
 	/*
 	 * A non-origin-form target on a non-CONNECT/OPTIONS request must be
@@ -425,58 +495,6 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 		if (!abs_form)
 			return -EINVAL;
 	}
-
-	/*
-	 * Parse the HTTP version. Only support HTTP/1.0 and HTTP/1.1.
-	 */
-	reml = len - off;
-	cmpl = min_st(reml, 7);
-	if (memcmp(&buf[off], "HTTP/1.", cmpl))
-		return -EINVAL;
-	if (cmpl < 7)
-		return -EAGAIN;
-
-	off += 7;
-	if (off >= len)
-		return -EAGAIN;
-
-	/*
-	 * Check exceeding length upfront, we know that
-	 * the HTTP version is always 8 characters long
-	 * followed by a CRLF (or just LF).
-	 */
-	if (ctx->tot_len + off + 1 + 1 >= ctx->max_len)
-		return -E2BIG;
-
-	switch (buf[off]) {
-	case '0':
-		version_code = GWNET_HTTP_VER_1_0;
-		break;
-	case '1':
-		version_code = GWNET_HTTP_VER_1_1;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	if (++off >= len)
-		return -EAGAIN;
-
-	/*
-	 * After the HTTP version, expect a CRLF. But the CR
-	 * is optional, so we can also accept just LF.
-	 */
-	if (buf[off] == '\r') {
-		if (++off >= len)
-			return -EAGAIN;
-	}
-
-	if (buf[off] != '\n')
-		return -EINVAL;
-
-	++off;
-	if (ctx->tot_len + off >= ctx->max_len)
-		return -E2BIG;
 
 	/* Where they are in the header; @path starts with @uri. */
 	hdr->uri_off = (uint32_t)(ctx->off + (size_t)(uri - buf));
@@ -962,6 +980,7 @@ static int hdr_translate_ret_err(struct gwnet_http_hdr_pctx *ctx, int r)
 		break;
 	case -EINVAL:
 	case -EEXIST:
+	case -EPROTONOSUPPORT:
 		ctx->err = GWNET_HTTP_HDR_ERR_MALFORMED;
 		break;
 	case -E2BIG:
@@ -1828,7 +1847,7 @@ static void test_req_hdr_invalid_version(void)
 	ctx.buf = buf;
 	ctx.len = len;
 	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
-	assert(r == -EINVAL);
+	assert(r == -EPROTONOSUPPORT);
 	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
 	gwnet_http_req_hdr_free(&hdr);
 	gwnet_http_hdr_pctx_free(&ctx);

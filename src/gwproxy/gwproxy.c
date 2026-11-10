@@ -7078,6 +7078,36 @@ static int http_reject_bad_request(struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Queue the HTTP 501 reply for a request this proxy does not serve
+ * (GWP_HTTP_NOT_IMPLEMENTED), or the 505 for an HTTP version other than 1.x
+ * (GWP_HTTP_BAD_VERSION). Same mechanism as the 407 above. Returns a negative
+ * error so the caller drops the connection.
+ */
+static int http_reject_not_implemented(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_not_implemented_reply(
+			gcp->target.buf + gcp->target.len,
+			gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -EOPNOTSUPP;
+}
+
+static int http_reject_bad_version(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_bad_version_reply(
+			gcp->target.buf + gcp->target.len,
+			gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -EPROTONOSUPPORT;
+}
+
+/*
  * A port as an HTTP authority carries it: decimal digits only, no sign, no
  * service name, at most 65535.
  */
@@ -7361,8 +7391,16 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		pr_dbg(&ctx->lh, "HTTP request header too large (fd=%d)",
 		       gcp->client.fd);
 		return http_reject_too_large(gcp);
+	case GWP_HTTP_NOT_IMPLEMENTED:
+		pr_dbg(&ctx->lh, "HTTP request not served (fd=%d)",
+		       gcp->client.fd);
+		return http_reject_not_implemented(gcp);
+	case GWP_HTTP_BAD_VERSION:
+		pr_dbg(&ctx->lh, "HTTP version not supported (fd=%d)",
+		       gcp->client.fd);
+		return http_reject_bad_version(gcp);
 	default:	/* GWP_HTTP_ERR */
-		pr_dbg(&ctx->lh, "Invalid HTTP request (fd=%d)", gcp->client.fd);
+		pr_dbg(&ctx->lh, "Not an HTTP request (fd=%d)", gcp->client.fd);
 		return -EINVAL;
 	}
 }

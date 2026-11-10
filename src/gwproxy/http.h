@@ -30,11 +30,15 @@ enum gwp_http_result {
 	GWP_HTTP_FORWARD,	/* Forward request; host/port set, the request
 				 * rewritten in place. */
 	GWP_HTTP_NEED_AUTH,	/* Proxy auth required/failed; reply 407. */
-	GWP_HTTP_ERR,		/* Malformed or unsupported; tear the conn down. */
-	GWP_HTTP_BAD_REQUEST,	/* Well-formed but unacceptable (e.g. a field
-				 * that may appear once is repeated); reply
-				 * 400. */
+	GWP_HTTP_ERR,		/* Not HTTP at all; tear the conn down. */
+	GWP_HTTP_BAD_REQUEST,	/* Malformed, or well-formed but unacceptable
+				 * (e.g. a field that may appear once is
+				 * repeated); reply 400. */
 	GWP_HTTP_TOO_LARGE,	/* Header too long or too many fields; 431. */
+	GWP_HTTP_NOT_IMPLEMENTED, /* A request this proxy does not serve:
+				 * origin-form, a scheme other than http://;
+				 * reply 501. */
+	GWP_HTTP_BAD_VERSION,	/* An HTTP version other than 1.x; 505. */
 };
 
 /*
@@ -221,6 +225,21 @@ int gwp_http_build_gateway_timeout_reply(void *out, size_t out_cap);
  * @return	Number of bytes written to @out, or -ENOBUFS if too small.
  */
 int gwp_http_build_too_large_reply(void *out, size_t out_cap);
+
+/**
+ * Build a "501 Not Implemented" reply, for a request this proxy does not
+ * serve (GWP_HTTP_NOT_IMPLEMENTED).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_not_implemented_reply(void *out, size_t out_cap);
+
+/**
+ * Build a "505 HTTP Version Not Supported" reply (GWP_HTTP_BAD_VERSION).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_bad_version_reply(void *out, size_t out_cap);
 
 /**
  * Build an upstream "CONNECT <authority> HTTP/1.1" request (used when chaining

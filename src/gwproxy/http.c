@@ -595,7 +595,7 @@ static int set_req_framing(struct gwp_http_conn *hc)
  * takes the place of the original header in @buf (*@len of @cap bytes) and
  * whatever followed the header moves along behind it. *@len and *@hdr_len_p
  * are set to the new lengths. Returns GWP_HTTP_FORWARD, GWP_HTTP_BAD_REQUEST,
- * GWP_HTTP_TOO_LARGE or GWP_HTTP_ERR.
+ * GWP_HTTP_NOT_IMPLEMENTED, GWP_HTTP_TOO_LARGE or GWP_HTTP_ERR.
  */
 /* Not inlined: its stack frame must not add up with its callers'. */
 static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
@@ -613,9 +613,19 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 	size_t i;
 	int r;
 
-	/* Only absolute-form http:// URIs are supported (no TLS termination). */
-	if (hc->req_hdr.uri_len < 7 || strncasecmp(uri, "http://", 7))
-		return GWP_HTTP_ERR;
+	/*
+	 * Only absolute-form http:// URIs are supported (no TLS termination).
+	 * Origin-form ("GET / HTTP/1.1"), asterisk-form ("OPTIONS *") and
+	 * other schemes ask for what this proxy does not do; anything else
+	 * an OPTIONS request may carry is no request-target at all.
+	 */
+	if (hc->req_hdr.uri_len < 7 || strncasecmp(uri, "http://", 7)) {
+		if (uri[0] == '/' ||
+		    (hc->req_hdr.uri_len == 1 && uri[0] == '*') ||
+		    memmem(uri, hc->req_hdr.uri_len, "://", 3))
+			return GWP_HTTP_NOT_IMPLEMENTED;
+		return GWP_HTTP_BAD_REQUEST;
+	}
 
 	authority = uri + 7;
 
@@ -632,7 +642,7 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 	       *slash != '#')
 		slash++;
 	if (slash == authority || (slash < uri_end && *slash == '#'))
-		return GWP_HTTP_ERR;		/* empty authority, fragment */
+		return GWP_HTTP_BAD_REQUEST;	/* empty authority, fragment */
 	auth_len = (size_t)(slash - authority);
 	if (slash < uri_end) {
 		path = slash;
@@ -666,13 +676,13 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 					  auth_len, out, max);
 	}
 
-	if (w == -EBADMSG)
+	if (w == -EBADMSG || w == -EINVAL)	/* -EINVAL: no host */
 		r = GWP_HTTP_BAD_REQUEST;
 	else if (w < 0)
 		r = GWP_HTTP_ERR;
-	else if (set_target(hc, authority, auth_len, host_p, port_p,
-			    default_port) < 0)
-		r = GWP_HTTP_ERR;
+	else if ((r = set_target(hc, authority, auth_len, host_p, port_p,
+				 default_port)) < 0)
+		r = r == -EINVAL ? GWP_HTTP_BAD_REQUEST : GWP_HTTP_ERR;
 	else if ((size_t)w > cap || rest > cap - (size_t)w)
 		r = GWP_HTTP_TOO_LARGE;		/* does not fit the buffer */
 	else
@@ -806,14 +816,21 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	}
 	*hdr_len_p = ctx->off;
 	/*
-	 * A repeated field that may appear only once (Host, Content-Length,
-	 * ...) is a well-formed line in an unacceptable request; say so
-	 * rather than drop the connection without a word.
+	 * Input that did not even start like a request line is not HTTP,
+	 * and is not answered: the client speaks something else. Past that
+	 * point the client is told what is wrong rather than dropped without
+	 * a word: a malformed request line or field line (RFC 9112 Sections
+	 * 3 and 5) or a repeated field that may appear only once (Host,
+	 * Content-Length, ...) gets 400, another HTTP version 505.
 	 */
-	if (r == -EEXIST)
+	if (r == -ENOMEM || (r < 0 && hc->start_st != RS_HTTP))
+		r = GWP_HTTP_ERR;
+	else if (r == -EEXIST || r == -EINVAL)
 		r = GWP_HTTP_BAD_REQUEST;
 	else if (r == -E2BIG)
 		r = GWP_HTTP_TOO_LARGE;
+	else if (r == -EPROTONOSUPPORT)
+		r = GWP_HTTP_BAD_VERSION;
 	else if (r < 0)
 		r = GWP_HTTP_ERR;
 	else
@@ -890,9 +907,15 @@ static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
 					hdr_len_p);
 
 	/* CONNECT: the target is an authority-form "host:port" to tunnel to. */
-	if (set_target(hc, gwnet_http_req_uri(req), req->uri_len, host_p,
-		       port_p, NULL) < 0)
+	switch (set_target(hc, gwnet_http_req_uri(req), req->uri_len, host_p,
+			   port_p, NULL)) {
+	case 0:
+		break;
+	case -EINVAL:
+		return GWP_HTTP_BAD_REQUEST;	/* no port, empty host, ... */
+	default:
 		return GWP_HTTP_ERR;
+	}
 
 	hc->is_forward = false;
 	return GWP_HTTP_CONNECT;
@@ -1635,6 +1658,38 @@ int gwp_http_build_too_large_reply(void *out, size_t out_cap)
 {
 	static const char resp[] =
 		"HTTP/1.1 431 Request Header Fields Too Large\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_not_implemented_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 501 Not Implemented\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_bad_version_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 505 HTTP Version Not Supported\r\n"
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n"
 		"\r\n";
