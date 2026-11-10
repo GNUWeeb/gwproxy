@@ -5528,6 +5528,7 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
 		return 0;
 	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
+	gcp->client.last_reply = true;
 	if (timed_out)
 		err = -ETIMEDOUT;
 
@@ -5593,6 +5594,7 @@ int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
 		return -EACCES;
 	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
+	gcp->client.last_reply = true;
 
 	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
 		gwp_upstream_dst_str(gcp), ip_to_str(&gcp->client_addr),

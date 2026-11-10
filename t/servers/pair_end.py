@@ -10,6 +10,7 @@
 #   pair_end.py linger-load <clients> <proxy_port> <proxy_pid>
 #   pair_end.py two-way <mode> <proxy_port> <target_port> <ends>
 #   pair_end.py reset-idle <mode> <dir> <proxy_port> <target_port>
+#   pair_end.py tls-reply <how> <proxy_port> <target_port>
 #
 # <mode> is how the client reaches the target listening on <target_port>:
 # plain (the proxy runs with --target pointing there), socks5 or http (a
@@ -45,6 +46,13 @@
 # "reset-idle": the peer named by <dir> (tgt or cli) resets a tunnel with
 # nothing pending. The other side must see a reset as well, not an EOF.
 #
+# "tls-reply": a TLS client that takes a stream without close_notify for cut
+# (Python's suppress_ragged_eofs=False) is refused: <how> is "407" (no
+# credentials), "400" (two Host fields), "502" (CONNECT to <target_port>,
+# where nothing listens), "s5" (SOCKS5 CONNECT there, REP 0x05) or "fwd-rst"
+# (a forwarded GET to an origin on <target_port> that resets, 502). It must
+# read the reply, then a close_notify.
+#
 # "linger-load": <clients> clients send a forwarding POST to a proxy that
 # wants credentials, and keep sending the body for 4 s, a little at a time,
 # while they read. Each must get its 407 and an EOF; the proxy must hold
@@ -58,6 +66,7 @@ import fcntl
 import os
 import select
 import socket
+import ssl
 import struct
 import sys
 import threading
@@ -361,6 +370,58 @@ def reset_idle(mode, d, pport, tport):
                       (mode, d, len(got), how))
 
 
+def tls_reply(how, pport, tport):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ls = th = None
+    if how == "fwd-rst":
+        ls = listener(tport)
+        th = threading.Thread(target=origin, args=(ls, "rst", 1),
+                              daemon=True)
+        th.start()
+    req, want = {
+        "407": (b"GET http://127.0.0.1:%d/ HTTP/1.1\r\nHost: x\r\n\r\n",
+                b"HTTP/1.1 407 "),
+        "400": (b"GET http://127.0.0.1:%d/ HTTP/1.1\r\nHost: a\r\n"
+                b"Host: b\r\n\r\n", b"HTTP/1.1 400 "),
+        "502": (b"CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: x\r\n\r\n",
+                b"HTTP/1.1 502 "),
+        "s5": (b"\x05\x01\x00\x05\x01\x00\x01\x7f\x00\x00\x01%s",
+               b"\x05\x00\x05\x05"),
+        "fwd-rst": (b"GET http://127.0.0.1:%d/ HTTP/1.1\r\nHost: x\r\n\r\n",
+                    b"HTTP/1.1 502 "),
+    }[how]
+    req = req % (struct.pack("!H", tport) if how == "s5" else tport)
+    raw = socket.create_connection(("127.0.0.1", pport), timeout=TIMEOUT)
+    s = ctx.wrap_socket(raw, suppress_ragged_eofs=False)
+    s.sendall(req)
+    got, end = b"", None
+    while end is None:
+        try:
+            d = s.recv(65536)
+        except ssl.SSLEOFError:
+            end = "an EOF without close_notify"
+        except ConnectionResetError:
+            end = "a reset"
+        except socket.timeout:
+            end = "a timeout"
+        except ssl.SSLError as e:
+            end = "TLS error %s" % e
+        else:
+            if not d:
+                end = "close_notify"
+            got += d
+    s.close()
+    if th:
+        th.join(TIMEOUT)
+        ls.close()
+    if not got.startswith(want):
+        errors.append("%s: got %r, then %s" % (how, got[:40], end))
+    elif end != "close_notify":
+        errors.append("%s: the reply, then %s" % (how, end))
+
+
 def nfds(pid):
     return len(os.listdir("/proc/%d/fd" % pid))
 
@@ -441,6 +502,8 @@ def main():
         two_way(a[1], int(a[2]), int(a[3]), a[4].split(","))
     elif a[0] == "reset-idle":
         reset_idle(a[1], a[2], int(a[3]), int(a[4]))
+    elif a[0] == "tls-reply":
+        tls_reply(a[1], int(a[2]), int(a[3]))
     elif a[0] == "linger-load":
         linger_load(int(a[1]), int(a[2]), int(a[3]))
     elif a[0] == "origin-reset":

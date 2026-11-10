@@ -1210,6 +1210,16 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		}
 	}
 
+	/*
+	 * The proxy's last reply to the client is all in the engine now: its
+	 * close_notify goes right behind it, in the same send. Not before:
+	 * the engine refuses to encrypt anything once it has been shut down.
+	 */
+	if (unlikely(gcp->client.last_reply) && !gcp->target.len) {
+		gwp_ssl_shutdown(ssl);
+		t->closing = true;
+	}
+
 	n = gwp_ssl_bio_read(ssl, t->tx, sizeof(t->tx));
 	t->tx_len = (n > 0) ? (uint32_t)n : 0;
 	t->tx_sent = 0;
@@ -3760,6 +3770,9 @@ static int process_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * reply would never be sent.
 	 */
 	r = chk_prot_result(w, gcp, r);
+	/* Refused: what is queued is the client's last reply. */
+	if (r < 0)
+		gcp->client.last_reply = true;
 	if (gcp->target.len)
 		prep_send_client(w, gcp);
 

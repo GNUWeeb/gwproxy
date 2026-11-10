@@ -1499,6 +1499,14 @@ again:
 		return -EIO;
 	}
 
+	/*
+	 * The proxy's last reply to the client is all in the engine now: its
+	 * close_notify goes right behind it, in the same flush. Not before:
+	 * the engine refuses to encrypt anything once it has been shut down.
+	 */
+	if (unlikely(dst->last_reply) && !src->len)
+		gwp_ssl_shutdown(dst->tls);
+
 	while ((p = gwp_ssl_bio_peek(dst->tls, &plen)) != NULL) {
 		n = __sys_send(dst->fd, p, plen, MSG_NOSIGNAL);
 		if (n > 0) {
@@ -2497,12 +2505,15 @@ static int conn_wr_flushed(struct gwp_conn __unused *c)
  * (conn_note_reset()), a TLS @o gets no close_notify, which would turn the
  * abort into a clean end: once the ciphertext it is owed has left, the pair
  * goes down as it did at the reset before, and gwp_conn_pair_abort_target()
- * deals with it. A plaintext @o is closed as for any end of @c's stream.
+ * deals with it. Not when the HTTP forwarding filter answered 502 in place
+ * of the reset origin's response (gwp_conn_reset_passed()): that reply is
+ * complete. A plaintext @o is closed as for any end of @c's stream.
  */
-static int conn_end_flushed(struct gwp_conn *c, struct gwp_conn *o)
+static int conn_end_flushed(struct gwp_conn_pair __unused *gcp,
+			    struct gwp_conn *c, struct gwp_conn *o)
 {
 #ifdef CONFIG_HTTPS
-	if (c->rst && o->tls)
+	if (o->tls && gwp_conn_reset_passed(gcp, c))
 		return gwp_ssl_bio_pending(o->tls) > 0 ? 0 : -ECONNRESET;
 #else
 	(void)c;
@@ -2604,7 +2615,7 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (gwp_upstream_tls_cut(gcp))
 			return -ECONNRESET;
 #endif
-		r = conn_end_flushed(&gcp->target, &gcp->client);
+		r = conn_end_flushed(gcp, &gcp->target, &gcp->client);
 		if (r < 0)
 			return r;
 		/*
@@ -2637,7 +2648,7 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * nothing, though, so the pair goes now.
 		 */
 		if (gcp->is_target_alive) {
-			r = conn_end_flushed(&gcp->client, &gcp->target);
+			r = conn_end_flushed(gcp, &gcp->client, &gcp->target);
 			if (r < 0)
 				return r;
 			if (r) {
@@ -3762,6 +3773,9 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 	if (r == -EAGAIN)
 		r = 0;
 
+	/* Refused: what is queued is the client's last reply. */
+	if (r < 0)
+		gcp->client.last_reply = true;
 	if (client_reply_pending(gcp)) {
 		ret = __do_send(&gcp->target, &gcp->client);
 		if (ret < 0)

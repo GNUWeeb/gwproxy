@@ -463,6 +463,13 @@ struct gwp_conn {
 	bool		rst;
 
 	/*
+	 * The client only: what is queued for it is the last thing the proxy
+	 * sends it, its failure reply. A TLS client gets a close_notify right
+	 * behind it, in the same flush (do_send_tls(), send_client_tls()).
+	 */
+	bool		last_reply;
+
+	/*
 	 * TLS state for this endpoint, NULL for a plaintext one: the client's
 	 * when it connected with TLS (--tls-cert), the target's when it is an
 	 * https:// upstream proxy. Once set and the handshake has completed,
