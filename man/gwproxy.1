@@ -1452,7 +1452,8 @@ host and port;
 of ordinary absolute\-form requests such as "GET http://host/path", which
 gwproxy rewrites to origin form, fetches from the origin and relays back, one
 request per connection. Any method is forwarded, spelt as the client sent it:
-extension methods such as WebDAV's PROPFIND as well.
+extension methods such as WebDAV's PROPFIND as well. A fragment ("#...") in
+the URI is not part of the request and is not sent on.
 .PP
 A connection whose first bytes cannot start a request line, a method token
 followed by a space after at most one empty line, is closed at once without a

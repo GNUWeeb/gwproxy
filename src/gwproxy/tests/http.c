@@ -300,11 +300,34 @@ static void test_forward_authority_end(void)
 	assert(!strncmp(req, "GET /a@127.0.0.1/ HTTP/1.1\r\n", 28));
 	gwp_http_conn_free(hc);
 
-	/* A fragment straight after the authority leaves nothing to send. */
+	/*
+	 * A fragment is never sent on: straight after the authority it
+	 * leaves the empty path, "/", and after a path or query it goes.
+	 */
 	hc = gwp_http_conn_alloc();
 	assert(hc);
 	assert(run(hc, NULL, frag_at, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_BAD_REQUEST);
+	       GWP_HTTP_FORWARD);
+	assert(!strcmp(host, "evil.example"));
+	assert(!strncmp(req, "GET / HTTP/1.1\r\nHost: evil.example\r\n",
+			strlen("GET / HTTP/1.1\r\nHost: evil.example\r\n")));
+	gwp_http_conn_free(hc);
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, "GET http://h/p?q#f?g/h HTTP/1.1\r\n\r\n", &host,
+		   &port, &req, &req_len) == GWP_HTTP_FORWARD);
+	assert(!strncmp(req, "GET /p?q HTTP/1.1\r\nHost: h\r\n",
+			strlen("GET /p?q HTTP/1.1\r\nHost: h\r\n")));
+	gwp_http_conn_free(hc);
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, "GET http://h:81?#a HTTP/1.1\r\n\r\n", &host,
+		   &port, &req, &req_len) == GWP_HTTP_FORWARD);
+	assert(!strcmp(port, "81"));
+	assert(!strncmp(req, "GET /? HTTP/1.1\r\nHost: h:81\r\n",
+			strlen("GET /? HTTP/1.1\r\nHost: h:81\r\n")));
 	gwp_http_conn_free(hc);
 
 	PRTEST_OK();

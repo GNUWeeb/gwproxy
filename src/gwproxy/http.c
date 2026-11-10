@@ -607,7 +607,7 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 	const char *uri_end = uri + hc->req_hdr.uri_len;
 	size_t hdr_len = hc->ctx_hdr.off, rest = *len - hdr_len;
 	size_t max = hdr_len * 2 + 64, path_len, auth_len;
-	const char *authority, *slash, *path;
+	const char *authority, *slash, *path, *frag;
 	char sbuf[REQ_FAST_MAX], *out = sbuf;
 	ssize_t w;
 	size_t i;
@@ -634,16 +634,21 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 	 * it only at '/' made "http://a?@b/" or "http://a#@b/" connect to "b",
 	 * which any other URL parser reads as host "a". The origin-form target
 	 * is the path and query from there, with "/" for an empty path (RFC
-	 * 9112 s3.2.1). A fragment is never part of a request-target, and one
-	 * right after the authority leaves no path to send: refuse it.
+	 * 9112 s3.2.1). A fragment is never part of a request-target: that is
+	 * the absolute path and the query, and a '#' is in neither. It is cut
+	 * off, as clients do before they send a URI, and one right after the
+	 * authority leaves the path empty.
 	 */
 	slash = authority;
 	while (slash < uri_end && *slash != '/' && *slash != '?' &&
 	       *slash != '#')
 		slash++;
-	if (slash == authority || (slash < uri_end && *slash == '#'))
-		return GWP_HTTP_BAD_REQUEST;	/* empty authority, fragment */
+	if (slash == authority)
+		return GWP_HTTP_BAD_REQUEST;	/* empty authority */
 	auth_len = (size_t)(slash - authority);
+	frag = memchr(slash, '#', (size_t)(uri_end - slash));
+	if (frag)
+		uri_end = frag;
 	if (slash < uri_end) {
 		path = slash;
 		path_len = (size_t)(uri_end - slash);
