@@ -82,11 +82,14 @@ for name, req, want in (
     no(name, req, want)
 
 ok('HTTP/1.2', b'GET %s HTTP/1.2\r\n\r\n' % u,
-   b'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' % auth)
+   b'GET / HTTP/1.1\r\nHost: %s\r\nVia: 1.1 gwproxy\r\n'
+   b'Connection: close\r\n\r\n' % auth)
 ok('leading CRLF', b'\r\nGET %s HTTP/1.1\r\n\r\n' % u,
-   b'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' % auth)
+   b'GET / HTTP/1.1\r\nHost: %s\r\nVia: 1.1 gwproxy\r\n'
+   b'Connection: close\r\n\r\n' % auth)
 ok('leading LF', b'\nGET %s HTTP/1.0\r\n\r\n' % u,
-   b'GET / HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n' % auth)
+   b'GET / HTTP/1.0\r\nHost: %s\r\nVia: 1.0 gwproxy\r\n'
+   b'Connection: close\r\n\r\n' % auth)
 
 sys.exit(1 if errors else 0)
 EOF

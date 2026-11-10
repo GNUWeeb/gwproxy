@@ -19,7 +19,8 @@ import http_check as hc
 
 port = int(sys.argv[1])
 errors = 0
-CC = b'Connection: close\r\nProxy-Connection: close\r\n\r\n'
+CC = (b'Via: 1.1 gwproxy\r\nConnection: close\r\n'
+      b'Proxy-Connection: close\r\n\r\n')
 
 for name, res, want in (
         ('CL and chunked',

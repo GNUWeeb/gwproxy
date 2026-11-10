@@ -229,9 +229,12 @@ may not pass on, see
 .BR \-\-udp\-associate )
 does not count, so sending junk to the relay port does not keep a quiet
 association open.
-The check runs on a coarse per\-worker clock, compares whole seconds and runs
-about once a second, so a pair can outlive the timeout by up to about two
-seconds.
+The check is a timer per pair, not a sweep: it fires when the timeout has
+passed since the tunnel or association came up, and while anything has moved
+since, it looks again when the timeout has passed since the last activity.
+Activity is stamped in whole seconds on a coarse per\-worker clock, and a pair
+is closed only once more than the timeout has passed by those stamps, so a
+pair can outlive the timeout by up to about two seconds.
 .B 0
 (or a negative value) never closes an idle connection, which keeps long quiet
 tunnels such as SSH sessions working. Default:
@@ -1602,6 +1605,14 @@ it to them as HTTP_PROXY, which many HTTP libraries take for the proxy of their
 own outgoing requests ("httpoxy"), so the client could pick where the origin's
 requests go. No other name reaches CGI as HTTP_PROXY, so it has no alias to
 refuse.
+.PP
+gwproxy names itself in the Via field (RFC 9110 Section 7.6.3) of the request
+it forwards and of the origin's final response: "1.1 gwproxy", or "1.0
+gwproxy" for a message received as HTTP/1.0, goes at the end of the last Via
+the message carries, or in a Via of its own when it has none (or only one that
+Connection names, which is dropped). Interim (1xx) responses are passed on
+without it. A CONNECT tunnel carries whatever the client sends through it and
+gets no Via.
 .PP
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client

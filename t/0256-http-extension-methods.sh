@@ -33,8 +33,8 @@ for m, fields, body in (
     n = o.nr_reqs()
     r = hc.xact(port, b'%s http://%s/dav/x?y HTTP/1.1\r\n%s\r\n%s%s' %
                 (m, auth, fields, body, evil))
-    want = (b'%s /dav/x?y HTTP/1.1\r\nHost: %s\r\n%sConnection: close\r\n'
-            b'\r\n%s' % (m, auth, fields, body))
+    want = (b'%s /dav/x?y HTTP/1.1\r\nHost: %s\r\n%sVia: 1.1 gwproxy\r\n'
+            b'Connection: close\r\n\r\n%s' % (m, auth, fields, body))
     if not r.startswith(b'HTTP/1.1 207 Multi-Status\r\n') or \
             not r.endswith(b'\r\n\r\nmulti'):
         errors += 1

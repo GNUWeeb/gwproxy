@@ -100,7 +100,7 @@ struct gwp_http_conn {
 	size_t				res_scan;
 };
 
-_Static_assert(GWP_HTTP_REWRITE_SLACK == 1 + 1 + 1 + 20 +
+_Static_assert(GWP_HTTP_REWRITE_SLACK == 1 + 1 + 1 + 20 + 18 +
 	       2 * GWNET_HTTP_HDR_MAX_FIELDS,
 	       "GWP_HTTP_REWRITE_SLACK must match the rewrite");
 
@@ -349,6 +349,18 @@ static bool conn_toks_have(const struct conn_tok *toks, int nr, const char *k,
 	return false;
 }
 
+/*
+ * What a forwarded message adds to its Via (RFC 9110 Section 7.6.3): the
+ * version of HTTP it was received with, and this proxy's pseudonym. Both
+ * versions take the same room.
+ */
+#define VIA_HOP_LEN	(sizeof("1.1 gwproxy") - 1)
+
+static const char *via_hop(bool http10)
+{
+	return http10 ? "1.0 gwproxy" : "1.1 gwproxy";
+}
+
 /* Append @len bytes at @p to @buf (@cap bytes, @n used); false if full. */
 static bool buf_add(char *buf, size_t cap, size_t *n, const char *p,
 		    size_t len)
@@ -363,12 +375,12 @@ static bool buf_add(char *buf, size_t cap, size_t *n, const char *p,
 /*
  * Rebuild the request in origin-form into @buf (@cap bytes): the absolute-form
  * request-target is replaced by @path (a bare "?query" gets the "/" its empty
- * path stands for), hop-by-hop / connection-specific headers are dropped and
- * "Connection: close" is appended (this proxy handles one request per
- * connection). @path and @authority, the URI's authority, are passed as
- * pointer+length because they are part of the request line and not
- * NUL-terminated. Returns the length written, -E2BIG if it does not fit, or
- * another negative error.
+ * path stands for), hop-by-hop / connection-specific headers are dropped,
+ * this hop is added to Via and "Connection: close" is appended (this proxy
+ * handles one request per connection). @path and @authority, the URI's
+ * authority, are passed as pointer+length because they are part of the
+ * request line and not NUL-terminated. Returns the length written, -E2BIG if
+ * it does not fit, or another negative error.
  */
 static ssize_t build_forward_request(struct gwp_http_conn *hc,
 				     const char *path, size_t path_len,
@@ -385,7 +397,8 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 	const char *conn = gwnet_http_hdr_fields_get(ff, "Connection",
 						     &conn_len);
 	struct conn_tok toks[CONN_MAX_TOKENS];
-	size_t n = 0, i;
+	const char *via = via_hop(req->version == GWNET_HTTP_VER_1_0);
+	size_t n = 0, i, via_at = SIZE_MAX;
 	int nr_toks = 0;
 	bool ok;
 
@@ -449,6 +462,20 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 			goto too_big;
 	}
 
+	/*
+	 * This hop goes at the end of the last Via passed on, which the
+	 * parser has made the only one; with none, a Via of its own follows
+	 * the other fields.
+	 */
+	for (i = 0; i < ff->nr; i++) {
+		const struct gwnet_http_hdr_field *f = &ff->ff[i];
+		const char *k = gwnet_http_hdr_field_key(ff, f);
+
+		if (f->klen == 3 && !strncasecmp(k, "Via", 3) &&
+		    !conn_toks_have(toks, nr_toks, k, f->klen))
+			via_at = i;
+	}
+
 	for (i = 0; i < ff->nr; i++) {
 		const struct gwnet_http_hdr_field *f = &ff->ff[i];
 		const char *k = gwnet_http_hdr_field_key(ff, f);
@@ -480,6 +507,17 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 		     buf_add(buf, cap, &n, ": ", 2) &&
 		     buf_add(buf, cap, &n, gwnet_http_hdr_field_val(ff, f),
 			     f->vlen) &&
+		     (i != via_at ||
+		      ((!f->vlen || buf_add(buf, cap, &n, ", ", 2)) &&
+		       buf_add(buf, cap, &n, via, VIA_HOP_LEN))) &&
+		     buf_add(buf, cap, &n, "\r\n", 2);
+		if (!ok)
+			goto too_big;
+	}
+
+	if (via_at == SIZE_MAX) {
+		ok = buf_add(buf, cap, &n, "Via: ", 5) &&
+		     buf_add(buf, cap, &n, via, VIA_HOP_LEN) &&
 		     buf_add(buf, cap, &n, "\r\n", 2);
 		if (!ok)
 			goto too_big;
@@ -1379,8 +1417,13 @@ static int res_cl_value(const char *v, size_t len, bool *have, uint64_t *val,
 /*
  * Rewrite one complete response header (@len bytes, ending with its blank
  * line) into @out: lines are normalised to CRLF, hop-by-hop fields and fields
- * named by Connection are dropped and, for a final response, the client is
- * told that the connection closes after it. *@code is set to the status code.
+ * named by Connection are dropped and, for a final response, this hop is
+ * added to Via and the client is told that the connection closes after it.
+ * *@code is set to the status code.
+ *
+ * An interim response gets no Via of ours: it is passed on as it is, as a run
+ * of them may fill the target buffer, whose reads leave room only for what
+ * the one final response grows by (HTTP_FWD_RES_SLACK).
  *
  * Returns the length written, -EBADMSG for a header that is not valid
  * HTTP/1.x, or -E2BIG if @out is too small or the header has more than
@@ -1395,8 +1438,9 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 	struct res_line lines[RES_MAX_FIELDS];
 	struct conn_tok toks[CONN_MAX_TOKENS];
 	const char *p = hdr, *end = hdr + len, *q;
-	int nr_toks = 0, nr_lines = 0, nr_cl = 0, l;
+	int nr_toks = 0, nr_lines = 0, nr_cl = 0, l, via_at = -1;
 	bool has_te = false, have_cl = false, cl_done = false;
+	const char *via;
 	uint64_t cl = 0;
 	size_t n, o, i;
 
@@ -1412,6 +1456,7 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 			return -EBADMSG;
 	}
 	*code = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+	via = via_hop(p[7] == '0');
 	if (n + 2 > out_cap)
 		return -E2BIG;
 	memcpy(out, p, n);
@@ -1479,6 +1524,16 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 					 &cl, &nr_cl) < 0)
 				return -EBADMSG;
 		}
+
+		/* As for a request (build_forward_request()), but here a
+		 * repeated Via is a line of its own: the last one takes it. */
+		for (l = 0; l < nr_lines; l++) {
+			const char *k = hdr + lines[l].off;
+
+			if (lines[l].klen == 3 && !strncasecmp(k, "Via", 3) &&
+			    !conn_toks_have(toks, nr_toks, k, 3))
+				via_at = l;
+		}
 	}
 
 	for (l = 0; l < nr_lines; l++) {
@@ -1513,8 +1568,32 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		if (o + n + 2 > out_cap)
 			return -E2BIG;
 		memcpy(out + o, k, n);
-		memcpy(out + o + n, "\r\n", 2);
-		o += n + 2;
+		o += n;
+		if (l == via_at) {
+			const char *v = k + klen + 1;
+
+			/* An empty value (OWS only) gets no list separator. */
+			while (v < k + n && (*v == ' ' || *v == '\t'))
+				v++;
+			if (o + 2 + VIA_HOP_LEN + 2 > out_cap)
+				return -E2BIG;
+			if (v < k + n)
+				out[o++] = ',';
+			out[o++] = ' ';
+			memcpy(out + o, via, VIA_HOP_LEN);
+			o += VIA_HOP_LEN;
+		}
+		memcpy(out + o, "\r\n", 2);
+		o += 2;
+	}
+
+	if (*code >= 200 && via_at < 0) {
+		if (o + 5 + VIA_HOP_LEN + 2 > out_cap)
+			return -E2BIG;
+		memcpy(out + o, "Via: ", 5);
+		memcpy(out + o + 5, via, VIA_HOP_LEN);
+		memcpy(out + o + 5 + VIA_HOP_LEN, "\r\n", 2);
+		o += 5 + VIA_HOP_LEN + 2;
 	}
 
 	/* An interim response says nothing about the connection. */

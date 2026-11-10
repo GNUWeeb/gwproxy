@@ -7567,12 +7567,13 @@ static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 /*
  * Room kept free in the target buffer while the response header is held back:
- * enough for the "Connection: close" and "Proxy-Connection: close" lines the
- * rewrite adds. A header therefore gets at most target-buf-size minus this,
- * counted together with any interim (1xx) responses still queued for the
- * client. That is enough for any CRLF header that fits, but the rewrite also
- * turns bare LF line ends into CRLF, so an LF-only header near the limit can
- * still outgrow the buffer; the rewrite is bounds-checked and answers 502.
+ * enough for the "Connection: close", "Proxy-Connection: close" and
+ * "Via: 1.1 gwproxy" lines the rewrite adds (62 bytes). A header therefore
+ * gets at most target-buf-size minus this, counted together with any interim
+ * (1xx) responses still queued for the client. That is enough for any CRLF
+ * header that fits, but the rewrite also turns bare LF line ends into CRLF,
+ * so an LF-only header near the limit can still outgrow the buffer; the
+ * rewrite is bounds-checked and answers 502.
  */
 #define HTTP_FWD_RES_SLACK	64
 

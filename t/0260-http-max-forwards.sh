@@ -60,18 +60,20 @@ local('not a number', b'TRACE %s HTTP/1.1\r\nMax-Forwards: 1x\r\n\r\n' % u,
       'HTTP/1.1 400 ')
 fwd('TRACE at 3', b'TRACE %s HTTP/1.1\r\nMax-Forwards: 3\r\n\r\n' % u,
     b'TRACE /x HTTP/1.1\r\nHost: %s\r\nMax-Forwards: 2\r\n'
-    b'Connection: close\r\n\r\n' % auth)
+    b'Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n' % auth)
 fwd('OPTIONS at 1', b'OPTIONS %s HTTP/1.1\r\nMax-Forwards: 1\r\n\r\n' % u,
     b'OPTIONS /x HTTP/1.1\r\nHost: %s\r\nMax-Forwards: 0\r\n'
-    b'Connection: close\r\n\r\n' % auth)
+    b'Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n' % auth)
 fwd('GET at 0', b'GET %s HTTP/1.1\r\nMax-Forwards: 0\r\n\r\n' % u,
     b'GET /x HTTP/1.1\r\nHost: %s\r\nMax-Forwards: 0\r\n'
-    b'Connection: close\r\n\r\n' % auth)
+    b'Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n' % auth)
 fwd('OPTIONS, empty path', b'OPTIONS http://%s HTTP/1.1\r\n\r\n' % auth,
-    b'OPTIONS * HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' % auth)
+    b'OPTIONS * HTTP/1.1\r\nHost: %s\r\nVia: 1.1 gwproxy\r\n'
+    b'Connection: close\r\n\r\n' % auth)
 fwd('OPTIONS, empty path and a query',
     b'OPTIONS http://%s?q HTTP/1.1\r\n\r\n' % auth,
-    b'OPTIONS /?q HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' % auth)
+    b'OPTIONS /?q HTTP/1.1\r\nHost: %s\r\nVia: 1.1 gwproxy\r\n'
+    b'Connection: close\r\n\r\n' % auth)
 
 sys.exit(1 if errors else 0)
 EOF
