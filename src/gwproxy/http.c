@@ -13,6 +13,7 @@
 #include <string.h>
 #include <strings.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #include "http.h"
 #include "http1.h"
@@ -38,10 +39,24 @@ struct gwp_http_conn {
 	size_t				scan;
 
 	/*
+	 * Whether the first bytes can start a request line at all (enum
+	 * req_start), and how many of them have been looked at.
+	 */
+	uint8_t				start_st;
+	size_t				start_off;
+
+	/*
 	 * True for a forwarding request (absolute-form target, e.g.
 	 * "GET http://host/path") as opposed to a CONNECT tunnel.
 	 */
 	bool				is_forward;
+
+	/*
+	 * The Max-Forwards value a forwarded TRACE or OPTIONS request goes on
+	 * with, one less than it came with (RFC 9110 Section 7.6.2); -1 to
+	 * copy the field, if any, as it is.
+	 */
+	int64_t				max_fwd;
 
 	/*
 	 * The target's authority, once classified, split in place into the
@@ -139,25 +154,6 @@ bool gwp_http_conn_auth_failed(const struct gwp_http_conn *hc,
 	*user = hc->bad_user_len >= 0 ? hc->user : NULL;
 	*len = hc->bad_user_len >= 0 ? (size_t)hc->bad_user_len : 0;
 	return true;
-}
-
-/*
- * Map a parsed HTTP method code back to its request-line token. Returns NULL
- * for a method the forwarding proxy does not re-emit.
- */
-static const char *http_method_str(uint8_t method)
-{
-	switch (method) {
-	case GWNET_HTTP_METHOD_GET:	return "GET";
-	case GWNET_HTTP_METHOD_POST:	return "POST";
-	case GWNET_HTTP_METHOD_PUT:	return "PUT";
-	case GWNET_HTTP_METHOD_DELETE:	return "DELETE";
-	case GWNET_HTTP_METHOD_HEAD:	return "HEAD";
-	case GWNET_HTTP_METHOD_OPTIONS:	return "OPTIONS";
-	case GWNET_HTTP_METHOD_PATCH:	return "PATCH";
-	case GWNET_HTTP_METHOD_TRACE:	return "TRACE";
-	default:			return NULL;
-	}
 }
 
 /*
@@ -382,7 +378,7 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 	static const char cls[] = "Connection: close\r\n\r\n";
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
 	const struct gwnet_http_hdr_fields *ff = &req->fields;
-	const char *method = http_method_str(req->method);
+	const char *method = gwnet_http_req_method(req);
 	const char *ver = (req->version == GWNET_HTTP_VER_1_0) ?
 			  " HTTP/1.0\r\n" : " HTTP/1.1\r\n";
 	size_t conn_len;
@@ -392,9 +388,6 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 	size_t n = 0, i;
 	int nr_toks = 0;
 	bool ok;
-
-	if (!method)
-		return -EINVAL;
 
 	/* Too many options to check every field against is not plausible. */
 	if (conn) {
@@ -417,9 +410,9 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 	    conn_toks_have(toks, nr_toks, "Host", 4))
 		return -EBADMSG;
 
-	ok = buf_add(buf, cap, &n, method, strlen(method)) &&
+	ok = buf_add(buf, cap, &n, method, req->method_len) &&
 	     buf_add(buf, cap, &n, " ", 1) &&
-	     (*path == '/' || buf_add(buf, cap, &n, "/", 1)) &&
+	     (*path == '/' || *path == '*' || buf_add(buf, cap, &n, "/", 1)) &&
 	     buf_add(buf, cap, &n, path, path_len) &&
 	     buf_add(buf, cap, &n, ver, 11);
 	if (!ok)
@@ -466,6 +459,22 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 		    conn_toks_have(toks, nr_toks, k, f->klen) ||
 		    (f->klen == 4 && !strncasecmp(k, "Host", 4)))
 			continue;
+
+		/* Never longer than the value it replaces. */
+		if (hc->max_fwd >= 0 && f->klen == 12 &&
+		    !strncasecmp(k, "Max-Forwards", 12)) {
+			char v[24];
+			int vl = snprintf(v, sizeof(v), "%" PRId64,
+					  hc->max_fwd);
+
+			ok = buf_add(buf, cap, &n, k, f->klen) &&
+			     buf_add(buf, cap, &n, ": ", 2) &&
+			     buf_add(buf, cap, &n, v, (size_t)vl) &&
+			     buf_add(buf, cap, &n, "\r\n", 2);
+			if (!ok)
+				goto too_big;
+			continue;
+		}
 
 		ok = buf_add(buf, cap, &n, k, f->klen) &&
 		     buf_add(buf, cap, &n, ": ", 2) &&
@@ -597,6 +606,47 @@ static int set_req_framing(struct gwp_http_conn *hc)
 }
 
 /*
+ * RFC 9110 Section 7.6.2: a proxy that receives a TRACE or OPTIONS request
+ * with Max-Forwards MUST NOT forward it once that is 0, but answer it as its
+ * final recipient: OPTIONS with a 200, TRACE, whose echo of the request is
+ * not offered, with a 501. Above 0 the request goes on with one less
+ * (hc->max_fwd). The value is digits only, a larger one than 2^32 - 1 taken
+ * for that; anything else gets a 400. Other methods are not hop-limited and
+ * keep the field as it is. Returns 0 to forward the request, else the
+ * gwp_http_conn_process() result to answer it with.
+ */
+static int max_forwards(struct gwp_http_conn *hc)
+{
+	uint8_t m = hc->req_hdr.method;
+	uint64_t v = 0;
+	const char *p;
+	size_t len, i;
+
+	hc->max_fwd = -1;
+	if (m != GWNET_HTTP_METHOD_TRACE && m != GWNET_HTTP_METHOD_OPTIONS)
+		return 0;
+	p = gwnet_http_hdr_fields_get(&hc->req_hdr.fields, "Max-Forwards",
+				      &len);
+	if (!p)
+		return 0;
+	if (!len)
+		return GWP_HTTP_BAD_REQUEST;
+	for (i = 0; i < len; i++) {
+		if (p[i] < '0' || p[i] > '9')
+			return GWP_HTTP_BAD_REQUEST;
+		if (v < UINT32_MAX)
+			v = v * 10 + (uint64_t)(p[i] - '0');
+	}
+	if (v > UINT32_MAX)
+		v = UINT32_MAX;
+	if (!v)
+		return m == GWNET_HTTP_METHOD_OPTIONS ? GWP_HTTP_OPTIONS_REPLY :
+							GWP_HTTP_NOT_IMPLEMENTED;
+	hc->max_fwd = (int64_t)v - 1;
+	return 0;
+}
+
+/*
  * The rewrite of a forwarding request is built here, on the stack, before it
  * replaces the request in the caller's buffer; a larger one in a buffer
  * allocated for it. The rewrite is never more than twice the header's size
@@ -610,7 +660,8 @@ static int set_req_framing(struct gwp_http_conn *hc)
  * takes the place of the original header in @buf (*@len of @cap bytes) and
  * whatever followed the header moves along behind it. *@len and *@hdr_len_p
  * are set to the new lengths. Returns GWP_HTTP_FORWARD, GWP_HTTP_BAD_REQUEST,
- * GWP_HTTP_TOO_LARGE or GWP_HTTP_ERR.
+ * GWP_HTTP_NOT_IMPLEMENTED, GWP_HTTP_OPTIONS_REPLY, GWP_HTTP_TOO_LARGE or
+ * GWP_HTTP_ERR.
  */
 /* Not inlined: its stack frame must not add up with its callers'. */
 static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
@@ -622,15 +673,25 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 	const char *uri_end = uri + hc->req_hdr.uri_len;
 	size_t hdr_len = hc->ctx_hdr.off, rest = *len - hdr_len;
 	size_t max = hdr_len * 2 + 64, path_len, auth_len;
-	const char *authority, *slash, *path;
+	const char *authority, *slash, *path, *frag;
 	char sbuf[REQ_FAST_MAX], *out = sbuf;
 	ssize_t w;
 	size_t i;
 	int r;
 
-	/* Only absolute-form http:// URIs are supported (no TLS termination). */
-	if (hc->req_hdr.uri_len < 7 || strncasecmp(uri, "http://", 7))
-		return GWP_HTTP_ERR;
+	/*
+	 * Only absolute-form http:// URIs are supported (no TLS termination).
+	 * Origin-form ("GET / HTTP/1.1"), asterisk-form ("OPTIONS *") and
+	 * other schemes ask for what this proxy does not do; anything else
+	 * an OPTIONS request may carry is no request-target at all.
+	 */
+	if (hc->req_hdr.uri_len < 7 || strncasecmp(uri, "http://", 7)) {
+		if (uri[0] == '/' ||
+		    (hc->req_hdr.uri_len == 1 && uri[0] == '*') ||
+		    memmem(uri, hc->req_hdr.uri_len, "://", 3))
+			return GWP_HTTP_NOT_IMPLEMENTED;
+		return GWP_HTTP_BAD_REQUEST;
+	}
 
 	authority = uri + 7;
 
@@ -639,23 +700,38 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 	 * it only at '/' made "http://a?@b/" or "http://a#@b/" connect to "b",
 	 * which any other URL parser reads as host "a". The origin-form target
 	 * is the path and query from there, with "/" for an empty path (RFC
-	 * 9112 s3.2.1). A fragment is never part of a request-target, and one
-	 * right after the authority leaves no path to send: refuse it.
+	 * 9112 s3.2.1). A fragment is never part of a request-target: that is
+	 * the absolute path and the query, and a '#' is in neither. It is cut
+	 * off, as clients do before they send a URI, and one right after the
+	 * authority leaves the path empty.
 	 */
 	slash = authority;
 	while (slash < uri_end && *slash != '/' && *slash != '?' &&
 	       *slash != '#')
 		slash++;
-	if (slash == authority || (slash < uri_end && *slash == '#'))
-		return GWP_HTTP_ERR;		/* empty authority, fragment */
+	if (slash == authority)
+		return GWP_HTTP_BAD_REQUEST;	/* empty authority */
 	auth_len = (size_t)(slash - authority);
+	frag = memchr(slash, '#', (size_t)(uri_end - slash));
+	if (frag)
+		uri_end = frag;
 	if (slash < uri_end) {
 		path = slash;
 		path_len = (size_t)(uri_end - slash);
 	} else {
-		path = "/";
+		/*
+		 * RFC 9112 Section 3.2.4: an OPTIONS request for a URI with
+		 * an empty path and no query asks about the server as a
+		 * whole, and goes to it as "OPTIONS *".
+		 */
+		path = hc->req_hdr.method == GWNET_HTTP_METHOD_OPTIONS ?
+		       "*" : "/";
 		path_len = 1;
 	}
+
+	r = max_forwards(hc);
+	if (r)
+		return r;
 
 	for (i = 0; i < hc->req_hdr.fields.nr; i++) {
 		const struct gwnet_http_hdr_fields *ff = &hc->req_hdr.fields;
@@ -681,13 +757,13 @@ static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
 					  auth_len, out, max);
 	}
 
-	if (w == -EBADMSG)
+	if (w == -EBADMSG || w == -EINVAL)	/* -EINVAL: no host */
 		r = GWP_HTTP_BAD_REQUEST;
 	else if (w < 0)
 		r = GWP_HTTP_ERR;
-	else if (set_target(hc, authority, auth_len, host_p, port_p,
-			    default_port) < 0)
-		r = GWP_HTTP_ERR;
+	else if ((r = set_target(hc, authority, auth_len, host_p, port_p,
+				 default_port)) < 0)
+		r = r == -EINVAL ? GWP_HTTP_BAD_REQUEST : GWP_HTTP_ERR;
 	else if ((size_t)w > cap || rest > cap - (size_t)w)
 		r = GWP_HTTP_TOO_LARGE;		/* does not fit the buffer */
 	else
@@ -710,6 +786,72 @@ static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			char *buf, size_t *len, size_t cap, char **host_p,
 			char **port_p, size_t *hdr_len_p);
 
+static bool is_tchar(unsigned char c)
+{
+	if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+	    (c >= 'a' && c <= 'z'))
+		return true;
+	return c && strchr("!#$%&'*+-.^_`|~", c);
+}
+
+/*
+ * How far the client's first bytes have shown it to speak HTTP (enum
+ * req_start): a request line starts, after at most one empty line (RFC 9112
+ * Section 2.2), with a method token and the white space behind it.
+ */
+enum req_start {
+	RS_START = 0,	/* Nothing seen yet. */
+	RS_CR,		/* A CR, which only an empty line may start with. */
+	RS_LINE,	/* The empty line; a method must start next. */
+	RS_METHOD,	/* Within the method token. */
+	RS_HTTP,	/* A method and the white space after it: HTTP. */
+	RS_NOT_HTTP,	/* A byte no request line can have there. */
+};
+
+/*
+ * Take the bytes from where the last call left off to @len in @p, and return
+ * the new enum req_start. A client speaking another protocol (SOCKS4, TLS on
+ * a listener without --tls-cert, ...) is told apart within its first bytes
+ * this way, rather than when a line end happens to come or the protocol
+ * timeout ends the wait.
+ */
+static int req_start_scan(struct gwp_http_conn *hc, const char *p, size_t len)
+{
+	size_t i = hc->start_off;
+	uint8_t st = hc->start_st;
+
+	for (; i < len && st != RS_HTTP && st != RS_NOT_HTTP; i++) {
+		unsigned char c = (unsigned char)p[i];
+
+		switch (st) {
+		case RS_START:
+			if (c == '\r')
+				st = RS_CR;
+			else if (c == '\n')
+				st = RS_LINE;
+			else
+				st = is_tchar(c) ? RS_METHOD : RS_NOT_HTTP;
+			break;
+		case RS_CR:
+			st = c == '\n' ? RS_LINE : RS_NOT_HTTP;
+			break;
+		case RS_LINE:
+			st = is_tchar(c) ? RS_METHOD : RS_NOT_HTTP;
+			break;
+		case RS_METHOD:
+			if (c == ' ' || c == '\t')
+				st = RS_HTTP;
+			else if (!is_tchar(c))
+				st = RS_NOT_HTTP;
+			break;
+		}
+	}
+
+	hc->start_off = i;
+	hc->start_st = st;
+	return st;
+}
+
 int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			  void *buf, size_t *buf_len, size_t cap,
 			  char **host_p, char **port_p, size_t *hdr_len_p)
@@ -727,6 +869,12 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	 * limit the parser runs anyway, to refuse the header.
 	 */
 	*hdr_len_p = 0;
+	if (hc->start_off > len)
+		hc->start_off = hc->start_st = 0;
+	if (hc->start_st != RS_HTTP &&
+	    req_start_scan(hc, p, len) == RS_NOT_HTTP)
+		return GWP_HTTP_ERR;
+
 	if (hc->scan > len || hc->scan < ctx->off)
 		hc->scan = ctx->off;
 	if (len <= REQ_HDR_MAX && !memchr(p + hc->scan, '\n', len - hc->scan)) {
@@ -749,14 +897,24 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	}
 	*hdr_len_p = ctx->off;
 	/*
-	 * A repeated field that may appear only once (Host, Content-Length,
-	 * ...) is a well-formed line in an unacceptable request; say so
-	 * rather than drop the connection without a word.
+	 * Input that did not even start like a request line is not HTTP,
+	 * and is not answered: the client speaks something else. Past that
+	 * point the client is told what is wrong rather than dropped without
+	 * a word: a malformed request line or field line (RFC 9112 Sections
+	 * 3 and 5) or a repeated field that may appear only once (Host,
+	 * Content-Length, ...) gets 400, another HTTP version 505, and a
+	 * request line past the header limit 414 (RFC 9112 Section 3).
 	 */
-	if (r == -EEXIST)
+	if (r == -ENOMEM || (r < 0 && hc->start_st != RS_HTTP))
+		r = GWP_HTTP_ERR;
+	else if (r == -EEXIST || r == -EINVAL)
 		r = GWP_HTTP_BAD_REQUEST;
 	else if (r == -E2BIG)
 		r = GWP_HTTP_TOO_LARGE;
+	else if (r == -ENAMETOOLONG)
+		r = GWP_HTTP_URI_TOO_LONG;
+	else if (r == -EPROTONOSUPPORT)
+		r = GWP_HTTP_BAD_VERSION;
 	else if (r < 0)
 		r = GWP_HTTP_ERR;
 	else
@@ -770,6 +928,16 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	 */
 	gwnet_http_req_hdr_free(req);
 	return r;
+}
+
+int gwp_http_conn_overflow(const struct gwp_http_conn *hc)
+{
+	if (hc->start_st != RS_HTTP)
+		return GWP_HTTP_ERR;
+	if (hc->ctx_hdr.state == GWNET_HTTP_HDR_PARSE_ST_INIT ||
+	    hc->ctx_hdr.state == GWNET_HTTP_HDR_PARSE_ST_FIRST_LINE)
+		return GWP_HTTP_URI_TOO_LONG;
+	return GWP_HTTP_TOO_LARGE;
 }
 
 /*
@@ -833,9 +1001,15 @@ static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
 					hdr_len_p);
 
 	/* CONNECT: the target is an authority-form "host:port" to tunnel to. */
-	if (set_target(hc, gwnet_http_req_uri(req), req->uri_len, host_p,
-		       port_p, NULL) < 0)
+	switch (set_target(hc, gwnet_http_req_uri(req), req->uri_len, host_p,
+			   port_p, NULL)) {
+	case 0:
+		break;
+	case -EINVAL:
+		return GWP_HTTP_BAD_REQUEST;	/* no port, empty host, ... */
+	default:
 		return GWP_HTTP_ERR;
+	}
 
 	hc->is_forward = false;
 	return GWP_HTTP_CONNECT;
@@ -875,14 +1049,6 @@ static bool is_framing_field(const char *k, size_t klen)
 {
 	return (klen == 14 && !strncasecmp(k, "Content-Length", 14)) ||
 	       (klen == 17 && !strncasecmp(k, "Transfer-Encoding", 17));
-}
-
-static bool is_tchar(unsigned char c)
-{
-	if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-	    (c >= 'a' && c <= 'z'))
-		return true;
-	return c && strchr("!#$%&'*+-.^_`|~", c);
 }
 
 /*
@@ -1171,6 +1337,46 @@ struct res_line {
 };
 
 /*
+ * Take the Content-Length value at @v (@len bytes, from just after the colon)
+ * into *@val and count its elements in *@nr: a single non-negative decimal,
+ * or a list of them, which must all be the same (RFC 9110 Section 8.6). The
+ * value is held to the limit of a request's (set_req_framing()). Returns 0,
+ * or -EBADMSG for anything else: the origin can then not be told to have
+ * meant one length.
+ */
+static int res_cl_value(const char *v, size_t len, bool *have, uint64_t *val,
+			int *nr)
+{
+	const char *p = v, *end = v + len;
+
+	for (;;) {
+		uint64_t x = 0;
+		const char *d;
+
+		while (p < end && (*p == ' ' || *p == '\t'))
+			p++;
+		for (d = p; p < end && *p >= '0' && *p <= '9'; p++) {
+			uint64_t n = (uint64_t)(*p - '0');
+
+			if (x > ((uint64_t)INT64_MAX - n) / 10)
+				return -EBADMSG;
+			x = x * 10 + n;
+		}
+		if (p == d || (*have && x != *val))
+			return -EBADMSG;
+		*have = true;
+		*val = x;
+		(*nr)++;
+		while (p < end && (*p == ' ' || *p == '\t'))
+			p++;
+		if (p == end)
+			return 0;
+		if (*p++ != ',')
+			return -EBADMSG;
+	}
+}
+
+/*
  * Rewrite one complete response header (@len bytes, ending with its blank
  * line) into @out: lines are normalised to CRLF, hop-by-hop fields and fields
  * named by Connection are dropped and, for a final response, the client is
@@ -1189,7 +1395,9 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 	struct res_line lines[RES_MAX_FIELDS];
 	struct conn_tok toks[CONN_MAX_TOKENS];
 	const char *p = hdr, *end = hdr + len, *q;
-	int nr_toks = 0, nr_lines = 0, l;
+	int nr_toks = 0, nr_lines = 0, nr_cl = 0, l;
+	bool has_te = false, have_cl = false, cl_done = false;
+	uint64_t cl = 0;
 	size_t n, o, i;
 
 	/* Status line: HTTP/1.x SP 3DIGIT [ SP reason-phrase ] */
@@ -1247,6 +1455,32 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		}
 	}
 
+	/*
+	 * The framing of a final response (RFC 9112 Section 6.3), which the
+	 * client reads the body by: with Transfer-Encoding present, every
+	 * Content-Length goes, as an intermediary MUST remove it; without,
+	 * a Content-Length that does not name one length makes the response
+	 * unusable (502), and one named more than once is passed on once.
+	 */
+	if (*code >= 200) {
+		for (l = 0; l < nr_lines; l++) {
+			if (lines[l].klen == 17 &&
+			    !strncasecmp(hdr + lines[l].off,
+					 "Transfer-Encoding", 17))
+				has_te = true;
+		}
+		for (l = 0; !has_te && l < nr_lines; l++) {
+			const char *k = hdr + lines[l].off;
+
+			if (lines[l].klen != 14 ||
+			    strncasecmp(k, "Content-Length", 14))
+				continue;
+			if (res_cl_value(k + 15, lines[l].len - 15, &have_cl,
+					 &cl, &nr_cl) < 0)
+				return -EBADMSG;
+		}
+	}
+
 	for (l = 0; l < nr_lines; l++) {
 		const char *k = hdr + lines[l].off;
 		size_t klen = lines[l].klen;
@@ -1257,6 +1491,25 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		if (!is_framing_field(k, klen) &&
 		    conn_toks_have(toks, nr_toks, k, klen))
 			continue;
+		if (*code >= 200 && (has_te || nr_cl > 1) && klen == 14 &&
+		    !strncasecmp(k, "Content-Length", 14)) {
+			char v[24];
+			int vl;
+
+			/* Dropped, or the one line left for all of them. */
+			if (has_te || cl_done)
+				continue;
+			vl = snprintf(v, sizeof(v), "%" PRIu64, cl);
+			if (o + klen + 2 + (size_t)vl + 2 > out_cap)
+				return -E2BIG;
+			memcpy(out + o, k, klen);
+			memcpy(out + o + klen, ": ", 2);
+			memcpy(out + o + klen + 2, v, (size_t)vl);
+			memcpy(out + o + klen + 2 + vl, "\r\n", 2);
+			o += klen + 2 + (size_t)vl + 2;
+			cl_done = true;
+			continue;
+		}
 		if (o + n + 2 > out_cap)
 			return -E2BIG;
 		memcpy(out + o, k, n);
@@ -1586,6 +1839,70 @@ int gwp_http_build_too_large_reply(void *out, size_t out_cap)
 {
 	static const char resp[] =
 		"HTTP/1.1 431 Request Header Fields Too Large\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_options_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_not_implemented_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 501 Not Implemented\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_bad_version_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 505 HTTP Version Not Supported\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_uri_too_long_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 414 URI Too Long\r\n"
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n"
 		"\r\n";

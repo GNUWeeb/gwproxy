@@ -1540,7 +1540,29 @@ host and port;
 .B forwarding
 of ordinary absolute\-form requests such as "GET http://host/path", which
 gwproxy rewrites to origin form, fetches from the origin and relays back, one
-request per connection.
+request per connection. Any method is forwarded, spelt as the client sent it:
+extension methods such as WebDAV's PROPFIND as well. A fragment ("#...") in
+the URI is not part of the request and is not sent on. An OPTIONS request
+for a URI with an empty path and no query, such as "OPTIONS http://host:8080",
+goes to the origin as "OPTIONS *". TRACE and OPTIONS requests are hop\-limited
+by Max\-Forwards (RFC 9110 Section 7.6.2): one with "Max\-Forwards: 0" is
+answered by gwproxy itself, an OPTIONS with "200 OK" and a TRACE with "501 Not
+Implemented", and one with a larger value goes on with one less. A Max\-Forwards
+value that is not a number gets "400 Bad Request" on these two methods; other
+methods keep the field as it is.
+.PP
+A connection whose first bytes cannot start a request line, a method token
+followed by a space after at most one empty line, is closed at once without a
+reply: a SOCKS4 request, say, or a SOCKS5 greeting on a listener without
+.BR \-\-as\-socks5 .
+Past that point a request that cannot be served is answered. A malformed
+request line or field line (a folded line, white space before the colon, a
+control byte) and a target without a usable host or port, such as a CONNECT
+with no port, get "400 Bad Request". An origin\-form target ("GET / HTTP/1.1"),
+"OPTIONS *" and a scheme other than http:// get "501 Not Implemented", and an
+HTTP version other than 1.x, the HTTP/2 connection preface among them, gets
+"505 HTTP Version Not Supported". A request for HTTP/1.2 or a later 1.x
+version is served as HTTP/1.1.
 .PP
 Only that one request reaches the origin: its body, delimited by Content\-Length
 or chunked Transfer\-Encoding, is forwarded, and anything the client sends after
@@ -1554,7 +1576,7 @@ an unterminated quoted string, whitespace before the line end), when it comes
 with the header; one that turns out malformed later closes the connection.
 A field value may hold bytes 0x80 to 0xff, which are passed on unchanged, and
 none of them makes a framing header acceptable; any other control byte than a
-tab in a value closes the connection without a reply.
+tab in a value is answered with "400 Bad Request".
 .PP
 A field that may appear only once (Authorization, Content\-Length,
 Content\-Location, Content\-Range, Content\-Type, Cookie, Date, Expect, From,
@@ -1584,7 +1606,11 @@ refuse.
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
 does not send another request on the connection, and the connection is closed
-once the origin has finished. A response that is not valid HTTP/1.x, one whose
+once the origin has finished. With Transfer\-Encoding present, any
+Content\-Length is dropped from the response (RFC 9112 Section 6.3), and a
+Content\-Length given more than once is passed on once. A response that is not
+valid HTTP/1.x, one with a Content\-Length that does not name a single length
+(two that differ, a list of different values, not a number), one whose
 header is too large, and a 407 from the origin, which would invite the client
 to hand over its proxy credentials, are answered with "502 Bad Gateway"
 instead. The response header, together with any interim (1xx) responses before
@@ -1597,7 +1623,8 @@ once rewritten (bare LF line ends become CRLF).
 A request header may take at most 16384 bytes, and must fit in
 .B \-\-client\-buf\-size
 as a whole; a larger one, or one with more than 128 field lines, is answered
-with "431 Request Header Fields Too Large".
+with "431 Request Header Fields Too Large". When it is the request line that
+runs past either limit, the answer is "414 URI Too Long" instead.
 .PP
 With
 .B \-\-auth\-file
@@ -1835,6 +1862,14 @@ the session: before the CONNECT's reply that fails the connection like a
 failed handshake, and once the tunnel is up the tunnel's stream is cut. TLS 1.3 has no renegotiation; its
 KeyUpdate is answered as usual. (A gwproxy built with an OpenSSL older than
 1.1.0h cannot refuse, and renegotiates.)
+.PP
+An
+.B http://
+or
+.B https://
+upstream may answer the CONNECT with interim responses (100 Continue, 102 or
+103, but not 101) before its final one; they are read past (RFC 9110 Section
+15.2), and only a 2xx after them puts the tunnel up.
 .PP
 An upstream that turns the CONNECT down is answered to an HTTP client with
 "502 Bad Gateway", or "504 Gateway Timeout" for a

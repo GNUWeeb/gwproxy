@@ -7319,6 +7319,65 @@ static int http_reject_bad_request(struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Queue the HTTP 501 reply for a request this proxy does not serve
+ * (GWP_HTTP_NOT_IMPLEMENTED), or the 505 for an HTTP version other than 1.x
+ * (GWP_HTTP_BAD_VERSION). Same mechanism as the 407 above. Returns a negative
+ * error so the caller drops the connection.
+ */
+static int http_reject_not_implemented(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_not_implemented_reply(
+			gcp->target.buf + gcp->target.len,
+			gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -EOPNOTSUPP;
+}
+
+/* The HTTP 414 reply for a request line that is too long; as the 431. */
+static int http_reject_uri_too_long(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_uri_too_long_reply(
+			gcp->target.buf + gcp->target.len,
+			gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -E2BIG;
+
+	gcp->target.len += (uint32_t)r;
+	return -E2BIG;
+}
+
+/*
+ * Queue the 200 for an OPTIONS request with Max-Forwards: 0, which this proxy
+ * answers itself (GWP_HTTP_OPTIONS_REPLY). Nothing more is done for the
+ * request, so the return is negative as for a refusal.
+ */
+static int http_answer_options(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_options_reply(gcp->target.buf + gcp->target.len,
+					     gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -ECANCELED;
+}
+
+static int http_reject_bad_version(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_bad_version_reply(
+			gcp->target.buf + gcp->target.len,
+			gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -EPROTONOSUPPORT;
+}
+
+/*
  * A port as an HTTP authority carries it: decimal digits only, no sign, no
  * service name, at most 65535.
  */
@@ -7579,9 +7638,16 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		 * level-triggered socket to be read again -- which would
 		 * busy-spin until the protocol timeout fires.
 		 */
-		if (gcp->client.len >= gcp->client.cap)
+		if (gcp->client.len < gcp->client.cap)
+			return 0;
+		switch (gwp_http_conn_overflow(gcp->http_conn)) {
+		case GWP_HTTP_URI_TOO_LONG:
+			return http_reject_uri_too_long(gcp);
+		case GWP_HTTP_TOO_LARGE:
 			return http_reject_too_large(gcp);
-		return 0;
+		default:
+			return -EINVAL;		/* not HTTP; no reply */
+		}
 	case GWP_HTTP_NEED_AUTH:
 		http_log_auth_failure(w, gcp);
 		return http_reject_unauthorized(gcp);
@@ -7602,8 +7668,24 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		pr_dbg(&ctx->lh, "HTTP request header too large (fd=%d)",
 		       gcp->client.fd);
 		return http_reject_too_large(gcp);
+	case GWP_HTTP_URI_TOO_LONG:
+		pr_dbg(&ctx->lh, "HTTP request line too long (fd=%d)",
+		       gcp->client.fd);
+		return http_reject_uri_too_long(gcp);
+	case GWP_HTTP_NOT_IMPLEMENTED:
+		pr_dbg(&ctx->lh, "HTTP request not served (fd=%d)",
+		       gcp->client.fd);
+		return http_reject_not_implemented(gcp);
+	case GWP_HTTP_OPTIONS_REPLY:
+		pr_dbg(&ctx->lh, "Answering OPTIONS with Max-Forwards: 0 (fd=%d)",
+		       gcp->client.fd);
+		return http_answer_options(gcp);
+	case GWP_HTTP_BAD_VERSION:
+		pr_dbg(&ctx->lh, "HTTP version not supported (fd=%d)",
+		       gcp->client.fd);
+		return http_reject_bad_version(gcp);
 	default:	/* GWP_HTTP_ERR */
-		pr_dbg(&ctx->lh, "Invalid HTTP request (fd=%d)", gcp->client.fd);
+		pr_dbg(&ctx->lh, "Not an HTTP request (fd=%d)", gcp->client.fd);
 		return -EINVAL;
 	}
 }

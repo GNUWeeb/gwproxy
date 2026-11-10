@@ -30,11 +30,20 @@ enum gwp_http_result {
 	GWP_HTTP_FORWARD,	/* Forward request; host/port set, the request
 				 * rewritten in place. */
 	GWP_HTTP_NEED_AUTH,	/* Proxy auth required/failed; reply 407. */
-	GWP_HTTP_ERR,		/* Malformed or unsupported; tear the conn down. */
-	GWP_HTTP_BAD_REQUEST,	/* Well-formed but unacceptable (e.g. a field
-				 * that may appear once is repeated); reply
-				 * 400. */
+	GWP_HTTP_ERR,		/* Not HTTP at all; tear the conn down. */
+	GWP_HTTP_BAD_REQUEST,	/* Malformed, or well-formed but unacceptable
+				 * (e.g. a field that may appear once is
+				 * repeated); reply 400. */
 	GWP_HTTP_TOO_LARGE,	/* Header too long or too many fields; 431. */
+	GWP_HTTP_NOT_IMPLEMENTED, /* A request this proxy does not serve:
+				 * origin-form, a scheme other than http://,
+				 * a TRACE with Max-Forwards: 0; reply
+				 * 501. */
+	GWP_HTTP_BAD_VERSION,	/* An HTTP version other than 1.x; 505. */
+	GWP_HTTP_URI_TOO_LONG,	/* Request line past the header limit; 414. */
+	GWP_HTTP_OPTIONS_REPLY,	/* An OPTIONS request with Max-Forwards: 0,
+				 * which this proxy answers itself; reply
+				 * 200. */
 };
 
 /*
@@ -70,6 +79,14 @@ const char *gwp_http_conn_username(const struct gwp_http_conn *hc);
  */
 bool gwp_http_conn_auth_failed(const struct gwp_http_conn *hc,
 			       const char **user, size_t *len);
+
+/**
+ * What to answer a client whose request header has filled the buffer, with
+ * gwp_http_conn_process() still asking for more: GWP_HTTP_URI_TOO_LONG while
+ * the request line is not complete, GWP_HTTP_TOO_LARGE once it is, and
+ * GWP_HTTP_ERR if the bytes have not yet shown they are HTTP at all.
+ */
+int gwp_http_conn_overflow(const struct gwp_http_conn *hc);
 
 /**
  * Parse the client's request header and, once it is complete, classify the
@@ -155,8 +172,9 @@ size_t gwp_http_fwd_res_pending(const struct gwp_http_conn *hc);
  * @out_len	Out: number of bytes written to @out.
  * @return	0; or, with the state moved to GWP_HTTP_RES_FAILED and nothing
  *		written, a negative error the caller answers with 502:
- *		-EBADMSG (not a valid HTTP/1.x header, a 101, or the origin
- *		closed early), -E2BIG (header too large, or more than 256
+ *		-EBADMSG (not a valid HTTP/1.x header, a Content-Length
+ *		that names no single length, a 101, or the origin closed
+ *		early), -E2BIG (header too large, or more than 256
  *		field lines or 32 Connection options), -EACCES (the origin
  *		answered 407), -ENOMEM.
  */
@@ -221,6 +239,38 @@ int gwp_http_build_gateway_timeout_reply(void *out, size_t out_cap);
  * @return	Number of bytes written to @out, or -ENOBUFS if too small.
  */
 int gwp_http_build_too_large_reply(void *out, size_t out_cap);
+
+/**
+ * Build the "200 OK" reply to an OPTIONS request that this proxy answers
+ * as its final recipient (GWP_HTTP_OPTIONS_REPLY).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_options_reply(void *out, size_t out_cap);
+
+/**
+ * Build a "501 Not Implemented" reply, for a request this proxy does not
+ * serve (GWP_HTTP_NOT_IMPLEMENTED).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_not_implemented_reply(void *out, size_t out_cap);
+
+/**
+ * Build a "505 HTTP Version Not Supported" reply (GWP_HTTP_BAD_VERSION).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_bad_version_reply(void *out, size_t out_cap);
+
+/**
+ * Build a "414 URI Too Long" reply (RFC 9112 Section 3), for a request line
+ * that does not fit the request header limit or the client buffer
+ * (GWP_HTTP_URI_TOO_LONG).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_uri_too_long_reply(void *out, size_t out_cap);
 
 /**
  * Build an upstream "CONNECT <authority> HTTP/1.1" request (used when chaining
