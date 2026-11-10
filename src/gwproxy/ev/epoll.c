@@ -512,23 +512,15 @@ static int credit_fd_closed(struct gwp_wrk *w, int n)
 	if (likely(!w->accept_is_stopped) || !n)
 		return 0;
 
-	x = atomic_fetch_add(&w->ctx->nr_fd_closed, n);
+	/* The count with this credit: closes that come in one batch count too. */
+	x = atomic_fetch_add(&w->ctx->nr_fd_closed, n) + n;
 	return rearm_accept(w, x);
 }
 
-/*
- * Credit @n sockets the linger set closed, one at a time, as each would have
- * been credited when its pair went: rearm_accept() looks at the count before
- * a credit, so a run that closes many at once would not rearm accept where
- * the same closes one by one do.
- */
+/* Credit @n sockets the linger set closed. */
 static int credit_linger(struct gwp_wrk *w, int n)
 {
-	int r = 0;
-
-	while (n-- > 0 && !r)
-		r = credit_fd_closed(w, 1);
-	return r;
+	return credit_fd_closed(w, n);
 }
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
