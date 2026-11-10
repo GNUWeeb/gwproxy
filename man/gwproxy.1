@@ -229,9 +229,12 @@ may not pass on, see
 .BR \-\-udp\-associate )
 does not count, so sending junk to the relay port does not keep a quiet
 association open.
-The check runs on a coarse per\-worker clock, compares whole seconds and runs
-about once a second, so a pair can outlive the timeout by up to about two
-seconds.
+The check is a timer per pair, not a sweep: it fires when the timeout has
+passed since the tunnel or association came up, and while anything has moved
+since, it looks again when the timeout has passed since the last activity.
+Activity is stamped in whole seconds on a coarse per\-worker clock, and a pair
+is closed only once more than the timeout has passed by those stamps, so a
+pair can outlive the timeout by up to about two seconds.
 .B 0
 (or a negative value) never closes an idle connection, which keeps long quiet
 tunnels such as SSH sessions working. Default:
