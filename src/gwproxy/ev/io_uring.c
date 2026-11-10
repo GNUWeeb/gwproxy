@@ -3785,18 +3785,25 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	case EV_BIT_IOU_STOP:
 		pr_dbg(&ctx->lh, "Handling stop doorbell: %d", cqe->res);
 		return 0;
-	case EV_BIT_IOU_CLOSE:
+	case EV_BIT_IOU_CLOSE: {
+		int fd = (int)CLEAR_EV_BIT(cqe->user_data);
+
 		/*
 		 * Closes are queued with IOSQE_CQE_SKIP_SUCCESS, so only a
-		 * failure gets here. The descriptor is gone either way (close
-		 * releases it even when it reports an error), and nothing
-		 * waits on it, so this concerns no connection but its own:
-		 * report it and keep serving the others.
+		 * failure gets here. Once a close has run, the descriptor is
+		 * gone even when it reports an error. -EINVAL, though, means
+		 * the request was refused before it ran, so the descriptor is
+		 * still open (and cannot have been reused): close it here.
+		 * Nothing waits on it either way, so this concerns no
+		 * connection but its own: report it and keep serving the
+		 * others.
 		 */
-		pr_warn(&ctx->lh, "close(%u) failed: %s",
-			(unsigned)CLEAR_EV_BIT(cqe->user_data),
+		pr_warn(&ctx->lh, "close(%d) failed: %s", fd,
 			strerror(-cqe->res));
+		if (cqe->res == -EINVAL)
+			__sys_close(fd);
 		return 0;
+	}
 	default:
 		pr_err(&ctx->lh, "Unknown event bit: %" PRIu64 "; res=%d", ev_bit, cqe->res);
 		return -EINVAL;
