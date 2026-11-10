@@ -419,6 +419,51 @@ static void arm_accept_retry(struct gwp_wrk *w)
 	s->user_data = EV_BIT_IOU_ACCEPT_RETRY;
 }
 
+/*
+ * Watch the linger set (gwp_conn_pair_linger()): one-shot, re-armed by its
+ * completion, which does the set's work.
+ */
+static void arm_linger_poll(struct gwp_wrk *w)
+{
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	io_uring_prep_poll_add(s, gwp_linger_fd(w->linger), POLLIN);
+	s->user_data = EV_BIT_IOU_LINGER;
+}
+
+/*
+ * Have a timeout complete when the linger set is next due for a look
+ * (gwp_linger_next_ms()): one at a time, moved earlier when a socket that
+ * joins the set is due before it.
+ */
+static void arm_linger_timer(struct gwp_wrk *w)
+{
+	uint64_t at = gwp_linger_next_ms(w->linger);
+	struct iou *iou = w->iou;
+	struct io_uring_sqe *s;
+
+	if (!at || (iou->linger_at_ms && iou->linger_at_ms <= at))
+		return;
+
+	/*
+	 * A timeout not yet submitted reads the new deadline as well, as does
+	 * the update that follows it: both want this one.
+	 */
+	iou->linger_ts.tv_sec = (long long)(at / 1000ull);
+	iou->linger_ts.tv_nsec = (long long)(at % 1000ull) * 1000000ll;
+	s = get_sqe_nofail(w);
+	if (iou->linger_at_ms) {
+		io_uring_prep_timeout_update(s, &iou->linger_ts,
+					     EV_BIT_IOU_LINGER_TMR,
+					     IORING_TIMEOUT_ABS);
+		s->user_data = EV_BIT_IOU_LINGER_TMR_UPD;
+	} else {
+		io_uring_prep_timeout(s, &iou->linger_ts, 0, IORING_TIMEOUT_ABS);
+		s->user_data = EV_BIT_IOU_LINGER_TMR;
+	}
+	iou->linger_at_ms = at;
+}
+
 static void prep_close(struct gwp_wrk *w, int fd)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
@@ -497,6 +542,12 @@ static bool put_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (x > 1)
 		return false;
 
+	/*
+	 * Nothing is in flight on the sockets any more: those that may still
+	 * get input linger (gwp_conn_pair_linger()), and the rest close here.
+	 */
+	gwp_conn_pair_linger(w, gcp);
+	arm_linger_timer(w);
 	tg_fd = gcp->target.fd;
 	cl_fd = gcp->client.fd;
 	ud_fd = gcp->udp_fd;
@@ -4046,6 +4097,23 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	case EV_BIT_IOU_STOP:
 		pr_dbg(&ctx->lh, "Handling stop doorbell: %d", cqe->res);
 		return 0;
+	case EV_BIT_IOU_LINGER:
+		if (cqe->res == -ECANCELED)
+			return 0;
+		gwp_linger_run(w->linger);
+		arm_linger_poll(w);
+		arm_linger_timer(w);
+		return 0;
+	case EV_BIT_IOU_LINGER_TMR:
+		if (cqe->res == -ECANCELED)
+			return 0;
+		w->iou->linger_at_ms = 0;
+		gwp_linger_run(w->linger);
+		arm_linger_timer(w);
+		return 0;
+	case EV_BIT_IOU_LINGER_TMR_UPD:
+		/* -ENOENT: it had expired already, and is re-armed from there. */
+		return 0;
 	case EV_BIT_IOU_CLOSE:
 		/*
 		 * Closes are queued with IOSQE_CQE_SKIP_SUCCESS, so only a
@@ -4169,6 +4237,7 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 
 	io_uring_set_iowait(&w->iou->ring, false);
 	arm_stop_poll(w);
+	arm_linger_poll(w);
 	if (ctx->dns)
 		arm_dns_cq_poll(w);
 	arm_accept(w);

@@ -1160,6 +1160,32 @@ static void gwp_ctx_free_thread_event(struct gwp_wrk *w)
 	}
 }
 
+/*
+ * Sockets a worker's linger set holds at once (gwp_conn_pair_linger()): a
+ * share of the descriptors, so that pairs that end in a burst cannot leave
+ * too few of them for new clients. Beyond that, a socket is closed at once.
+ */
+#define GWP_LINGER_MIN		16u
+#define GWP_LINGER_MAX		4096u
+
+__cold
+static int gwp_ctx_init_thread_linger(struct gwp_wrk *w)
+{
+	uint64_t max = GWP_LINGER_MAX;
+	struct rlimit rl;
+
+	if (!getrlimit(RLIMIT_NOFILE, &rl) && rl.rlim_cur != RLIM_INFINITY) {
+		max = (uint64_t)rl.rlim_cur / 8 / (uint64_t)w->ctx->cfg.nr_workers;
+		if (max < GWP_LINGER_MIN)
+			max = GWP_LINGER_MIN;
+		if (max > GWP_LINGER_MAX)
+			max = GWP_LINGER_MAX;
+	}
+
+	w->linger = gwp_linger_new((uint32_t)max);
+	return w->linger ? 0 : -errno;
+}
+
 __cold
 static int gwp_ctx_init_thread(struct gwp_wrk *w,
 			       const struct gwp_sockaddr *bind_addr)
@@ -1183,14 +1209,24 @@ static int gwp_ctx_init_thread(struct gwp_wrk *w,
 		}
 	}
 
+	r = gwp_ctx_init_thread_linger(w);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to create the linger set: %s",
+		       strerror(-r));
+		goto out_err_raw_dns;
+	}
+
 	r = gwp_ctx_init_thread_event(w);
 	if (r < 0) {
 		pr_err(&ctx->lh, "gwp_ctx_init_thread_event: %s", strerror(-r));
-		goto out_err_raw_dns;
+		goto out_err_linger;
 	}
 
 	return r;
 
+out_err_linger:
+	gwp_linger_free(w->linger);
+	w->linger = NULL;
 out_err_raw_dns:
 	if (cfg->use_raw_dns)
 		gwp_ctx_free_raw_dns(w);
@@ -1280,16 +1316,84 @@ bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
 	       gwp_http_fwd_res_state(gcp->http_conn) != GWP_HTTP_RES_FAILED;
 }
 
+/* Whether the pair resets the target, or the client, as described above. */
+static bool gwp_conn_pair_aborts_target(const struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	return gcp->client.tls && gcp->target.fd >= 0 && !gcp->target.wr_shut;
+#else
+	return false;
+#endif
+}
+
+static bool gwp_conn_pair_aborts_client(const struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	return gcp->target.tls && gcp->is_target_alive && gcp->client.fd >= 0 &&
+	       !gcp->client.wr_shut;
+#else
+	return false;
+#endif
+}
+
 static void gwp_conn_pair_abort_target(const struct gwp_conn_pair __unused *gcp)
 {
 #ifdef CONFIG_HTTPS
-	if (gcp->client.tls && gcp->target.fd >= 0 && !gcp->target.wr_shut)
+	if (gwp_conn_pair_aborts_target(gcp))
 		gwp_set_reset_on_close(gcp->target.fd);
-	if (gcp->target.tls && gcp->is_target_alive && gcp->client.fd >= 0 &&
-	    !gcp->client.wr_shut)
+	if (gwp_conn_pair_aborts_client(gcp))
 		gwp_set_reset_on_close(gcp->client.fd);
 	gwp_conn_pair_abort_attempts(gcp);
 #endif
+}
+
+/*
+ * How long a socket may linger (gwp_conn_pair_linger()), in ms: long enough
+ * for a peer to take what it was sent, or to finish sending what it had
+ * started, short enough not to hold descriptors for clients that never stop;
+ * never longer than --protocol-timeout, the bound of the handshake.
+ */
+#define GWP_LINGER_FIN_MS	2000u
+
+static uint32_t gwp_linger_bound(const struct gwp_cfg *cfg)
+{
+	uint64_t pt = cfg->protocol_timeout > 0 ?
+		      (uint64_t)cfg->protocol_timeout * 1000u : UINT64_MAX;
+
+	return pt < GWP_LINGER_FIN_MS ? (uint32_t)pt : GWP_LINGER_FIN_MS;
+}
+
+/*
+ * Linger on @c, which may still get input: it has not been read to its end.
+ * Not when it was reset, as there is nobody left to linger for, nor when the
+ * pair aborts it (@abort), as the reset is then the point.
+ */
+static int gwp_conn_linger(struct gwp_wrk *w, struct gwp_conn *c, bool abort)
+{
+	int r;
+
+	if (c->fd < 0 || c->rst || abort || c->rd_eof)
+		return 0;
+
+	r = gwp_linger_add(w->linger, c->fd, GWP_LINGER_FIN,
+			   gwp_linger_bound(&w->ctx->cfg));
+	c->fd = -1;
+	return r;
+}
+
+int gwp_conn_pair_linger(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int n;
+
+	if (!w->linger)
+		return 0;
+
+	n = gwp_conn_linger(w, &gcp->client, gwp_conn_pair_aborts_client(gcp));
+	/* A target that is not up yet has no peer to linger for. */
+	if (gcp->is_target_alive)
+		n += gwp_conn_linger(w, &gcp->target,
+				     gwp_conn_pair_aborts_target(gcp));
+	return n;
 }
 
 __cold
@@ -1387,6 +1491,8 @@ static void gwp_ctx_free_thread(struct gwp_wrk *w)
 		gwp_ctx_free_raw_dns(w);
 
 	gwp_ctx_free_thread_sock_pairs(w);
+	gwp_linger_free(w->linger);
+	w->linger = NULL;
 	gwp_ctx_free_thread_sock(w);
 }
 
