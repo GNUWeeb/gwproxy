@@ -2869,6 +2869,51 @@ static int handle_sock_ret(int r)
 }
 
 /*
+ * A send to @c failed with @err while the pair forwards. A plaintext peer that
+ * reset the connection, or died otherwise, ends only its own side, as on the
+ * epoll loop (conn_note_reset() there): nothing more can be sent to it, so its
+ * write side counts as shut and what is queued for it is dropped (see
+ * drop_for_reset()), but what it sent before is still queued on its socket
+ * and goes on to the other side, like any data before an EOF. Its recv ends
+ * with an EOF then, as the send has taken the error off the socket. The reset
+ * is recorded in gwp_conn::rst. Returns true when @err was taken so.
+ *
+ * TLS sides are left as they were: a failure on one ends the pair at once,
+ * and gwp_conn_pair_abort_target() passes the abort on.
+ */
+static bool conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    struct gwp_conn *c, int err)
+{
+	if (!gcp->is_target_alive || c->tls)
+		return false;
+	if (err != -ECONNRESET && err != -EPIPE && err != -ETIMEDOUT)
+		return false;
+
+	if (!c->rst) {
+		pr_dbg(&w->ctx->lh, "%s connection ended: %s (idx=%u, fd=%d)",
+			c == &gcp->client ? "Client" : "Target",
+			strerror(-err), gcp->idx, c->fd);
+		c->rst = true;
+	}
+	c->wr_shut = true;
+	return true;
+}
+
+/*
+ * @dst was reset (conn_note_reset()): what @src holds for it can no longer be
+ * delivered. Drop it instead of sending it, and do not read @src for @dst
+ * any more: the pair ends once @dst's own stream has been delivered, which
+ * does not wait for @src. Returns true when @dst was reset.
+ */
+static bool drop_for_reset(struct gwp_conn *src, struct gwp_conn *dst)
+{
+	if (likely(!dst->rst))
+		return false;
+	gwp_conn_buf_consume(src, src->len);
+	return true;
+}
+
+/*
  * Half-close bookkeeping for the forwarding path, mirroring the epoll
  * forward_progress(). Once a direction's source is at EOF and its buffer has
  * been flushed to the peer, shut the peer's write side so it observes the FIN.
@@ -2906,6 +2951,35 @@ static bool tls_close_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
 	return false;
 }
+
+/*
+ * The plaintext target was reset (conn_note_reset()) and the TLS client has
+ * been handed all it sent. A close_notify would turn the abort into a clean
+ * end: once the ciphertext the client is owed has left, the pair goes down
+ * as it did at the reset before, and gwp_conn_pair_abort_target() deals with
+ * it, as on the epoll loop (conn_end_flushed() there). Returns 0 while
+ * ciphertext is on its way, whose send completion comes back here.
+ */
+static int tls_client_cut(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_iou_tls *t = gcp->tls_io;
+
+	if (t->tx_sent < t->tx_len)
+		return 0;
+	if (gwp_ssl_bio_pending(gcp->client.tls) > 0) {
+		send_client_tls(w, gcp);
+		return 0;
+	}
+	return -ECONNRESET;
+}
+
+/* Likewise for an https:// upstream once the plaintext client was reset. */
+static int tls_target_cut(struct gwp_conn_pair *gcp)
+{
+	struct gwp_iou_tls *t = gcp->up_tls_io;
+
+	return t->tx_sent < t->tx_len ? 0 : -ECONNRESET;
+}
 #endif
 
 static int iou_forward_progress(struct gwp_wrk __unused *w,
@@ -2918,6 +2992,8 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 		/* As for a TLS client below: not an end to pass on. */
 		if (gwp_upstream_tls_cut(gcp))
 			return -ECONNRESET;
+		if (client_is_tls(gcp) && gwp_conn_reset_passed(gcp, &gcp->target))
+			return tls_client_cut(w, gcp);
 		if (client_is_tls(gcp) && !tls_close_client(w, gcp))
 			return 0;
 #endif
@@ -2934,6 +3010,8 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 		/* Not an end to pass on; see gwp_free_conn_pair(). */
 		if (client_is_tls(gcp) && gwp_ssl_rx_cut(gcp->client.tls))
 			return -ECONNRESET;
+		if (target_is_tls(gcp) && gcp->client.rst)
+			return tls_target_cut(gcp);
 		if (target_is_tls(gcp) && !tls_close_target(w, gcp))
 			return 0;
 #endif
@@ -3056,6 +3134,9 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return r;
 	}
 
+	if (drop_for_reset(&gcp->target, &gcp->client))
+		return iou_forward_progress(w, gcp);
+
 	/*
 	 * Usually what was read is sent on, but an HTTP forwarding filter may
 	 * have held all of it back, and at EOF it may have a reply to deliver.
@@ -3077,6 +3158,10 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 
 	gcp->client_tx = false;
+	if (r < 0 && conn_note_reset(w, gcp, &gcp->client, r)) {
+		gwp_conn_buf_consume(&gcp->target, gcp->target.len);
+		return iou_forward_progress(w, gcp);
+	}
 	r = handle_sock_ret(r);
 	if (r < 0) {
 #ifdef CONFIG_HTTPS
@@ -3168,6 +3253,15 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int r = cqe->res;
 
+	/*
+	 * The target was reset: what the client sends can no longer reach it,
+	 * but what the target sent before the reset is still to be read, and
+	 * the target's recv goes on until it ends (conn_note_reset()).
+	 */
+	if (r < 0 && conn_note_reset(w, gcp, &gcp->target, r)) {
+		gwp_conn_buf_consume(&gcp->client, gcp->client.len);
+		return iou_forward_progress(w, gcp);
+	}
 	r = handle_sock_ret(r);
 	if (r < 0)
 		return r;

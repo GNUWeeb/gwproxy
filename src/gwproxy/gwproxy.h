@@ -1330,6 +1330,15 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
 int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
 void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair *gcp);
 
+/*
+ * @c, one side of @gcp, was reset while the pair forwarded (gwp_conn::rst),
+ * and its stream is to end on the other side as a cut, not as a normal end.
+ * Not when the HTTP forwarding filter has answered 502 in place of the
+ * origin's response: that reply is complete.
+ */
+bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
+			   const struct gwp_conn *c);
+
 /* True if the ACL INPUT chain permits an incoming client for @proto (allow-all
  * with no ACL). */
 bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,

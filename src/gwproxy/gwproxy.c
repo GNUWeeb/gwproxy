@@ -1271,6 +1271,15 @@ void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair __unused *gcp)
 #endif
 }
 
+bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
+			   const struct gwp_conn *c)
+{
+	if (!c->rst)
+		return false;
+	return c != &gcp->target || !gwp_http_fwd_active(gcp) ||
+	       gwp_http_fwd_res_state(gcp->http_conn) != GWP_HTTP_RES_FAILED;
+}
+
 static void gwp_conn_pair_abort_target(const struct gwp_conn_pair __unused *gcp)
 {
 #ifdef CONFIG_HTTPS
