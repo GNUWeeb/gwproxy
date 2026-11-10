@@ -382,6 +382,7 @@ static void cancel_all_requests(struct gwp_wrk *w)
 
 	for (;;) {
 		bool done;
+		int res;
 
 		r = io_uring_wait_cqe(ring, &cqe);
 		if (r == -EINTR)
@@ -389,9 +390,19 @@ static void cancel_all_requests(struct gwp_wrk *w)
 		if (r < 0)
 			goto out_err;
 		done = cqe->user_data == tag;
+		res = cqe->res;
 		io_uring_cqe_seen(ring, cqe);
-		if (done)
+		if (!done)
+			continue;
+		/*
+		 * The count of requests cancelled, or -ENOENT for none.
+		 * Anything else, such as the -EINVAL of a kernel that does
+		 * not know the flag, cancelled nothing.
+		 */
+		if (res >= 0 || res == -ENOENT)
 			return;
+		r = res;
+		goto out_err;
 	}
 
 out_err:

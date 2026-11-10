@@ -2,9 +2,10 @@
 /*
  * LD_PRELOAD shim: make io_uring look like an older kernel's, as far as the
  * io_uring event loop can tell. liburing makes its system calls itself, so a
- * seccomp filter traps io_uring_setup(2) and io_uring_enter(2) into a signal
- * handler here, which makes the real call from the one place the filter lets
- * it through, and edits what goes in or comes out.
+ * seccomp filter traps io_uring_setup(2), io_uring_enter(2) and
+ * io_uring_register(2) into a signal handler here, which makes the real call
+ * from the one place the filter lets it through, and edits what goes in or
+ * comes out.
  *
  * $IOU_OLD_KERNEL says what to pretend:
  *   5.15          no IORING_FEAT_CQE_SKIP, and a request flagged
@@ -13,6 +14,10 @@
  *                 -EINVAL (as before 5.19)
  *   close-einval  only: a close fails with -EINVAL; no kernel does just
  *                 this, it shows what the loop does with such a close
+ *   exit-cancel   only: IORING_REGISTER_SYNC_CANCEL (6.0) and a cancel with
+ *                 IORING_ASYNC_CANCEL_ANY fail with -EINVAL, as before 5.19,
+ *                 where the probe's cancel is not refused; it shows what a
+ *                 worker does at exit with a cancel that cancelled nothing
  * Every version also refuses IORING_SETUP_NO_SQARRAY (6.6) at setup, which
  * liburing then retries without, so the submission queue keeps its index
  * array.
@@ -52,8 +57,12 @@
 #ifndef IORING_SETUP_NO_SQARRAY
 #define IORING_SETUP_NO_SQARRAY		(1U << 16)
 #endif
+#ifndef IORING_ASYNC_CANCEL_ANY
+#define IORING_ASYNC_CANCEL_ANY		(1U << 2)
+#endif
+#define REGISTER_SYNC_CANCEL		24
 
-enum { OLD_5_15 = 1, OLD_5_18, CLOSE_EINVAL };
+enum { OLD_5_15 = 1, OLD_5_18, CLOSE_EINVAL, EXIT_CANCEL };
 
 static int mode;
 
@@ -147,6 +156,11 @@ static void edit(struct io_uring_sqe *sqe)
 		if (sqe->opcode == IORING_OP_CLOSE)
 			sqe->off = 1;
 		break;
+	case EXIT_CANCEL:
+		if (sqe->opcode == IORING_OP_ASYNC_CANCEL &&
+		    (sqe->cancel_flags & IORING_ASYNC_CANCEL_ANY))
+			sqe->off = 1;
+		break;
 	}
 }
 
@@ -175,6 +189,16 @@ static void on_sigsys(int sig, siginfo_t *si, void *ucv)
 				      (struct io_uring_params *)g[REG_RSI]);
 		return;
 	}
+	if (si->si_syscall == SYS_io_uring_register) {
+		if (mode == EXIT_CANCEL &&
+		    (unsigned int)g[REG_RSI] == REGISTER_SYNC_CANCEL)
+			g[REG_RAX] = -22;	/* EINVAL */
+		else
+			g[REG_RAX] = real_syscall(SYS_io_uring_register,
+						  g[REG_RDI], g[REG_RSI],
+						  g[REG_RDX], g[REG_R10], 0, 0);
+		return;
+	}
 	if ((unsigned int)g[REG_RSI])
 		edit_queued(g[REG_RDI]);
 	g[REG_RAX] = real_syscall(SYS_io_uring_enter, g[REG_RDI], g[REG_RSI],
@@ -188,8 +212,9 @@ static void install(void)
 	struct sock_filter f[] = {
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
 			 offsetof(struct seccomp_data, nr)),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_enter, 2, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_setup, 1, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_enter, 3, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_setup, 2, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_register, 1, 0),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
 			 offsetof(struct seccomp_data, instruction_pointer)),
@@ -218,6 +243,8 @@ static void install(void)
 		mode = OLD_5_18;
 	else if (!strcmp(m, "close-einval"))
 		mode = CLOSE_EINVAL;
+	else if (!strcmp(m, "exit-cancel"))
+		mode = EXIT_CANCEL;
 	else
 		_exit(99);
 

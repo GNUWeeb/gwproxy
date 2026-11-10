@@ -12,6 +12,12 @@
 # t/servers/iou_old_kernel.c); after 60 connections through a plain proxy to an
 # origin that answers and closes, the proxy's descriptor count must be back
 # where it started.
+#
+# Likewise, at exit a worker cancels every request still in flight before it
+# frees their buffers; where the synchronous cancel is missing (before 6.0),
+# with an asynchronous IORING_ASYNC_CANCEL_ANY. When that was refused with
+# -EINVAL it cancelled nothing, and the worker went on silently. The shim
+# refuses both (as kernels before 5.19 do), and the worker must say so.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -31,7 +37,7 @@ wrap="$WORK/gwproxy-shim"
 # See t/0250 for why the shim is preloaded into the proxy alone.
 cat >"$wrap" <<-WRAP
 	#!/bin/sh
-	IOU_OLD_KERNEL=close-einval LD_PRELOAD="$WORK/shim.so" \
+	IOU_OLD_KERNEL="\${IOU_OLD_KERNEL:-close-einval}" LD_PRELOAD="$WORK/shim.so" \
 	ASAN_OPTIONS="\${ASAN_OPTIONS:+\$ASAN_OPTIONS:}verify_asan_link_order=0" \
 	exec "$real" "\$@"
 WRAP
@@ -105,4 +111,22 @@ grep -v "Closing connection pair\|New connection" "$log" | tail -20 | \
 [ "$rc" = 0 ] || fail "io_uring leaked the descriptors of closes the kernel refused"
 grep -q "failed: Invalid argument" "$log" \
 	|| fail "the shim refused no close: nothing was tested"
+
+kill "$GWP_PID" 2>/dev/null
+
+# Exit with a refused cancel of everything.
+pp="$(pick_port)"
+IOU_OLD_KERNEL=exit-cancel GWPROXY="$wrap" gwp_start "127.0.0.1:$pp" \
+	--event-loop=io_uring --nr-workers=2 --target="127.0.0.1:$op"
+log="$WORK/gwp.$pp.log"
+wait_sigterm_handled "$GWP_PID" || fail "no SIGTERM handler"
+kill "$GWP_PID"
+for _ in $(seq 1 300); do
+	kill -0 "$GWP_PID" 2>/dev/null || break
+	sleep 0.1
+done
+kill -0 "$GWP_PID" 2>/dev/null && fail "the proxy did not exit on SIGTERM"
+sed 's/^/# gwp: /' "$log" >&2
+[ "$(grep -c 'cannot cancel pending io_uring requests: Invalid argument' "$log")" = 2 ] \
+	|| fail "a worker freed its requests' buffers after a refused cancel, saying nothing"
 pass
