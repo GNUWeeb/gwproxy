@@ -2649,6 +2649,32 @@ bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
 	return false;
 }
 
+/*
+ * Log a client just accepted from @addr that the INPUT chain rejected. Such a
+ * client costs only an accept and a close, so it can come back as fast as it
+ * likes: log at most one line a second per worker, saying how many were left
+ * out since the previous one, so a flood of them cannot flood the log.
+ */
+void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	uint32_t quiet;
+
+	if ((int32_t)(w->now - w->acl_deny_next) < 0) {
+		w->acl_deny_quiet++;
+		return;
+	}
+
+	quiet = w->acl_deny_quiet;
+	w->acl_deny_quiet = 0;
+	w->acl_deny_next = w->now + 1;
+	if (quiet)
+		pr_info(&ctx->lh, "ACL denied client %s (and %u more since the last such line)",
+			ip_to_str(addr), quiet);
+	else
+		pr_info(&ctx->lh, "ACL denied client %s", ip_to_str(addr));
+}
+
 /* Uncount a client gwp_ctx_iplim_get() admitted. */
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr)
 {
@@ -3445,14 +3471,55 @@ static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 	return 0;
 }
 
+/*
+ * How long a stop waits for the resolver threads: one inside getaddrinfo()
+ * returns only when the system resolver gives up, which can take many
+ * seconds, and nothing needs its answer any more.
+ */
+#define GWP_DNS_STOP_GRACE_MS	1000
+
+/*
+ * The sleep of gwp_ctx_free_dns()'s wait, cut short by a SIGINT or SIGTERM.
+ * Both are blocked on every thread by then (sig_handler_detach_ctx(), or
+ * still from gwp_ctx_init() on its error path), so a second stop signal
+ * stays pending until it is taken here, and tells the proxy not to wait.
+ * @arg is a bool set when that happened.
+ */
+__cold
+static bool gwp_stop_signal_wait(int ms, void *arg)
+{
+	struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)ms * 1000000L };
+	sigset_t set;
+
+	sigemptyset(&set);
+	sigaddset(&set, SIGINT);
+	sigaddset(&set, SIGTERM);
+	if (sigtimedwait(&set, NULL, &ts) < 0)
+		return false;
+
+	*(bool *)arg = true;
+	return true;
+}
+
 static void gwp_ctx_free_dns(struct gwp_ctx *ctx)
 {
+	bool sig = false;
+	uint32_t left;
+
 	if (!ctx->dns)
 		return;
 
-	gwp_dns_ctx_free(ctx->dns);
+	left = gwp_dns_ctx_free_timed(ctx->dns, GWP_DNS_STOP_GRACE_MS,
+				      gwp_stop_signal_wait, &sig);
 	ctx->dns = NULL;
-	pr_dbg(&ctx->lh, "DNS context freed");
+	if (!left)
+		pr_dbg(&ctx->lh, "DNS context freed");
+	else if (sig)
+		pr_info(&ctx->lh, "Stop signal repeated: not waiting for %u DNS lookup(s) still in the system resolver",
+			left);
+	else
+		pr_info(&ctx->lh, "Not waiting for %u DNS lookup(s) still in the system resolver after %d ms",
+			left, GWP_DNS_STOP_GRACE_MS);
 }
 
 static int gwp_ctx_parse_ev(struct gwp_ctx *ctx)
@@ -7545,7 +7612,9 @@ static void sig_handler(int sig)
  * thread. This thread is the last one left once the context is freed, so keep
  * the signals pending on it from here on: there is nothing left for them to
  * stop, and one landing in exit() can upset what runs there, such as the
- * leak check of a sanitizer build, which stops the process with ptrace.
+ * leak check of a sanitizer build, which stops the process with ptrace. Only
+ * the wait for the resolver threads takes one, as a sign not to wait any
+ * longer (gwp_stop_signal_wait()).
  */
 __cold
 static void sig_handler_detach_ctx(void)

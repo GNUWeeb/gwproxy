@@ -65,6 +65,7 @@ struct gwp_dns_thr {
 	pthread_t		thread;
 	uint32_t		id;
 	uint8_t			state;
+	bool			busy;	/* in process_queue_entry() */
 	bool			join;	/* free_threads() only */
 };
 
@@ -166,6 +167,7 @@ struct gwp_dns_ctx {
 	struct gwp_dns_cache	*cache;
 	struct gwp_dns_cq	*cqs;		/* @cfg.nr_cqs of them */
 	time_t			last_scan;
+	struct gwp_dns_ctx	*abandoned_next;
 	struct gwp_dns_cfg	cfg;
 };
 
@@ -711,9 +713,9 @@ static void deliver_waiters(struct gwp_dns_entry *e, int res,
 
 /*
  * Must be called with ctx->lock held. May release the lock, but
- * it will reacquire it before returning.
+ * it will reacquire it before returning. @t is busy meanwhile.
  */
-static void process_queue_entry(struct gwp_dns_ctx *ctx)
+static void process_queue_entry(struct gwp_dns_ctx *ctx, struct gwp_dns_thr *t)
 {
 	struct gwp_sockaddr addrs[GWP_DNS_MAX_ADDRS];
 	struct dns_lookup *l = take_lookup(ctx);
@@ -723,6 +725,7 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 	uint8_t nr;
 	int r;
 
+	t->busy = true;
 	if (all_cancelled(l->waiters)) {
 		/*
 		 * Nobody cares about the result any more. Drop the lookup
@@ -733,6 +736,7 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 		free_all_entries(l->waiters);
 		free(l);
 		pthread_mutex_lock(&ctx->lock);
+		t->busy = false;
 		return;
 	}
 	pthread_mutex_unlock(&ctx->lock);
@@ -768,6 +772,7 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 	free(l);
 
 	pthread_mutex_lock(&ctx->lock);
+	t->busy = false;
 }
 
 static void *gwp_dns_thread_entry(void *arg)
@@ -778,7 +783,7 @@ static void *gwp_dns_thread_entry(void *arg)
 	pthread_mutex_lock(&ctx->lock);
 	while (!ctx->should_stop) {
 		if (nr_takeable(ctx)) {
-			process_queue_entry(ctx);
+			process_queue_entry(ctx, t);
 			continue;
 		}
 
@@ -844,22 +849,81 @@ static void maybe_grow(struct gwp_dns_ctx *ctx)
 	}
 }
 
-static void free_threads(struct gwp_dns_ctx *ctx)
+static uint32_t nr_busy(struct gwp_dns_ctx *ctx)
 {
-	uint32_t i;
+	uint32_t i, n = 0;
+
+	pthread_mutex_lock(&ctx->lock);
+	for (i = 0; i < ctx->max_threads; i++)
+		n += ctx->threads[i].busy;
+	pthread_mutex_unlock(&ctx->lock);
+	return n;
+}
+
+static int64_t mono_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static bool sleep_ms(int ms, void *arg)
+{
+	struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)ms * 1000000L };
+
+	(void)arg;
+	nanosleep(&ts, NULL);
+	return false;
+}
+
+/*
+ * Stop the threads and join them. With @grace_ms >= 0, wait at most that
+ * long for the busy ones, those with a lookup, to finish it, sleeping
+ * through @wait, which can cut the wait short. Returns how many are still
+ * busy then, inside getaddrinfo(): those are detached and left alone, with
+ * all they can still touch, the slots included, for the caller to keep.
+ * Waits for all of them when @grace_ms < 0.
+ */
+static uint32_t free_threads(struct gwp_dns_ctx *ctx, int grace_ms,
+			     gwp_dns_wait_fn wait, void *arg)
+{
+	int64_t deadline = grace_ms >= 0 ? mono_ms() + grace_ms : 0;
+	uint32_t i, left = 0;
 
 	if (!ctx->threads)
-		return;
+		return 0;
 
 	/*
 	 * Nothing queues lookups any more, so no slot leaves FREE from here
-	 * on; a RUNNING one may still turn EXITED, which needs joining too.
+	 * on, and no thread becomes busy: each sees @should_stop under the
+	 * lock before it takes a lookup. An idle one leaves at once.
 	 */
 	pthread_mutex_lock(&ctx->lock);
 	ctx->should_stop = true;
 	pthread_cond_broadcast(&ctx->cond);
-	for (i = 0; i < ctx->max_threads; i++)
-		ctx->threads[i].join = ctx->threads[i].state != GWP_DNS_THR_FREE;
+	pthread_mutex_unlock(&ctx->lock);
+
+	if (!wait)
+		wait = sleep_ms;
+	while (grace_ms >= 0 && nr_busy(ctx)) {
+		int64_t rem = deadline - mono_ms();
+
+		if (rem <= 0 || wait(rem < 10 ? (int)rem : 10, arg))
+			break;
+	}
+
+	pthread_mutex_lock(&ctx->lock);
+	for (i = 0; i < ctx->max_threads; i++) {
+		struct gwp_dns_thr *t = &ctx->threads[i];
+
+		t->join = t->state != GWP_DNS_THR_FREE;
+		if (t->busy && grace_ms >= 0) {
+			pthread_detach(t->thread);
+			t->join = false;
+			left++;
+		}
+	}
 	pthread_mutex_unlock(&ctx->lock);
 
 	for (i = 0; i < ctx->max_threads; i++) {
@@ -867,8 +931,12 @@ static void free_threads(struct gwp_dns_ctx *ctx)
 			pthread_join(ctx->threads[i].thread, NULL);
 	}
 
+	if (left)
+		return left;
+
 	free(ctx->threads);
 	ctx->threads = NULL;
+	return 0;
 }
 
 static int init_threads(struct gwp_dns_ctx *ctx)
@@ -901,7 +969,7 @@ static int init_threads(struct gwp_dns_ctx *ctx)
 	pthread_mutex_unlock(&ctx->lock);
 
 	if (r)
-		free_threads(ctx);
+		free_threads(ctx, -1, NULL, NULL);
 
 	return r;
 }
@@ -1193,15 +1261,35 @@ out_free_ctx:
 	return r;
 }
 
-void gwp_dns_ctx_free(struct gwp_dns_ctx *ctx)
+/*
+ * Contexts left to the process exit by gwp_dns_ctx_free_timed(), kept
+ * reachable so that a leak checker does not take them for leaks.
+ */
+static struct gwp_dns_ctx *abandoned_ctxs;
+
+uint32_t gwp_dns_ctx_free_timed(struct gwp_dns_ctx *ctx, int grace_ms,
+				gwp_dns_wait_fn wait, void *arg)
 {
-	free_threads(ctx);
+	uint32_t left = free_threads(ctx, grace_ms, wait, arg);
+
+	if (left) {
+		ctx->abandoned_next = abandoned_ctxs;
+		abandoned_ctxs = ctx;
+		return left;
+	}
+
 	pthread_mutex_destroy(&ctx->lock);
 	pthread_cond_destroy(&ctx->cond);
 	free_all_queued_entries(ctx);
 	free_cqs(ctx);
 	free_cache(ctx->cache);
 	free(ctx);
+	return 0;
+}
+
+void gwp_dns_ctx_free(struct gwp_dns_ctx *ctx)
+{
+	gwp_dns_ctx_free_timed(ctx, -1, NULL, NULL);
 }
 
 static struct dns_lookup *find_lookup(struct gwp_dns_ctx *ctx,

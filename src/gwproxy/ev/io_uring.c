@@ -1899,8 +1899,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 
 	if (!gwp_ctx_acl_client_allowed(ctx, &w->iou->accept_addr,
 					GWP_ACL_PROTO_TCP)) {
-		pr_info(&ctx->lh, "ACL denied client %s",
-			ip_to_str(&w->iou->accept_addr));
+		gwp_wrk_acl_denied(w, &w->iou->accept_addr);
 		prep_close(w, fd);
 		return 0;
 	}
