@@ -2617,8 +2617,14 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * client.buf. Send it first, since the client may wait for an answer
 	 * to it before it sends anything else; the send completion arms the
 	 * client recv.
+	 *
+	 * Neither for a target that was reset as it connected
+	 * (target_note_reset()): nothing can be sent to it, and its end ends
+	 * the pair.
 	 */
-	if (!http_fwd && gcp->client.len) {
+	if (gcp->target.wr_shut) {
+		/* Only what the target sent is left to deliver. */
+	} else if (!http_fwd && gcp->client.len) {
 		prep_send_target(w, gcp);
 #ifdef CONFIG_HTTPS
 	} else if (!http_fwd && client_is_tls(gcp)) {
@@ -2654,7 +2660,8 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			r = gwp_http_fwd_begin(w, gcp);
 			if (r)
 				return r;
-			prep_send_target(w, gcp);
+			if (!gcp->target.wr_shut)
+				prep_send_target(w, gcp);
 			prep_recv_target(w, gcp);
 			return 0;
 		}
@@ -2675,6 +2682,34 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 }
 
 /*
+ * Whether the result @res of a connect says that the target accepted and then
+ * reset the connection: a refused SYN gives ECONNREFUSED, one that is never
+ * answered ETIMEDOUT. What it sent before the reset can still be read, so the
+ * connect counts as a success. Not for an upstream proxy, whose reset fails
+ * the handshake that is yet to run on the connection.
+ */
+static bool target_was_up(const struct gwp_conn_pair *gcp, int res)
+{
+	return (res == -ECONNRESET || res == -EPIPE) && !gcp->upstream;
+}
+
+/*
+ * A connect that target_was_up() took as a success. Its result has taken the
+ * error off the socket, and nothing more can be sent to the target: its write
+ * side counts as shut, and what the client sent for it is dropped. Forwarding
+ * reads what the target sent, then the end of stream, and the pair ends once
+ * that is delivered.
+ */
+static void target_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      int res)
+{
+	pr_dbg(&w->ctx->lh, "Target connected, then ended: %s (idx=%u, fd=%d)",
+		strerror(-res), gcp->idx, gcp->target.fd);
+	gcp->target.wr_shut = true;
+	gwp_conn_buf_consume(&gcp->client, gcp->client.len);
+}
+
+/*
  * One racing connect completed. Attempts are retired here rather than where
  * they are cancelled, so an attempt socket is closed only once io_uring is
  * done with it.
@@ -2684,7 +2719,7 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 {
 	struct gwp_conn_pair *gcp = udata;
 	struct gwp_ctx *ctx = w->ctx;
-	int fd;
+	int fd, up_res = 0;
 
 	if (unlikely(slot >= GWP_MAX_CONN_CAND))
 		return -EINVAL;
@@ -2692,6 +2727,12 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 	fd = gcp->attempt_fd[slot];
 	if (unlikely(fd < 0))
 		return 0;		/* already retired */
+
+	/* Connected, then reset; see target_was_up(). */
+	if (target_was_up(gcp, res)) {
+		up_res = res;
+		res = 0;
+	}
 
 	/* Plain forwarding was asked before the connect. */
 	if (!res && gcp->target.fd < 0 && !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL) &&
@@ -2729,6 +2770,8 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 	}
 
 	adopt_winning_attempt(w, gcp, slot);
+	if (up_res)
+		target_note_reset(w, gcp, up_res);
 	return finish_target_connect(w, gcp, res);
 }
 

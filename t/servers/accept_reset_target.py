@@ -3,12 +3,15 @@
 # A target that accepts, sends a short banner and resets at once, before the
 # proxy has looked at its connect's result, for t/0223. The connect succeeded:
 # the client must get a success reply and the banner, then an end of stream.
+# For an HTTP forwarding request the "banner" is a whole response, which the
+# client must get as the origin's answer.
 #
 # Usage: accept_reset_target.py <mode> <proxy_port> <proxy_pid> \
 #     <target_port> [<rounds>]
 #
 # <mode> is how the client asks for the target: plain (the proxy runs with
-# --target pointing at <target_port>), socks5 or http (CONNECT).
+# --target pointing at <target_port>), socks5, http (CONNECT) or fwd (an HTTP
+# GET in absolute form).
 #
 # To have the proxy see the result only after the reset, whatever the timing:
 # the target's accept queue is kept full (listen(0) and a connection that is
@@ -28,6 +31,7 @@ import time
 
 TIMEOUT = 30
 BANNER = b"HELLO-BANNER\n"
+RESPONSE = b"HTTP/1.1 503 Busy\r\nContent-Length: 4\r\n\r\nbusy"
 errors = []
 
 
@@ -80,6 +84,9 @@ def one(mode, pport, pid, ls, tport):
             raise RuntimeError("SOCKS5 greeting refused")
         c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") +
                   struct.pack("!H", tport))
+    elif mode == "fwd":
+        c.sendall(b"GET http://127.0.0.1:%d/ HTTP/1.1\r\nHost: x\r\n\r\n" %
+                  tport)
     elif mode == "http":
         c.sendall(b"CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: x\r\n\r\n" % tport)
 
@@ -95,7 +102,7 @@ def one(mode, pport, pid, ls, tport):
         f.close()
         filler.close()
         t, _ = ls.accept()	# the retransmitted SYN, a second later
-        t.sendall(BANNER)
+        t.sendall(RESPONSE if mode == "fwd" else BANNER)
         t.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
                      struct.pack("ii", 1, 0))
         t.close()
@@ -121,6 +128,13 @@ def one(mode, pport, pid, ls, tport):
             return
     got, how = read_all(c)
     c.close()
+    if mode == "fwd":
+        # The proxy adds its own Connection headers.
+        if (not got.startswith(b"HTTP/1.1 503 Busy\r\n") or
+                not got.endswith(b"\r\n\r\nbusy") or how == "timeout"):
+            errors.append("fwd: got %r, then %s, not the origin's 503" %
+                          (got, how))
+        return
     if got != BANNER or how == "timeout":
         errors.append("%s: got %r, then %s, not the banner and an end" %
                       (mode, got, how))
