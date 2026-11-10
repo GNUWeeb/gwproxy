@@ -168,6 +168,19 @@ Number of worker threads, each with its own
 .B SO_REUSEPORT
 listener, from 1 to 1024. Default:
 .BR 4 .
+.IP
+Since every listener sets
+.BR SO_REUSEPORT ,
+another process of the same user that listens on the same address and port
+with
+.B SO_REUSEPORT
+too, such as a second gwproxy, shares the port with this one: the kernel
+spreads new connections over both, each handling them with its own
+configuration. That makes an overlapping restart possible, but a second
+instance started by mistake gets no error either. gwproxy therefore logs a
+warning at startup when another socket already listens on its
+.B \-\-bind
+address and port, and starts all the same.
 .TP
 .BR \-o ", " \-\-protocol\-timeout=\fIsec\fR
 Seconds allowed for a client to complete the SOCKS5/HTTP (and, if enabled, TLS)
