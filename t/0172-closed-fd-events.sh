@@ -78,6 +78,13 @@ hold_start()
 	fi
 }
 
+# hold_fail <message>: fail with the end of the proxy's log.
+hold_fail()
+{
+	tail -40 "$HLOG" | sed 's/^/# gwp: /' >&2
+	fail "$1"
+}
+
 # hold_check <name> <rc> <out>: judge a part's client, then stop the proxy.
 hold_check()
 {
@@ -87,22 +94,22 @@ hold_check()
 	sanitizer_check "$HLOG" "[$name]"
 	if ! kill -0 "$GPID" 2>/dev/null; then
 		wait "$HPID"
-		fail "[$name] the proxy died (status $?): $out"
+		hold_fail "[$name] the proxy died (status $?): $out"
 	fi
 	case $rc in
 	0) ;;
-	2) fail "[$name] the worker spun on events of closed sockets: $out" ;;
-	*) fail "[$name] $out" ;;
+	2) hold_fail "[$name] the worker spun on events of closed sockets: $out" ;;
+	*) hold_fail "[$name] $out" ;;
 	esac
 	r="$(python3 "$SERVERS_DIR/socks5_probe.py" "$PP" "$hp")"
-	[ "$r" = "REP=0x00" ] || fail "[$name] SOCKS5 CONNECT afterwards: $r"
+	[ "$r" = "REP=0x00" ] || hold_fail "[$name] SOCKS5 CONNECT afterwards: $r"
 	kill -TERM "$GPID"
 	timeout 30 bash -c "while kill -0 $GPID 2>/dev/null; do sleep 0.05; done" ||
-		fail "[$name] the proxy did not exit on SIGTERM"
+		hold_fail "[$name] the proxy did not exit on SIGTERM"
 	wait "$HPID"
 	ec=$?
 	sanitizer_check "$HLOG" "[$name]"
-	[ "$ec" = 0 ] || { tail -20 "$HLOG" >&2; fail "[$name] exit status $ec"; }
+	[ "$ec" = 0 ] || hold_fail "[$name] exit status $ec"
 }
 
 # The client of the pool and DNS parts: a SOCKS5 tunnel to <dst>:<hp>, idle
@@ -338,7 +345,7 @@ for loop in epoll io_uring; do
 		    s.sendto(resp, peer)
 		PY
 		_PIDS+=("$!")
-		timeout 10 bash -c "until grep -q ready '$WORK/dns.log'; do sleep 0.05; done" ||
+		timeout 10 bash -c "until grep -qs ready '$WORK/dns.log'; do sleep 0.05; done" ||
 			fail "the DNS server did not start"
 		hold_start "$loop/dns" --log-level=3 --acl-allow-all --as-socks5=1 \
 			--event-loop="$loop" --raw-dns=1 --dns-server="127.0.0.1:$dp" \
