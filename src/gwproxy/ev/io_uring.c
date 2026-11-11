@@ -1605,11 +1605,16 @@ static int tls_forward_resume(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * plaintext recv of the same segment would, since no completion will come
  * for them later.
  *
- * Not while a reply is on its way to the client, though: a protocol pass
- * may queue another reply, and the tx scratch it would be encrypted into is
- * still being sent. Neither is a recv armed then, since the records the
- * engine may hold would not complete one. handle_ev_client_send() picks the
- * pump up again once the reply is out.
+ * That goes on while a reply is on its way to the client: a reply a pass
+ * queues meanwhile waits in target.buf, and the completion of the send
+ * encrypts it (send_client_tls()). A client may well not read what it is
+ * sent before it has sent all of its request, and its socket is not drained
+ * for as long as it is not read: a KeyUpdate's answers fill the client's
+ * receive window, and the request behind them would never come in. Only
+ * once the engine has more for the client than forwarding would leave it
+ * (gwp_ssl_tx_backlog()) does the pump stop, without arming a recv, so a
+ * client that does not read cannot have the answers pile up;
+ * handle_ev_client_send() picks it up again once they are out.
  *
  * The control connection of a UDP association has no more protocol to run: what
  * the client sends over it is thrown away, as with a plaintext client. It still
@@ -1624,8 +1629,9 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	size_t got;
 	int sr;
 
-	if (t->tx_sent < t->tx_len) {
+	if (gwp_ssl_tx_backlog(c->tls, gcp->target.cap)) {
 		t->prot_resume = true;
+		send_client_tls(w, gcp);
 		return 0;
 	}
 
@@ -1659,14 +1665,16 @@ again:
 		if (c->rd_eof)
 			return -ECONNRESET;
 		/*
-		 * The engine has records of its own to send, in answer to a
-		 * KeyUpdate, say. Take no more until they are out, so a client
-		 * that does not read them cannot have them pile up.
+		 * The engine may have records of its own to send, in answer
+		 * to a KeyUpdate, say: send them, and read on unless the
+		 * client has left too many of them unread (see above).
 		 */
 		if (gwp_ssl_bio_pending(c->tls) > 0) {
-			t->prot_resume = true;
 			send_client_tls(w, gcp);
-			return 0;
+			if (gwp_ssl_tx_backlog(c->tls, gcp->target.cap)) {
+				t->prot_resume = true;
+				return 0;
+			}
 		}
 		/* Nothing new, and room for more: wait for the client. */
 		return prep_recv_client_prot(w, gcp);
@@ -1678,8 +1686,8 @@ again:
 /*
  * Whether the protocol should be fed from the engine rather than the socket:
  * it still holds records and client.buf has room for them, or it has records
- * of its own to send first. With a reply still being sent, tls_prot_pump()
- * waits for that send to complete.
+ * of its own to send first. With too many of those unread, tls_prot_pump()
+ * waits for the client to take them.
  */
 static bool tls_prot_more(struct gwp_conn_pair *gcp)
 {
