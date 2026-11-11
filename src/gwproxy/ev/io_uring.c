@@ -2879,10 +2879,11 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 		res = -ELOOP;
 
 	/*
-	 * A winner was already adopted, or the pair is being torn down: this is
-	 * a loser being reaped, not a result to act on.
+	 * A winner was already adopted, or the pair is being torn down or
+	 * held for its failure reply (hold_for_fail_reply()): this is a loser
+	 * being reaped, not a result to act on.
 	 */
-	if (res < 0 || gcp->target.fd >= 0 ||
+	if (res < 0 || gcp->target.fd >= 0 || gcp->fail_err ||
 	    (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)) {
 		gcp->attempt_fd[slot] = -1;
 		prep_close(w, fd);
@@ -2893,7 +2894,8 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 				slot, strerror(-res), fd, gcp->idx,
 				ip_to_str(&gcp->attempt_addr[slot]));
 
-		if (gcp->target.fd >= 0 || (gcp->flags & GWP_CONN_FLAG_IS_CANCEL))
+		if (gcp->target.fd >= 0 || gcp->fail_err ||
+		    (gcp->flags & GWP_CONN_FLAG_IS_CANCEL))
 			return 0;
 
 		/*
@@ -3698,11 +3700,12 @@ static int handle_ev_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 
 	/*
-	 * It expired just as the pair started going away. The cancels are
-	 * queued already, so none would reach a connect started now, and its
+	 * It expired just as the pair started going away, or was held for
+	 * its failure reply (hold_for_fail_reply()). The cancels are queued
+	 * already, so none would reach a connect started now, and its
 	 * reference would hold the pair for as long as the SYN is retried.
 	 */
-	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
+	if ((gcp->flags & GWP_CONN_FLAG_IS_CANCEL) || gcp->fail_err)
 		return 0;
 
 	if (gcp->next_cand >= gcp->nr_cand)
@@ -4061,29 +4064,50 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
  * return @err then. Returns true when the teardown is to wait. Meanwhile,
  * what else completes on the client is not acted on (handle_event()).
  *
- * Only while nothing else is in flight that could take the pair further: a
- * connect attempt, I/O on the target or the UDP relay, a lookup. A timer
- * bounds the wait, the pair's own if it is due soon enough, else one armed
- * here, so a client that does not read cannot hold the pair, whatever
- * --connect-timeout and --protocol-timeout are; handle_ev_timer() returns
- * @err when it expires.
+ * Only while no I/O on the target or the UDP relay is in flight, which could
+ * take the pair further. The racing connect attempts and their timer, and a
+ * lookup, are given up on, as by the teardown (shutdown_gcp()): a connect
+ * that completes meanwhile is closed (handle_ev_target_attempt()), and the
+ * resolver throws the lookup's result away. The pair's timer bounds the
+ * wait, re-armed for GWP_FAIL_REPLY_SEC, so a client that does not read
+ * cannot hold the pair, whatever --connect-timeout, --protocol-timeout and
+ * --idle-timeout are; handle_ev_timer() returns @err when it expires.
+ * Whatever it was armed for is over: a connect timeout that is about to
+ * expire must not cut the reply to a connect that failed. As on epoll.
  */
 static bool hold_for_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				int err)
 {
-	uint64_t now, due;
+	uint8_t i;
 
 	if (gcp->fail_err || !gcp->client.last_reply || !client_send_busy(gcp))
 		return false;
-	if (has_inflight_attempt(gcp) || gcp->nr_ops_target ||
-	    gcp->nr_ops_udp || gcp->gde)
+	if (gcp->nr_ops_target || gcp->nr_ops_udp)
 		return false;
 
 	gcp->fail_err = err;
-	now = iou_now_ms();
-	due = now + GWP_FAIL_REPLY_SEC * 1000ull;
-	if (gcp->tmr_due <= now || gcp->tmr_due > due)
-		prep_timer_target(w, gcp, GWP_FAIL_REPLY_SEC);
+
+	gwp_conn_pair_abort_attempts(gcp);
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
+		if (gcp->attempt_fd[i] >= 0)
+			cancel_attempt(w, gcp, i);
+	}
+	prep_attempt_timer_del(w, gcp);
+	/* The caller holds a reference of its own, as for shutdown_gcp(). */
+	if (gcp->gde) {
+		gwp_dns_entry_cancel(gcp->gde);
+		gcp->gde = NULL;
+		put_gcp(w, gcp);
+	}
+
+	/*
+	 * Each removal takes one live timer, and the one armed behind them
+	 * cannot be among those: they run first.
+	 */
+	for (i = 0; i < gcp->nr_timers_armed; i++)
+		prep_timer_del_target(w, gcp);
+	prep_timer_target(w, gcp, GWP_FAIL_REPLY_SEC);
+
 	pr_dbg(&w->ctx->lh,
 	       "Waiting for the failure reply to be sent (idx=%u, err=%d)",
 	       gcp->idx, err);
