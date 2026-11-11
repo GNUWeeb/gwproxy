@@ -14,9 +14,9 @@
 # On io_uring the same client was not read while the engine's answers were
 # being sent to it, and as it does not read before its request is out, the
 # request never came in: the pair sat until the protocol timeout, and the
-# client got no reply at all. Both loops, but io_uring does not hold the
-# pair for a refusal, nor while connect attempts are in flight: there only
-# the 502.
+# client got no reply at all; and it did not keep the pair for a refusal,
+# whose 407 then went with the teardown. Both loops, but io_uring does not
+# hold the pair while connect attempts are in flight: not the 504 there.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -61,9 +61,9 @@ check()
 for loop in epoll io_uring; do
 	[ "$loop" = io_uring ] && ! have_io_uring && continue
 
+	check "$loop" 407 "127.0.0.1:$CLOSED_PORT" 1 --auth-file="$WORK/auth"
 	check "$loop" 502 "127.0.0.1:$CLOSED_PORT" 1
 	[ "$loop" = io_uring ] && continue
-	check "$loop" 407 "127.0.0.1:$CLOSED_PORT" 1 --auth-file="$WORK/auth"
 	check "$loop" 504 "127.0.0.1:$tport" 2.5 --connect-timeout=1
 done
 

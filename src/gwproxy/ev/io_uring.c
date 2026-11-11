@@ -2944,6 +2944,10 @@ static int handle_ev_client_watch(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (res & (POLLERR | POLLHUP))
 		return -ECONNRESET;
 
+	/* Held for its last reply (hold_for_fail_reply()): a FIN is no news. */
+	if (gcp->fail_err)
+		return 0;
+
 	if (!(res & POLLRDHUP))
 		return 0;
 
@@ -4045,15 +4049,17 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 #define GWP_FAIL_REPLY_SEC 5
 
 /*
- * @err ends the pair, and its client has been given a failure reply, but a
- * send to the client is still on its way: the reply is in it, or in
- * target.buf behind it, to be sent by its completion. The teardown would
- * cancel that send, and drop its completion: the client would get only what
- * went before the reply, "05 00" and EOF for a SOCKS5 client that sent its
- * CONNECT along with its greeting, when its lookup failed before the method
- * reply was out (a name in the negative cache, say). Keep the pair until
- * handle_ev_client_send() has sent the rest, and have it return @err then.
- * Returns true when the teardown is to wait.
+ * @err ends the pair, and its client has been given its last reply (a
+ * failure reply, or a refusal such as a 407), but a send to the client is
+ * still on its way: the reply is in it, or in target.buf behind it, to be
+ * sent by its completion. The teardown would cancel that send, and drop its
+ * completion: the client would get only what went before the reply, "05 00"
+ * and EOF for a SOCKS5 client that sent its CONNECT along with its greeting,
+ * when its lookup failed before the method reply was out (a name in the
+ * negative cache, say), or a TLS client's KeyUpdate answers and no 407.
+ * Keep the pair until handle_ev_client_send() has sent the rest, and have it
+ * return @err then. Returns true when the teardown is to wait. Meanwhile,
+ * what else completes on the client is not acted on (handle_event()).
  *
  * Only while nothing else is in flight that could take the pair further: a
  * connect attempt, I/O on the target or the UDP relay, a lookup. A timer
@@ -4067,8 +4073,7 @@ static bool hold_for_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	uint64_t now, due;
 
-	if (gcp->fail_err || !(gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED) ||
-	    !client_send_busy(gcp))
+	if (gcp->fail_err || !gcp->client.last_reply || !client_send_busy(gcp))
 		return false;
 	if (has_inflight_attempt(gcp) || gcp->nr_ops_target ||
 	    gcp->nr_ops_udp || gcp->gde)
@@ -4169,6 +4174,18 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		 */
 		gcp = udata;
 		if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL) {
+			put_gcp(w, gcp);
+			return 0;
+		}
+
+		/*
+		 * Held for its last reply (hold_for_fail_reply()): only the
+		 * send of it, and a reset the client watch reports, count.
+		 * A recv armed during the handshake may complete meanwhile:
+		 * what the client sent is not acted on, as after the close.
+		 */
+		if (unlikely(gcp->fail_err) && ev_bit != EV_BIT_IOU_CLIENT_SEND &&
+		    ev_bit != EV_BIT_IOU_CLIENT_WATCH) {
 			put_gcp(w, gcp);
 			return 0;
 		}
