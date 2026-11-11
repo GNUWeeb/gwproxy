@@ -680,6 +680,19 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return credit_fd_closed(w, nr_fd_closed);
 }
 
+/* A client waiting for its target socket (wait_for_target()) waits no more. */
+static void drop_tgt_wait(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	uint32_t i;
+
+	for (i = 0; unlikely(i < w->nr_tgt_wait); i++) {
+		if (w->tgt_wait[i] == gcp) {
+			w->tgt_wait[i] = w->tgt_wait[--w->nr_tgt_wait];
+			break;
+		}
+	}
+}
+
 /*
  * Tear a pair down. Events later in the batch being handled may still carry
  * a pointer to it, so it is only marked dying here: handle_event() skips its
@@ -694,21 +707,12 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  */
 static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	uint32_t i;
-
 	if (gcp->flags & GWP_CONN_FLAG_IS_DYING)
 		return 0;
 
 	tmr_disarm(w, gcp, GWP_TMR_CONN);
 	tmr_disarm(w, gcp, GWP_TMR_ATTEMPT);
-
-	/* A client waiting for its target socket (see wait_for_target()). */
-	for (i = 0; unlikely(i < w->nr_tgt_wait); i++) {
-		if (w->tgt_wait[i] == gcp) {
-			w->tgt_wait[i] = w->tgt_wait[--w->nr_tgt_wait];
-			break;
-		}
-	}
+	drop_tgt_wait(w, gcp);
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	/*
@@ -3483,6 +3487,114 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
+/*
+ * How long a pair that failed waits at most for its failure reply to reach
+ * the client (hold_for_fail_reply()), in seconds; as on io_uring.
+ */
+#define GWP_FAIL_REPLY_SEC 5
+
+/*
+ * Whether what is left of a client's last reply can only go once the client
+ * has been read: a TLS engine that waits for the peer (gwp_ssl_tx_starved())
+ * with no ciphertext of its own left to send. The reply is never read on, so
+ * a writable socket would only bring back the same SSL_write() at once.
+ */
+static bool fail_reply_stuck(struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	struct gwp_ssl *tls = gcp->client.tls;
+
+	if (tls && gwp_ssl_tx_starved(tls) && !gwp_ssl_bio_pending(tls))
+		return true;
+#endif
+	return false;
+}
+
+/*
+ * @err ends the pair, and its client has been given its last reply (a
+ * failure reply, a refusal), but the socket did not take all of it: the
+ * client has not read what was sent before, as a TLS client that asks for
+ * KeyUpdates without reading the answers has not. The teardown would throw
+ * the rest away, the reply and a TLS client's close_notify with it. Keep the
+ * pair until the client has taken it (handle_ev_fail_reply()), and end it
+ * with @err then. Returns true when the teardown is to wait.
+ *
+ * Nothing else may take the pair further meanwhile: the target, the racing
+ * connect attempts and the UDP relay are no longer watched, a raw DNS query
+ * is dropped and a getaddrinfo() lookup's result is thrown away when it
+ * comes (handle_ev_dns_cq()). Their descriptors are closed with the pair.
+ * Only EPOLLOUT is watched on the client, so what it sends meanwhile stays
+ * unread, as it would after the close; the linger set deals with it then.
+ * The pair's timer bounds the wait, re-armed for GWP_FAIL_REPLY_SEC, so a
+ * client that does not read cannot hold the pair, whatever
+ * --connect-timeout, --protocol-timeout and --idle-timeout are. Whatever it
+ * was armed for is over: a connect timeout that is about to expire must not
+ * cut the reply to a connect that failed.
+ */
+static bool hold_for_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				int err)
+{
+	struct gwp_conn *c = &gcp->client;
+	struct epoll_event ev;
+	uint8_t i;
+	int r;
+
+	if (gcp->fail_err || !c->last_reply || c->fd < 0 || c->rst ||
+	    c->wr_shut || !client_reply_pending(gcp) || fail_reply_stuck(gcp))
+		return false;
+
+	ev.events = EPOLLOUT;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
+	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, c->fd, &ev);
+	if (r == -ENOENT)
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, c->fd, &ev);
+	if (unlikely(r))
+		return false;
+
+	if (unlikely(tmr_arm(w, gcp, GWP_TMR_CONN,
+			     GWP_FAIL_REPLY_SEC * 1000ull)))
+		return false;
+	c->ep_mask = EPOLLOUT;
+	gcp->fail_err = err;
+
+	tmr_disarm(w, gcp, GWP_TMR_ATTEMPT);
+	drop_tgt_wait(w, gcp);
+	ep_del(w, gcp->target.fd);
+	ep_del(w, gcp->udp_fd);
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++)
+		ep_del(w, gcp->attempt_fd[i]);
+#ifdef CONFIG_NEW_DNS_RESOLVER
+	r = drop_raw_dns_query(w, gcp);
+	if (unlikely(r))
+		pr_err(&w->ctx->lh, "Failed to drop the DNS query: %s",
+		       strerror(-r));
+#endif
+
+	pr_dbg(&w->ctx->lh,
+	       "Waiting for the failure reply to be sent (idx=%u, err=%d)",
+	       gcp->idx, err);
+	return true;
+}
+
+/*
+ * The client of a pair held for its failure reply (hold_for_fail_reply()):
+ * send it what is left, and end the pair once it is all out, or once the
+ * client cannot take it.
+ */
+static int handle_ev_fail_reply(struct gwp_conn_pair *gcp,
+				struct epoll_event *ev)
+{
+	ssize_t sr;
+
+	if (ev->events & EPOLLERR)
+		return gcp->fail_err;
+
+	sr = __do_send(&gcp->target, &gcp->client);
+	if (sr < 0 || !client_reply_pending(gcp) || fail_reply_stuck(gcp))
+		return gcp->fail_err;
+	return 0;
+}
+
 static void log_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			  struct gwp_dns_entry *gde)
 {
@@ -3560,14 +3672,15 @@ static int handle_ev_dns_cq(struct gwp_wrk *w)
 		}
 
 		assert(gcp->gde == e);
-		if (gcp->flags & GWP_CONN_FLAG_IS_DYING) {
+		/* Or held for its failure reply (hold_for_fail_reply()). */
+		if (gcp->flags & GWP_CONN_FLAG_IS_DYING || gcp->fail_err) {
 			gcp->gde = NULL;
 			gwp_dns_entry_free(e);
 			continue;
 		}
 
 		r = handle_ev_dns_query(w, gcp);
-		if (r) {
+		if (r && !hold_for_fail_reply(w, gcp, r)) {
 			r = free_conn_pair(w, gcp);
 			if (unlikely(r) && !ret)
 				ret = r;
@@ -4175,6 +4288,18 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		 */
 		if (ev_bit != EV_BIT_UDP_RELAY)
 			gcp->last_act = w->now;
+
+		/*
+		 * Held for its failure reply (hold_for_fail_reply()): only the
+		 * client's events count, and those of the other descriptors
+		 * that came in the same batch are stale.
+		 */
+		if (unlikely(gcp->fail_err)) {
+			r = 0;
+			if (ev_bit == EV_BIT_CLIENT || ev_bit == EV_BIT_CLIENT_PROT)
+				r = handle_ev_fail_reply(gcp, ev);
+			goto out;
+		}
 	}
 
 	/*
@@ -4229,6 +4354,9 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 out:
 	if (r && is_ev_bit_conn_pair(ev_bit)) {
 		struct gwp_conn_pair *gcp = udata;
+
+		if (hold_for_fail_reply(w, gcp, r))
+			return 0;
 		r = free_conn_pair(w, gcp);
 	}
 
@@ -4259,14 +4387,16 @@ static int run_timers(struct gwp_wrk *w)
 
 		budget--;
 		tmr_disarm(w, gcp, kind);
-		if (kind == GWP_TMR_CONN)
+		if (unlikely(gcp->fail_err))
+			r = gcp->fail_err;	/* see hold_for_fail_reply() */
+		else if (kind == GWP_TMR_CONN)
 			r = handle_conn_timer(w, gcp);
 		else if (gwp_in_dns_lookup(gcp))
 			r = handle_raw_dns_timer(w, gcp);
 		else
 			r = handle_attempt_timer(w, gcp);
 
-		if (r) {
+		if (r && !hold_for_fail_reply(w, gcp, r)) {
 			r = free_conn_pair(w, gcp);
 			if (unlikely(r))
 				return r;
