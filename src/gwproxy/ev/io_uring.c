@@ -1977,9 +1977,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	if (transparent) {
 		r = gwp_get_orig_dst(fd, &w->iou->accept_addr, &tdst);
 		if (r) {
-			pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
-				ip_to_str(&w->iou->accept_addr),
-				r == -ELOOP ? "it is this proxy" : strerror(-r));
+			gwp_wrk_no_orig_dst(w, &w->iou->accept_addr, r);
 			r = 0;
 			goto out_uncount;
 		}

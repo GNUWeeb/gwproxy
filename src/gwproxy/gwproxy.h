@@ -1087,6 +1087,11 @@ struct gwp_wrk {
 	uint32_t		now;
 	/* The INPUT chain's refusals (gwp_wrk_acl_denied()). */
 	struct gwp_log_limit	acl_deny_log;
+	/*
+	 * Transparent clients with no original destination
+	 * (gwp_wrk_no_orig_dst()).
+	 */
+	struct gwp_log_limit	no_orig_dst_log;
 	pthread_t		thread;
 
 	/*
@@ -1252,6 +1257,8 @@ bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
 bool gwp_wrk_log_limit(struct gwp_wrk *w, struct gwp_log_limit *l,
 		       uint32_t *quiet);
 void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
+void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
+			 int err);
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 /* Make @gcp chain through @up (NULL: go direct), dropping what it had. */

@@ -2887,6 +2887,30 @@ void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
 		pr_info(&ctx->lh, "ACL denied client %s", ip_to_str(addr));
 }
 
+/*
+ * Log a client just accepted from @addr on a transparent listener whose
+ * original destination could not be read (gwp_get_orig_dst() returned @err).
+ * Any client that reaches the listener directly gets here, and it costs only
+ * an accept and a close, so limit the lines as gwp_wrk_acl_denied() does.
+ */
+void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
+			 int err)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	const char *why = err == -ELOOP ? "it is this proxy" : strerror(-err);
+	uint32_t quiet;
+
+	if (!gwp_wrk_log_limit(w, &w->no_orig_dst_log, &quiet))
+		return;
+
+	if (quiet)
+		pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?) (and %u more since the last such line)",
+			ip_to_str(addr), why, quiet);
+	else
+		pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
+			ip_to_str(addr), why);
+}
+
 /* Uncount a client gwp_ctx_iplim_get() admitted. */
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr)
 {
