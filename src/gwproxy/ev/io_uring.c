@@ -1605,11 +1605,16 @@ static int tls_forward_resume(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * plaintext recv of the same segment would, since no completion will come
  * for them later.
  *
- * Not while a reply is on its way to the client, though: a protocol pass
- * may queue another reply, and the tx scratch it would be encrypted into is
- * still being sent. Neither is a recv armed then, since the records the
- * engine may hold would not complete one. handle_ev_client_send() picks the
- * pump up again once the reply is out.
+ * That goes on while a reply is on its way to the client: a reply a pass
+ * queues meanwhile waits in target.buf, and the completion of the send
+ * encrypts it (send_client_tls()). A client may well not read what it is
+ * sent before it has sent all of its request, and its socket is not drained
+ * for as long as it is not read: a KeyUpdate's answers fill the client's
+ * receive window, and the request behind them would never come in. Only
+ * once the engine has more for the client than forwarding would leave it
+ * (gwp_ssl_tx_backlog()) does the pump stop, without arming a recv, so a
+ * client that does not read cannot have the answers pile up;
+ * handle_ev_client_send() picks it up again once they are out.
  *
  * The control connection of a UDP association has no more protocol to run: what
  * the client sends over it is thrown away, as with a plaintext client. It still
@@ -1624,8 +1629,9 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	size_t got;
 	int sr;
 
-	if (t->tx_sent < t->tx_len) {
+	if (gwp_ssl_tx_backlog(c->tls, gcp->target.cap)) {
 		t->prot_resume = true;
+		send_client_tls(w, gcp);
 		return 0;
 	}
 
@@ -1659,14 +1665,16 @@ again:
 		if (c->rd_eof)
 			return -ECONNRESET;
 		/*
-		 * The engine has records of its own to send, in answer to a
-		 * KeyUpdate, say. Take no more until they are out, so a client
-		 * that does not read them cannot have them pile up.
+		 * The engine may have records of its own to send, in answer
+		 * to a KeyUpdate, say: send them, and read on unless the
+		 * client has left too many of them unread (see above).
 		 */
 		if (gwp_ssl_bio_pending(c->tls) > 0) {
-			t->prot_resume = true;
 			send_client_tls(w, gcp);
-			return 0;
+			if (gwp_ssl_tx_backlog(c->tls, gcp->target.cap)) {
+				t->prot_resume = true;
+				return 0;
+			}
 		}
 		/* Nothing new, and room for more: wait for the client. */
 		return prep_recv_client_prot(w, gcp);
@@ -1678,8 +1686,8 @@ again:
 /*
  * Whether the protocol should be fed from the engine rather than the socket:
  * it still holds records and client.buf has room for them, or it has records
- * of its own to send first. With a reply still being sent, tls_prot_pump()
- * waits for that send to complete.
+ * of its own to send first. With too many of those unread, tls_prot_pump()
+ * waits for the client to take them.
  */
 static bool tls_prot_more(struct gwp_conn_pair *gcp)
 {
@@ -2871,10 +2879,11 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 		res = -ELOOP;
 
 	/*
-	 * A winner was already adopted, or the pair is being torn down: this is
-	 * a loser being reaped, not a result to act on.
+	 * A winner was already adopted, or the pair is being torn down or
+	 * held for its failure reply (hold_for_fail_reply()): this is a loser
+	 * being reaped, not a result to act on.
 	 */
-	if (res < 0 || gcp->target.fd >= 0 ||
+	if (res < 0 || gcp->target.fd >= 0 || gcp->fail_err ||
 	    (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)) {
 		gcp->attempt_fd[slot] = -1;
 		prep_close(w, fd);
@@ -2885,7 +2894,8 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 				slot, strerror(-res), fd, gcp->idx,
 				ip_to_str(&gcp->attempt_addr[slot]));
 
-		if (gcp->target.fd >= 0 || (gcp->flags & GWP_CONN_FLAG_IS_CANCEL))
+		if (gcp->target.fd >= 0 || gcp->fail_err ||
+		    (gcp->flags & GWP_CONN_FLAG_IS_CANCEL))
 			return 0;
 
 		/*
@@ -2935,6 +2945,10 @@ static int handle_ev_client_watch(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	if (res & (POLLERR | POLLHUP))
 		return -ECONNRESET;
+
+	/* Held for its last reply (hold_for_fail_reply()): a FIN is no news. */
+	if (gcp->fail_err)
+		return 0;
 
 	if (!(res & POLLRDHUP))
 		return 0;
@@ -3686,11 +3700,12 @@ static int handle_ev_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 
 	/*
-	 * It expired just as the pair started going away. The cancels are
-	 * queued already, so none would reach a connect started now, and its
+	 * It expired just as the pair started going away, or was held for
+	 * its failure reply (hold_for_fail_reply()). The cancels are queued
+	 * already, so none would reach a connect started now, and its
 	 * reference would hold the pair for as long as the SYN is retried.
 	 */
-	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
+	if ((gcp->flags & GWP_CONN_FLAG_IS_CANCEL) || gcp->fail_err)
 		return 0;
 
 	if (gcp->next_cand >= gcp->nr_cand)
@@ -4037,40 +4052,62 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 #define GWP_FAIL_REPLY_SEC 5
 
 /*
- * @err ends the pair, and its client has been given a failure reply, but a
- * send to the client is still on its way: the reply is in it, or in
- * target.buf behind it, to be sent by its completion. The teardown would
- * cancel that send, and drop its completion: the client would get only what
- * went before the reply, "05 00" and EOF for a SOCKS5 client that sent its
- * CONNECT along with its greeting, when its lookup failed before the method
- * reply was out (a name in the negative cache, say). Keep the pair until
- * handle_ev_client_send() has sent the rest, and have it return @err then.
- * Returns true when the teardown is to wait.
+ * @err ends the pair, and its client has been given its last reply (a
+ * failure reply, or a refusal such as a 407), but a send to the client is
+ * still on its way: the reply is in it, or in target.buf behind it, to be
+ * sent by its completion. The teardown would cancel that send, and drop its
+ * completion: the client would get only what went before the reply, "05 00"
+ * and EOF for a SOCKS5 client that sent its CONNECT along with its greeting,
+ * when its lookup failed before the method reply was out (a name in the
+ * negative cache, say), or a TLS client's KeyUpdate answers and no 407.
+ * Keep the pair until handle_ev_client_send() has sent the rest, and have it
+ * return @err then. Returns true when the teardown is to wait. Meanwhile,
+ * what else completes on the client is not acted on (handle_event()).
  *
- * Only while nothing else is in flight that could take the pair further: a
- * connect attempt, I/O on the target or the UDP relay, a lookup. A timer
- * bounds the wait, the pair's own if it is due soon enough, else one armed
- * here, so a client that does not read cannot hold the pair, whatever
- * --connect-timeout and --protocol-timeout are; handle_ev_timer() returns
- * @err when it expires.
+ * Only while no I/O on the target or the UDP relay is in flight, which could
+ * take the pair further. The racing connect attempts and their timer, and a
+ * lookup, are given up on, as by the teardown (shutdown_gcp()): a connect
+ * that completes meanwhile is closed (handle_ev_target_attempt()), and the
+ * resolver throws the lookup's result away. The pair's timer bounds the
+ * wait, re-armed for GWP_FAIL_REPLY_SEC, so a client that does not read
+ * cannot hold the pair, whatever --connect-timeout, --protocol-timeout and
+ * --idle-timeout are; handle_ev_timer() returns @err when it expires.
+ * Whatever it was armed for is over: a connect timeout that is about to
+ * expire must not cut the reply to a connect that failed. As on epoll.
  */
 static bool hold_for_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				int err)
 {
-	uint64_t now, due;
+	uint8_t i;
 
-	if (gcp->fail_err || !(gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED) ||
-	    !client_send_busy(gcp))
+	if (gcp->fail_err || !gcp->client.last_reply || !client_send_busy(gcp))
 		return false;
-	if (has_inflight_attempt(gcp) || gcp->nr_ops_target ||
-	    gcp->nr_ops_udp || gcp->gde)
+	if (gcp->nr_ops_target || gcp->nr_ops_udp)
 		return false;
 
 	gcp->fail_err = err;
-	now = iou_now_ms();
-	due = now + GWP_FAIL_REPLY_SEC * 1000ull;
-	if (gcp->tmr_due <= now || gcp->tmr_due > due)
-		prep_timer_target(w, gcp, GWP_FAIL_REPLY_SEC);
+
+	gwp_conn_pair_abort_attempts(gcp);
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
+		if (gcp->attempt_fd[i] >= 0)
+			cancel_attempt(w, gcp, i);
+	}
+	prep_attempt_timer_del(w, gcp);
+	/* The caller holds a reference of its own, as for shutdown_gcp(). */
+	if (gcp->gde) {
+		gwp_dns_entry_cancel(gcp->gde);
+		gcp->gde = NULL;
+		put_gcp(w, gcp);
+	}
+
+	/*
+	 * Each removal takes one live timer, and the one armed behind them
+	 * cannot be among those: they run first.
+	 */
+	for (i = 0; i < gcp->nr_timers_armed; i++)
+		prep_timer_del_target(w, gcp);
+	prep_timer_target(w, gcp, GWP_FAIL_REPLY_SEC);
+
 	pr_dbg(&w->ctx->lh,
 	       "Waiting for the failure reply to be sent (idx=%u, err=%d)",
 	       gcp->idx, err);
@@ -4161,6 +4198,18 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		 */
 		gcp = udata;
 		if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL) {
+			put_gcp(w, gcp);
+			return 0;
+		}
+
+		/*
+		 * Held for its last reply (hold_for_fail_reply()): only the
+		 * send of it, and a reset the client watch reports, count.
+		 * A recv armed during the handshake may complete meanwhile:
+		 * what the client sent is not acted on, as after the close.
+		 */
+		if (unlikely(gcp->fail_err) && ev_bit != EV_BIT_IOU_CLIENT_SEND &&
+		    ev_bit != EV_BIT_IOU_CLIENT_WATCH) {
 			put_gcp(w, gcp);
 			return 0;
 		}

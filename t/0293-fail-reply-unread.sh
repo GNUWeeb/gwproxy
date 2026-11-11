@@ -11,9 +11,12 @@
 # for a target that refuses the connect (502), and for one that never
 # answers (504, from the connect timeout).
 #
-# epoll only: on io_uring this client is not read on while a send to it is
-# in flight, and the reply then only comes once the client reads, so the
-# case does not arise in the same way.
+# On io_uring the same client was not read while the engine's answers were
+# being sent to it, and as it does not read before its request is out, the
+# request never came in: the pair sat until the protocol timeout, and the
+# client got no reply at all; and it kept the pair neither for a refusal,
+# whose 407 then went with the teardown, nor for the 504 of a connect still
+# in flight. Both loops.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -37,26 +40,30 @@ done
 [ -n "${tport:-}" ] || fail "blackhole listener did not report its port"
 closed_port
 
-# check <status> <target> <wait> [proxy args...]
+# check <loop> <status> <target> <wait> [proxy args...]
 check()
 {
-	local st="$1" tgt="$2" wait="$3" pp out rc
-	shift 3
+	local loop="$1" st="$2" tgt="$3" wait="$4" pp out rc
+	shift 4
 
 	pp="$(pick_port)"
-	gwp_start "127.0.0.1:$pp" --event-loop=epoll --nr-workers=1 \
+	gwp_start "127.0.0.1:$pp" --event-loop="$loop" --nr-workers=1 \
 		--as-http=1 --tls-cert="$WORK/cert.pem" \
 		--tls-key="$WORK/key.pem" "$@"
 	out="$(timeout 150 python3 "$SERVERS_DIR/tls_fail_reply_unread.py" \
 		"$pp" "$tgt" "$st" "$wait" 2>&1)"
 	rc=$?
 	[ "$rc" = 77 ] && skip "$out"
-	[ "$out" = ok ] || fail "[$st] rc=$rc $out"
+	[ "$out" = ok ] || fail "[$loop $st] rc=$rc $out"
 	gwp_stop_pids "$GWP_PID"
 }
 
-check 407 "127.0.0.1:$CLOSED_PORT" 1 --auth-file="$WORK/auth"
-check 502 "127.0.0.1:$CLOSED_PORT" 1
-check 504 "127.0.0.1:$tport" 2.5 --connect-timeout=1
+for loop in epoll io_uring; do
+	[ "$loop" = io_uring ] && ! have_io_uring && continue
+
+	check "$loop" 407 "127.0.0.1:$CLOSED_PORT" 1 --auth-file="$WORK/auth"
+	check "$loop" 502 "127.0.0.1:$CLOSED_PORT" 1
+	check "$loop" 504 "127.0.0.1:$tport" 2.5 --connect-timeout=1
+done
 
 pass
