@@ -21,6 +21,12 @@ struct gwp_dns_packet {
 	uint16_t		txid;
 	uint16_t		buf_len;
 	uint16_t		port;
+	/*
+	 * How many times the query in gdp->buf went out: the event loop
+	 * resends it on a schedule until a reply comes or the tries run out.
+	 * gwp_dns_res_prep_query() starts it over for each new query.
+	 */
+	uint8_t			nr_sent;
 	/* This query's own socket, or -1 before the first query. */
 	int			fd;
 	uint8_t			buf[UDP_MSG_LIMIT];

@@ -27,6 +27,8 @@
 # It must also stay within one query per address family. The resolver used to
 # send the same query again on every unusable answer, as fast as the server
 # answered, until the protocol timeout -- thousands of queries for one request.
+# A question that is not ours is no answer at all, so that lookup sends its
+# query again on its schedule (after 1 s and 3 s): three sends, no more.
 #
 # The port matters as much as the payload here. --dns-server used to drop the
 # port from "addr:port" and query 53 regardless, and because the socket is
@@ -79,7 +81,7 @@ loop=epoll
 # took minutes on a loaded host. A case keeps its files in $WORK/<case>.
 dns_case()
 {
-	local mode="$1" W="$WORK/$1" dp p rep nq code
+	local mode="$1" W="$WORK/$1" dp p rep nq code max
 
 	mkdir -p "$W"
 	case "$mode" in
@@ -110,14 +112,16 @@ dns_case()
 		# -ECONNREFUSED on recv. That used to break the event loop: one
 		# unreachable resolver and the worker took every connection
 		# down with it. Nothing is started on this port on purpose.
+		# The lookup fails then and there, as for a name that does not
+		# resolve (t/0253 times it).
 		dp="$(pick_port)"
 		p="$(pick_port)"
 		gwp_start "127.0.0.1:$p" --as-socks5=1 --raw-dns=1 \
 			--dns-server="127.0.0.1:$dp" --event-loop="$loop" \
 			--nr-workers=1
 		rep="$(ask "$p" "$hp")"
-		[ "$rep" = "NONE" ] || \
-			fail "[$loop] an absent DNS server somehow answered (got '$rep')"
+		[ "$rep" = "REP=0x04" ] || \
+			fail "[$loop] an absent DNS server got '$rep' (want REP=0x04)"
 		kill -0 "$GWP_PID" 2>/dev/null || \
 			fail "[$loop] proxy died because its DNS server was unreachable"
 		return 0
@@ -152,8 +156,10 @@ dns_case()
 		# Anything still being sent would show up by now.
 		sleep 0.5
 		nq="$(cat "$W/nr_queries" 2>/dev/null)"
-		[ -n "$nq" ] && [ "$nq" -le 2 ] || \
-			fail "[$loop] $mode took '$nq' queries (want at most 2)"
+		max=2
+		[ "$mode" = question-label ] && max=3
+		[ -n "$nq" ] && [ "$nq" -le "$max" ] || \
+			fail "[$loop] $mode took '$nq' queries (want at most $max)"
 		;;
 	esac
 

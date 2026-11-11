@@ -95,7 +95,7 @@ body = bytes(ord('a') + i % 26 for i in range(20000))
 cl = b'Content-Length: %d' % len(body)
 head = b'POST http://%s/ HTTP/1.1' % auth
 out = b'POST / HTTP/1.1\r\nHost: %s\r\n' % auth
-close = b'Connection: close\r\n\r\n'
+close = b'Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n'
 
 # No Connection line and no Host to drop: the rewrite only adds.
 check('plain', head + b'\r\n' + cl + b'\r\n\r\n' + body, 'HTTP/1.1 200 ',

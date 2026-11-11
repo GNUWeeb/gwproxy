@@ -150,6 +150,13 @@ int gwp_ssl_read(struct gwp_ssl *s, void *buf, size_t len, size_t *out_len);
  */
 int gwp_ssl_write(struct gwp_ssl *s, const void *buf, size_t len,
 		  size_t *consumed);
+/*
+ * Whether the last gwp_ssl_write() returned GWP_SSL_WANT_READ, and no
+ * ciphertext has been received since: the engine waits for the peer (a
+ * renegotiation in progress) and writing again cannot make progress until
+ * the peer has been read.
+ */
+bool gwp_ssl_tx_starved(struct gwp_ssl *s);
 
 /*
  * Queue a close_notify into the send BIO (best effort). Only the first call

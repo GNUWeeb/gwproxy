@@ -121,7 +121,7 @@ def req(lines, tail=b''):
 def out(lines, tail=b''):
     return (b'POST / HTTP/1.1\r\nHost: %s\r\n' % auth +
             b''.join(l + b'\r\n' for l in lines) +
-            b'Connection: close\r\n\r\n' + tail)
+            b'Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n' + tail)
 
 
 def ok(name, data, want):

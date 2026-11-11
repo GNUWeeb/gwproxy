@@ -46,8 +46,8 @@ put()
 }
 
 # writer <burst|constant>: change the files from one process, timing each
-# change, and print the most reloads the changes may cause, followed by the
-# number of the last auth version (constant only).
+# change, and print the most reloads the changes may cause, the number of the
+# last auth version (constant only), and "starved" or "ok" (constant only).
 #
 # The reload thread reloads once the files were quiet for 100 ms, or 1 s after
 # the first change it has not reloaded yet (GWP_RELOAD_QUIET_MS and
@@ -57,6 +57,12 @@ put()
 # shorter than the real one: on a loaded host, where this process can be
 # held up for longer than the quiet time, the bound grows with the pauses it
 # really took, and on an idle one it is a single reload.
+#
+# The constant changes show a reload while changes keep coming only if they
+# did keep coming. A writer held up as on a loaded host (a CI run under the
+# sanitizers once made one change in 3.3 s) proves nothing either way: it is
+# reported "starved" when it made fewer than a third of the 150 changes it
+# aims at, or took 0.5 s or more from one change to the next.
 writer()
 {
 	python3 - "$1" "$WORK/auth" "$WORK/acl" "$allow" "$deny" <<-'PY'
@@ -94,9 +100,13 @@ writer()
 	pauses = sum(1 for (b0, _), (_, a1) in zip(marks, marks[1:])
 	             if a1 - b0 >= QUIET)
 	span = marks[-1][1] - marks[0][0]
-	print(1 + pauses + int(span / MAX_WAIT), last)
-	sys.stderr.write("# %s: %d changes in %.3f s, %d pauses of %.0f ms or more\n" %
-	                 (mode, len(marks), span, pauses, QUIET * 1000))
+	held = max([a1 - b0 for (b0, _), (_, a1) in zip(marks, marks[1:])],
+	           default=0)
+	starved = len(marks) < 50 or held >= 0.5
+	print(1 + pauses + int(span / MAX_WAIT), last,
+	      "starved" if starved else "ok")
+	sys.stderr.write("# %s: %d changes in %.3f s, %d pauses of %.0f ms or more, held up %.3f s at most\n" %
+	                 (mode, len(marks), span, pauses, QUIET * 1000, held))
 	PY
 }
 
@@ -149,22 +159,30 @@ for loop in epoll io_uring; do
 
 	# Changes every 20 ms for 3 s never pause long enough to settle, yet
 	# they are reloaded meanwhile, not only once they stop: one reload
-	# when they stop, at least one before.
-	a0="$(nr_reloads "$log" auth)"
-	read -r most i < <(writer constant)
-	[ -n "${i:-}" ] || fail "[$loop] the constant changes were not written"
-	wait_fetch 1 "$pp" "u$i" pw \
-		|| fail "[$loop] the last of the constant changes was not loaded"
-	for _ in $(seq 1 50); do
+	# when they stop, at least one before. A starved writer's round is
+	# redone, up to 3 rounds; the upper bound holds in every round.
+	for round in 1 2 3; do
+		a0="$(nr_reloads "$log" auth)"
+		read -r most i how < <(writer constant)
+		[ -n "${how:-}" ] || fail "[$loop] the constant changes were not written"
+		wait_fetch 1 "$pp" "u$i" pw \
+			|| fail "[$loop] the last of the constant changes was not loaded"
+		for _ in $(seq 1 50); do
+			a="$(( $(nr_reloads "$log" auth) - a0 ))"
+			[ "$a" -ge 2 ] && break
+			sleep 0.1
+		done
+		sleep 1
 		a="$(( $(nr_reloads "$log" auth) - a0 ))"
-		[ "$a" -ge 2 ] && break
-		sleep 0.1
+		diag "[$loop] 3 s of constant changes, round $round: $a auth reloads (at most $most), writer $how"
+		[ "$a" -le "$most" ] || fail "[$loop] constant changes gave $a reloads (want at most $most)"
+		[ "$how" = ok ] && break
 	done
-	sleep 1
-	a="$(( $(nr_reloads "$log" auth) - a0 ))"
-	diag "[$loop] 3 s of constant changes: $a auth reloads (at most $most)"
-	[ "$a" -ge 2 ] || fail "[$loop] constant changes held back every reload until they stopped"
-	[ "$a" -le "$most" ] || fail "[$loop] constant changes gave $a reloads (want at most $most)"
+	if [ "$how" = ok ]; then
+		[ "$a" -ge 2 ] || fail "[$loop] constant changes held back every reload until they stopped"
+	else
+		diag "[$loop] the writer was starved in every round: reloads while changes keep coming not checked"
+	fi
 
 	kill "$GWP_PID" 2>/dev/null
 done

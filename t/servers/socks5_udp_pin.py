@@ -9,7 +9,7 @@
 #                          case
 #
 # Exits 0 when the case holds; otherwise says what happened, exits 1.
-import socket, struct, sys
+import socket, struct, sys, time
 
 argv = sys.argv[1:]
 
@@ -64,17 +64,34 @@ def dgram(tag):
     return b'\x00\x00\x00' + sock_addr(echo_host, echo_port) + tag
 
 
+def from_relay(addr, bnd_port):
+    return addr[1] == bnd_port and \
+        socket.inet_pton(family, addr[0]) == socket.inet_pton(family, proxy_host)
+
+
 def relayed(u, bnd_port, tag, wait):
-    """Send a datagram from @u: does its echo come back within @wait s?"""
-    u.settimeout(wait)
+    """Send a datagram from @u: does its echo come back within @wait s?
+
+    Only what comes from the relay counts. Under `make -jN` another test's
+    association may still send to a port this socket has just been given:
+    its client closed that port, a reply was in flight, and the kernel handed
+    the number out again before that proxy saw the control connection go."""
     u.sendto(dgram(tag), (proxy_host, bnd_port))
-    try:
-        d = u.recv(65535)
-    except socket.timeout:
-        return False
-    if not d.endswith(tag):
-        fail('wrong echo %r' % d)
-    return True
+    end = time.monotonic() + wait
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        u.settimeout(left)
+        try:
+            d, addr = u.recvfrom(65535)
+        except socket.timeout:
+            return False
+        if not from_relay(addr, bnd_port):
+            continue
+        if not d.endswith(tag):
+            fail('wrong echo %r' % d)
+        return True
 
 
 def must_relay(u, bnd_port, tag):

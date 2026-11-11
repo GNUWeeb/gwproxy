@@ -54,7 +54,9 @@ event loop. It recovers gracefully from file\-descriptor exhaustion
 (EMFILE/ENFILE): a worker out of descriptors stops accepting and tries again
 after 100 ms on io_uring; on epoll, once several connections' worth have been
 closed, or after 5 seconds at the latest. It caches DNS answers for hostname
-targets, tries and races the
+targets when asked to
+.RB ( \-\-dns\-cache\-secs ,
+off by default), tries and races the
 addresses of a multi\-homed name on either loop (see
 .BR "TARGET ADDRESS SELECTION" ),
 and can mark its own outgoing connections with
@@ -89,7 +91,9 @@ or
 The
 .B io_uring
 loop is only available when gwproxy was built with io_uring support (see
-.BR "AVAILABILITY" ).
+.BR "AVAILABILITY" ),
+and needs Linux 5.19 or later (see
+.BR "EVENT LOOPS" ).
 Default:
 .BR epoll .
 .TP
@@ -155,14 +159,30 @@ against the proxy's own address.
 .TP
 .BR \-t ", " \-\-target=\fIaddr:port\fR
 For plain TCP forwarding, the fixed destination every accepted connection is
-proxied to. Ignored in SOCKS5/HTTP/transparent modes, where the destination
-comes from the protocol or the socket.
+proxied to. Ignored in SOCKS5/HTTP modes, where the destination comes from
+the protocol; there the value is not even parsed, so a bad address or port is
+not refused either. Refused at startup with
+.BR \-\-as\-transparent ,
+which takes the destination from the socket.
 .TP
 .BR \-w ", " \-\-nr\-workers=\fInr\fR
 Number of worker threads, each with its own
 .B SO_REUSEPORT
 listener, from 1 to 1024. Default:
 .BR 4 .
+.IP
+Since every listener sets
+.BR SO_REUSEPORT ,
+another process of the same user that listens on the same address and port
+with
+.B SO_REUSEPORT
+too, such as a second gwproxy, shares the port with this one: the kernel
+spreads new connections over both, each handling them with its own
+configuration. That makes an overlapping restart possible, but a second
+instance started by mistake gets no error either. gwproxy therefore logs a
+warning at startup when another socket already listens on its
+.B \-\-bind
+address and port, and starts all the same.
 .TP
 .BR \-o ", " \-\-protocol\-timeout=\fIsec\fR
 Seconds allowed for a client to complete the SOCKS5/HTTP (and, if enabled, TLS)
@@ -171,7 +191,13 @@ target's name; a client whose request is waiting for one when the time runs out
 gets a SOCKS5 reply 0x06 or an HTTP 504 first. With
 .B \-\-connect\-timeout=0
 it also bounds the connect of a client that half\-closes its connection while
-the connect is in progress (see there). Default:
+the connect is in progress (see there).
+.B 0
+(or a negative value) sets no limit: a client that sends half a request, or
+nothing at all, then holds its connection for as long as it stays connected,
+and with
+.B \-\-connect\-timeout=0
+nothing bounds the connect of a client that has half\-closed either. Default:
 .BR 10 .
 .TP
 .BR \-c ", " \-\-connect\-timeout=\fIsec\fR
@@ -183,15 +209,13 @@ for the same name (see
 (or a negative value) sets no limit: the kernel still gives up on a target that
 never answers after its SYN retries, but an upstream proxy that accepts and then
 says nothing is waited for as long as the client stays. A client that resets its
-connection ends the wait at once, though with io_uring on a kernel older than
-5.13 only when the connect ends. One that has sent a FIN may only have finished
+connection ends the wait at once. One that has sent a FIN may only have finished
 sending and be waiting for the answer, so its FIN is passed on once the target
 is up; but as it can no longer end the wait itself,
 .B \-\-protocol\-timeout
 bounds the rest of the connect from that FIN on (the upstream proxy handshake
 included), and the client gets a SOCKS5 reply 0x06 or an HTTP 504 when it runs
-out. With io_uring on a kernel older than 5.13 the FIN goes unnoticed and the
-wait stays unbounded.
+out.
 Default:
 .BR 5 .
 .TP
@@ -199,10 +223,18 @@ Default:
 Close an established tunnel, or a SOCKS5 UDP association, once no data has
 moved in either direction for this many seconds. Any traffic restarts the
 count, so a tunnel that keeps moving data is never closed, however long it
-lives; a UDP association counts as active while datagrams go either way.
-The check runs on a coarse per\-worker clock, compares whole seconds and runs
-about once a second, so a pair can outlive the timeout by up to about two
-seconds.
+lives; a UDP association counts as active while datagrams are relayed either
+way. A datagram the relay drops (one from a stranger, or one it cannot or
+may not pass on, see
+.BR \-\-udp\-associate )
+does not count, so sending junk to the relay port does not keep a quiet
+association open.
+The check is a timer per pair, not a sweep: it fires when the timeout has
+passed since the tunnel or association came up, and while anything has moved
+since, it looks again when the timeout has passed since the last activity.
+Activity is stamped in whole seconds on a coarse per\-worker clock, and a pair
+is closed only once more than the timeout has passed by those stamps, so a
+pair can outlive the timeout by up to about two seconds.
 .B 0
 (or a negative value) never closes an idle connection, which keeps long quiet
 tunnels such as SSH sessions working. Default:
@@ -256,13 +288,34 @@ the proxy rejects it with reply
 .B CONNECT
 unaffected; only meaningful with
 .BR \-\-as\-socks5 .
-Datagrams are taken only from the IP address of the control connection. When
+The reply names the address the client reached the proxy at as BND.ADDR,
+and every datagram to the client is sent from that address, whichever
+source routing would pick toward the client, so a client that takes
+datagrams only from the relay it was told (a connected UDP socket, a
+stateful firewall) gets them on a host with several addresses too.
+The client's own datagrams, the ones relayed to targets, are taken only from
+the IP address of the control connection. When
 the request declares that address and a port, only that port is the client;
 when it declares any other address, or no port, the first valid datagram from
 that IP address decides the port, so another party on the same IP address can
 get there first. A client behind a NAT cannot know its outside port and is
 served by the latter rule. A client that declares the control connection's
 address with a port the NAT rewrites gets no service.
+.IP
+A datagram from any other source is taken for a target's reply, and relayed
+to the client only if it comes from the exact address and port of a target
+the client has sent to: a reply from another port or address of the same
+server (a TFTP server's new port, an anycast or load\-balanced service) is
+dropped, as is anything a target sends before the client has sent to it
+(hole punching). The
+.B OUTPUT
+chain judges such a target again after a reload, and a target it no longer
+accepts may not answer until the client is let through to it again. Only
+the 32 targets the client has sent to most recently are remembered; a reply
+from one that dropped out is dropped too, so a client that talks to more
+targets at once (a DHT node, say) loses replies. Through a pool server only
+the server's relay may answer (see
+.BR "UPSTREAM CHAINING" ).
 Default:
 .BR 1 .
 .TP
@@ -348,6 +401,11 @@ is not given, a built\-in default ACL is applied instead (see
 .BR \-\-acl\-allow\-all
 below). Each line is one directive, evaluated top\-to\-bottom
 with first\-match\-wins; a chain's policy applies when nothing matches.
+A client that the
+.B INPUT
+chain rejects is closed as soon as it is accepted, before anything is read from
+it, and logged at info level with its address, at most once a second per worker
+thread, with the number rejected since the previous line.
 A word that starts with
 .B #
 begins a comment that runs to the end of the line; a
@@ -661,8 +719,13 @@ fails (it needs
 or, since Linux 5.11,
 .BR CAP_NET_RAW )
 the connection is dropped rather than egressing unmarked via the wrong route.
-It applies to TCP target connections (SOCKS5, HTTP, plain and transparent), not
-the UDP relay. (The coarse global
+It applies to TCP target connections (SOCKS5, HTTP, plain and transparent) and
+to the datagrams the SOCKS5 UDP relay sends to a target (see
+.BR \-\-bind\-iface ),
+which a rule tells apart with
+.BR "\-p udp" ;
+a datagram whose mark cannot be set is dropped. (The coarse
+global
 .B \-\-mark
 remains best\-effort.)
 .IP
@@ -680,7 +743,8 @@ is required. Like
 .BR MARK ,
 it is a composable modifier (the last match wins), takes
 .B \-\-accept
-the same way, and applies to the same TCP target connections. It
+the same way, and applies to the same TCP target connections and UDP relay
+datagrams. It
 .I replaces
 the global
 .BR \-\-bind\-source / \-\-bind\-iface
@@ -1127,6 +1191,19 @@ chain) on every connection. Note the cache uses this fixed duration, not the
 authoritative record TTL, so a short\-TTL name may be served stale for up to
 .I sec
 seconds.
+.IP
+A failed lookup is remembered too: until the entry expires, requests for the
+name are answered at once with SOCKS5 reply
+.B 0x04
+(host unreachable) or HTTP
+.BR 502 ,
+without a new lookup. The entry is kept for 30 seconds when the answer is that the name, or
+an address of the family asked for, does not exist, and for 5 seconds after
+any other failure, such as a timeout or a server failure; never longer than
+.I sec
+seconds. This, too, is a fixed duration, not the zone's negative caching TTL,
+so a name that was just published or fixed can keep failing for up to that
+long.
 .TP
 .BR \-\-dns\-cache\-max\-entries=\fInr\fR
 Bound the DNS cache to at most
@@ -1139,11 +1216,15 @@ means unlimited. Default:
 .BR 65536 .
 .TP
 .BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
-Number of DNS resolver worker threads kept running, at most 1024. This does not
+Number of DNS resolver worker threads kept running, from 1 to 1024. This does not
 cap how many lookups run at once: more threads are started on demand when lookups
 are waiting, up to 64 threads or
 .IR nr ,
-whichever is larger, and those exit again after 10 seconds idle. Default:
+whichever is larger, and those exit again after 10 seconds idle.
+.B 0
+is taken only where no resolver thread is needed: with
+.B \-\-raw\-dns
+or without SOCKS5 and HTTP. Default:
 .BR 4 .
 .IP
 Each thread runs one blocking lookup, so the threads are shared out by client
@@ -1189,6 +1270,18 @@ SOCKS5 reply
 .B 0x04
 (host unreachable), HTTP
 .BR 502 .
+A query that has no reply after 1\ s is sent again, and again 2\ s after
+that; 4\ s after the third send the lookup fails as for a name that does not
+resolve. It fails at once when the server refuses the query (an ICMP port
+unreachable comes back), as with the system resolver. So a lookup takes at most
+7\ s per address family, also with
+.BR \-\-protocol\-timeout=0 ;
+a shorter
+.B \-\-protocol\-timeout
+ends it first, with the timeout reply (SOCKS5
+.BR 0x06 ,
+HTTP
+.BR 504 ).
 Default:
 .BR 0 .
 .SS Upstream proxy chaining
@@ -1334,8 +1427,38 @@ prevent. In this they differ from the global
 which stays best\-effort. They apply to TCP target connections \(em SOCKS5,
 HTTP, plain and transparent forwarding, and the hop to an
 .B \-\-upstream\-proxy
-\(em but not to the SOCKS5 UDP relay, matching the reach of
-.BR "\-j BIND" .
+\(em and to the datagrams the SOCKS5 UDP relay sends to its targets.
+.IP
+The relay socket also talks to the client, so it is bound to neither: each
+datagram to a target is given its source address and interface, and its
+mark, as it is sent
+.RB ( IP_PKTINFO / IPV6_PKTINFO " and " SO_MARK
+control messages), from these options,
+.BR \-\-mark ,
+or an ACL
+.BR "\-j BIND" " or " "\-j MARK"
+rule matching that target, as a TCP connection to it would be; the datagrams
+to the client are sent as before, from the address it was told and with no
+mark. It is as strict: a datagram is dropped where a connection would fail
+\(em an interface that does not exist (looked up again at most once a
+second, so one that comes up later is used), or a
+.B \-\-to\-source
+of the other family \(em and logged once for the association. The
+differences: the port of a source is not used, the datagrams leave from the
+relay's own port; and a datagram to an IPv6 target that is to be held to both
+a source and an interface is dropped, because the kernel holds an IPv6
+datagram to the interface given with it only when it picks the source itself,
+and sends one with a source of its own by any other interface where this one
+has no route to the target. An interface alone, or a source alone, is
+applied to IPv6 targets as to IPv4 ones. A kernel older than 5.0, or one that
+does not let the process mark a single datagram, has the
+.B \-\-mark
+set on the relay socket instead, which then marks the datagrams to the client
+as well (a warning at startup says so).
+The datagrams of a UDP association through a pool server go to the
+server's relay from the address, out of the interface and with the mark of
+gwproxy's control connection to that server, which these options bind (see
+.BR "UPSTREAM CHAINING" ).
 A matching
 .B \-j BIND
 rule
@@ -1451,7 +1574,29 @@ host and port;
 .B forwarding
 of ordinary absolute\-form requests such as "GET http://host/path", which
 gwproxy rewrites to origin form, fetches from the origin and relays back, one
-request per connection.
+request per connection. Any method is forwarded, spelt as the client sent it:
+extension methods such as WebDAV's PROPFIND as well. A fragment ("#...") in
+the URI is not part of the request and is not sent on. An OPTIONS request
+for a URI with an empty path and no query, such as "OPTIONS http://host:8080",
+goes to the origin as "OPTIONS *". TRACE and OPTIONS requests are hop\-limited
+by Max\-Forwards (RFC 9110 Section 7.6.2): one with "Max\-Forwards: 0" is
+answered by gwproxy itself, an OPTIONS with "200 OK" and a TRACE with "501 Not
+Implemented", and one with a larger value goes on with one less. A Max\-Forwards
+value that is not a number gets "400 Bad Request" on these two methods; other
+methods keep the field as it is.
+.PP
+A connection whose first bytes cannot start a request line, a method token
+followed by a space after at most one empty line, is closed at once without a
+reply: a SOCKS4 request, say, or a SOCKS5 greeting on a listener without
+.BR \-\-as\-socks5 .
+Past that point a request that cannot be served is answered. A malformed
+request line or field line (a folded line, white space before the colon, a
+control byte) and a target without a usable host or port, such as a CONNECT
+with no port, get "400 Bad Request". An origin\-form target ("GET / HTTP/1.1"),
+"OPTIONS *" and a scheme other than http:// get "501 Not Implemented", and an
+HTTP version other than 1.x, the HTTP/2 connection preface among them, gets
+"505 HTTP Version Not Supported". A request for HTTP/1.2 or a later 1.x
+version is served as HTTP/1.1.
 .PP
 Only that one request reaches the origin: its body, delimited by Content\-Length
 or chunked Transfer\-Encoding, is forwarded, and anything the client sends after
@@ -1465,7 +1610,7 @@ an unterminated quoted string, whitespace before the line end), when it comes
 with the header; one that turns out malformed later closes the connection.
 A field value may hold bytes 0x80 to 0xff, which are passed on unchanged, and
 none of them makes a framing header acceptable; any other control byte than a
-tab in a value closes the connection without a reply.
+tab in a value is answered with "400 Bad Request".
 .PP
 A field that may appear only once (Authorization, Content\-Length,
 Content\-Location, Content\-Range, Content\-Type, Cookie, Date, Expect, From,
@@ -1492,13 +1637,26 @@ own outgoing requests ("httpoxy"), so the client could pick where the origin's
 requests go. No other name reaches CGI as HTTP_PROXY, so it has no alias to
 refuse.
 .PP
+gwproxy names itself in the Via field (RFC 9110 Section 7.6.3) of the request
+it forwards and of the origin's final response: "1.1 gwproxy", or "1.0
+gwproxy" for a message received as HTTP/1.0, goes at the end of the last Via
+the message carries, or in a Via of its own when it has none (or only one that
+Connection names, which is dropped). Interim (1xx) responses are passed on
+without it. A CONNECT tunnel carries whatever the client sends through it and
+gets no Via.
+.PP
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
 does not send another request on the connection, and the connection is closed
-once the origin has finished. A response that is not valid HTTP/1.x, one whose
-header is too large, and a 407 from the origin, which would invite the client
-to hand over its proxy credentials, are answered with "502 Bad Gateway"
-instead. The response header, together with any interim (1xx) responses before
+once the origin has finished. With Transfer\-Encoding present, any
+Content\-Length is dropped from the response (RFC 9112 Section 6.3), and a
+Content\-Length given more than once is passed on once. A response that is not
+valid HTTP/1.x, one that ends before its header is complete, whether the
+origin closes or resets the connection, one with a Content\-Length that does
+not name a single length (two that differ, a list of different values, not a
+number), one whose header is too large, and a 407 from the origin, which would
+invite the client to hand over its proxy credentials, are answered with
+"502 Bad Gateway" instead. The response header, together with any interim (1xx) responses before
 it that the client has not yet received, may take at most
 .B \-\-target\-buf\-size
 minus 64 bytes, and must still fit in
@@ -1508,7 +1666,8 @@ once rewritten (bare LF line ends become CRLF).
 A request header may take at most 16384 bytes, and must fit in
 .B \-\-client\-buf\-size
 as a whole; a larger one, or one with more than 128 field lines, is answered
-with "431 Request Header Fields Too Large".
+with "431 Request Header Fields Too Large". When it is the request line that
+runs past either limit, the answer is "414 URI Too Long" instead.
 .PP
 With
 .B \-\-auth\-file
@@ -1521,6 +1680,47 @@ and
 .B \-\-as\-http=1
 serves both protocols on the same listening port. The protocol is detected from
 the client's first bytes, and both share the same credential store.
+.SH HOW CONNECTIONS END
+Each direction of a tunnel ends on its own. When one side is done sending (a
+TCP FIN), gwproxy delivers everything it sent and then shuts the other side's
+write side, so the end is passed on as a half\-close, while the other direction
+goes on; the pair is closed once both directions are done.
+.PP
+A plaintext side that resets its connection (TCP RST) ends only its own
+direction, whether gwproxy reads the reset or learns of it from a send that
+fails: what that side sent before the reset is still delivered, and what was
+waiting to go to it is dropped. The other side's connection is then reset as
+well, rather than closed, so that a protocol delimited by the connection
+closing does not take the cut stream for complete. As a reset throws away what
+its socket has not delivered yet, gwproxy first waits until the peer has
+acknowledged everything sent to it, for at most 5 seconds. Earlier
+versions of gwproxy closed it normally. A 502 that gwproxy sends in place of the response
+of an origin that reset (see
+.BR HTTP )
+is complete, and ends with a normal close. How the end of a TLS side's stream
+is passed on is described under
+.B "TLS TERMINATION"
+and
+.BR "UPSTREAM CHAINING" .
+.PP
+A connection whose peer may still be sending when gwproxy closes it, such as
+a client refused while it uploads a request body, or one that sent more
+behind a request that fails, is not closed at once: a close with input left
+unread resets the connection, which can destroy the reply on its way. gwproxy
+shuts its write side instead, so that the reply is followed by a normal end of
+stream, reads and discards what the peer still sends, and closes the
+connection once the peer has closed too, or has acknowledged everything and
+stopped sending, or after 2 seconds, or
+.B \-\-protocol\-timeout
+if that is shorter. A peer that sends more than 16 MiB meanwhile is cut off.
+Each worker keeps at most 4096 such connections at once, and no more than an
+eighth of the descriptor limit shared between the workers; beyond that a
+connection is closed at once.
+.PP
+A reply that gwproxy itself sends a TLS client before closing the connection,
+an HTTP error status or a SOCKS5 reply refusing the request, is followed by a
+.B close_notify
+in the same send, as a forwarded response is.
 .SH TLS TERMINATION
 When built with OpenSSL and started with
 .B \-\-tls\-cert
@@ -1540,7 +1740,10 @@ bytes do not, so
 gwproxy advertises only the "http/1.1" ALPN protocol, cleanly downgrading an
 HTTP/2\-preferring client. The OpenSSL engine is driven entirely through memory
 BIOs and never touches the socket directly. TLS termination works on both the
-epoll and io_uring event loops.
+epoll and io_uring event loops. A client's request to renegotiate a TLS 1.2
+session is refused with a
+.B no_renegotiation
+alert.
 .PP
 The end of a TLS client's stream reaches the target as a normal end of stream
 only if it is one. If a record fails to verify, the client sends a fatal alert,
@@ -1726,12 +1929,31 @@ also be the URL's host's: a name must be among the certificate's DNS names
 not count), and is sent as the TLS server
 name (SNI); an IP address literal must be among its IP addresses, and is not
 sent as SNI. TLS 1.2 is the oldest version accepted. A handshake that fails,
-or a certificate that is refused, fails the connection as any other upstream
-failure does (SOCKS5 reply 0x01, HTTP 502 to the client, after a pool's retry
+a certificate that is refused, or a TLS stream that fails before the
+CONNECT's reply (a record that fails to verify, a fatal alert) fails the
+connection as any other upstream failure does (SOCKS5 reply 0x01, HTTP 502 to the client, after a pool's retry
 on another server; see
 .BR "Upstream pools" )
 and is logged with the reason, for example
 .IR "certificate verify failed: hostname mismatch" .
+.PP
+gwproxy does not take part in a TLS 1.2 renegotiation: it answers an
+upstream's HelloRequest with a
+.B no_renegotiation
+alert and goes on with the session as it is. An upstream that insists on
+renegotiating, as OpenSSL's servers do (they take the refusal as fatal), ends
+the session: before the CONNECT's reply that fails the connection like a
+failed handshake, and once the tunnel is up the tunnel's stream is cut. TLS 1.3 has no renegotiation; its
+KeyUpdate is answered as usual. (A gwproxy built with an OpenSSL older than
+1.1.0h cannot refuse, and renegotiates.)
+.PP
+An
+.B http://
+or
+.B https://
+upstream may answer the CONNECT with interim responses (100 Continue, 102 or
+103, but not 101) before its final one; they are read past (RFC 9110 Section
+15.2), and only a 2xx after them puts the tunnel up.
 .PP
 An upstream that turns the CONNECT down is answered to an HTTP client with
 "502 Bad Gateway", or "504 Gateway Timeout" for a
@@ -1771,7 +1993,10 @@ equally on any other teardown, including
 .B \-\-idle\-timeout
 and gwproxy shutting down. A tunnel that fails before it is up, and a 502
 gwproxy sends in place of an unusable response to a forwarded request, end
-with a normal close. When the client is done sending, the upstream is sent a
+with a normal close, after a
+.B close_notify
+to a TLS client (see
+.BR "HOW CONNECTIONS END" ). When the client is done sending, the upstream is sent a
 .B close_notify
 before the TCP FIN. A TLS client
 .RB ( \-\-tls\-cert )
@@ -1945,7 +2170,8 @@ A pool also keeps track of its servers' health, from the connections they
 carry (passively: gwproxy sends no probes of its own). A failure counts
 against a server only when it is the server's own: its TCP connection
 refused, reset or timed out, its TLS handshake failing (a refused
-certificate included), a SOCKS5 server that accepts none of the offered
+certificate included) or its TLS stream failing before the CONNECT's reply,
+a SOCKS5 server that accepts none of the offered
 authentication methods, refuses the credentials or answers a CONNECT with
 reply 0x07 or 0x08 (a refused UDP ASSOCIATE never counts, see below), an
 HTTP server that answers 407, a reply that does not parse, the
@@ -2187,14 +2413,19 @@ server cannot carry UDP, and the client is refused (reply 0x07). gwproxy
 connects to the server as for a CONNECT through it, with the same
 authentication, and asks it for a UDP ASSOCIATE of its own, naming the
 address of that connection and the port of the relay socket gwproxy sends
-the datagrams from. The client is answered only once the server has: on
+the datagrams from. They are sent from that address, out of the
+interface that connection is bound to, if any, and with its mark, so they
+come from where the server was told even when
+.BR \-\-bind\-source ", " \-\-bind\-iface " or " "\-j BIND"
+moved that connection off the address routing would pick. The client is answered only once the server has: on
 success with gwproxy's own relay address, as for a direct relay, and the
 server's relay, where gwproxy sends the datagrams, is the address the server
 replies with (or the server's own address, when the reply names 0.0.0.0 or
 ::). Each datagram from the client goes to the server's relay as the client
 sent it, its SOCKS5 header included, and each from the server's relay goes
 back to the client as it came, so the server reaches the targets and wraps
-their replies; datagrams from anywhere else are dropped, as are a client's
+their replies, and which targets may answer is the server's to decide;
+datagrams from anywhere else are dropped, as are a client's
 before it is known (see
 .BR \-\-udp\-associate ).
 The
@@ -2335,11 +2566,8 @@ Multi\-address fallback and racing work on both the
 and the
 .B io_uring
 event loop. A racing connection holds one target socket per attempt in flight,
-up to four instead of one, and on
-.B epoll
-it additionally holds a file descriptor for its attempt timer, which the
-.B io_uring
-loop does not need; size the descriptor limit accordingly, or set
+up to four instead of one, on either loop; size the descriptor limit
+accordingly, or set
 .B \-\-connect\-attempt\-delay=0
 to keep a single attempt in flight.
 .PP
@@ -2360,7 +2588,14 @@ Each worker uses one event loop, selected with
 is always available and is the default.
 .B io_uring
 is available only in builds configured with io_uring support and is selected at
-run time. All proxy features, including TLS termination and the multi\-address
+run time. It needs Linux 5.19 or later: it queues its closes with
+IOSQE_CQE_SKIP_SUCCESS (Linux 5.17) and ends a connection's requests with
+IORING_ASYNC_CANCEL_FD and IORING_ASYNC_CANCEL_ALL (Linux 5.19). Each worker
+checks for both when it sets up its ring, and on an older kernel, or wherever
+the kernel refuses them, gwproxy does not start, with an error naming what is
+missing; use
+.B epoll
+there. All proxy features, including TLS termination and the multi\-address
 racing described under
 .BR "TARGET ADDRESS SELECTION" ,
 work on both loops, except the built\-in raw DNS resolver
@@ -2372,11 +2607,20 @@ which requires
 .BR SIGINT ", " SIGTERM
 Stop at once: workers leave their event loops and every connection is closed,
 with whatever is still in its buffers or on its way discarded. There is no
-drain. A client in the middle of a transfer sees a normal end of stream after
+drain. A client in the middle of a download sees a normal end of stream after
 only part of the data, so a protocol that does not mark its own end cannot tell
-this from a complete transfer. The process exits once a reload in progress is
+this from a complete transfer; a client still sending, with data the proxy has
+not read yet, sees its connection reset instead. Connections that gwproxy is
+still closing (see
+.BR "HOW CONNECTIONS END" )
+are closed, or reset, at once. The process exits once a reload in progress is
 over (see
 .BR "RELOADING THE FILES" ).
+A lookup still in the system resolver, which can take until the resolver's
+own timeout, is waited for at most one second, or until a second
+.BR SIGINT " or " SIGTERM ;
+then the process exits without it, and removes its PID file as on any other
+stop.
 Early in the startup, while it loads its files, the signal ends the process
 at once. From when it starts its threads and opens its listeners until its
 handler is in place, the signal is held instead, and then stops the proxy as

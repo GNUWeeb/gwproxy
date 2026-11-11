@@ -190,6 +190,12 @@ static inline ssize_t __sys_sendto(int sockfd, const void *buf, size_t len,
 				       dest_addr, addrlen);
 }
 
+static inline ssize_t __sys_sendmsg(int sockfd, const struct msghdr *msg,
+				    int flags)
+{
+	return (ssize_t) __do_syscall3(__NR_sendmsg, sockfd, msg, flags);
+}
+
 static inline int __sys_close(int fd)
 {
 	return (int) __do_syscall1(__NR_close, fd);
@@ -331,6 +337,13 @@ static inline ssize_t __sys_sendto(int sockfd, const void *buf, size_t len,
 				   socklen_t addrlen)
 {
 	ssize_t r = sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+	return (r < 0) ? -errno : r;
+}
+
+static inline ssize_t __sys_sendmsg(int sockfd, const struct msghdr *msg,
+				    int flags)
+{
+	ssize_t r = sendmsg(sockfd, msg, flags);
 	return (r < 0) ? -errno : r;
 }
 

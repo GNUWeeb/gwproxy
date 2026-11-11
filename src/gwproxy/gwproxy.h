@@ -16,6 +16,7 @@
 #include <gwproxy/dns.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/iplimit.h>
+#include <gwproxy/linger.h>
 #include <gwproxy/upstream.h>
 #include <gwproxy/upstream_lb.h>
 #include <gwproxy/log.h>
@@ -261,6 +262,12 @@ enum {
 	 */
 	EV_BIT_ATTEMPT_TIMER		= (48ull << 48ull),
 
+	/*
+	 * The worker's linger set (linger.h), on both loops: one of its
+	 * sockets has input, or one of its checks is due.
+	 */
+	EV_BIT_LINGER			= (51ull << 48ull),
+
 	EV_BIT_CLIENT_PROT		= (1000ull << 48ull),
 
 #ifdef CONFIG_IO_URING
@@ -315,6 +322,12 @@ enum {
 	 */
 	EV_BIT_IOU_CLIENT_WATCH		= (25ull << 48ull),
 	EV_BIT_IOU_CLIENT_WATCH_DEL	= (27ull << 48ull),
+	/* The cancel of an upstream handshake request, see upstream_tmo(). */
+	EV_BIT_IOU_UPSTREAM_CANCEL	= (28ull << 48ull),
+	EV_BIT_IOU_LINGER		= EV_BIT_LINGER,
+	/* The linger set's timeout, and the moves of its deadline. */
+	EV_BIT_IOU_LINGER_TMR		= (52ull << 48ull),
+	EV_BIT_IOU_LINGER_TMR_UPD	= (53ull << 48ull),
 #endif
 };
 
@@ -442,6 +455,23 @@ struct gwp_conn {
 	bool		wr_shut;
 
 	/*
+	 * The peer reset the connection (or it died otherwise) while the pair
+	 * was forwarding: a plaintext side only. Nothing more can be sent to
+	 * it, so @wr_shut is set with it and what was queued for it is
+	 * dropped, but what it sent before is still read up to @rd_eof and
+	 * delivered. Recorded when first seen, as the recv() or send() that
+	 * reports the error also clears it from the socket.
+	 */
+	bool		rst;
+
+	/*
+	 * The client only: what is queued for it is the last thing the proxy
+	 * sends it, its failure reply. A TLS client gets a close_notify right
+	 * behind it, in the same flush (do_send_tls(), send_client_tls()).
+	 */
+	bool		last_reply;
+
+	/*
 	 * TLS state for this endpoint, NULL for a plaintext one: the client's
 	 * when it connected with TLS (--tls-cert), the target's when it is an
 	 * https:// upstream proxy. Once set and the handshake has completed,
@@ -490,9 +520,9 @@ enum {
 	 */
 	GWP_CONN_FLAG_UP_FAILED		= (1ull << 7ull),
 	/*
-	 * The client has been given its failure reply (gwp_conn_fail_reply()),
-	 * so a failure that surfaces again on its way out gives no second
-	 * one (gwp_upstream_fail_reply()).
+	 * The client has been given its failure reply (gwp_conn_fail_reply(),
+	 * gwp_acl_reject_reply()), so a failure that surfaces again on its
+	 * way out gives no second one.
 	 */
 	GWP_CONN_FLAG_FAIL_REPLIED	= (1ull << 9ull),
 	/*
@@ -513,6 +543,13 @@ enum {
 	 * relay takes the datagrams.
 	 */
 	GWP_CONN_FLAG_UDP_UP		= (1ull << 11ull),
+	/*
+	 * io_uring: the connect timeout ran out during the handshake with a
+	 * plaintext upstream while a request of it was in flight on
+	 * target.buf. The client's answer waits for that request to complete
+	 * (upstream_tmo()).
+	 */
+	GWP_CONN_FLAG_UP_TMO_WAIT	= (1ull << 12ull),
 };
 
 enum {
@@ -569,16 +606,45 @@ struct gwp_udp_peers {
  * relay takes the datagrams (@relay, in the family of the pair's udp_fd), and
  * the last domain target's OUTPUT verdict, as struct gwp_udp_acl_cache keeps
  * an address's: @ok for @dom and @dport, while @valid and the ACL is still at
- * generation @gen.
+ * generation @gen. The datagrams leave from @local, the address of the
+ * control connection that gwproxy's own UDP ASSOCIATE declares, out of
+ * @ifindex, the interface that connection is bound to (0 for none), and
+ * with @mark, its SO_MARK (0 for none).
  */
 struct gwp_udp_up {
 	struct gwp_sockaddr	relay;
+	struct gwp_sockaddr	local;
+	uint32_t		ifindex;
+	uint32_t		mark;
 	socklen_t		relay_len;
 	uint32_t		gen;
 	__be16			dport;
 	bool			valid;
 	bool			ok;
 	char			dom[256];
+};
+
+/*
+ * How a direct UDP association's datagrams to its targets leave the relay
+ * socket, which also talks to the client and so is bound to nothing: the
+ * source address, interface and mark that --bind-source, --bind-iface and
+ * --mark, or an ACL -j BIND or -j MARK rule, give a TCP connection to the
+ * same target are applied to each datagram (gwp_udp_src_cmsg()). @so holds
+ * the ACL's -j MARK and -j BIND for the target of gcp->udp_acl, the last
+ * one judged. @ifname is the last interface name looked up, and @ifindex
+ * its index (0 when it was not found), looked up again when the second
+ * changes (@if_at), as the interface may come and go. @src is the source of
+ * the datagram being sent, spelled for its destination. @warned holds the
+ * GWP_UDP_EG_* failures already logged for the association. Allocated on
+ * the association's first datagram that needs it.
+ */
+struct gwp_udp_egress {
+	struct gwp_conn_sockopt	so;
+	struct gwp_sockaddr	src;
+	uint32_t		ifindex;
+	uint32_t		if_at;
+	char			ifname[16];
+	uint8_t			warned;
 };
 
 struct gwp_conn_pair {
@@ -604,6 +670,14 @@ struct gwp_conn_pair {
 	 * io_uring has no timerfd to test for.
 	 */
 	struct __kernel_timespec	ats;
+	/*
+	 * When the earliest of the pair's live protocol, connect or idle
+	 * timers expires, in CLOCK_MONOTONIC ms; 0 when none is live. An
+	 * expiry that comes before it, or while none is live, is that of a
+	 * timer that was removed as it fired: io_uring cannot tell the two
+	 * apart, as both carry the same user_data (handle_ev_timer()).
+	 */
+	uint64_t			tmr_due;
 #ifdef CONFIG_HTTPS
 	/*
 	 * Persistent ciphertext scratch for the client's TLS on the io_uring
@@ -636,6 +710,8 @@ struct gwp_conn_pair {
 	struct gwp_udp_peers	*udp_peers;
 	/* A UDP association through the upstream, see GWP_CONN_FLAG_UDP_UP. */
 	struct gwp_udp_up	*udp_up;
+	/* A direct UDP association's egress state; NULL until it needs one. */
+	struct gwp_udp_egress	*udp_eg;
 	/* The next pair on the epoll loop's list of pairs to free (@dead). */
 	struct gwp_conn_pair	*next_dead;
 	/*
@@ -698,6 +774,11 @@ struct gwp_conn_pair {
 	 * from a target in @udp_peers.
 	 */
 	struct gwp_sockaddr	udp_peer;
+	/*
+	 * The address the client reached the proxy at, which it is told is the
+	 * relay's (BND.ADDR): datagrams to it are sent from there.
+	 */
+	struct gwp_sockaddr	udp_local;
 	/* Last client->target datagram's ACL verdict; see udp_target_allowed(). */
 	struct gwp_udp_acl_cache	udp_acl;
 	struct gwp_sockaddr	client_addr;
@@ -757,6 +838,13 @@ struct gwp_conn_pair {
 	 * searched from its start again on every read.
 	 */
 	uint32_t		up_scan;
+
+	/*
+	 * The error that ends the pair, while its teardown waits for the
+	 * failure reply to reach the client (hold_for_fail_reply(), in either
+	 * event loop); 0 otherwise.
+	 */
+	int			fail_err;
 
 	/*
 	 * How the attempt through the upstream failed, when the place that
@@ -855,6 +943,14 @@ struct iou {
 	 */
 	struct gwp_held_sqe	*held_first;
 	struct gwp_held_sqe	*held_last;
+
+	/*
+	 * The timeout for the linger set's next look (arm_linger_timer()):
+	 * its absolute deadline, which must outlive the SQE's submission, and
+	 * when it is due in CLOCK_MONOTONIC ms, 0 while none is armed.
+	 */
+	struct __kernel_timespec linger_ts;
+	uint64_t		linger_at_ms;
 };
 #endif
 
@@ -877,7 +973,10 @@ struct gwp_wrk_dns {
 enum {
 	/* The protocol, connect or idle timeout of the pair. */
 	GWP_TMR_CONN		= 0,
-	/* The next connect attempt joins the race. */
+	/*
+	 * The next connect attempt joins the race; before it, while the
+	 * name resolves with --raw-dns, the query is sent again.
+	 */
 	GWP_TMR_ATTEMPT		= 1,
 };
 
@@ -895,6 +994,16 @@ struct gwp_tmr_heap {
 	struct gwp_tmr		*tmr;
 	uint32_t		nr;
 	uint32_t		cap;
+};
+
+/*
+ * A log line a client can trigger at will, written at most once a second per
+ * worker: the next is due from @next on, and @quiet counts the ones left out
+ * since the last (gwp_wrk_log_limit()).
+ */
+struct gwp_log_limit {
+	uint32_t	next;
+	uint32_t	quiet;
 };
 
 struct gwp_wrk {
@@ -974,6 +1083,13 @@ struct gwp_wrk {
 	 * enough to stamp every event with (gwp_conn_pair::last_act).
 	 */
 	uint32_t		now;
+	/* The INPUT chain's refusals (gwp_wrk_acl_denied()). */
+	struct gwp_log_limit	acl_deny_log;
+	/*
+	 * Transparent clients with no original destination
+	 * (gwp_wrk_no_orig_dst()).
+	 */
+	struct gwp_log_limit	no_orig_dst_log;
 	pthread_t		thread;
 
 	/*
@@ -983,6 +1099,12 @@ struct gwp_wrk {
 	 * (no copy); the tail holds up to one max-size UDP payload.
 	 */
 	unsigned char		*udp_buf;
+
+	/*
+	 * The sockets of this worker's finished pairs that are still being
+	 * closed (gwp_conn_pair_linger()).
+	 */
+	struct gwp_linger_set	*linger;
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	struct gwp_wrk_dns	*dns;
@@ -1076,6 +1198,12 @@ struct gwp_ctx {
 	 * neither option was given.
 	 */
 	struct gwp_acl_bind		bind_def;
+	/*
+	 * The SO_MARK of every UDP relay socket: 0, as the datagrams to the
+	 * targets carry --mark each, but --mark when the kernel does not take
+	 * a mark per datagram (see gwp_ctx_init_udp_mark()).
+	 */
+	uint32_t			udp_sk_mark;
 	struct gwp_cfg			cfg;
 	/* The locked --pid-file, removed on exit; -1 when there is none. */
 	int				pid_fd;
@@ -1124,6 +1252,11 @@ struct gwp_ctx {
 
 struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w);
 bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
+bool gwp_wrk_log_limit(struct gwp_wrk *w, struct gwp_log_limit *l,
+		       uint32_t *quiet);
+void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
+void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
+			 int err);
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 /* Make @gcp chain through @up (NULL: go direct), dropping what it had. */
@@ -1248,7 +1381,40 @@ struct gwp_udp_out {
 	size_t			len;
 	struct gwp_sockaddr	dst;
 	socklen_t		dstlen;
+	/*
+	 * The source to send from, or NULL for the one routing picks, and the
+	 * interface to send out of, or 0 for the source's scope (if any).
+	 */
+	const struct gwp_sockaddr *from;
+	uint32_t		from_ifindex;
+	/* The SO_MARK to send with, when @mark_set; else the socket's own. */
+	uint32_t		mark;
+	bool			mark_set;
 };
+
+/*
+ * Room for the control messages of a relayed datagram (gwp_udp_src_cmsg()):
+ * CMSG_SPACE() of a struct in6_pktinfo and of a 32-bit SO_MARK, with the
+ * padding of each part spelled out, and aligned as control messages are.
+ * (A struct cmsghdr member would make it a type of variable size, as the
+ * header ends in a flexible array.)
+ */
+union gwp_udp_cmsg {
+	size_t		align;
+	unsigned char	b[2 * sizeof(struct cmsghdr) +
+			  sizeof(struct in6_pktinfo) + sizeof(uint32_t) +
+			  4 * sizeof(size_t)];
+};
+
+/*
+ * Build in @cb the control messages that make a datagram of @out leave the
+ * relay socket from @out->from and out of @out->from_ifindex, and with
+ * @out->mark, and return their length for msg_controllen: IPV6_PKTINFO on
+ * the dual-stack relay (an IPv4 source v4-mapped), IP_PKTINFO on an IPv4
+ * one, then SO_MARK. A source of the other family than the destination is
+ * left out. Returns 0 when there is nothing to say.
+ */
+size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb);
 
 /*
  * SOCKS5 UDP relay per-datagram classifier, shared by both event loops. @base
@@ -1302,6 +1468,37 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
  */
 int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
 void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair *gcp);
+
+/*
+ * @c, one side of @gcp, was reset while the pair forwarded (gwp_conn::rst),
+ * and its stream is to end on the other side as a cut, not as a normal end.
+ * Not when the HTTP forwarding filter has answered 502 in place of the
+ * origin's response: that reply is complete.
+ */
+bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
+			   const struct gwp_conn *c);
+
+/*
+ * The other side of @c was reset (gwp_conn_reset_passed()), and @c, the
+ * plaintext survivor, is to be reset in turn once it has taken what it is
+ * owed, so that the cut shows: the end of the pair gives it no FIN, and
+ * gwp_conn_pair_linger() resets it. A TLS survivor is ended as the TLS
+ * TERMINATION and UPSTREAM CHAINING sections of the manual describe.
+ */
+bool gwp_conn_reset_passes_to(const struct gwp_conn_pair *gcp,
+			      const struct gwp_conn *c);
+
+/*
+ * @gcp is done and about to be freed, with no I/O left in flight on its
+ * sockets and both out of the event loop's own set. Hand those that may still
+ * get input to the worker's linger set (linger.h) instead of closing them, so
+ * that a close does not reset the connection and destroy what is still on
+ * its way to the peer: a failure reply, the end of a response. A reset to be
+ * passed on (gwp_conn_reset_passes_to()) waits there for the same reason.
+ * Their fds are set to -1 then. Returns the number of descriptors closed at
+ * once in there.
+ */
+int gwp_conn_pair_linger(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /* True if the ACL INPUT chain permits an incoming client for @proto (allow-all
  * with no ACL). */
@@ -1480,7 +1677,9 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  * Build the "ACL denied" downstream reply (SOCKS5 CONNECT refusal or HTTP 403)
  * into gcp->target.buf, ready for the caller to flush its own way. Logs the
  * denial. Returns -EACCES (the terminal handshake verdict) once the reply is
- * built, or a negative errno if it could not be built.
+ * built, or a negative errno if it could not be built. Once the client has
+ * its final answer (GWP_CONN_FLAG_FAIL_REPLIED) it adds nothing and returns
+ * -EACCES.
  */
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
@@ -1490,6 +1689,8 @@ int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
  * into gcp->target.buf, ready for the caller to flush its own way. @err is a
  * negative errno. Returns 0 (including for plain forwarding, which has no
  * protocol to answer in), or a negative errno if the reply could not be built.
+ * Once the client has its final answer (GWP_CONN_FLAG_FAIL_REPLIED) it adds
+ * nothing and returns 0.
  */
 int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
 
@@ -1585,6 +1786,12 @@ int gwp_upstream_tls_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /* The TLS handshake with the upstream proxy failed: log why. */
 void gwp_upstream_tls_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+/*
+ * Past the handshake, the upstream's TLS stream failed before anything of
+ * the CONNECT's reply came (a record that fails to verify, a fatal alert):
+ * a failure of the upstream's, like a failed handshake. Log why.
+ */
+void gwp_upstream_tls_rx_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /*
  * The https:// upstream's stream has ended, and the end was a cut rather than

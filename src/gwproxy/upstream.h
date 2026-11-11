@@ -63,7 +63,7 @@ enum gwp_upstream_fail_class {
  */
 enum gwp_upstream_end {
 	GWP_UPSTREAM_END_CONNECT,	/* TCP connect failed; errno, any sign */
-	GWP_UPSTREAM_END_TLS,		/* TLS handshake failed */
+	GWP_UPSTREAM_END_TLS,		/* TLS failed before the reply */
 	GWP_UPSTREAM_END_S5_METHOD,	/* SOCKS5 method we cannot use */
 	GWP_UPSTREAM_END_S5_AUTH,	/* SOCKS5 user/password status */
 	GWP_UPSTREAM_END_S5_REP,	/* SOCKS5 CONNECT REP */

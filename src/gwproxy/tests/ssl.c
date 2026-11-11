@@ -231,6 +231,59 @@ static void test_handshake_and_roundtrip(void)
 }
 
 /*
+ * A write that the engine cannot take before it has heard from the peer says
+ * so until ciphertext has been received: a write before the handshake, which
+ * sends the ClientHello and waits for the answer, is one.
+ */
+static void test_tx_starved(void)
+{
+	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
+	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
+	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
+	struct gwp_ssl *srv, *cli;
+	size_t consumed;
+	int fd;
+
+	fd = mkstemp(cert); assert(fd >= 0); close(fd);
+	fd = mkstemp(key); assert(fd >= 0); close(fd);
+	write_file(cert, TEST_CERT);
+	write_file(key, TEST_KEY);
+	assert(!gwp_ssl_ctx_server_create(&sctx, cert, key));
+	assert(!gwp_ssl_ctx_client_create(&cctx));
+	srv = gwp_ssl_server_new(sctx);
+	cli = gwp_ssl_client_new(cctx);
+	assert(srv && cli);
+
+	assert(!gwp_ssl_tx_starved(cli));
+	assert(gwp_ssl_write(cli, "x", 1, &consumed) == GWP_SSL_WANT_READ);
+	assert(!consumed && gwp_ssl_tx_starved(cli));
+	/* Nothing received: still so, however often it is asked. */
+	assert(gwp_ssl_write(cli, "x", 1, &consumed) == GWP_SSL_WANT_READ);
+	assert(gwp_ssl_tx_starved(cli));
+	gwp_ssl_rx_commit(cli, 0);
+	assert(gwp_ssl_tx_starved(cli));
+
+	shuttle(cli, srv);
+	assert(gwp_ssl_handshake(srv) == GWP_SSL_WANT_READ);
+	assert(!gwp_ssl_tx_starved(srv));
+	/* The server's answer has come: the next write may get somewhere. */
+	shuttle(srv, cli);
+	assert(!gwp_ssl_tx_starved(cli));
+
+	do_handshake(cli, srv);
+	round_trip(cli, srv, "after", 5);
+	assert(!gwp_ssl_tx_starved(cli));
+
+	gwp_ssl_free(srv);
+	gwp_ssl_free(cli);
+	gwp_ssl_ctx_free(sctx);
+	gwp_ssl_ctx_free(cctx);
+	unlink(cert);
+	unlink(key);
+	PRTEST_OK();
+}
+
+/*
  * Move ciphertext the zero-copy way the epoll loop does: take it from the send
  * queue with peek/consume in small, uneven pieces, and hand it to the receive
  * queue through rx_space/rx_commit. Check that the plaintext arrives intact
@@ -664,6 +717,7 @@ int main(void)
 		test_rx_cut();
 	}
 	test_client_verify();
+	test_tx_starved();
 
 	printf("All tests passed!\n");
 	return 0;

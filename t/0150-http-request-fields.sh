@@ -6,7 +6,8 @@
 # not defined to appear once may be repeated. None of that may open the way to
 # request smuggling: a framing field the proxy cannot read exactly as a number
 # or as "chunked" is refused, whatever bytes surround it, and so is a byte that
-# some peer could take for a line end or for part of a field name. Whatever is
+# some peer could take for a line end or for part of a field name: each with a
+# 400. Whatever is
 # accepted is compared byte for byte with what reaches the origin, which sees
 # that one request and nothing behind it.
 
@@ -120,7 +121,7 @@ def req(lines, tail=b'', method=b'GET', p=b''):
 def out(lines, tail=b'', method=b'GET'):
     return (b'%s / HTTP/1.1\r\nHost: %s\r\n' % (method, auth) +
             b''.join(l + b'\r\n' for l in lines) +
-            b'Connection: close\r\n\r\n' + tail)
+            b'Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n' + tail)
 
 
 def ok(name, data, want, p=None):
@@ -183,7 +184,6 @@ def connect_ok(name, lines):
 
 
 BAD = 'HTTP/1.1 400 '
-GONE = 'CLOSED'
 
 # obs-text is passed on unchanged, wherever it is in the value.
 for v in (b'caf\xc3\xa9', b'caf\xe9', b'a\x80b', b'a\xffb', b'\x80', b'\xff',
@@ -220,14 +220,14 @@ no('Connection naming a framing field, after obs-text',
 # Field names are tokens, and only the value may hold these bytes.
 for l in (b'Content-Length\xa0: 4', b'\xa0Content-Length: 4',
           b'Transfer-Encoding\x85: chunked', b'X-\xc3\xa9: 1', b'\xff: 1'):
-    no('name %r' % l, req([l], b'body', b'POST'), GONE)
+    no('name %r' % l, req([l], b'body', b'POST'), BAD)
 
 # Nor does a control byte get in by standing next to one of them.
 for v in (b'\xc3\x00', b'\x00\xc3', b'a\x01\xff', b'\xff\x7f', b'\xa0\x1f',
           b'\xc3\rContent-Length: 0', b'\xa0\rX: 1'):
-    no('control byte in %r' % v, req([b'X-N: ' + v]), GONE)
+    no('control byte in %r' % v, req([b'X-N: ' + v]), BAD)
 # A line folded behind obs-text, which an origin could read as its own field.
-no('obs-fold', req([b'X-N: \xa0', b' Content-Length: 0']), GONE)
+no('obs-fold', req([b'X-N: \xa0', b' Content-Length: 0']), BAD)
 
 # It is not a credential, and must not be taken for part of one.
 ok('good credentials, obs-text elsewhere',

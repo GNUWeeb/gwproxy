@@ -63,8 +63,12 @@ hold_start()
 		sed 's/^/# gwp: /' "$HLOG" >&2
 		fail "[$name] the proxy did not listen on $PP"
 	fi
-	timeout 10 bash -c "until [ -s '$st' ]; do sleep 0.05; done" ||
-		fail "[$name] fd_holder.py reported nothing"
+	# Not just the first state: the helper writes one before the proxy
+	# has opened any socket ("HELD 0"), and only learns at the first one
+	# whether pidfd_getfd() is allowed. Wait for its verdict on the
+	# listener, which is open by now.
+	timeout 20 bash -c "until grep -qE 'NOGETFD|HELD [1-9]' '$st' 2>/dev/null; do sleep 0.05; done" ||
+		fail "[$name] fd_holder.py did not take the listener ($(cat "$st" 2>/dev/null))"
 	GPID="$(awk '{print $2}' "$st")"
 	HST="$st"
 	HELD=1
@@ -72,6 +76,13 @@ hold_start()
 		diag "[$name] pidfd_getfd() unavailable ($(cat "$st")), part skipped"
 		HELD=0
 	fi
+}
+
+# hold_fail <message>: fail with the end of the proxy's log.
+hold_fail()
+{
+	tail -40 "$HLOG" | sed 's/^/# gwp: /' >&2
+	fail "$1"
 }
 
 # hold_check <name> <rc> <out>: judge a part's client, then stop the proxy.
@@ -83,27 +94,33 @@ hold_check()
 	sanitizer_check "$HLOG" "[$name]"
 	if ! kill -0 "$GPID" 2>/dev/null; then
 		wait "$HPID"
-		fail "[$name] the proxy died (status $?): $out"
+		hold_fail "[$name] the proxy died (status $?): $out"
 	fi
 	case $rc in
 	0) ;;
-	2) fail "[$name] the worker spun on events of closed sockets: $out" ;;
-	*) fail "[$name] $out" ;;
+	2) hold_fail "[$name] the worker spun on events of closed sockets: $out" ;;
+	*) hold_fail "[$name] $out" ;;
 	esac
 	r="$(python3 "$SERVERS_DIR/socks5_probe.py" "$PP" "$hp")"
-	[ "$r" = "REP=0x00" ] || fail "[$name] SOCKS5 CONNECT afterwards: $r"
+	[ "$r" = "REP=0x00" ] || hold_fail "[$name] SOCKS5 CONNECT afterwards: $r"
 	kill -TERM "$GPID"
 	timeout 30 bash -c "while kill -0 $GPID 2>/dev/null; do sleep 0.05; done" ||
-		fail "[$name] the proxy did not exit on SIGTERM"
+		hold_fail "[$name] the proxy did not exit on SIGTERM"
 	wait "$HPID"
 	ec=$?
 	sanitizer_check "$HLOG" "[$name]"
-	[ "$ec" = 0 ] || { tail -20 "$HLOG" >&2; fail "[$name] exit status $ec"; }
+	[ "$ec" = 0 ] || hold_fail "[$name] exit status $ec"
 }
 
 # The client of the pool and DNS parts: a SOCKS5 tunnel to <dst>:<hp>, idle
 # for a second, then used and closed; the proxy must stay idle meanwhile
 # and after. Exit 2 when it spun.
+#
+# Its CONNECT waits on servers that answer late on purpose, and the default
+# connect timeout of 5 seconds bounds all of it, the retry on the second
+# pool server included: a machine that stalls for a few seconds (a loaded
+# CI runner) ran out of it, and the client got REP 0x06. Those parts give
+# the proxy as long as the client waits, 20 seconds.
 cat >"$WORK/tunnel.py" <<'PY'
 import os, socket, struct, sys, time
 
@@ -214,8 +231,7 @@ for loop in epoll io_uring; do
 		        time.sleep(0.02)
 		    return False
 
-		time.sleep(0.3)		# the listeners are held by now
-		base = held()
+		base = held()		# the listener, held since hold_start
 		conns = []
 		for _ in range(n):
 		    c = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -286,7 +302,8 @@ for loop in epoll io_uring; do
 			echo '-A OUTPUT -j UPSTREAM --to p --accept'
 		} >"$WORK/pool.$loop.acl"
 		hold_start "$loop/redial" --log-level=4 --as-socks5=1 \
-			--event-loop="$loop" --acl-file="$WORK/pool.$loop.acl"
+			--event-loop="$loop" --acl-file="$WORK/pool.$loop.acl" \
+			--connect-timeout=20
 		if [ "$HELD" = 1 ]; then
 			rc=0
 			for _ in 1 2; do
@@ -328,10 +345,11 @@ for loop in epoll io_uring; do
 		    s.sendto(resp, peer)
 		PY
 		_PIDS+=("$!")
-		timeout 10 bash -c "until grep -q ready '$WORK/dns.log'; do sleep 0.05; done" ||
+		timeout 10 bash -c "until grep -qs ready '$WORK/dns.log'; do sleep 0.05; done" ||
 			fail "the DNS server did not start"
 		hold_start "$loop/dns" --log-level=3 --acl-allow-all --as-socks5=1 \
-			--event-loop="$loop" --raw-dns=1 --dns-server="127.0.0.1:$dp"
+			--event-loop="$loop" --raw-dns=1 --dns-server="127.0.0.1:$dp" \
+			--connect-timeout=20
 		if [ "$HELD" = 1 ]; then
 			out="$(python3 "$WORK/tunnel.py" "$PP" "$GPID" "$HLOG" q.example "$hp")"
 			hold_check "$loop/dns" $? "$out"

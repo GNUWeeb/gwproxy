@@ -247,7 +247,11 @@ static int add_field(struct gwnet_http_hdr_fields *ff, uint32_t koff,
  * @return     0 on success,
  *             -EAGAIN if more data is needed,
  *             -EINVAL if the request line is malformed,
- *             -E2BIG  if the request line exceeds the maximum length.
+ *             -EPROTONOSUPPORT if it is for an HTTP version other than 1.x,
+ *             -ENAMETOOLONG if the request line exceeds the maximum length
+ *             past the method, which for any real request means its
+ *             request-target is too long (RFC 9112 Section 3: 414),
+ *             -E2BIG  if the method alone does.
  */
 static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 				    struct gwnet_http_req_hdr *hdr)
@@ -273,32 +277,57 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	const char *uri, *qs, *path, *buf = &ctx->buf[ctx->off];
 	uint32_t uri_len, qs_len, path_len;
 	uint8_t method_code, version_code;
+	char major;
 
 	if (!len)
 		return -EAGAIN;
 
-	method_code = GWNET_HTTP_METHOD_UNKNOWN;
-	for (i = 0; i < nr_methods; i++) {
-		const struct method_entry *me = &methods[i];
-		size_t mlen = me->len;
-
-		cmpl = min_st(len, mlen);
-		if (memcmp(buf, me->str, cmpl))
-			continue;
-
-		if (cmpl < mlen)
+	/*
+	 * RFC 9112 Section 2.2: a server SHOULD ignore at least one empty
+	 * line received before the request line. One is skipped, CRLF or a
+	 * bare LF; another is refused like any other byte that cannot start
+	 * a method.
+	 */
+	if (!ctx->tot_len && (buf[0] == '\r' || buf[0] == '\n')) {
+		off = buf[0] == '\r' ? 2 : 1;
+		if (len < off)
 			return -EAGAIN;
-
-		method_code = me->code;
-		off += mlen;
-		break;
+		if (off == 2 && buf[1] != '\n')
+			return -EINVAL;
+		ctx->off += off;
+		ctx->tot_len += off;
+		buf += off;
+		len -= off;
+		off = 0;
+		if (!len)
+			return -EAGAIN;
 	}
 
-	if (method_code == GWNET_HTTP_METHOD_UNKNOWN)
+	/*
+	 * The method is a token (RFC 9110 Section 9.1), and case-sensitive.
+	 * Any token is taken: the ones not in the table are extension
+	 * methods (WebDAV's PROPFIND, say), GWNET_HTTP_METHOD_OTHER.
+	 */
+	while (is_tchar(buf[off])) {
+		if (++off >= len)
+			return -EAGAIN;
+		if (ctx->tot_len + off >= ctx->max_len)
+			return -E2BIG;
+	}
+	if (!off)
 		return -EINVAL;
 
-	if (off >= len)
-		return -EAGAIN;
+	method_code = GWNET_HTTP_METHOD_OTHER;
+	for (i = 0; i < nr_methods; i++) {
+		const struct method_entry *me = &methods[i];
+
+		if (off == me->len && !memcmp(buf, me->str, off)) {
+			method_code = me->code;
+			break;
+		}
+	}
+	hdr->method_off = (uint32_t)ctx->off;
+	hdr->method_len = (uint32_t)off;
 
 	/*
 	 * After the method, there must be a space.
@@ -309,35 +338,9 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 
 	off++;
 	if (ctx->tot_len + off >= ctx->max_len)
-		return -E2BIG;
+		return -ENAMETOOLONG;
 	if (off >= len)
 		return -EAGAIN;
-
-	/*
-	 * Per RFC 7230, Section 5.3.1:
-	 * When making a request directly to an origin server,
-	 * other than a CONNECT or server-wide OPTIONS request
-	 * a client MUST send only the absolute path and query
-	 * components of the target URI as the request-target.
-	 * If the target URI's path component is empty, the
-	 * client MUST send "/" as the path within the
-	 * origin-form of request-target.
-	 */
-	if (method_code != GWNET_HTTP_METHOD_CONNECT &&
-	    method_code != GWNET_HTTP_METHOD_OPTIONS) {
-		/*
-		 * Origin-form starts with '/'. absolute-form (which a client
-		 * uses to address a forwarding proxy, RFC 7230 Section 5.3.2)
-		 * starts with a scheme, i.e. an alphabetic character; it is
-		 * validated in full once the whole request-target has been
-		 * captured below.
-		 */
-		if (buf[off] != '/' && !is_alpha(buf[off]))
-			return -EINVAL;
-	} else {
-		if (!is_vchar(buf[off]))
-			return -EINVAL;
-	}
 
 	path = uri = &buf[off];
 	qs = NULL;
@@ -353,7 +356,7 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 			return -EAGAIN;
 
 		if (ctx->tot_len + off >= ctx->max_len)
-			return -E2BIG;
+			return -ENAMETOOLONG;
 
 		if (is_space(c))
 			break;
@@ -386,6 +389,10 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 		}
 	}
 
+	/* Two spaces in a row: no request-target at all. */
+	if (!uri_len)
+		return -EINVAL;
+
 	/*
 	 * Trim trailing slashes from the path.
 	 *
@@ -398,6 +405,75 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 			break; /* Keep at least one slash. */
 		path_len--;
 	}
+
+	/*
+	 * The version: "HTTP/" DIGIT "." DIGIT (RFC 9112 Section 2.3). A
+	 * higher minor version than 1 is HTTP/1.1 to us (RFC 9110 Section
+	 * 2.5); another major version, the HTTP/2 connection preface "PRI *
+	 * HTTP/2.0" among them, is one this parser does not speak, which is
+	 * told apart from a malformed line (-EPROTONOSUPPORT).
+	 */
+	reml = len - off;
+	cmpl = min_st(reml, 5);
+	if (memcmp(&buf[off], "HTTP/", cmpl))
+		return -EINVAL;
+	if (cmpl < 5)
+		return -EAGAIN;
+	off += 5;
+
+	/*
+	 * Check exceeding length upfront, we know that
+	 * the rest of the version is always 3 characters
+	 * long followed by a CRLF (or just LF).
+	 */
+	if (ctx->tot_len + off + 3 + 1 >= ctx->max_len)
+		return -ENAMETOOLONG;
+
+	for (i = 0; i < 3; i++) {
+		if (off + i >= len)
+			return -EAGAIN;
+		if (i == 1 ? buf[off + i] != '.' :
+		    (buf[off + i] < '0' || buf[off + i] > '9'))
+			return -EINVAL;
+	}
+	major = buf[off];
+	version_code = buf[off + 2] == '0' ? GWNET_HTTP_VER_1_0 :
+					     GWNET_HTTP_VER_1_1;
+	off += 3;
+	if (off >= len)
+		return -EAGAIN;
+
+	/*
+	 * After the HTTP version, expect a CRLF. But the CR
+	 * is optional, so we can also accept just LF.
+	 */
+	if (buf[off] == '\r') {
+		if (++off >= len)
+			return -EAGAIN;
+	}
+
+	if (buf[off] != '\n')
+		return -EINVAL;
+
+	++off;
+	if (ctx->tot_len + off >= ctx->max_len)
+		return -ENAMETOOLONG;
+
+	if (major != '1')
+		return -EPROTONOSUPPORT;
+
+	/*
+	 * Per RFC 9112 Section 3.2: a request to an origin server, other than
+	 * a CONNECT or server-wide OPTIONS request, carries the absolute path
+	 * and query (origin-form, starting with '/'). absolute-form, which a
+	 * client uses to address a forwarding proxy (Section 3.2.2), starts
+	 * with a scheme, i.e. an alphabetic character; the proxy layer
+	 * validates the rest.
+	 */
+	if (method_code != GWNET_HTTP_METHOD_CONNECT &&
+	    method_code != GWNET_HTTP_METHOD_OPTIONS && uri[0] != '/' &&
+	    !is_alpha(uri[0]))
+		return -EINVAL;
 
 	/*
 	 * A non-origin-form target on a non-CONNECT/OPTIONS request must be
@@ -422,58 +498,6 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 		if (!abs_form)
 			return -EINVAL;
 	}
-
-	/*
-	 * Parse the HTTP version. Only support HTTP/1.0 and HTTP/1.1.
-	 */
-	reml = len - off;
-	cmpl = min_st(reml, 7);
-	if (memcmp(&buf[off], "HTTP/1.", cmpl))
-		return -EINVAL;
-	if (cmpl < 7)
-		return -EAGAIN;
-
-	off += 7;
-	if (off >= len)
-		return -EAGAIN;
-
-	/*
-	 * Check exceeding length upfront, we know that
-	 * the HTTP version is always 8 characters long
-	 * followed by a CRLF (or just LF).
-	 */
-	if (ctx->tot_len + off + 1 + 1 >= ctx->max_len)
-		return -E2BIG;
-
-	switch (buf[off]) {
-	case '0':
-		version_code = GWNET_HTTP_VER_1_0;
-		break;
-	case '1':
-		version_code = GWNET_HTTP_VER_1_1;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	if (++off >= len)
-		return -EAGAIN;
-
-	/*
-	 * After the HTTP version, expect a CRLF. But the CR
-	 * is optional, so we can also accept just LF.
-	 */
-	if (buf[off] == '\r') {
-		if (++off >= len)
-			return -EAGAIN;
-	}
-
-	if (buf[off] != '\n')
-		return -EINVAL;
-
-	++off;
-	if (ctx->tot_len + off >= ctx->max_len)
-		return -E2BIG;
 
 	/* Where they are in the header; @path starts with @uri. */
 	hdr->uri_off = (uint32_t)(ctx->off + (size_t)(uri - buf));
@@ -959,9 +983,11 @@ static int hdr_translate_ret_err(struct gwnet_http_hdr_pctx *ctx, int r)
 		break;
 	case -EINVAL:
 	case -EEXIST:
+	case -EPROTONOSUPPORT:
 		ctx->err = GWNET_HTTP_HDR_ERR_MALFORMED;
 		break;
 	case -E2BIG:
+	case -ENAMETOOLONG:
 		ctx->err = GWNET_HTTP_HDR_ERR_TOO_LONG;
 		break;
 	default:
@@ -1753,26 +1779,59 @@ static void test_req_hdr_invalid_uri_chars2(void)
 	PRTEST_OK();
 }
 
+/*
+ * Any token is a method (RFC 9110 Section 9.1): the known ones get their
+ * code, others GWNET_HTTP_METHOD_OTHER, and either way the name is where
+ * the request line has it. Method names are case-sensitive.
+ */
 static void test_req_hdr_invalid_method(void)
 {
-	static const char buf[] =
-		"INVALID /index.html HTTP/1.1\r\n"
-		"Host: example.com\r\n"
-		"\r\n";
-	static const size_t len = sizeof(buf) - 1;
+	static const struct {
+		const char	*line;
+		int		ret;
+		uint8_t		code;
+		size_t		mlen;
+	} cases[] = {
+		{ "INVALID /index.html HTTP/1.1\r\n\r\n", 0,
+		  GWNET_HTTP_METHOD_OTHER, 7 },
+		{ "PROPFIND /a HTTP/1.1\r\n\r\n", 0,
+		  GWNET_HTTP_METHOD_OTHER, 8 },
+		{ "get /a HTTP/1.1\r\n\r\n", 0, GWNET_HTTP_METHOD_OTHER, 3 },
+		{ "GETS /a HTTP/1.1\r\n\r\n", 0, GWNET_HTTP_METHOD_OTHER, 4 },
+		{ "GE /a HTTP/1.1\r\n\r\n", 0, GWNET_HTTP_METHOD_OTHER, 2 },
+		{ "M-SEARCH~!#$%&'*+.^_`| /a HTTP/1.1\r\n\r\n", 0,
+		  GWNET_HTTP_METHOD_OTHER, 22 },
+		{ "GET /a HTTP/1.1\r\n\r\n", 0, GWNET_HTTP_METHOD_GET, 3 },
+		{ "CONNECT h:1 HTTP/1.1\r\n\r\n", 0,
+		  GWNET_HTTP_METHOD_CONNECT, 7 },
+		{ "GE(T /a HTTP/1.1\r\n\r\n", -EINVAL, 0, 0 },
+		{ "GET\x01 /a HTTP/1.1\r\n\r\n", -EINVAL, 0, 0 },
+		{ " GET /a HTTP/1.1\r\n\r\n", -EINVAL, 0, 0 },
+		{ "/a HTTP/1.1\r\n\r\n", -EINVAL, 0, 0 },
+		{ "GET\r\n\r\n", -EINVAL, 0, 0 },
+	};
 	struct gwnet_http_hdr_pctx ctx;
 	struct gwnet_http_req_hdr hdr;
+	size_t i;
 	int r;
 
-	r = gwnet_http_hdr_pctx_init(&ctx);
-	assert(!r);
-	ctx.buf = buf;
-	ctx.len = len;
-	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		r = gwnet_http_hdr_pctx_init(&ctx);
+		assert(!r);
+		ctx.buf = cases[i].line;
+		ctx.len = strlen(cases[i].line);
+		r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+		assert(r == cases[i].ret);
+		if (!r) {
+			assert(hdr.method == cases[i].code);
+			assert(hdr.method_len == cases[i].mlen);
+			assert(gwnet_http_req_method(&hdr) == cases[i].line);
+		} else {
+			assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+		}
+		gwnet_http_req_hdr_free(&hdr);
+		gwnet_http_hdr_pctx_free(&ctx);
+	}
 	PRTEST_OK();
 }
 
@@ -1792,7 +1851,7 @@ static void test_req_hdr_invalid_version(void)
 	ctx.buf = buf;
 	ctx.len = len;
 	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
-	assert(r == -EINVAL);
+	assert(r == -EPROTONOSUPPORT);
 	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
 	gwnet_http_req_hdr_free(&hdr);
 	gwnet_http_hdr_pctx_free(&ctx);
@@ -2642,7 +2701,16 @@ static void test_req_hdr_oversized(void)
 		ctx.len = len;
 		ctx.max_len = i;
 		r = gwnet_http_req_hdr_parse(&ctx, &hdr);
-		assert(r == -E2BIG);
+		/*
+		 * Past the method, a limit that the request line runs into
+		 * is told apart from one the fields do (414 against 431).
+		 */
+		if (i < 3)		/* in "GET" */
+			assert(r == -E2BIG);
+		else if (i < (size_t)(strchr(buf, '\n') + 1 - buf))
+			assert(r == -ENAMETOOLONG);
+		else
+			assert(r == -E2BIG);
 		assert(ctx.err == GWNET_HTTP_HDR_ERR_TOO_LONG);
 		gwnet_http_req_hdr_free(&hdr);
 		gwnet_http_hdr_pctx_free(&ctx);

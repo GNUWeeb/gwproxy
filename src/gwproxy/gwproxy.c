@@ -43,6 +43,7 @@
 #endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <getopt.h>
 #include <signal.h>
@@ -652,6 +653,17 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		goto einval;
 	}
 
+	/*
+	 * The system resolver needs a thread to run a lookup on. --raw-dns
+	 * and the modes without hostname targets start none, so 0 is fine
+	 * there (see gwp_ctx_init_dns()).
+	 */
+	if ((cfg->as_socks5 || cfg->as_http) && !cfg->use_raw_dns &&
+	    cfg->nr_dns_workers < 1) {
+		fprintf(stderr, ERR_WRAP "Error: -W/--nr-dns-workers must be at least 1 for SOCKS5 or HTTP with the system resolver.\n" ERR_WRAP);
+		goto einval;
+	}
+
 #ifdef CONFIG_HTTPS
 	if ((cfg->tls_cert != NULL) != (cfg->tls_key != NULL)) {
 		fprintf(stderr, ERR_WRAP "Error: --tls-cert and --tls-key must be provided together\n" ERR_WRAP);
@@ -1160,6 +1172,32 @@ static void gwp_ctx_free_thread_event(struct gwp_wrk *w)
 	}
 }
 
+/*
+ * Sockets a worker's linger set holds at once (gwp_conn_pair_linger()): a
+ * share of the descriptors, so that pairs that end in a burst cannot leave
+ * too few of them for new clients. Beyond that, a socket is closed at once.
+ */
+#define GWP_LINGER_MIN		16u
+#define GWP_LINGER_MAX		4096u
+
+__cold
+static int gwp_ctx_init_thread_linger(struct gwp_wrk *w)
+{
+	uint64_t max = GWP_LINGER_MAX;
+	struct rlimit rl;
+
+	if (!getrlimit(RLIMIT_NOFILE, &rl) && rl.rlim_cur != RLIM_INFINITY) {
+		max = (uint64_t)rl.rlim_cur / 8 / (uint64_t)w->ctx->cfg.nr_workers;
+		if (max < GWP_LINGER_MIN)
+			max = GWP_LINGER_MIN;
+		if (max > GWP_LINGER_MAX)
+			max = GWP_LINGER_MAX;
+	}
+
+	w->linger = gwp_linger_new((uint32_t)max);
+	return w->linger ? 0 : -errno;
+}
+
 __cold
 static int gwp_ctx_init_thread(struct gwp_wrk *w,
 			       const struct gwp_sockaddr *bind_addr)
@@ -1183,14 +1221,24 @@ static int gwp_ctx_init_thread(struct gwp_wrk *w,
 		}
 	}
 
+	r = gwp_ctx_init_thread_linger(w);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to create the linger set: %s",
+		       strerror(-r));
+		goto out_err_raw_dns;
+	}
+
 	r = gwp_ctx_init_thread_event(w);
 	if (r < 0) {
 		pr_err(&ctx->lh, "gwp_ctx_init_thread_event: %s", strerror(-r));
-		goto out_err_raw_dns;
+		goto out_err_linger;
 	}
 
 	return r;
 
+out_err_linger:
+	gwp_linger_free(w->linger);
+	w->linger = NULL;
 out_err_raw_dns:
 	if (cfg->use_raw_dns)
 		gwp_ctx_free_raw_dns(w);
@@ -1271,16 +1319,115 @@ void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair __unused *gcp)
 #endif
 }
 
+bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
+			   const struct gwp_conn *c)
+{
+	if (!c->rst)
+		return false;
+	return c != &gcp->target || !gwp_http_fwd_active(gcp) ||
+	       gwp_http_fwd_res_state(gcp->http_conn) != GWP_HTTP_RES_FAILED;
+}
+
+/* Whether the pair resets the target, or the client, as described above. */
+static bool gwp_conn_pair_aborts_target(const struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	return gcp->client.tls && gcp->target.fd >= 0 && !gcp->target.wr_shut;
+#else
+	return false;
+#endif
+}
+
+static bool gwp_conn_pair_aborts_client(const struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	return gcp->target.tls && gcp->is_target_alive && gcp->client.fd >= 0 &&
+	       !gcp->client.wr_shut;
+#else
+	return false;
+#endif
+}
+
 static void gwp_conn_pair_abort_target(const struct gwp_conn_pair __unused *gcp)
 {
 #ifdef CONFIG_HTTPS
-	if (gcp->client.tls && gcp->target.fd >= 0 && !gcp->target.wr_shut)
+	if (gwp_conn_pair_aborts_target(gcp))
 		gwp_set_reset_on_close(gcp->target.fd);
-	if (gcp->target.tls && gcp->is_target_alive && gcp->client.fd >= 0 &&
-	    !gcp->client.wr_shut)
+	if (gwp_conn_pair_aborts_client(gcp))
 		gwp_set_reset_on_close(gcp->client.fd);
 	gwp_conn_pair_abort_attempts(gcp);
 #endif
+}
+
+bool gwp_conn_reset_passes_to(const struct gwp_conn_pair *gcp,
+			      const struct gwp_conn *c)
+{
+	const struct gwp_conn *o = c == &gcp->client ? &gcp->target :
+						       &gcp->client;
+
+	return !c->tls && !c->rst && gwp_conn_reset_passed(gcp, o);
+}
+
+/*
+ * How long a socket may linger (gwp_conn_pair_linger()), in ms: long enough
+ * for a peer to take what it was sent, or to finish sending what it had
+ * started, short enough not to hold descriptors for clients that never stop;
+ * never longer than --protocol-timeout, the bound of the handshake. A reset
+ * that is passed on waits longer for the peer to take what it is owed, as
+ * the reset destroys what is left.
+ */
+#define GWP_LINGER_FIN_MS	2000u
+#define GWP_LINGER_RST_MS	5000u
+
+static uint32_t gwp_linger_bound(const struct gwp_cfg *cfg)
+{
+	uint64_t pt = cfg->protocol_timeout > 0 ?
+		      (uint64_t)cfg->protocol_timeout * 1000u : UINT64_MAX;
+
+	return pt < GWP_LINGER_FIN_MS ? (uint32_t)pt : GWP_LINGER_FIN_MS;
+}
+
+/*
+ * Linger on @c: until the reset of the other side can be passed on to it
+ * (gwp_conn_reset_passes_to()) without destroying what it is still owed, or
+ * when it may still get input, as it has not been read to its end. Not when
+ * it was reset itself, as there is nobody left to linger for, nor when the
+ * pair aborts it (@abort), as the reset is then the point.
+ */
+static int gwp_conn_linger(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   struct gwp_conn *c, bool abort)
+{
+	int r;
+
+	if (c->fd < 0 || c->rst || abort)
+		return 0;
+
+	if (gwp_conn_reset_passes_to(gcp, c))
+		r = gwp_linger_add(w->linger, c->fd, GWP_LINGER_RST,
+				   GWP_LINGER_RST_MS);
+	else if (!c->rd_eof)
+		r = gwp_linger_add(w->linger, c->fd, GWP_LINGER_FIN,
+				   gwp_linger_bound(&w->ctx->cfg));
+	else
+		return 0;
+	c->fd = -1;
+	return r;
+}
+
+int gwp_conn_pair_linger(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int n;
+
+	if (!w->linger)
+		return 0;
+
+	n = gwp_conn_linger(w, gcp, &gcp->client,
+			    gwp_conn_pair_aborts_client(gcp));
+	/* A target that is not up yet has no peer to linger for. */
+	if (gcp->is_target_alive)
+		n += gwp_conn_linger(w, gcp, &gcp->target,
+				     gwp_conn_pair_aborts_target(gcp));
+	return n;
 }
 
 __cold
@@ -1312,6 +1459,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
 		free(gcp->udp_peers);
 		free(gcp->udp_up);
+		free(gcp->udp_eg);
 		gwp_conn_set_upstream(w->ctx, gcp, NULL);
 
 		/*
@@ -1378,6 +1526,8 @@ static void gwp_ctx_free_thread(struct gwp_wrk *w)
 		gwp_ctx_free_raw_dns(w);
 
 	gwp_ctx_free_thread_sock_pairs(w);
+	gwp_linger_free(w->linger);
+	w->linger = NULL;
 	gwp_ctx_free_thread_sock(w);
 }
 
@@ -1413,6 +1563,53 @@ static void gwp_ctx_warn_open_proxy(struct gwp_ctx *ctx,
 
 	pr_warn(&ctx->lh, "Listening on %s without --auth-file: anyone who can reach it can use this proxy, unless an --acl-file INPUT rule limits the clients",
 		ip_to_str(addr));
+}
+
+/*
+ * Every listener sets SO_REUSEPORT, so a second gwproxy started by mistake on
+ * the same --bind (an old instance still running, two units with different
+ * configurations) starts without an error, and the kernel then spreads new
+ * connections over both. Refusing to start would break a deliberate
+ * overlapping restart, so only warn. A probe bind without SO_REUSEPORT, before
+ * this instance's own listeners exist, fails with EADDRINUSE when another
+ * socket listens on the port. It races with other instances starting at the
+ * same time, which is fine for a warning. Port 0 gets a fresh port per
+ * worker and cannot collide.
+ */
+__cold
+static void gwp_ctx_warn_shared_port(struct gwp_ctx *ctx,
+				     const struct gwp_sockaddr *addr)
+{
+	socklen_t slen;
+	int fd, r;
+
+	if (addr->sa.sa_family == AF_INET) {
+		if (!addr->i4.sin_port)
+			return;
+		slen = sizeof(addr->i4);
+	} else if (addr->sa.sa_family == AF_INET6) {
+		if (!addr->i6.sin6_port)
+			return;
+		slen = sizeof(addr->i6);
+	} else {
+		return;
+	}
+
+	fd = __sys_socket(addr->sa.sa_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return;
+
+	/* As the listener has them, but for SO_REUSEPORT. */
+	setskopt_int(fd, SOL_SOCKET, SO_REUSEADDR, 1);
+	if (addr->sa.sa_family == AF_INET6)
+		setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+			     ctx->cfg.bind_ipv6_only ? 1 : 0);
+
+	r = __sys_bind(fd, &addr->sa, slen);
+	__sys_close(fd);
+	if (r == -EADDRINUSE)
+		pr_warn(&ctx->lh, "Another socket already listens on %s: if it is another gwproxy (or anything else with SO_REUSEPORT) of this user, the kernel will share new connections between it and this one",
+			ip_to_str(addr));
 }
 
 /*
@@ -1484,6 +1681,7 @@ static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 	if (r)
 		return r;
 	gwp_ctx_warn_open_proxy(ctx, &bind_addr);
+	gwp_ctx_warn_shared_port(ctx, &bind_addr);
 
 	if (posix_memalign((void **)&workers, GWP_CACHELINE,
 			   (size_t)cfg->nr_workers * sizeof(*workers)))
@@ -2649,6 +2847,70 @@ bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
 	return false;
 }
 
+/*
+ * Whether a line limited by @l may be logged now. When it may, *@quiet is set
+ * to the number left out since the last one, for the line to say; when not,
+ * this one is counted among them.
+ */
+bool gwp_wrk_log_limit(struct gwp_wrk *w, struct gwp_log_limit *l,
+		       uint32_t *quiet)
+{
+	if ((int32_t)(w->now - l->next) < 0) {
+		l->quiet++;
+		return false;
+	}
+
+	*quiet = l->quiet;
+	l->quiet = 0;
+	l->next = w->now + 1;
+	return true;
+}
+
+/*
+ * Log a client just accepted from @addr that the INPUT chain rejected. Such a
+ * client costs only an accept and a close, so it can come back as fast as it
+ * likes: log at most one line a second per worker, saying how many were left
+ * out since the previous one, so a flood of them cannot flood the log.
+ */
+void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	uint32_t quiet;
+
+	if (!gwp_wrk_log_limit(w, &w->acl_deny_log, &quiet))
+		return;
+
+	if (quiet)
+		pr_info(&ctx->lh, "ACL denied client %s (and %u more since the last such line)",
+			ip_to_str(addr), quiet);
+	else
+		pr_info(&ctx->lh, "ACL denied client %s", ip_to_str(addr));
+}
+
+/*
+ * Log a client just accepted from @addr on a transparent listener whose
+ * original destination could not be read (gwp_get_orig_dst() returned @err).
+ * Any client that reaches the listener directly gets here, and it costs only
+ * an accept and a close, so limit the lines as gwp_wrk_acl_denied() does.
+ */
+void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
+			 int err)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	const char *why = err == -ELOOP ? "it is this proxy" : strerror(-err);
+	uint32_t quiet;
+
+	if (!gwp_wrk_log_limit(w, &w->no_orig_dst_log, &quiet))
+		return;
+
+	if (quiet)
+		pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?) (and %u more since the last such line)",
+			ip_to_str(addr), why, quiet);
+	else
+		pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
+			ip_to_str(addr), why);
+}
+
 /* Uncount a client gwp_ctx_iplim_get() admitted. */
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr)
 {
@@ -2804,13 +3066,14 @@ static const char *gcp_req_user(const struct gwp_conn_pair *gcp)
 }
 
 /*
- * OUTPUT verdict for a UDP ASSOCIATE datagram to @target. Only the verdict
- * applies to UDP (no DNAT, MARK or BIND), and every input but the target is
- * fixed for the association (pinned peer, username), so the last target's
- * verdict is reused while the target and the ruleset generation stay the
- * same: a client streaming to one peer costs one evaluation, not one per
- * datagram. A chain with a -m statistic rule is evaluated every time, as its
- * answer changes per evaluation.
+ * OUTPUT verdict for a UDP ASSOCIATE datagram to @target. No DNAT applies to
+ * UDP; a direct relay keeps the -j MARK and -j BIND of the target in
+ * gcp->udp_eg, for udp_egress(). Every input but the target is fixed for
+ * the association (pinned peer, username), so the last target's verdict is
+ * reused while the target and the ruleset generation stay the same: a
+ * client streaming to one peer costs one evaluation, not one per datagram.
+ * A chain with a -m statistic rule is evaluated every time, as its answer
+ * changes per evaluation.
  */
 static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			       const struct gwp_sockaddr *target)
@@ -2831,6 +3094,15 @@ static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	/* UDP is relayed direct: -j UPSTREAM does not apply to it. */
 	gwp_acl_req_release(&req);
 
+	if (gcp->udp_eg) {
+		struct gwp_conn_sockopt *so = &gcp->udp_eg->so;
+
+		memset(so, 0, sizeof(*so));
+		so->mark_set = req.mark_set;
+		so->mark = req.mark;
+		if (req.bind.set)
+			so->bind = req.bind;
+	}
 	c->valid = req.cacheable;
 	c->gen = req.gen;
 	c->dst = *target;
@@ -3445,14 +3717,55 @@ static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 	return 0;
 }
 
+/*
+ * How long a stop waits for the resolver threads: one inside getaddrinfo()
+ * returns only when the system resolver gives up, which can take many
+ * seconds, and nothing needs its answer any more.
+ */
+#define GWP_DNS_STOP_GRACE_MS	1000
+
+/*
+ * The sleep of gwp_ctx_free_dns()'s wait, cut short by a SIGINT or SIGTERM.
+ * Both are blocked on every thread by then (sig_handler_detach_ctx(), or
+ * still from gwp_ctx_init() on its error path), so a second stop signal
+ * stays pending until it is taken here, and tells the proxy not to wait.
+ * @arg is a bool set when that happened.
+ */
+__cold
+static bool gwp_stop_signal_wait(int ms, void *arg)
+{
+	struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)ms * 1000000L };
+	sigset_t set;
+
+	sigemptyset(&set);
+	sigaddset(&set, SIGINT);
+	sigaddset(&set, SIGTERM);
+	if (sigtimedwait(&set, NULL, &ts) < 0)
+		return false;
+
+	*(bool *)arg = true;
+	return true;
+}
+
 static void gwp_ctx_free_dns(struct gwp_ctx *ctx)
 {
+	bool sig = false;
+	uint32_t left;
+
 	if (!ctx->dns)
 		return;
 
-	gwp_dns_ctx_free(ctx->dns);
+	left = gwp_dns_ctx_free_timed(ctx->dns, GWP_DNS_STOP_GRACE_MS,
+				      gwp_stop_signal_wait, &sig);
 	ctx->dns = NULL;
-	pr_dbg(&ctx->lh, "DNS context freed");
+	if (!left)
+		pr_dbg(&ctx->lh, "DNS context freed");
+	else if (sig)
+		pr_info(&ctx->lh, "Stop signal repeated: not waiting for %u DNS lookup(s) still in the system resolver",
+			left);
+	else
+		pr_info(&ctx->lh, "Not waiting for %u DNS lookup(s) still in the system resolver after %d ms",
+			left, GWP_DNS_STOP_GRACE_MS);
 }
 
 static int gwp_ctx_parse_ev(struct gwp_ctx *ctx)
@@ -3742,6 +4055,72 @@ out:
 	explicit_bzero(buf, sizeof(buf));
 	close(fd);
 	return r;
+}
+
+/*
+ * Whether the kernel takes SO_MARK per datagram, as the UDP relay gives
+ * --mark to the datagrams to the targets only (see udp_egress()). A kernel
+ * older than 5.0 does not, nor, on some, a process with CAP_NET_RAW but not
+ * CAP_NET_ADMIN, which SO_MARK on a socket is happy with. Asked of a
+ * sendmsg() that sends nothing: the mark comes first, then an IP_PKTINFO
+ * naming an interface that does not exist, so a kernel that takes the mark
+ * fails the send with ENODEV, and one that does not with EPERM or EINVAL.
+ * Where it does not, the relay socket itself is marked, as it was before
+ * the mark went per datagram: the datagrams to the clients get it too.
+ */
+__cold
+static void gwp_ctx_init_udp_mark(struct gwp_ctx *ctx)
+{
+	union gwp_udp_cmsg cb;
+	struct gwp_sockaddr dst;
+	struct in_pktinfo pi;
+	struct cmsghdr *cm;
+	struct msghdr mh;
+	struct iovec iov;
+	ssize_t r;
+	int fd;
+
+	ctx->udp_sk_mark = 0;
+	fd = __sys_socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return;
+
+	memset(&cb, 0, sizeof(cb));
+	cm = (struct cmsghdr *)(void *)cb.b;
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type = SO_MARK;
+	cm->cmsg_len = CMSG_LEN(sizeof(ctx->cfg.mark));
+	memcpy(CMSG_DATA(cm), &ctx->cfg.mark, sizeof(ctx->cfg.mark));
+	cm = (struct cmsghdr *)(void *)(cb.b + CMSG_SPACE(sizeof(ctx->cfg.mark)));
+	memset(&pi, 0, sizeof(pi));
+	pi.ipi_ifindex = INT_MAX;
+	cm->cmsg_level = IPPROTO_IP;
+	cm->cmsg_type = IP_PKTINFO;
+	cm->cmsg_len = CMSG_LEN(sizeof(pi));
+	memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
+
+	memset(&dst, 0, sizeof(dst));
+	dst.i4.sin_family = AF_INET;
+	dst.i4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	dst.i4.sin_port = htons(9);	/* discard, were it ever sent */
+	iov.iov_base = &pi;
+	iov.iov_len = 0;
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_name = &dst.sa;
+	mh.msg_namelen = sizeof(dst.i4);
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = cb.b;
+	mh.msg_controllen = CMSG_SPACE(sizeof(ctx->cfg.mark)) +
+			    CMSG_SPACE(sizeof(pi));
+	r = __sys_sendmsg(fd, &mh, MSG_NOSIGNAL);
+	__sys_close(fd);
+	if (r >= 0 || r == -ENODEV)
+		return;
+
+	ctx->udp_sk_mark = ctx->cfg.mark;
+	pr_warn(&ctx->lh, "--mark: the kernel does not take SO_MARK per datagram (%s), so the UDP relay marks its datagrams to the clients too",
+		strerror((int)-r));
 }
 
 /*
@@ -4440,6 +4819,8 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_upstream *up = gcp->upstream;
 	bool udp_refused;
 	unsigned int val;
+	uint16_t up_val;
+	uint8_t up_end;
 	char why[64];
 
 	if (!up || gcp->is_target_alive || (gcp->flags & GWP_CONN_FLAG_UP_FAILED))
@@ -4518,16 +4899,24 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	    (gcp->flags & (GWP_CONN_FLAG_UP_RETRIED | GWP_CONN_FLAG_IS_DYING |
 			   GWP_CONN_FLAG_IS_CANCEL)))
 		return false;
+	up_end = gcp->up_end;
+	up_val = gcp->up_val;
 	if (!upstream_retry(w, gcp))
 		return false;
 	/*
 	 * A pool may mix socks5h:// servers with http:// and https:// ones,
-	 * which cannot carry UDP: the retry is spent, and the failure stands.
+	 * which cannot carry UDP: the retry is spent, and the failure stands,
+	 * as the first server ended it. upstream_retry() cleared how it ended
+	 * for the new attempt, and the client's answer is made from that
+	 * (gwp_upstream_fail_reply()), so put it back.
 	 */
 	if ((gcp->flags & GWP_CONN_FLAG_UDP_UP) &&
 	    gcp->upstream->type != GWP_UPSTREAM_SOCKS5) {
 		pr_dbg(&w->ctx->lh, "Upstream retry for idx=%u landed on a server that cannot carry UDP; giving up",
 		       gcp->idx);
+		gcp->flags |= GWP_CONN_FLAG_UP_FAILED;
+		gcp->up_end = up_end;
+		gcp->up_val = up_val;
 		return false;
 	}
 	return true;
@@ -4624,6 +5013,7 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 				goto out_free_log;
 			}
 		}
+		gwp_ctx_init_udp_mark(ctx);
 	}
 
 	if (ctx->cfg.pid_file)
@@ -4911,6 +5301,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gwp_conn_close_attempts(gcp);
 	free(gcp->udp_peers);
 	free(gcp->udp_up);
+	free(gcp->udp_eg);
 	gwp_conn_set_upstream(w->ctx, gcp, NULL);
 
 	gwp_conn_pair_drop_dns(w, gcp);
@@ -5381,7 +5772,17 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	 */
 	bool timed_out = (err == -ETIMEDOUT || err == -ETIME);
 
+	/*
+	 * One final answer per request. A failure seen again on the pair's
+	 * way out (a timer that expired as it failed, say) adds nothing: the
+	 * answer already given may still be on its way, and a second one
+	 * would follow it, or be written over it. The SOCKS5 reply builder
+	 * refuses a second reply by its state; the HTTP ones would not.
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
+		return 0;
 	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
+	gcp->client.last_reply = true;
 	if (timed_out)
 		err = -ETIMEDOUT;
 
@@ -5443,6 +5844,12 @@ int gwp_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
+	/* A final answer as well, see gwp_conn_fail_reply(). */
+	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
+		return -EACCES;
+	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
+	gcp->client.last_reply = true;
+
 	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
 		gwp_upstream_dst_str(gcp), ip_to_str(&gcp->client_addr),
 		gcp->idx);
@@ -6450,6 +6857,12 @@ static enum gwp_udp_act udp_up_classify(struct gwp_wrk *w,
 	out->len = n;
 	out->dst = u->relay;
 	out->dstlen = u->relay_len;
+	out->from = &u->local;
+	out->from_ifindex = u->ifindex;
+	if (u->mark != w->ctx->udp_sk_mark) {
+		out->mark = u->mark;
+		out->mark_set = true;
+	}
 	return GWP_UDP_TO_TARGET;
 
 from_relay:
@@ -6461,7 +6874,121 @@ from_relay:
 	out->dst = gcp->udp_peer;
 	out->dstlen = gcp->udp_peer.sa.sa_family == AF_INET ?
 		      sizeof(gcp->udp_peer.i4) : sizeof(gcp->udp_peer.i6);
+	out->from = &gcp->udp_local;
 	return GWP_UDP_TO_CLIENT;
+}
+
+/* The failures of udp_egress() an association has logged, once each. */
+enum {
+	GWP_UDP_EG_IFACE	= 1 << 0,
+	GWP_UDP_EG_FAMILY	= 1 << 1,
+	GWP_UDP_EG_V6_BOTH	= 1 << 2,
+};
+
+/*
+ * The index of interface @name, looked up at most once a second for @eg: an
+ * interface that comes up later is found, and one that went away, or came
+ * back with another index, is noticed. 0 when there is no such interface.
+ */
+static uint32_t udp_eg_ifindex(struct gwp_wrk *w, struct gwp_udp_egress *eg,
+			       const char *name)
+{
+	if (eg->if_at != w->now || strcmp(eg->ifname, name)) {
+		snprintf(eg->ifname, sizeof(eg->ifname), "%s", name);
+		eg->ifindex = if_nametoindex(name);
+		eg->if_at = w->now;
+	}
+	return eg->ifindex;
+}
+
+/*
+ * Set @out, a direct association's datagram to its target out->dst, to leave
+ * the relay socket the way a TCP connection to that target would: from the
+ * source address, out of the interface, and with the mark that a matching
+ * ACL -j BIND or -j MARK rule, else --bind-source, --bind-iface and --mark,
+ * give it, as gwp_create_sock_target() applies them, and as strictly. The
+ * socket is bound to nothing, as it talks to the client too, so these go
+ * with each datagram (gwp_udp_src_cmsg()): the datagrams to the client keep
+ * the address the client was told and routing's interface, and carry no
+ * mark, as on a TCP client connection.
+ *
+ * Returns false, to drop the datagram, where a connection would fail: an
+ * interface that does not exist (yet), or an ACL source of the other family.
+ * Also for an IPv6 target with both a source and an interface: per datagram
+ * the kernel holds an IPv6 one to the interface only when it picks the
+ * source itself, and would otherwise send it by another interface where
+ * this one has no route to the target. A source port is not applied: the
+ * datagrams leave from the relay socket's port.
+ */
+static bool udp_egress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		       struct gwp_udp_out *out)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_udp_egress *eg = gcp->udp_eg;
+	const struct gwp_conn_sockopt *so = (eg && ctx->acl) ? &eg->so : NULL;
+	const struct gwp_acl_bind *b = NULL;
+	uint32_t mark = ctx->cfg.mark;
+	bool global = false;
+	const char *why;
+	uint8_t bit;
+
+	/* A -j MARK replaces --mark, as on a TCP connection. */
+	if (so && so->mark_set)
+		mark = so->mark;
+	if (mark != ctx->udp_sk_mark) {
+		out->mark = mark;
+		out->mark_set = true;
+	}
+
+	/* A -j BIND replaces --bind-source and --bind-iface wholesale. */
+	if (so && so->bind.set) {
+		b = &so->bind;
+	} else if (ctx->bind_def.set) {
+		b = &ctx->bind_def;
+		global = true;
+	}
+	if (!b)
+		return true;
+	/* Allocated whenever there is a bind to apply, see the caller. */
+	assert(eg);
+
+	if (b->iface[0]) {
+		out->from_ifindex = udp_eg_ifindex(w, eg, b->iface);
+		if (!out->from_ifindex) {
+			bit = GWP_UDP_EG_IFACE;
+			why = "no such interface";
+			goto drop;
+		}
+	}
+	if (b->have_src) {
+		if (conn_bind_src(&eg->src, &b->src, &out->dst)) {
+			out->from = &eg->src;
+		} else if (!global) {
+			/* --bind-source of the other family just does not apply. */
+			bit = GWP_UDP_EG_FAMILY;
+			why = "the -j BIND --to-source is of another family";
+			goto drop;
+		}
+	}
+	if (out->from && out->from_ifindex &&
+	    out->dst.sa.sa_family == AF_INET6 &&
+	    !IN6_IS_ADDR_V4MAPPED(&out->dst.i6.sin6_addr)) {
+		bit = GWP_UDP_EG_V6_BOTH;
+		why = "an IPv6 datagram cannot be held to both a source and an interface";
+		goto drop;
+	}
+	return true;
+
+drop:
+	if (!(eg->warned & bit)) {
+		eg->warned |= bit;
+		pr_err(&ctx->lh,
+		       "UDP relay: dropping the datagrams to %s from %s on interface %s: %s (idx=%u)",
+		       ip_to_str(&out->dst),
+		       b->have_src ? ip_to_str(&b->src) : "(any)",
+		       b->iface[0] ? b->iface : "(any)", why, gcp->idx);
+	}
+	return false;
 }
 
 enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
@@ -6472,6 +6999,9 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 {
 	bool client_dgram;
 
+	out->from = NULL;
+	out->from_ifindex = 0;
+	out->mark_set = false;
 	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
 		return udp_up_classify(w, gcp, base, n, src, out);
 
@@ -6517,16 +7047,24 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 			gcp->udp_peer = *src;
 			gcp->udp_pinned = true;
 		}
+		/* Room for what the ACL and the bind options say, see udp_egress(). */
+		if (!gcp->udp_eg && (w->ctx->acl || w->ctx->bind_def.set)) {
+			gcp->udp_eg = calloc(1, sizeof(*gcp->udp_eg));
+			if (unlikely(!gcp->udp_eg))
+				return GWP_UDP_DROP;
+		}
 		if (!udp_target_allowed(w->ctx, gcp, &tsa))
 			return GWP_UDP_DROP;	/* ACL denied this datagram */
+		out->dst = tsa;
+		out->dstlen = tslen;
+		if (!udp_egress(w, gcp, out))
+			return GWP_UDP_DROP;
 		/* Only a target the client has sent to may answer it. */
 		if (!udp_peer_note(gcp, &tsa,
 				   w->ctx->acl ? gcp->udp_acl.gen : 0))
 			return GWP_UDP_DROP;
 		out->buf = base + hdr_len;
 		out->len = n - hdr_len;
-		out->dst = tsa;
-		out->dstlen = tslen;
 		return GWP_UDP_TO_TARGET;
 	} else {
 		/* Target -> client: prepend a header in the front slack. */
@@ -6545,6 +7083,7 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 		out->dst = gcp->udp_peer;
 		out->dstlen = gcp->udp_peer.sa.sa_family == AF_INET ?
 			      sizeof(gcp->udp_peer.i4) : sizeof(gcp->udp_peer.i6);
+		out->from = &gcp->udp_local;
 		return GWP_UDP_TO_CLIENT;
 	}
 }
@@ -6650,6 +7189,12 @@ static void udp_pin_declared(struct gwp_conn_pair *gcp, int family)
  * from the relay socket. An IPv4 client of a dual-stack listener is told an
  * IPv4 address, not the v4-mapped form of it that getsockname() reports.
  * @relay is the relay socket's address, or NULL to read it.
+ *
+ * The relay socket is bound to the wildcard address, so the address is
+ * kept too (gcp->udp_local): the datagrams to the client are sent from it,
+ * not from whichever source routing would pick toward the client. A client
+ * that checks where they come from, with a connect()ed socket or behind a
+ * stateful firewall, takes only those from BND.ADDR.
  */
 static int udp_client_bnd(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			  const struct gwp_sockaddr *relay,
@@ -6665,6 +7210,7 @@ static int udp_client_bnd(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			strerror(-r));
 		return r;
 	}
+	gcp->udp_local = local;
 	if (!relay) {
 		slen = sizeof(ra);
 		r = __sys_getsockname(gcp->udp_fd, &ra.sa, &slen);
@@ -6778,8 +7324,9 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (relay.sa.sa_family == AF_INET6)
 		setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
-	if (ctx->cfg.mark)
-		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)ctx->cfg.mark);
+	/* The datagrams to the targets carry their mark, see udp_egress(). */
+	if (ctx->udp_sk_mark)
+		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)ctx->udp_sk_mark);
 
 	r = __sys_bind(fd, &relay.sa, relay_len);
 	if (r < 0) {
@@ -6849,11 +7396,97 @@ reply:
 	return (rep == GWP_SOCKS5_REP_SUCCESS) ? 0 : -ECONNREFUSED;
 }
 
+size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
+{
+	const struct gwp_sockaddr *f = out->from;
+	struct cmsghdr *cm = (struct cmsghdr *)(void *)cb->b;
+	struct in_addr a4 = { 0 };
+	size_t len = 0;
+	bool f4, d4;
+
+	/* The destination has the relay socket's family. */
+	d4 = out->dst.sa.sa_family == AF_INET ||
+	     IN6_IS_ADDR_V4MAPPED(&out->dst.i6.sin6_addr);
+	f4 = d4;
+	if (f && f->sa.sa_family == AF_INET) {
+		f4 = true;
+		a4 = f->i4.sin_addr;
+	} else if (f && f->sa.sa_family == AF_INET6) {
+		f4 = IN6_IS_ADDR_V4MAPPED(&f->i6.sin6_addr);
+		memcpy(&a4, &f->i6.sin6_addr.s6_addr[12], sizeof(a4));
+	} else {
+		f = NULL;
+	}
+	if (f4 != d4)
+		f = NULL;
+	if (!f && !out->from_ifindex && !out->mark_set)
+		return 0;
+
+	assert(CMSG_SPACE(sizeof(struct in6_pktinfo)) +
+	       CMSG_SPACE(sizeof(uint32_t)) <= sizeof(cb->b));
+	memset(cb, 0, sizeof(*cb));
+	if (!f && !out->from_ifindex) {
+		/* Only a mark. */
+	} else if (out->dst.sa.sa_family == AF_INET6) {
+		struct in6_pktinfo pi;
+
+		/* With no source, the unspecified one: routing picks it. */
+		memset(&pi, 0, sizeof(pi));
+		if (d4) {
+			pi.ipi6_addr.s6_addr[10] = 0xff;
+			pi.ipi6_addr.s6_addr[11] = 0xff;
+			memcpy(&pi.ipi6_addr.s6_addr[12], &a4, sizeof(a4));
+		} else if (f) {
+			pi.ipi6_addr = f->i6.sin6_addr;
+			/* A link-local source is of its own link. */
+			pi.ipi6_ifindex = f->i6.sin6_scope_id;
+		}
+		if (out->from_ifindex)
+			pi.ipi6_ifindex = out->from_ifindex;
+		cm->cmsg_level = IPPROTO_IPV6;
+		cm->cmsg_type = IPV6_PKTINFO;
+		cm->cmsg_len = CMSG_LEN(sizeof(pi));
+		memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
+		len = CMSG_SPACE(sizeof(pi));
+	} else {
+		struct in_pktinfo pi;
+
+		memset(&pi, 0, sizeof(pi));
+		pi.ipi_spec_dst = a4;
+		pi.ipi_ifindex = (int)out->from_ifindex;
+		cm->cmsg_level = IPPROTO_IP;
+		cm->cmsg_type = IP_PKTINFO;
+		cm->cmsg_len = CMSG_LEN(sizeof(pi));
+		memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
+		len = CMSG_SPACE(sizeof(pi));
+	}
+	if (out->mark_set) {
+		cm = (struct cmsghdr *)(void *)(cb->b + len);
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type = SO_MARK;
+		cm->cmsg_len = CMSG_LEN(sizeof(out->mark));
+		memcpy(CMSG_DATA(cm), &out->mark, sizeof(out->mark));
+		len += CMSG_SPACE(sizeof(out->mark));
+	}
+	return len;
+}
+
+/*
+ * What gwproxy's own UDP ASSOCIATE to the pair's upstream declares: the
+ * address of the control connection to it, and the port of the relay
+ * socket. The control connection follows --bind-source and --bind-iface
+ * (or -j BIND), and the relay socket, bound to the wildcard address, does
+ * not, so its datagrams to the server are sent from that address and out
+ * of that interface (gcp->udp_up): a server that takes datagrams only from
+ * the declared address, as gwproxy does, would drop them otherwise. They
+ * carry the connection's mark (--mark or -j MARK) as well, as the socket
+ * has none of its own (see udp_egress()).
+ */
 int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_sockaddr local, relay;
 	socklen_t slen = sizeof(local);
-	int r;
+	int r, ifindex = 0, mark = 0;
 
 	r = __sys_getsockname(gcp->target.fd, &local.sa, &slen);
 	if (r >= 0) {
@@ -6865,6 +7498,20 @@ int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		       strerror(-r), gcp->idx);
 		return r;
 	}
+#ifdef SO_BINDTOIFINDEX
+	/* Unknown to a kernel older than 5.0: no interface then. */
+	slen = sizeof(ifindex);
+	if (__sys_getsockopt(gcp->target.fd, SOL_SOCKET, SO_BINDTOIFINDEX,
+			     &ifindex, &slen) < 0 || ifindex < 0)
+		ifindex = 0;
+#endif
+	slen = sizeof(mark);
+	if (__sys_getsockopt(gcp->target.fd, SOL_SOCKET, SO_MARK, &mark,
+			     &slen) < 0)
+		mark = 0;
+	gcp->udp_up->local = local;
+	gcp->udp_up->ifindex = (uint32_t)ifindex;
+	gcp->udp_up->mark = (uint32_t)mark;
 
 	/* An IPv4 control connection names its address as IPv4. */
 	gwp_socks5_reply_addr_from_sockaddr(&local, &gcp->up_dst);
@@ -7078,6 +7725,65 @@ static int http_reject_bad_request(struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Queue the HTTP 501 reply for a request this proxy does not serve
+ * (GWP_HTTP_NOT_IMPLEMENTED), or the 505 for an HTTP version other than 1.x
+ * (GWP_HTTP_BAD_VERSION). Same mechanism as the 407 above. Returns a negative
+ * error so the caller drops the connection.
+ */
+static int http_reject_not_implemented(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_not_implemented_reply(
+			gcp->target.buf + gcp->target.len,
+			gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -EOPNOTSUPP;
+}
+
+/* The HTTP 414 reply for a request line that is too long; as the 431. */
+static int http_reject_uri_too_long(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_uri_too_long_reply(
+			gcp->target.buf + gcp->target.len,
+			gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -E2BIG;
+
+	gcp->target.len += (uint32_t)r;
+	return -E2BIG;
+}
+
+/*
+ * Queue the 200 for an OPTIONS request with Max-Forwards: 0, which this proxy
+ * answers itself (GWP_HTTP_OPTIONS_REPLY). Nothing more is done for the
+ * request, so the return is negative as for a refusal.
+ */
+static int http_answer_options(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_options_reply(gcp->target.buf + gcp->target.len,
+					     gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -ECANCELED;
+}
+
+static int http_reject_bad_version(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_bad_version_reply(
+			gcp->target.buf + gcp->target.len,
+			gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -EPROTONOSUPPORT;
+}
+
+/*
  * A port as an HTTP authority carries it: decimal digits only, no sign, no
  * service name, at most 65535.
  */
@@ -7128,12 +7834,13 @@ static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 /*
  * Room kept free in the target buffer while the response header is held back:
- * enough for the "Connection: close" and "Proxy-Connection: close" lines the
- * rewrite adds. A header therefore gets at most target-buf-size minus this,
- * counted together with any interim (1xx) responses still queued for the
- * client. That is enough for any CRLF header that fits, but the rewrite also
- * turns bare LF line ends into CRLF, so an LF-only header near the limit can
- * still outgrow the buffer; the rewrite is bounds-checked and answers 502.
+ * enough for the "Connection: close", "Proxy-Connection: close" and
+ * "Via: 1.1 gwproxy" lines the rewrite adds (62 bytes). A header therefore
+ * gets at most target-buf-size minus this, counted together with any interim
+ * (1xx) responses still queued for the client. That is enough for any CRLF
+ * header that fits, but the rewrite also turns bare LF line ends into CRLF,
+ * so an LF-only header near the limit can still outgrow the buffer; the
+ * rewrite is bounds-checked and answers 502.
  */
 #define HTTP_FWD_RES_SLACK	64
 
@@ -7338,9 +8045,16 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		 * level-triggered socket to be read again -- which would
 		 * busy-spin until the protocol timeout fires.
 		 */
-		if (gcp->client.len >= gcp->client.cap)
+		if (gcp->client.len < gcp->client.cap)
+			return 0;
+		switch (gwp_http_conn_overflow(gcp->http_conn)) {
+		case GWP_HTTP_URI_TOO_LONG:
+			return http_reject_uri_too_long(gcp);
+		case GWP_HTTP_TOO_LARGE:
 			return http_reject_too_large(gcp);
-		return 0;
+		default:
+			return -EINVAL;		/* not HTTP; no reply */
+		}
 	case GWP_HTTP_NEED_AUTH:
 		http_log_auth_failure(w, gcp);
 		return http_reject_unauthorized(gcp);
@@ -7361,8 +8075,24 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		pr_dbg(&ctx->lh, "HTTP request header too large (fd=%d)",
 		       gcp->client.fd);
 		return http_reject_too_large(gcp);
+	case GWP_HTTP_URI_TOO_LONG:
+		pr_dbg(&ctx->lh, "HTTP request line too long (fd=%d)",
+		       gcp->client.fd);
+		return http_reject_uri_too_long(gcp);
+	case GWP_HTTP_NOT_IMPLEMENTED:
+		pr_dbg(&ctx->lh, "HTTP request not served (fd=%d)",
+		       gcp->client.fd);
+		return http_reject_not_implemented(gcp);
+	case GWP_HTTP_OPTIONS_REPLY:
+		pr_dbg(&ctx->lh, "Answering OPTIONS with Max-Forwards: 0 (fd=%d)",
+		       gcp->client.fd);
+		return http_answer_options(gcp);
+	case GWP_HTTP_BAD_VERSION:
+		pr_dbg(&ctx->lh, "HTTP version not supported (fd=%d)",
+		       gcp->client.fd);
+		return http_reject_bad_version(gcp);
 	default:	/* GWP_HTTP_ERR */
-		pr_dbg(&ctx->lh, "Invalid HTTP request (fd=%d)", gcp->client.fd);
+		pr_dbg(&ctx->lh, "Not an HTTP request (fd=%d)", gcp->client.fd);
 		return -EINVAL;
 	}
 }
@@ -7531,7 +8261,9 @@ static void sig_handler(int sig)
  * thread. This thread is the last one left once the context is freed, so keep
  * the signals pending on it from here on: there is nothing left for them to
  * stop, and one landing in exit() can upset what runs there, such as the
- * leak check of a sanitizer build, which stops the process with ptrace.
+ * leak check of a sanitizer build, which stops the process with ptrace. Only
+ * the wait for the resolver threads takes one, as a sign not to wait any
+ * longer (gwp_stop_signal_wait()).
  */
 __cold
 static void sig_handler_detach_ctx(void)

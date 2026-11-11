@@ -27,6 +27,23 @@ struct gwp_ssl_ctx {
 };
 
 /*
+ * Refuse TLS 1.2 renegotiation, whoever asks for it: OpenSSL answers a
+ * HelloRequest, or a client's new ClientHello, with a no_renegotiation
+ * alert. A renegotiation is pending for as long as the peer likes, and
+ * meanwhile nothing can be written to it: a peer could hold a tunnel
+ * that way. TLS 1.3 has none. Builds with an OpenSSL older than 1.1.0h
+ * lack the option and keep OpenSSL's default.
+ */
+static void ctx_no_renegotiation(SSL_CTX *ctx)
+{
+#ifdef SSL_OP_NO_RENEGOTIATION
+	SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+#else
+	(void)ctx;
+#endif
+}
+
+/*
  * A byte queue: the bytes in [head, tail) of @buf are queued, the rest of the
  * @cap bytes is free. It backs one direction of a connection's ciphertext and
  * gives the caller direct access to both ends, which a memory BIO does not:
@@ -62,6 +79,11 @@ struct gwp_ssl {
 	bool		rx_closed;
 	/* Reading failed for good; the engine is not to be asked again. */
 	bool		rx_failed;
+	/*
+	 * The last SSL_write() took nothing and asked for ciphertext first,
+	 * and nothing has been received since: writing again cannot help.
+	 */
+	bool		tx_starved;
 };
 
 _Static_assert(GWP_SSL_RECORD_MAX >= SSL3_RT_HEADER_LENGTH +
@@ -260,6 +282,7 @@ int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
 		goto err;
 
 	SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
+	ctx_no_renegotiation(c->ctx);
 	SSL_CTX_set_alpn_select_cb(c->ctx, alpn_select_cb, NULL);
 	if (SSL_CTX_use_certificate_chain_file(c->ctx, cert_file) != 1)
 		goto err;
@@ -296,6 +319,7 @@ int gwp_ssl_ctx_client_create(struct gwp_ssl_ctx **out)
 	}
 
 	SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
+	ctx_no_renegotiation(c->ctx);
 	/* Test-only, see ssl.h: no peer verification. */
 	SSL_CTX_set_verify(c->ctx, SSL_VERIFY_NONE, NULL);
 	*out = c;
@@ -326,6 +350,7 @@ int gwp_ssl_ctx_client_verify_create(struct gwp_ssl_ctx **out,
 		free(c);
 		return -EINVAL;
 	}
+	ctx_no_renegotiation(c->ctx);
 	SSL_CTX_set_verify(c->ctx, SSL_VERIFY_PEER, NULL);
 	/*
 	 * A CA file that loads no certificate at all fails here, rather than
@@ -496,8 +521,10 @@ void gwp_ssl_rx_commit(struct gwp_ssl *s, size_t len)
 {
 	s->rq.pinned = false;
 	s->rq.tail += len;
-	if (len)
+	if (len) {
 		s->rx_starved = false;
+		s->tx_starved = false;
+	}
 }
 
 bool gwp_ssl_rx_more(struct gwp_ssl *s)
@@ -649,9 +676,17 @@ int gwp_ssl_write(struct gwp_ssl *s, const void *buf, size_t len,
 	r = SSL_write(s->ssl, buf, cap_int(len));
 	if (r > 0) {
 		*consumed = (size_t)r;
+		s->tx_starved = false;
 		return GWP_SSL_OK;
 	}
-	return map_err(s, r);
+	r = map_err(s, r);
+	s->tx_starved = r == GWP_SSL_WANT_READ;
+	return r;
+}
+
+bool gwp_ssl_tx_starved(struct gwp_ssl *s)
+{
+	return s->tx_starved;
 }
 
 int gwp_ssl_shutdown(struct gwp_ssl *s)

@@ -186,7 +186,10 @@ for loop in epoll io_uring; do
 	want "$loop e" "retries" "$(retries p_e | wc -w)" 1
 
 	# Never ejected: retried on another server each time it is drawn.
-	for i in $(seq 1 20); do
+	# With no tunnel open a tie goes to the first server drawn, so the
+	# dead one is taken about once in three: 40 tries miss it with a
+	# chance of (2/3)^40, about 1e-7 (20 tries: 3e-4, too often).
+	for i in $(seq 1 40); do
 		get "$loop x $i" x
 	done
 	n="$(npicks p_x 1)"

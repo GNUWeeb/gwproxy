@@ -293,9 +293,22 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	size_t consumed, scan = gcp->up_scan;
 	int status, r;
 
+again:
 	r = gwp_http_cli_parse_connect_reply(gcp->target.buf, gcp->target.len,
 					     &scan, &status, &consumed);
 	gcp->up_scan = (uint32_t)scan;
+	/*
+	 * An interim response (100 Continue, 102 Processing, 103 Early Hints)
+	 * comes before the final one, and a client MUST take it and read on
+	 * (RFC 9110 Section 15.2). Drop it and parse what follows; a flood
+	 * of them is bounded by the connect timeout. A 101 is no interim
+	 * response here: nobody asked to switch protocols.
+	 */
+	if (!r && status >= 100 && status < 200 && status != 101) {
+		gwp_conn_buf_advance(&gcp->target, consumed);
+		scan = 0;
+		goto again;
+	}
 	/*
 	 * A reply header that fills the buffer without ending never will:
 	 * there is no room left to receive the rest. Waiting for it only
@@ -514,6 +527,16 @@ void gwp_upstream_tls_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		fail_class(GWP_UPSTREAM_END_TLS, 0), gcp->idx, up->host,
 		ip_to_str(&up->addr), why ? "certificate verify failed: " : "",
 		why ? why : gwp_ssl_errstr());
+	gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TLS, 0);
+}
+
+void gwp_upstream_tls_rx_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_upstream *up = gcp->upstream;
+
+	pr_err(&w->ctx->lh, "Upstream TLS failed before the CONNECT reply (class=%s, idx=%u, host=%s, up=%s): %s",
+		fail_class(GWP_UPSTREAM_END_TLS, 0), gcp->idx, up->host,
+		ip_to_str(&up->addr), gwp_ssl_errstr());
 	gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TLS, 0);
 }
 

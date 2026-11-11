@@ -122,7 +122,7 @@ reload()
 	local n
 
 	n="$(count 'Reloaded ACL file')"
-	gwp_hup "$front" "$log" 1
+	gwp_hup "$front" "$log" 2
 	want "$1" "reloads" "$(count 'Reloaded ACL file')" "$((n + 1))"
 	# A reload starts each pool's turns again; the picks count from here.
 	MARK="$(wc -l <"$log")"
