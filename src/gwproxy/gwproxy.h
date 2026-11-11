@@ -998,6 +998,16 @@ struct gwp_tmr_heap {
 	uint32_t		cap;
 };
 
+/*
+ * A log line a client can trigger at will, written at most once a second per
+ * worker: the next is due from @next on, and @quiet counts the ones left out
+ * since the last (gwp_wrk_log_limit()).
+ */
+struct gwp_log_limit {
+	uint32_t	next;
+	uint32_t	quiet;
+};
+
 struct gwp_wrk {
 	int			tcp_fd;
 	/* Where tcp_fd listens, see gwp_target_is_self(). */
@@ -1075,12 +1085,13 @@ struct gwp_wrk {
 	 * enough to stamp every event with (gwp_conn_pair::last_act).
 	 */
 	uint32_t		now;
+	/* The INPUT chain's refusals (gwp_wrk_acl_denied()). */
+	struct gwp_log_limit	acl_deny_log;
 	/*
-	 * The INPUT chain's refusals: logged at most once a second, from
-	 * @acl_deny_next on, with the number left out since (gwp_wrk_acl_denied()).
+	 * Transparent clients with no original destination
+	 * (gwp_wrk_no_orig_dst()).
 	 */
-	uint32_t		acl_deny_next;
-	uint32_t		acl_deny_quiet;
+	struct gwp_log_limit	no_orig_dst_log;
 	pthread_t		thread;
 
 	/*
@@ -1243,7 +1254,11 @@ struct gwp_ctx {
 
 struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w);
 bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
+bool gwp_wrk_log_limit(struct gwp_wrk *w, struct gwp_log_limit *l,
+		       uint32_t *quiet);
 void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
+void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
+			 int err);
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 /* Make @gcp chain through @up (NULL: go direct), dropping what it had. */

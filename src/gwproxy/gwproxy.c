@@ -2848,6 +2848,25 @@ bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
 }
 
 /*
+ * Whether a line limited by @l may be logged now. When it may, *@quiet is set
+ * to the number left out since the last one, for the line to say; when not,
+ * this one is counted among them.
+ */
+bool gwp_wrk_log_limit(struct gwp_wrk *w, struct gwp_log_limit *l,
+		       uint32_t *quiet)
+{
+	if ((int32_t)(w->now - l->next) < 0) {
+		l->quiet++;
+		return false;
+	}
+
+	*quiet = l->quiet;
+	l->quiet = 0;
+	l->next = w->now + 1;
+	return true;
+}
+
+/*
  * Log a client just accepted from @addr that the INPUT chain rejected. Such a
  * client costs only an accept and a close, so it can come back as fast as it
  * likes: log at most one line a second per worker, saying how many were left
@@ -2858,19 +2877,38 @@ void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
 	struct gwp_ctx *ctx = w->ctx;
 	uint32_t quiet;
 
-	if ((int32_t)(w->now - w->acl_deny_next) < 0) {
-		w->acl_deny_quiet++;
+	if (!gwp_wrk_log_limit(w, &w->acl_deny_log, &quiet))
 		return;
-	}
 
-	quiet = w->acl_deny_quiet;
-	w->acl_deny_quiet = 0;
-	w->acl_deny_next = w->now + 1;
 	if (quiet)
 		pr_info(&ctx->lh, "ACL denied client %s (and %u more since the last such line)",
 			ip_to_str(addr), quiet);
 	else
 		pr_info(&ctx->lh, "ACL denied client %s", ip_to_str(addr));
+}
+
+/*
+ * Log a client just accepted from @addr on a transparent listener whose
+ * original destination could not be read (gwp_get_orig_dst() returned @err).
+ * Any client that reaches the listener directly gets here, and it costs only
+ * an accept and a close, so limit the lines as gwp_wrk_acl_denied() does.
+ */
+void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
+			 int err)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	const char *why = err == -ELOOP ? "it is this proxy" : strerror(-err);
+	uint32_t quiet;
+
+	if (!gwp_wrk_log_limit(w, &w->no_orig_dst_log, &quiet))
+		return;
+
+	if (quiet)
+		pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?) (and %u more since the last such line)",
+			ip_to_str(addr), why, quiet);
+	else
+		pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
+			ip_to_str(addr), why);
 }
 
 /* Uncount a client gwp_ctx_iplim_get() admitted. */

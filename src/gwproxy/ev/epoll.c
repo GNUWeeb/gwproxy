@@ -1209,9 +1209,7 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	if (cfg->as_transparent) {
 		r = gwp_get_orig_dst(fd, &gcp->client_addr, &gcp->target_addr);
 		if (r) {
-			pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
-				ip_to_str(&gcp->client_addr),
-				r == -ELOOP ? "it is this proxy" : strerror(-r));
+			gwp_wrk_no_orig_dst(w, &gcp->client_addr, r);
 			free_conn_pair(w, gcp);
 			return 0;
 		}
